@@ -29,7 +29,7 @@ public class SmartFusionSettingsApiController {
     public ResponseEntity<?> getUserSettings(@RequestParam Long chatId,
                                              @RequestParam(defaultValue = "BTCUSDT") String symbol) {
         try {
-            SmartFusionStrategySettings settings = settingsService.getOrCreate(chatId, symbol);
+            SmartFusionStrategySettings settings = settingsService.getOrCreate(chatId);
             log.info("📤 [GET] SmartFusion settings loaded (chatId={}, symbol={}, id={})",
                     chatId, symbol, settings != null ? settings.getId() : null);
             return ResponseEntity.ok(settings);

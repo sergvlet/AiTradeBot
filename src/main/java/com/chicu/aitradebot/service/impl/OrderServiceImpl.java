@@ -4,6 +4,7 @@ import com.chicu.aitradebot.domain.OrderEntity;
 import com.chicu.aitradebot.exchange.model.Order;
 import com.chicu.aitradebot.repository.OrderRepository;
 import com.chicu.aitradebot.service.OrderService;
+import com.chicu.aitradebot.web.ws.RealtimeStreamService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -18,6 +19,22 @@ import java.util.List;
 public class OrderServiceImpl implements OrderService {
 
     private final OrderRepository orderRepository;
+    private final RealtimeStreamService realtimeStreamService; // ⬅️ уже существующий сервис из web.ws
+
+    // ======================= Вспомогательный метод =========================
+    /**
+     * Всегда используем его вместо прямого orderRepository.save(),
+     * чтобы каждый ордер отправлялся в WebSocket.
+     */
+    private OrderEntity saveAndBroadcast(OrderEntity e) {
+        OrderEntity saved = orderRepository.save(e);
+        try {
+            realtimeStreamService.sendTrade(saved);
+        } catch (Exception ex) {
+            log.warn("Не удалось отправить ордер в realtime WS: id={}, error={}", saved.getId(), ex.getMessage(), ex);
+        }
+        return saved;
+    }
 
     // =====================================================================
     // MARKET
@@ -39,7 +56,8 @@ public class OrderServiceImpl implements OrderService {
         e.setFilled(true);
         e.setTimestamp(System.currentTimeMillis());
         e.setCreatedAt(LocalDateTime.now());
-        orderRepository.save(e);
+
+        e = saveAndBroadcast(e);
 
         Order order = new Order();
         order.setId(e.getId());
@@ -73,7 +91,8 @@ public class OrderServiceImpl implements OrderService {
         e.setStrategyType(strategyType);
         e.setTimestamp(System.currentTimeMillis());
         e.setCreatedAt(LocalDateTime.now());
-        orderRepository.save(e);
+
+        e = saveAndBroadcast(e);
 
         Order order = new Order();
         order.setId(e.getId());
@@ -109,7 +128,8 @@ public class OrderServiceImpl implements OrderService {
         e.setFilled(false);
         e.setTimestamp(System.currentTimeMillis());
         e.setCreatedAt(LocalDateTime.now());
-        orderRepository.save(e);
+
+        e = saveAndBroadcast(e);
 
         Order order = new Order();
         order.setId(e.getId());
@@ -129,10 +149,12 @@ public class OrderServiceImpl implements OrderService {
         if (!orderRepository.existsById(orderId)) return false;
         var e = orderRepository.findById(orderId).orElse(null);
         if (e == null) return false;
+
         e.setStatus("CANCELED");
         e.setFilled(false);
         e.setUpdatedAt(LocalDateTime.now());
-        orderRepository.save(e);
+
+        saveAndBroadcast(e);
         return true;
     }
 
@@ -143,8 +165,9 @@ public class OrderServiceImpl implements OrderService {
         for (OrderEntity e : open) {
             if ("OPEN".equals(e.getStatus())) {
                 e.setStatus("CANCELED");
+                e.setFilled(false);
                 e.setUpdatedAt(LocalDateTime.now());
-                orderRepository.save(e);
+                saveAndBroadcast(e);
                 count++;
             }
         }
@@ -169,18 +192,21 @@ public class OrderServiceImpl implements OrderService {
     public Order createOrder(Order order) {
         OrderEntity e = new OrderEntity();
         e.setChatId(order.getChatId());
+        e.setUserId(order.getChatId());
         e.setSymbol(order.getSymbol());
         e.setSide(order.getSide());
         e.setPrice(order.getPrice());
         e.setQuantity(order.getQuantity());
-        e.setTotal(order.getPrice().multiply(order.getQuantity()));
-        e.setFilled("FILLED".equals(order.getStatus()));
+        if (order.getPrice() != null && order.getQuantity() != null) {
+            e.setTotal(order.getPrice().multiply(order.getQuantity()));
+        }
+        e.setFilled("FILLED".equalsIgnoreCase(order.getStatus()));
         e.setStatus(order.getStatus());
-        e.setStrategyType(String.valueOf(order.getStrategyType()));
-        e.setTimestamp(order.getTime());
+        e.setStrategyType(order.getStrategyType() != null ? String.valueOf(order.getStrategyType()) : "UNKNOWN");
+        e.setTimestamp(order.getTime() != null ? order.getTime() : System.currentTimeMillis());
         e.setCreatedAt(LocalDateTime.now());
-        orderRepository.save(e);
 
+        e = saveAndBroadcast(e);
         order.setId(e.getId());
         return order;
     }
@@ -208,7 +234,7 @@ public class OrderServiceImpl implements OrderService {
     }
 
     // =====================================================================
-    // ENTITY (для графика)
+    // ENTITY (для графика / аналитики)
     // =====================================================================
     @Override
     public List<OrderEntity> getOrderEntitiesByChatIdAndSymbol(long chatId, String symbol) {

@@ -1,6 +1,7 @@
 package com.chicu.aitradebot.strategy.smartfusion;
 
 import com.chicu.aitradebot.common.enums.NetworkType;
+import com.chicu.aitradebot.strategy.core.StrategySettingsProvider;
 import com.chicu.aitradebot.strategy.smartfusion.dto.SmartFusionUserSettingsDto;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -11,21 +12,34 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 
-@Service
-@RequiredArgsConstructor
 @Slf4j
-public class SmartFusionStrategySettingsServiceImpl implements SmartFusionStrategySettingsService {
+@Service("SMART_FUSION")
+@RequiredArgsConstructor
+public class SmartFusionStrategySettingsServiceImpl
+        implements SmartFusionStrategySettingsService,
+                   StrategySettingsProvider<SmartFusionStrategySettings> {
 
     private final SmartFusionStrategySettingsRepository repository;
 
+    // =============================================================
+    // StrategySettingsProvider — load()
+    // =============================================================
     @Override
-    public SmartFusionStrategySettings getOrCreate(Long chatId, String symbol) {
-        return repository.findByChatIdAndSymbol(chatId, symbol)
-                .orElseGet(() -> {
+    public SmartFusionStrategySettings load(Long chatId) {
+        return repository.findLatestByChatId(chatId).orElse(null);
+    }
 
+    // =============================================================
+    // SmartFusionStrategySettingsService — getOrCreate()
+    // =============================================================
+    @Override
+    public SmartFusionStrategySettings getOrCreate(Long chatId) {
+
+        return repository.findLatestByChatId(chatId)
+                .orElseGet(() -> {
                     SmartFusionStrategySettings def = SmartFusionStrategySettings.builder()
                             .chatId(chatId)
-                            .symbol(symbol)
+                            .symbol("BTCUSDT")
                             .exchange("BINANCE")
                             .networkType(NetworkType.TESTNET)
                             .timeframe("15m")
@@ -50,67 +64,86 @@ public class SmartFusionStrategySettingsServiceImpl implements SmartFusionStrate
                             .build();
 
                     SmartFusionStrategySettings saved = repository.save(def);
-                    log.info("🆕 Созданы настройки SmartFusion (chatId={}, symbol={})", chatId, symbol);
+
+                    log.info("🆕 Созданы дефолтные настройки SmartFusion (chatId={})", chatId);
                     return saved;
                 });
     }
 
+    // =============================================================
     @Override
     public SmartFusionStrategySettings save(SmartFusionStrategySettings settings) {
         return repository.save(settings);
     }
 
+    // =============================================================
+    // UPDATE PARAMS
+    // =============================================================
     @Override
     @Transactional
     public SmartFusionStrategySettings updateUserParams(Long chatId, SmartFusionUserSettingsDto dto) {
-        SmartFusionStrategySettings settings =
-                repository.findByChatIdAndSymbol(chatId, dto.getSymbol())
-                        .orElseGet(() -> getOrCreate(chatId, dto.getSymbol()));
 
+        SmartFusionStrategySettings settings =
+                repository.findLatestByChatId(chatId).orElseGet(() -> getOrCreate(chatId));
+
+        // Создаём новую запись если изменён символ
+        if (dto.getSymbol() != null && !dto.getSymbol().equals(settings.getSymbol())) {
+
+            settings = SmartFusionStrategySettings.builder()
+                    .chatId(chatId)
+                    .symbol(dto.getSymbol())
+                    .exchange(settings.getExchange())
+                    .networkType(settings.getNetworkType())
+                    .timeframe(settings.getTimeframe())
+                    .candleLimit(settings.getCandleLimit())
+                    .commissionPct(settings.getCommissionPct())
+                    .capitalUsd(settings.getCapitalUsd())
+                    .riskPerTradePct(settings.getRiskPerTradePct())
+                    .dailyLossLimitPct(settings.getDailyLossLimitPct())
+                    .emaFastPeriod(settings.getEmaFastPeriod())
+                    .emaSlowPeriod(settings.getEmaSlowPeriod())
+                    .rsiPeriod(settings.getRsiPeriod())
+                    .rsiBuyThreshold(settings.getRsiBuyThreshold())
+                    .rsiSellThreshold(settings.getRsiSellThreshold())
+                    .bollingerPeriod(settings.getBollingerPeriod())
+                    .bollingerK(settings.getBollingerK())
+                    .mlBuyMin(settings.getMlBuyMin())
+                    .mlSellMin(settings.getMlSellMin())
+                    .takeProfitAtrMult(settings.getTakeProfitAtrMult())
+                    .stopLossAtrMult(settings.getStopLossAtrMult())
+                    .autoRetrain(settings.isAutoRetrain())
+                    .reinvestProfit(settings.isReinvestProfit())
+                    .build();
+        }
+
+        // apply changes
         if (dto.getExchange() != null) settings.setExchange(dto.getExchange());
         if (dto.getNetworkType() != null) settings.setNetworkType(dto.getNetworkType());
         if (dto.getTimeframe() != null) settings.setTimeframe(dto.getTimeframe());
         if (dto.getCandleLimit() > 0) settings.setCandleLimit(dto.getCandleLimit());
         if (dto.getCapitalUsd() > 0) settings.setCapitalUsd(dto.getCapitalUsd());
-        if (dto.getLeverage() > 0) settings.setLeverage(dto.getLeverage());
         if (dto.getRiskPerTradePct() > 0) settings.setRiskPerTradePct(dto.getRiskPerTradePct());
         if (dto.getDailyLossLimitPct() > 0) settings.setDailyLossLimitPct(dto.getDailyLossLimitPct());
 
         settings.setReinvestProfit(dto.isReinvestProfit());
 
-        SmartFusionStrategySettings saved = repository.save(settings);
-
-        log.info("⚙️ Обновлены SmartFusion параметры (chatId={}, symbol={})", chatId, dto.getSymbol());
-        return saved;
+        return repository.save(settings);
     }
 
-    /**
-     * ⚠️Важно:
-     * SmartFusion может хранить несколько символов.
-     * Но стратегия или дашборд всегда работает с одним символом.
-
-     * Мы возвращаем ПОСЛЕДНИЙ ИЗМЕНЁННЫЙ символ — а не просто рандом.
-     */
+    // =============================================================
+    // ❗ правильная реализация findByChatId → Optional
+    // =============================================================
     @Override
-    public Optional<SmartFusionStrategySettings> findByChatId(Long chatId) {
+    public Optional<Object> findByChatId(Long chatId) {
 
-        List<SmartFusionStrategySettings> list = repository.findAllByChatId(chatId);
+        List<SmartFusionStrategySettings> all = repository.findAllByChatId(chatId);
 
-        if (list.isEmpty())
-            return Optional.empty();
+        if (all.isEmpty()) return Optional.empty();
 
-        // сортируем по ID → последняя запись = последняя активная
-        list.sort(Comparator.comparing(SmartFusionStrategySettings::getId).reversed());
-
-        SmartFusionStrategySettings last = list.getFirst();
-
-        log.debug("📌 findByChatId(chatId={}): выбран символ {}", chatId, last.getSymbol());
-
-        return Optional.of(last);
-    }
-
-    @Override
-    public Optional<SmartFusionStrategySettings> findByChatIdAndSymbol(Long chatId, String symbol) {
-        return repository.findByChatIdAndSymbol(chatId, symbol);
+        return Optional.of(
+                all.stream()
+                        .max(Comparator.comparing(SmartFusionStrategySettings::getId))
+                        .get()
+        );
     }
 }

@@ -111,7 +111,7 @@ public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectab
 
     @Override
     public void setContext(long chatId, String symbol) {
-        SmartFusionStrategySettings cfg = settingsService.getOrCreate(chatId, symbol);
+        SmartFusionStrategySettings cfg = settingsService.getOrCreate(chatId);
 
         cfg.setChatId(chatId);
         cfg.setSymbol(symbol.toUpperCase(Locale.ROOT));
@@ -148,7 +148,7 @@ public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectab
     private void executeCycle() {
         if (!running.get()) return;
 
-        SmartFusionStrategySettings cfg = settingsService.getOrCreate(chatId, symbol);
+        SmartFusionStrategySettings cfg = settingsService.getOrCreate(chatId);
         List<SmartFusionCandleService.Candle> candles = candleService.getCandles(cfg);
         if (candles.size() < 20) {
             log.warn("⚠️ Недостаточно данных по свечам {}", symbol);

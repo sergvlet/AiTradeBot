@@ -4,13 +4,13 @@ import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.domain.ExchangeSettings;
 import com.chicu.aitradebot.exchange.client.ExchangeClient;
 import com.chicu.aitradebot.exchange.client.ExchangeClientFactory;
+import com.chicu.aitradebot.exchange.client.ExchangeClient;
 import com.chicu.aitradebot.exchange.service.ExchangeSettingsService;
 import com.chicu.aitradebot.strategy.smartfusion.SmartFusionStrategySettings;
 import com.chicu.aitradebot.strategy.smartfusion.SmartFusionStrategySettingsService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
-import com.chicu.aitradebot.strategy.smartfusion.components.SmartFusionCandleService;
 
 import java.time.Instant;
 import java.util.*;
@@ -21,9 +21,12 @@ import java.util.concurrent.ConcurrentHashMap;
 @RequiredArgsConstructor
 public class SmartFusionCandleService {
 
-    /** DTO свечи */
+    /** DTO свечи для SmartFusion + графика */
     public record Candle(Instant ts, double open, double high, double low, double close) {
-        public Instant getTime() { return ts; } // 👈 используется в контроллере
+        // этот геттер используется в ChartApiController
+        public Instant getTime() {
+            return ts;
+        }
     }
 
     private final ExchangeClientFactory clientFactory;
@@ -34,13 +37,12 @@ public class SmartFusionCandleService {
     private final Map<String, List<Candle>> cache = new ConcurrentHashMap<>();
 
     /**
-     * ✅ Новый метод: позволяет контроллеру получить свечи по chatId.
+     * Получить последние свечи по chatId (для графика / dashboard по умолчанию).
      */
     public List<Candle> getRecentCandles(long chatId, int limit) {
-        SmartFusionStrategySettings cfg = settingsService.findByChatId(chatId)
+        SmartFusionStrategySettings cfg = (SmartFusionStrategySettings) settingsService.findByChatId(chatId)
                 .orElseThrow(() -> new IllegalStateException("SmartFusion настройки не найдены для chatId=" + chatId));
 
-        // перезаписываем лимит свечей, если передан явно
         cfg.setCandleLimit(limit);
         return getCandles(cfg);
     }
@@ -76,23 +78,30 @@ public class SmartFusionCandleService {
             for (ExchangeClient.Kline k : klines) {
                 candles.add(new Candle(
                         Instant.ofEpochMilli(k.openTime()),
-                        k.open(), k.high(), k.low(), k.close()
+                        k.open(),
+                        k.high(),
+                        k.low(),
+                        k.close()
                 ));
             }
+
+
 
             cache.put(key, candles);
             log.info("📊 Загружено {} свечей для {} [{} / {}]", candles.size(), symbol, exchange, network);
             return candles;
 
         } catch (Exception e) {
-            log.error("❌ Ошибка загрузки свечей {} {}: {}", exchange, symbol, e.getMessage());
+            log.error("❌ Ошибка загрузки свечей {} {}: {}", exchange, symbol, e.getMessage(), e);
             return generateFallbackData(symbol, limit);
         }
     }
 
-    /** Последняя цена символа */
+    /** Последняя цена символа (по кэшу) */
     public double getLastPrice(String symbol) {
-        return cache.values().stream()
+        return cache.entrySet().stream()
+                .filter(e -> e.getKey().contains("|" + symbol + "|"))
+                .map(Map.Entry::getValue)
                 .flatMap(List::stream)
                 .reduce((first, second) -> second)
                 .map(Candle::close)
@@ -111,16 +120,19 @@ public class SmartFusionCandleService {
             price = Math.max(1.0, price + change);
             candles.add(new Candle(
                     now.minusSeconds(60L * (limit - i)),
-                    price * 0.999, price * 1.002, price * 0.998, price
+                    price * 0.999,
+                    price * 1.002,
+                    price * 0.998,
+                    price
             ));
         }
 
         log.warn("⚠️ Используются сгенерированные свечи для {} (offline mode)", symbol);
         return candles;
     }
+
     /**
-     * 📈 Расчёт EMA (экспоненциальной скользящей средней)
-     * для отображения на графике
+     * 📈 Расчёт EMA (экспоненциальной скользящей средней) для отображения на графике.
      */
     public List<Map<String, Object>> calculateEma(List<Candle> candles, int period) {
         if (candles == null || candles.isEmpty()) return Collections.emptyList();
@@ -140,6 +152,10 @@ public class SmartFusionCandleService {
 
         return ema;
     }
+
+    /**
+     * Построение временных настроек для графика (используется ChartApiController).
+     */
     public SmartFusionStrategySettings buildSettings(Long chatId, String symbol, String timeframe, int limit) {
         SmartFusionStrategySettings s = new SmartFusionStrategySettings();
         s.setChatId(chatId);
@@ -148,9 +164,8 @@ public class SmartFusionCandleService {
         s.setCandleLimit(Math.max(50, limit));
         // разумные дефолты (биржа/сеть подтянутся в getCandles(...) через ExchangeSettingsService)
         s.setExchange("BINANCE");
-        s.setNetworkType(com.chicu.aitradebot.common.enums.NetworkType.TESTNET);
+        s.setNetworkType(NetworkType.TESTNET);
         return s;
     }
-
 
 }

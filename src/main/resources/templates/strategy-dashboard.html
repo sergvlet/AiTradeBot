@@ -42,8 +42,9 @@
       <div>
         <div class="small-label mb-1">Статус</div>
         <span class="pill-badge"
-              th:classappend="${info != null and info.running} ? ' bg-success-subtle text-success-emphasis'
-                                           : ' bg-danger-subtle text-danger-emphasis'">
+              th:classappend="${info != null and info.running}
+              ? ' bg-success-subtle text-success-emphasis'
+              : ' bg-danger-subtle text-danger-emphasis'">
           <span class="status-dot"
                 th:classappend="${info != null and info.running} ? ' status-dot-running'
                                                                  : ' status-dot-stopped'"></span>
@@ -128,7 +129,6 @@
           </div>
 
           <div class="d-flex flex-wrap align-items-center gap-2">
-            <!-- Быстрый выбор таймфрейма -->
             <div class="d-flex align-items-center gap-1">
               <span class="small-label me-1">Таймфрейм</span>
               <select id="timeframe-select"
@@ -161,7 +161,6 @@
 
         <div class="row g-3">
 
-          <!-- ROI -->
           <div class="col-12">
             <div class="d-flex justify-content-between align-items-center">
               <div>
@@ -178,7 +177,6 @@
             <div class="metric-sub mt-1">Накопленный результат по всем сделкам.</div>
           </div>
 
-          <!-- Current balance -->
           <div class="col-12">
             <div class="d-flex justify-content-between align-items-center">
               <div>
@@ -198,7 +196,6 @@
             </div>
           </div>
 
-          <!-- Trades count -->
           <div class="col-12">
             <div class="d-flex justify-content-between align-items-center">
               <div>
@@ -286,8 +283,6 @@
         </ul>
       </div>
 
-      <!-- AI layer (уже выше, здесь можно добавить что-то ещё позже) -->
-
     </div>
 
     <!-- TRADES TABLE ======================================================= -->
@@ -322,33 +317,49 @@
             <tbody>
 
             <tr th:each="t : ${trades}">
-              <td class="small"
-                  th:text="${#temporals.format(t.time,'dd.MM HH:mm')}">12.10 14:22</td>
 
-              <td>
-                <span th:if="${t.side == 'BUY'}"
-                      class="badge-trade-buy small px-2 py-1">
-                    <i class="bi bi-arrow-up-right me-1"></i>BUY
-                </span>
-                <span th:if="${t.side == 'SELL'}"
-                      class="badge-trade-sell small px-2 py-1">
-                    <i class="bi bi-arrow-down-right me-1"></i>SELL
-                </span>
+              <!-- TIME -->
+              <td class="small"
+                  th:text="${t.timestamp != null
+                  ? #temporals.format(@timeUtil.fromMillis(t.timestamp),'dd.MM HH:mm')
+                  : (t.createdAt != null
+                       ? #temporals.format(t.createdAt,'dd.MM HH:mm')
+                       : '—')}">
               </td>
 
+              <!-- SIDE -->
+              <td>
+    <span th:if="${t.side == 'BUY'}"
+          class="badge-trade-buy small px-2 py-1">
+        <i class="bi bi-arrow-up-right me-1"></i>BUY
+    </span>
+
+                <span th:if="${t.side == 'SELL'}"
+                      class="badge-trade-sell small px-2 py-1">
+        <i class="bi bi-arrow-down-right me-1"></i>SELL
+    </span>
+              </td>
+
+              <!-- PRICE -->
               <td class="small"
                   th:text="${#numbers.formatDecimal(t.price,1,4)}">0.0000</td>
 
+              <!-- QUANTITY (исправлено qty → quantity) -->
               <td class="small"
-                  th:text="${#numbers.formatDecimal(t.qty,1,4)}">0.0000</td>
+                  th:text="${#numbers.formatDecimal(t.quantity,1,4)}">0.0000</td>
 
+              <!-- PNL -->
               <td class="small"
-                  th:classappend="${t.pnl != null and t.pnl >= 0} ? ' text-success' : ' text-danger'"
-                  th:text="${(t.pnl != null)
-                              ? #numbers.formatDecimal(t.pnl,1,4)
-                              : '0.0000'}">0.0000
+                  th:classappend="${t.realizedPnlUsd != null and t.realizedPnlUsd >= 0}
+                        ? ' text-success'
+                        : ' text-danger'"
+                  th:text="${t.realizedPnlUsd != null
+                 ? #numbers.formatDecimal(t.realizedPnlUsd,1,4)
+                 : '0.0000'}">
               </td>
+
             </tr>
+
 
             <tr th:if="${trades == null or #lists.isEmpty(trades)}">
               <td colspan="5" class="text-center text-secondary small py-4">

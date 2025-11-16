@@ -85,7 +85,7 @@ public class StrategyController {
             // Подгружаем настройки по типу
             Object settings;
             if (type == StrategyType.SMART_FUSION) {
-                settings = smartFusionSettingsService.getOrCreate(chatId, symbol);
+                settings = smartFusionSettingsService.getOrCreate(chatId);
             } else {
                 // 🔸 Защита от null — создаём "пустые" настройки для других стратегий
                 settings = Map.of("symbol", symbol, "placeholder", true);

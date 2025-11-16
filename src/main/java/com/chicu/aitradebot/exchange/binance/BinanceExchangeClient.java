@@ -230,13 +230,25 @@ public class BinanceExchangeClient implements ExchangeClient {
             headers.set("X-MBX-APIKEY", cleanKey(s.getApiKey()));
             headers.setAccept(Collections.singletonList(MediaType.APPLICATION_JSON));
 
+            // 🔥 ЛОГИ ПЕРЕД ОТПРАВКОЙ
+            log.warn("🌐 Binance REQUEST [{}] {} {}", getNetworkType(), method, url);
+            log.warn("📤 Headers: {}", headers);
+            log.warn("📤 Params: {}", params);
+            log.warn("📤 Query: {}", query);
+
             ResponseEntity<String> response =
                     restTemplate.exchange(url, method, new HttpEntity<>("", headers), String.class);
+
+            // 🔥 ЛОГИ ПОСЛЕ ОТВЕТА
+            log.warn("📥 Binance RESPONSE [{}]: {}", getNetworkType(), response.getBody());
+
             return response.getBody();
 
         } catch (HttpClientErrorException e) {
+            log.error("❌ Binance HTTP ERROR: {}", e.getResponseBodyAsString());
             throw new RuntimeException("Ошибка Binance HTTP: " + e.getResponseBodyAsString(), e);
         } catch (Exception e) {
+            log.error("❌ signedRequest ERROR: {}", e.getMessage());
             throw new RuntimeException("Ошибка signedRequest Binance: " + e.getMessage(), e);
         }
     }

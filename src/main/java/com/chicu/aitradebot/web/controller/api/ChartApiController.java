@@ -29,7 +29,7 @@ public class ChartApiController {
     @Data
     @AllArgsConstructor
     static class CandleDto {
-        long time;      // ms
+        long time;
         double open;
         double high;
         double low;
@@ -39,7 +39,7 @@ public class ChartApiController {
     @Data
     @AllArgsConstructor
     static class EmaPoint {
-        long time;      // ms
+        long time;
         double value;
     }
 
@@ -48,17 +48,16 @@ public class ChartApiController {
     static class TradeMarker {
         long id;
 
-        long time;          // время входа (ms)
-        String side;        // BUY / SELL
-        double price;       // цена входа
-        double qty;         // объём
+        long time;
+        String side;
+        double price;
+        double qty;
 
-        String status;      // NEW / FILLED / CANCELED ...
+        String status;
         String strategyType;
 
-        // Выход и TP/SL
-        Double exitPrice;   // цена выхода
-        Long exitTime;      // время выхода (ms)
+        Double exitPrice;
+        Long exitTime;
 
         Double tpPrice;
         Double slPrice;
@@ -66,14 +65,12 @@ public class ChartApiController {
         Boolean tpHit;
         Boolean slHit;
 
-        // PnL
         Double pnlUsd;
         Double pnlPct;
 
-        // Причины и ML
         String entryReason;
         String exitReason;
-        Double mlConfidence;   // 0..1
+        Double mlConfidence;
     }
 
     @Data
@@ -86,101 +83,95 @@ public class ChartApiController {
     }
 
     // =============================================================
-    //  API: /api/chart/history?chatId=123&symbol=BTCUSDT&timeframe=15m&limit=250
+    // API: /api/chart/history
     // =============================================================
 
     @GetMapping("/history")
     public ChartResponse getChart(
             @RequestParam long chatId,
             @RequestParam String symbol,
-            @RequestParam(defaultValue = "15m") String timeframe,
+            @RequestParam(required = false) String timeframe,
             @RequestParam(defaultValue = "250") int limit
     ) {
 
         try {
-            // ---------- 1) Свечи ----------
-            var settings = candleService.buildSettings(chatId, symbol, timeframe, limit);
-            var candles = candleService.getCandles(settings);
+
+            // ======================
+            // 1) Нормализация timeframe
+            // ======================
+            if (timeframe == null || timeframe.isBlank()) {
+                timeframe = "15m";
+            }
+
+            // ======================
+            // 2) Свечи
+            // ======================
+            var candleSettings = candleService.buildSettings(chatId, symbol, timeframe, limit);
+            var candles = candleService.getCandles(candleSettings);
 
             List<CandleDto> candleDto = new ArrayList<>();
             for (var c : candles) {
-                candleDto.add(
-                        new CandleDto(
-                                c.ts().toEpochMilli(),
-                                c.open(),
-                                c.high(),
-                                c.low(),
-                                c.close()
-                        )
-                );
+                candleDto.add(new CandleDto(
+                        c.ts().toEpochMilli(),
+                        c.open(),
+                        c.high(),
+                        c.low(),
+                        c.close()
+                ));
             }
 
-            // ---------- 2) EMA (быстрая/медленная) ----------
+            // ======================
+            // 3) EMA fast / slow
+            // ======================
             var emaFast = candleService.calculateEma(candles, 9).stream()
                     .map(e -> new EmaPoint(
                             ((Number) e.get("time")).longValue(),
                             ((Number) e.get("value")).doubleValue()
-                    ))
-                    .toList();
+                    )).toList();
 
             var emaSlow = candleService.calculateEma(candles, 21).stream()
                     .map(e -> new EmaPoint(
                             ((Number) e.get("time")).longValue(),
                             ((Number) e.get("value")).doubleValue()
-                    ))
-                    .toList();
+                    )).toList();
 
-            // ---------- 3) Сделки для маркеров ----------
+            // ======================
+            // 4) Сделки
+            // ======================
             List<OrderEntity> orders = orderService.getOrderEntitiesByChatIdAndSymbol(chatId, symbol);
             List<TradeMarker> trades = new ArrayList<>();
 
             for (OrderEntity o : orders) {
 
-                long time = (o.getTimestamp() != null)
-                        ? o.getTimestamp()
-                        : System.currentTimeMillis();
+                long time = o.getTimestamp() != null ? o.getTimestamp() : System.currentTimeMillis();
+                Long exitTime = o.getExitTimestamp();
 
-                Long exitTime = (o.getExitTimestamp() != null)
-                        ? o.getExitTimestamp()
-                        : null;
-
-                double price = (o.getPrice() != null) ? o.getPrice().doubleValue() : 0.0;
-                double qty = (o.getQuantity() != null) ? o.getQuantity().doubleValue() : 0.0;
-
-                Double exitPrice = (o.getExitPrice() != null) ? o.getExitPrice().doubleValue() : null;
-                Double tpPrice = (o.getTakeProfitPrice() != null) ? o.getTakeProfitPrice().doubleValue() : null;
-                Double slPrice = (o.getStopLossPrice() != null) ? o.getStopLossPrice().doubleValue() : null;
-
-                Double pnlUsd = (o.getRealizedPnlUsd() != null) ? o.getRealizedPnlUsd().doubleValue() : null;
-                Double pnlPct = (o.getRealizedPnlPct() != null) ? o.getRealizedPnlPct().doubleValue() : null;
-
-                Double mlConf = (o.getMlConfidence() != null) ? o.getMlConfidence().doubleValue() : null;
-
-                TradeMarker marker = new TradeMarker(
+                trades.add(new TradeMarker(
                         o.getId() != null ? o.getId() : -1L,
                         time,
                         o.getSide(),
-                        price,
-                        qty,
+                        o.getPrice() != null ? o.getPrice().doubleValue() : 0.0,
+                        o.getQuantity() != null ? o.getQuantity().doubleValue() : 0.0,
                         o.getStatus(),
                         o.getStrategyType(),
-                        exitPrice,
+                        o.getExitPrice() != null ? o.getExitPrice().doubleValue() : null,
                         exitTime,
-                        tpPrice,
-                        slPrice,
+                        o.getTakeProfitPrice() != null ? o.getTakeProfitPrice().doubleValue() : null,
+                        o.getStopLossPrice() != null ? o.getStopLossPrice().doubleValue() : null,
                         o.getTpHit(),
                         o.getSlHit(),
-                        pnlUsd,
-                        pnlPct,
+                        o.getRealizedPnlUsd() != null ? o.getRealizedPnlUsd().doubleValue() : null,
+                        o.getRealizedPnlPct() != null ? o.getRealizedPnlPct().doubleValue() : null,
                         o.getEntryReason(),
                         o.getExitReason(),
-                        mlConf
-                );
-
-                trades.add(marker);
+                        o.getMlConfidence() != null ? o.getMlConfidence().doubleValue() : null
+                ));
             }
 
-            log.info("📊 /api/chart/history chatId={}, symbol={}, tf={}, candles={}, trades={}",
+            // ======================
+            // 5) Лог
+            // ======================
+            log.info("📊 /api/chart/history chatId={} symbol={} timeframe={} candles={} trades={}",
                     chatId, symbol, timeframe, candleDto.size(), trades.size());
 
             return new ChartResponse(candleDto, emaFast, emaSlow, trades);
@@ -196,4 +187,5 @@ public class ChartApiController {
             );
         }
     }
+
 }

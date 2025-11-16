@@ -52,7 +52,7 @@ public class StrategyDashboardService {
         SmartFusionStrategySettings sf = null;
 
         if (isSmart) {
-            sf = sfSettingsService.findByChatId(chatId)
+            sf = (SmartFusionStrategySettings) sfSettingsService.findByChatId(chatId)
                     .orElseThrow(() -> new IllegalStateException(
                             "SmartFusion настройки не найдены: chatId=" + chatId));
         }

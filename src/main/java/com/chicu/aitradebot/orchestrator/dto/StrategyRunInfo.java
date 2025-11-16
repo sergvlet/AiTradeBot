@@ -26,11 +26,11 @@ public class StrategyRunInfo implements Serializable {
     private Long chatId;
     private StrategyType type;
     private String symbol;
-    private boolean active;
 
-    public boolean isRunning() {
-        return active;
-    }
+    /** Активность стратегии */
+    private boolean active;
+    private boolean running;
+
 
     // === Временные отметки ===
     private Instant startedAt;
@@ -51,7 +51,7 @@ public class StrategyRunInfo implements Serializable {
     private BigDecimal winRatePct;
 
     // === AI слой ===
-    private BigDecimal mlConfidence;   // ✔ ИЗ-ЗА ЭТОГО БЫЛ КРАШ
+    private BigDecimal mlConfidence;
 
     // === Настройки стратегии ===
     private Integer version;
@@ -60,9 +60,6 @@ public class StrategyRunInfo implements Serializable {
     private BigDecimal slPct;
     private BigDecimal riskPerTradePct;
 
-    // === Алиасы ===
-    public BigDecimal getPnlPct() { return totalProfitPct; }
-    public void setPnlPct(BigDecimal v) { this.totalProfitPct = v; }
 
     // === График ===
     private List<String> timestamps;

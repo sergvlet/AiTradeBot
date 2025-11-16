@@ -10,8 +10,13 @@ import com.chicu.aitradebot.strategy.core.ContextAwareStrategy;
 import com.chicu.aitradebot.strategy.core.RuntimeIntrospectable;
 import com.chicu.aitradebot.strategy.core.TradingStrategy;
 import com.chicu.aitradebot.strategy.registry.StrategyRegistry;
+import com.chicu.aitradebot.strategy.registry.StrategySettingsMapper;
+import com.chicu.aitradebot.strategy.registry.StrategySettingsResolver;
+import com.chicu.aitradebot.strategy.core.StrategySettingsProvider;
+
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.ApplicationContext;
 import org.springframework.stereotype.Service;
 
@@ -26,6 +31,7 @@ public class StrategyFacade {
 
     private final StrategyRegistry strategyRegistry;
     private final SchedulerService schedulerService;
+    private final StrategySettingsResolver settingsResolver;
     private final ApplicationContext applicationContext;
     private final AiStrategyOrchestrator aiOrchestrator;
     private final OrderService orderService;
@@ -48,8 +54,7 @@ public class StrategyFacade {
 
                 if (strategy instanceof ContextAwareStrategy ctx) {
                     ctx.setContext(chatId, symbol);
-                    log.info("⚙️ Контекст установлен: strategy={}, chatId={}, symbol={}",
-                            type, chatId, symbol);
+                    log.info("⚙️ Контекст установлен: strategy={}, chatId={}, symbol={}", type, chatId, symbol);
                 }
 
                 strategy.start();
@@ -91,49 +96,41 @@ public class StrategyFacade {
     }
 
     // =====================================================================
-    // 🧠 AI ORCHESTRATOR
+    // 📡 СТАТУС + НАСТРОЙКИ (АВТО-ДИНАМИЧЕСКИ)
     // =====================================================================
-    public void startAiOrchestrator(long chatId) {
-        log.info("🧠 Запуск AI Orchestrатор (chatId={})", chatId);
-        aiOrchestrator.startSession(chatId);
-    }
 
-    public void stopAiOrchestrator(long chatId) {
-        log.info("🛑 Остановка AI Orchestrатор (chatId={})", chatId);
-        aiOrchestrator.stopSession(chatId);
-    }
 
-    public void tickAiOrchestrator(long chatId) {
-        log.info("🔄 Принудительный тик (chatId={})", chatId);
-        aiOrchestrator.runTick(chatId);
-    }
-
-    // =====================================================================
-    // 📡 СТАТУС
-    // =====================================================================
     public StrategyRunInfo status(long chatId, StrategyType type) {
+
+        boolean running = schedulerService.isRunning(chatId, type);
+
+        StrategyRunInfo.StrategyRunInfoBuilder b = StrategyRunInfo.builder()
+                .chatId(chatId)
+                .type(type)
+                .active(running);
 
         TradingStrategy strategy = instances
                 .getOrDefault(chatId, Map.of())
                 .get(type);
 
-        boolean active = schedulerService.isRunning(chatId, type);
-
-        StrategyRunInfo.StrategyRunInfoBuilder builder = StrategyRunInfo.builder()
-                .chatId(chatId)
-                .type(type)
-                .active(active);
-
+        // === runtime from strategy instance ===
         if (strategy instanceof RuntimeIntrospectable r) {
-
-            builder.symbol(r.getSymbol())
-                    .startedAt(r.getStartedAt())
-                    .lastEvent(r.getLastEvent())
-                    .threadName(r.getThreadName())
-                    .active(r.isActive());
+            b.symbol(r.getSymbol());
+            b.startedAt(r.getStartedAt());
+            b.lastEvent(r.getLastEvent());
+            b.threadName(r.getThreadName());
         }
 
-        return builder.build();
+        // === settings from provider ===
+        StrategySettingsProvider<?> provider = settingsResolver.getProvider(type);
+        if (provider != null) {
+            Object settings = provider.load(chatId);
+            if (settings != null) {
+                StrategySettingsMapper.fill(b, settings);
+            }
+        }
+
+        return b.build();
     }
 
     // =====================================================================
@@ -148,7 +145,7 @@ public class StrategyFacade {
     }
 
     // =====================================================================
-    // 🔍 Получение SYMBOL из стратегии
+    // 📍 Получение SYMBOL
     // =====================================================================
     public String getSymbol(long chatId, StrategyType type) {
 
@@ -156,26 +153,16 @@ public class StrategyFacade {
                 .getOrDefault(chatId, Map.of())
                 .get(type);
 
-        if (strategy == null) {
-            log.warn("⚠️ Стратегия {} не запущена для chatId={}", type, chatId);
-            return null;
-        }
-
-        if (strategy instanceof RuntimeIntrospectable r)
+        if (strategy instanceof RuntimeIntrospectable r) {
             return r.getSymbol();
-
-        if (strategy instanceof ContextAwareStrategy) {
-            try {
-                return (String) strategy.getClass().getMethod("getSymbol").invoke(strategy);
-            } catch (Exception ignore) {}
         }
 
         return null;
     }
 
     // =====================================================================
-// 📈 История сделок (для дашборда и графика)
-// =====================================================================
+    // 📈 История сделок (для дашборда и графика)
+    // =====================================================================
     public List<OrderEntity> getTrades(long chatId, String symbol) {
         return orderService.getOrderEntitiesByChatIdAndSymbol(chatId, symbol);
     }
