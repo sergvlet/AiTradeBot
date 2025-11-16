@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="ru" xmlns:th="http://www.thymeleaf.org">
+<body th:replace="~{layout :: layout(~{::title}, ~{::section}, 'strategies')}">
+<section>
+    <h2 class="fw-bold mb-4">
+        <i class="bi bi-sliders"></i>
+        <span th:text="${strategy.strategyName}">Стратегия</span> — настройки
+    </h2>
+
+    <div class="card card-theme p-4">
+        <div class="row g-3">
+            <div class="col-md-4"><strong>Статус:</strong>
+                <span class="badge"
+                      th:classappend="${strategy.active} ? ' bg-success' : ' bg-secondary'"
+                      th:text="${strategy.active} ? 'Активна' : 'Остановлена'">—</span>
+            </div>
+            <div class="col-md-4"><strong>PnL:</strong> <span th:text="${strategy.totalProfitPct}">0</span>%</div>
+            <div class="col-md-4"><strong>ML доверие:</strong> <span th:text="${strategy.mlConfidence}">0</span></div>
+        </div>
+
+        <hr class="my-4">
+
+        <!-- Тут разместим реальные параметры стратегии (полями формы) -->
+        <p class="muted">Здесь будут поля конкретных параметров стратегии. Могу сгенерировать форму под RSI_EMA / Scalping / Fibonacci — скажи какую.</p>
+
+        <div class="d-flex gap-2 mt-3">
+            <a href="/strategies" class="btn btn-outline-secondary">
+                <i class="bi bi-arrow-left"></i> Назад
+            </a>
+            <button class="btn btn-theme">
+                <i class="bi bi-check2-circle"></i> Сохранить
+            </button>
+        </div>
+    </div>
+</section>
+</body>
+</html>
