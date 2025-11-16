@@ -4,7 +4,7 @@ import com.chicu.aitradebot.domain.OrderEntity;
 import com.chicu.aitradebot.exchange.model.Order;
 import com.chicu.aitradebot.repository.OrderRepository;
 import com.chicu.aitradebot.service.OrderService;
-import com.chicu.aitradebot.web.ws.RealtimeStreamService;
+import com.chicu.aitradebot.market.ws.RealtimeStreamService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;

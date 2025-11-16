@@ -131,16 +131,14 @@
           <div class="d-flex flex-wrap align-items-center gap-2">
             <div class="d-flex align-items-center gap-1">
               <span class="small-label me-1">Таймфрейм</span>
-              <select id="timeframe-select"
-                      class="form-select form-select-sm"
-                      style="min-width: 90px;">
+              <label for="timeframe-select"></label><select id="timeframe-select"
+                                                            class="form-select form-select-sm"
+                                                            style="min-width: 90px;">
                 <option value="">…</option>
               </select>
             </div>
 
-            <button class="btn btn-sm btn-outline-light border-opacity-25" id="btn-refresh-chart">
-              <i class="bi bi-arrow-clockwise"></i>
-            </button>
+            <!-- Кнопка обновления убрана, график обновляется сам -->
             <button class="btn btn-sm btn-outline-light border-opacity-25" id="btn-export-png">
               <i class="bi bi-download"></i>
             </button>

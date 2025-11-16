@@ -2,6 +2,7 @@ package com.chicu.aitradebot.web.controller.api;
 
 import com.chicu.aitradebot.domain.OrderEntity;
 import com.chicu.aitradebot.service.OrderService;
+import com.chicu.aitradebot.strategy.smartfusion.SmartFusionStrategySettings;
 import com.chicu.aitradebot.strategy.smartfusion.components.SmartFusionCandleService;
 import lombok.AllArgsConstructor;
 import lombok.Data;
@@ -9,9 +10,9 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.*;
 
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
+import java.time.ZoneId;
+import java.util.*;
+import java.util.stream.Collectors;
 
 @Slf4j
 @RestController
@@ -26,8 +27,7 @@ public class ChartApiController {
     // DTO
     // =============================================================
 
-    @Data
-    @AllArgsConstructor
+    @Data @AllArgsConstructor
     static class CandleDto {
         long time;
         double open;
@@ -36,156 +36,214 @@ public class ChartApiController {
         double close;
     }
 
-    @Data
-    @AllArgsConstructor
-    static class EmaPoint {
+    @Data @AllArgsConstructor
+    static class EmaPointDto {
         long time;
         double value;
     }
 
-    @Data
-    @AllArgsConstructor
-    static class TradeMarker {
-        long id;
-
+    @Data @AllArgsConstructor
+    static class TradeDto {
+        Long id;
         long time;
         String side;
         double price;
         double qty;
-
         String status;
-        String strategyType;
-
-        Double exitPrice;
-        Long exitTime;
-
         Double tpPrice;
         Double slPrice;
-
-        Boolean tpHit;
-        Boolean slHit;
-
         Double pnlUsd;
         Double pnlPct;
-
+        String strategyType;
         String entryReason;
         String exitReason;
         Double mlConfidence;
     }
 
-    @Data
-    @AllArgsConstructor
+    @Data @AllArgsConstructor
     static class ChartResponse {
         List<CandleDto> candles;
-        List<EmaPoint> emaFast;
-        List<EmaPoint> emaSlow;
-        List<TradeMarker> trades;
+        List<EmaPointDto> emaFast;
+        List<EmaPointDto> emaSlow;
+        List<TradeDto> trades;
     }
 
-    // =============================================================
-    // API: /api/chart/history
-    // =============================================================
 
-    @GetMapping("/history")
-    public ChartResponse getChart(
-            @RequestParam long chatId,
+    // =============================================================
+    //     ✔ FIXED /api/chart/candles — FULL DATA FOR JS
+    // =============================================================
+    @GetMapping("/candles")
+    public ChartResponse getCandles(
+            @RequestParam(required = false) Long chatId,
             @RequestParam String symbol,
-            @RequestParam(required = false) String timeframe,
-            @RequestParam(defaultValue = "250") int limit
+            @RequestParam(defaultValue = "1m") String timeframe,
+            @RequestParam(defaultValue = "200") Integer limit
     ) {
+        long cid = chatId != null ? chatId : 0L;
 
-        try {
+        log.info("🔥 /api/chart/candles symbol={}, tf={}, chatId={}, limit={}",
+                symbol, timeframe, cid, limit);
 
-            // ======================
-            // 1) Нормализация timeframe
-            // ======================
-            if (timeframe == null || timeframe.isBlank()) {
-                timeframe = "15m";
-            }
+        // build settings for candle loader
+        SmartFusionStrategySettings cfg =
+                candleService.buildSettings(cid, symbol, timeframe, limit);
 
-            // ======================
-            // 2) Свечи
-            // ======================
-            var candleSettings = candleService.buildSettings(chatId, symbol, timeframe, limit);
-            var candles = candleService.getCandles(candleSettings);
+        // 1️⃣ Load candles
+        var raw = candleService.getCandles(cfg);
 
-            List<CandleDto> candleDto = new ArrayList<>();
-            for (var c : candles) {
-                candleDto.add(new CandleDto(
-                        c.ts().toEpochMilli(),
+        List<CandleDto> candles = raw.stream()
+                .map(c -> new CandleDto(
+                        c.getTime(),
                         c.open(),
                         c.high(),
                         c.low(),
                         c.close()
-                ));
-            }
+                ))
+                .toList();
 
-            // ======================
-            // 3) EMA fast / slow
-            // ======================
-            var emaFast = candleService.calculateEma(candles, 9).stream()
-                    .map(e -> new EmaPoint(
-                            ((Number) e.get("time")).longValue(),
-                            ((Number) e.get("value")).doubleValue()
-                    )).toList();
+        // 2️⃣ EMA20 / EMA50
+        var ema20raw = candleService.calculateEma(raw, 20);
+        var ema50raw = candleService.calculateEma(raw, 50);
 
-            var emaSlow = candleService.calculateEma(candles, 21).stream()
-                    .map(e -> new EmaPoint(
-                            ((Number) e.get("time")).longValue(),
-                            ((Number) e.get("value")).doubleValue()
-                    )).toList();
+        List<EmaPointDto> emaFast = ema20raw.stream()
+                .map(m -> new EmaPointDto(
+                        ((Number)m.get("time")).longValue(),
+                        ((Number)m.get("value")).doubleValue()
+                ))
+                .toList();
 
-            // ======================
-            // 4) Сделки
-            // ======================
-            List<OrderEntity> orders = orderService.getOrderEntitiesByChatIdAndSymbol(chatId, symbol);
-            List<TradeMarker> trades = new ArrayList<>();
+        List<EmaPointDto> emaSlow = ema50raw.stream()
+                .map(m -> new EmaPointDto(
+                        ((Number)m.get("time")).longValue(),
+                        ((Number)m.get("value")).doubleValue()
+                ))
+                .toList();
 
-            for (OrderEntity o : orders) {
+        // 3️⃣ Trades (buy/sell markers)
+        List<OrderEntity> entities =
+                orderService.getOrderEntitiesByChatIdAndSymbol(cid, symbol);
 
-                long time = o.getTimestamp() != null ? o.getTimestamp() : System.currentTimeMillis();
-                Long exitTime = o.getExitTimestamp();
+        if (entities.size() > limit)
+            entities = entities.subList(entities.size() - limit, entities.size());
 
-                trades.add(new TradeMarker(
-                        o.getId() != null ? o.getId() : -1L,
-                        time,
+        List<TradeDto> trades = entities.stream()
+                .map(o -> new TradeDto(
+                        o.getId(),
+                        resolveOrderTime(o),
                         o.getSide(),
-                        o.getPrice() != null ? o.getPrice().doubleValue() : 0.0,
-                        o.getQuantity() != null ? o.getQuantity().doubleValue() : 0.0,
+                        safe(o.getPrice()),
+                        safe(o.getQuantity()),
                         o.getStatus(),
+                        safeNull(o.getTakeProfitPrice()),
+                        safeNull(o.getStopLossPrice()),
+                        safeNull(o.getRealizedPnlUsd()),
+                        safeNull(o.getRealizedPnlPct()),
                         o.getStrategyType(),
-                        o.getExitPrice() != null ? o.getExitPrice().doubleValue() : null,
-                        exitTime,
-                        o.getTakeProfitPrice() != null ? o.getTakeProfitPrice().doubleValue() : null,
-                        o.getStopLossPrice() != null ? o.getStopLossPrice().doubleValue() : null,
-                        o.getTpHit(),
-                        o.getSlHit(),
-                        o.getRealizedPnlUsd() != null ? o.getRealizedPnlUsd().doubleValue() : null,
-                        o.getRealizedPnlPct() != null ? o.getRealizedPnlPct().doubleValue() : null,
                         o.getEntryReason(),
                         o.getExitReason(),
-                        o.getMlConfidence() != null ? o.getMlConfidence().doubleValue() : null
-                ));
-            }
+                        safeNull(o.getMlConfidence())
+                ))
+                .toList();
 
-            // ======================
-            // 5) Лог
-            // ======================
-            log.info("📊 /api/chart/history chatId={} symbol={} timeframe={} candles={} trades={}",
-                    chatId, symbol, timeframe, candleDto.size(), trades.size());
-
-            return new ChartResponse(candleDto, emaFast, emaSlow, trades);
-
-        } catch (Exception e) {
-            log.error("❌ ChartApiController error: {}", e.getMessage(), e);
-
-            return new ChartResponse(
-                    Collections.emptyList(),
-                    Collections.emptyList(),
-                    Collections.emptyList(),
-                    Collections.emptyList()
-            );
-        }
+        // 4️⃣ return FULL DATA (required by JS)
+        return new ChartResponse(candles, emaFast, emaSlow, trades);
     }
 
+
+    // =============================================================
+    // /api/chart/history — unchanged
+    // =============================================================
+    @GetMapping("/history")
+    public ChartResponse getHistory(
+            @RequestParam Long chatId,
+            @RequestParam String symbol,
+            @RequestParam(defaultValue = "15m") String timeframe,
+            @RequestParam(defaultValue = "250") Integer limit
+    ) {
+        log.info("📈 /api/chart/history chatId={}, symbol={}, timeframe={}, limit={}",
+                chatId, symbol, timeframe, limit);
+
+        SmartFusionStrategySettings cfg =
+                candleService.buildSettings(chatId, symbol, timeframe, limit);
+
+        var candlesRaw = candleService.getCandles(cfg);
+
+        List<CandleDto> candles = candlesRaw.stream()
+                .map(c -> new CandleDto(
+                        c.getTime(), c.open(), c.high(), c.low(), c.close()
+                ))
+                .toList();
+
+        var emaFastRaw = candleService.calculateEma(candlesRaw, 20);
+        var emaSlowRaw = candleService.calculateEma(candlesRaw, 50);
+
+        List<EmaPointDto> emaFast = emaFastRaw.stream()
+                .map(m -> new EmaPointDto(
+                        ((Number)m.get("time")).longValue(),
+                        ((Number)m.get("value")).doubleValue()
+                ))
+                .toList();
+
+        List<EmaPointDto> emaSlow = emaSlowRaw.stream()
+                .map(m -> new EmaPointDto(
+                        ((Number)m.get("time")).longValue(),
+                        ((Number)m.get("value")).doubleValue()
+                ))
+                .toList();
+
+        List<OrderEntity> entities =
+                orderService.getOrderEntitiesByChatIdAndSymbol(chatId, symbol);
+
+        if (entities.size() > limit)
+            entities = entities.subList(entities.size() - limit, entities.size());
+
+        List<TradeDto> trades = entities.stream()
+                .map(o -> new TradeDto(
+                        o.getId(),
+                        resolveOrderTime(o),
+                        o.getSide(),
+                        safe(o.getPrice()),
+                        safe(o.getQuantity()),
+                        o.getStatus(),
+                        safeNull(o.getTakeProfitPrice()),
+                        safeNull(o.getStopLossPrice()),
+                        safeNull(o.getRealizedPnlUsd()),
+                        safeNull(o.getRealizedPnlPct()),
+                        o.getStrategyType(),
+                        o.getEntryReason(),
+                        o.getExitReason(),
+                        safeNull(o.getMlConfidence())
+                ))
+                .toList();
+
+        return new ChartResponse(candles, emaFast, emaSlow, trades);
+    }
+
+
+    // =============================================================
+    // Helpers
+    // =============================================================
+
+    private long resolveOrderTime(OrderEntity o) {
+        try {
+            if (o.getTimestamp() != null)
+                return o.getTimestamp();
+        } catch (Exception ignored) {}
+
+        try {
+            if (o.getCreatedAt() != null)
+                return o.getCreatedAt().atZone(ZoneId.systemDefault())
+                        .toInstant().toEpochMilli();
+        } catch (Exception ignored) {}
+
+        return System.currentTimeMillis();
+    }
+
+    private double safe(Number n) {
+        return n != null ? n.doubleValue() : 0.0;
+    }
+
+    private Double safeNull(Number n) {
+        return n != null ? n.doubleValue() : null;
+    }
 }

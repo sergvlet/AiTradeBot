@@ -4,52 +4,138 @@ import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.domain.ExchangeSettings;
 import com.chicu.aitradebot.exchange.client.ExchangeClient;
 import com.chicu.aitradebot.exchange.client.ExchangeClientFactory;
-import com.chicu.aitradebot.exchange.client.ExchangeClient;
 import com.chicu.aitradebot.exchange.service.ExchangeSettingsService;
+import com.chicu.aitradebot.market.ws.CandleWebSocketHandler;
+import com.chicu.aitradebot.market.ws.TradeFeedListener;
 import com.chicu.aitradebot.strategy.smartfusion.SmartFusionStrategySettings;
 import com.chicu.aitradebot.strategy.smartfusion.SmartFusionStrategySettingsService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
+/**
+ * Сервис свечей для SmartFusion + дашборда.
+ * Поддерживает:
+ *  - загрузку истории с биржи (getCandles / getRecentCandles)
+ *  - live 1s-свечи из BinancePublicTradeStreamService.onTrade(...)
+ *  - отправку последней свечи в WebSocket /ws/candles
+ */
 @Service
 @Slf4j
 @RequiredArgsConstructor
-public class SmartFusionCandleService {
+public class SmartFusionCandleService implements TradeFeedListener {
 
-    /** DTO свечи для SmartFusion + графика */
+    /**
+     * DTO свечи для SmartFusion + графика.
+     * Важно: getTime() → Jackson/Map даёт поле "time", которое ожидает JS.
+     */
     public record Candle(Instant ts, double open, double high, double low, double close) {
-        // этот геттер используется в ChartApiController
-        public Instant getTime() {
-            return ts;
+        /** time в миллисекундах для фронта. */
+        public long getTime() {
+            return ts.toEpochMilli();
         }
     }
 
     private final ExchangeClientFactory clientFactory;
     private final ExchangeSettingsService exchangeSettingsService;
     private final SmartFusionStrategySettingsService settingsService;
+    private final CandleWebSocketHandler candleWebSocketHandler;
 
     /** Кэш свечей: key = exchange|network|symbol|timeframe */
     private final Map<String, List<Candle>> cache = new ConcurrentHashMap<>();
 
+    /** Live 1-секундные свечи по символу (timeframe = 1s). */
+    private static class LiveCandle {
+        long openSec;
+        double open;
+        double high;
+        double low;
+        double close;
+    }
+
+    /** key = SYMBOL (верхний регистр), только для 1s. */
+    private final Map<String, LiveCandle> live1s = new ConcurrentHashMap<>();
+
+    // ======================================================================
+    //  TradeFeedListener (из BinancePublicTradeStreamService)
+    // ======================================================================
+
+    @Override
+    public void onTrade(String symbol, BigDecimal price, long ts) {
+        if (symbol == null || price == null) return;
+        onTradeTick(symbol, ts, price.doubleValue());
+    }
+
+
+
+    // ======================================================================
+    //  PUBLIC: live тик с Binance → 1s свеча → WS
+    // ======================================================================
+
     /**
-     * Получить последние свечи по chatId (для графика / dashboard по умолчанию).
+     * Собирает 1-секундную свечу и пушит её в WebSocket /ws/candles.
+     *
+     * @param symbol  "BTCUSDT"
+     * @param tsMillis timestamp трейда в миллисекундах
+     * @param price   цена сделки
      */
+    public void onTradeTick(String symbol, long tsMillis, double price) {
+        if (symbol == null || symbol.isBlank()) return;
+
+        String sym = symbol.toUpperCase(Locale.ROOT);
+        long sec = tsMillis / 1000L; // бакет 1 секунда
+
+        LiveCandle lc = live1s.compute(sym, (k, old) -> {
+            if (old == null || old.openSec != sec) {
+                LiveCandle nc = new LiveCandle();
+                nc.openSec = sec;
+                nc.open = price;
+                nc.high = price;
+                nc.low = price;
+                nc.close = price;
+                return nc;
+            } else {
+                old.close = price;
+                if (price > old.high) old.high = price;
+                if (price < old.low) old.low = price;
+                return old;
+            }
+        });
+
+        Candle candle = new Candle(
+                Instant.ofEpochSecond(lc.openSec),
+                lc.open,
+                lc.high,
+                lc.low,
+                lc.close
+        );
+
+        // отправляем только для timeframe=1s (именно его выбирает фронт для live)
+        try {
+            candleWebSocketHandler.broadcastTick(sym, "1s", candle);
+        } catch (Exception e) {
+            log.error("❌ Ошибка отправки WS свечи {}: {}", sym, e.getMessage());
+        }
+    }
+
+    // ======================================================================
+    //  ИСТОРИЯ ДЛЯ ДАШБОРДА / СТРАТЕГИИ
+    // ======================================================================
+
     public List<Candle> getRecentCandles(long chatId, int limit) {
         SmartFusionStrategySettings cfg = (SmartFusionStrategySettings) settingsService.findByChatId(chatId)
-                .orElseThrow(() -> new IllegalStateException("SmartFusion настройки не найдены для chatId=" + chatId));
+                .orElseThrow(() -> new IllegalStateException(
+                        "SmartFusion настройки не найдены для chatId=" + chatId));
 
         cfg.setCandleLimit(limit);
         return getCandles(cfg);
     }
 
-    /**
-     * Основная загрузка свечей для конкретной конфигурации стратегии.
-     */
     public List<Candle> getCandles(SmartFusionStrategySettings cfg) {
         String exchange = Optional.ofNullable(cfg.getExchange()).orElse("BINANCE");
         NetworkType network = Optional.ofNullable(cfg.getNetworkType()).orElse(NetworkType.MAINNET);
@@ -68,10 +154,12 @@ public class SmartFusionCandleService {
             ExchangeSettings settings = exchangeSettingsService
                     .findByChatIdAndExchangeAndNetwork(cfg.getChatId(), exchange, network)
                     .orElseThrow(() -> new IllegalStateException(
-                            "Настройки не найдены: chatId=" + cfg.getChatId() +
-                            ", exchange=" + exchange + ", network=" + network));
+                            "Настройки не найдены: chatId=" + cfg.getChatId()
+                                    + ", exchange=" + exchange + ", network=" + network));
 
             ExchangeClient client = clientFactory.getClient(settings);
+
+            // Если биржа не поддерживает timeframe — client сам бросит ошибку
             List<ExchangeClient.Kline> klines = client.getKlines(symbol, timeframe, limit);
 
             List<Candle> candles = new ArrayList<>();
@@ -85,8 +173,6 @@ public class SmartFusionCandleService {
                 ));
             }
 
-
-
             cache.put(key, candles);
             log.info("📊 Загружено {} свечей для {} [{} / {}]", candles.size(), symbol, exchange, network);
             return candles;
@@ -97,10 +183,16 @@ public class SmartFusionCandleService {
         }
     }
 
-    /** Последняя цена символа (по кэшу) */
+    /** Последняя цена символа (по кэшу + live 1s). */
     public double getLastPrice(String symbol) {
+        if (symbol == null) return 0.0;
+        String sym = symbol.toUpperCase(Locale.ROOT);
+
+        LiveCandle lc = live1s.get(sym);
+        if (lc != null) return lc.close;
+
         return cache.entrySet().stream()
-                .filter(e -> e.getKey().contains("|" + symbol + "|"))
+                .filter(e -> e.getKey().contains("|" + sym + "|"))
                 .map(Map.Entry::getValue)
                 .flatMap(List::stream)
                 .reduce((first, second) -> second)
@@ -108,7 +200,7 @@ public class SmartFusionCandleService {
                 .orElse(0.0);
     }
 
-    /** Генератор фейковых свечей при недоступности API */
+    /** Генератор фейковых свечей при недоступности API. */
     private List<Candle> generateFallbackData(String symbol, int limit) {
         List<Candle> candles = new ArrayList<>();
         Random rnd = new Random();
@@ -131,9 +223,7 @@ public class SmartFusionCandleService {
         return candles;
     }
 
-    /**
-     * 📈 Расчёт EMA (экспоненциальной скользящей средней) для отображения на графике.
-     */
+    /** 📈 Расчёт EMA для графика. */
     public List<Map<String, Object>> calculateEma(List<Candle> candles, int period) {
         if (candles == null || candles.isEmpty()) return Collections.emptyList();
 
@@ -153,19 +243,16 @@ public class SmartFusionCandleService {
         return ema;
     }
 
-    /**
-     * Построение временных настроек для графика (используется ChartApiController).
-     */
+    /** Построение временных настроек для графика (используется ChartApiController). */
     public SmartFusionStrategySettings buildSettings(Long chatId, String symbol, String timeframe, int limit) {
         SmartFusionStrategySettings s = new SmartFusionStrategySettings();
         s.setChatId(chatId);
         s.setSymbol(symbol);
         s.setTimeframe(timeframe != null ? timeframe : "15m");
         s.setCandleLimit(Math.max(50, limit));
-        // разумные дефолты (биржа/сеть подтянутся в getCandles(...) через ExchangeSettingsService)
+        // Биржа/сеть подтянутся из ExchangeSettingsService при getCandles(...)
         s.setExchange("BINANCE");
         s.setNetworkType(NetworkType.TESTNET);
         return s;
     }
-
 }

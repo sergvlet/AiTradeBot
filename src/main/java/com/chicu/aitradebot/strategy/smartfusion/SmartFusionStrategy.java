@@ -3,6 +3,7 @@ package com.chicu.aitradebot.strategy.smartfusion;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.exchange.enums.OrderSide;
+import com.chicu.aitradebot.market.MarketStreamManager;
 import com.chicu.aitradebot.strategy.core.ContextAwareStrategy;
 import com.chicu.aitradebot.strategy.core.RuntimeIntrospectable;
 import com.chicu.aitradebot.strategy.core.TradingStrategy;
@@ -35,6 +36,9 @@ public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectab
     private final SmartFusionOrderExecutor orderExecutor;
     private final SmartFusionPnLTracker pnlTracker;
     private final SmartFusionStrategySettingsService settingsService;
+    private final MarketStreamManager marketStreamManager;
+
+
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private Thread workerThread;
@@ -68,12 +72,16 @@ public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectab
         running.set(true);
         startedAt = Instant.now();
         threadName = "SmartFusion-" + symbol;
+
+        // 🟢 Подписка на WebSocket рыночных данных
+        marketStreamManager.subscribeSymbol(symbol);
         log.info("▶️ Стратегия SmartFusion запущена: {} ({})", symbol, network);
 
         workerThread = new Thread(this::runLoop, threadName);
         workerThread.setDaemon(true);
         workerThread.start();
     }
+
 
     @Override
     public synchronized void stop() {
@@ -84,11 +92,10 @@ public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectab
 
         running.set(false);
 
-        // Прерываем поток, если он ещё жив
         if (workerThread != null && workerThread.isAlive()) {
             workerThread.interrupt();
             try {
-                workerThread.join(1000); // ждём максимум 1 секунду
+                workerThread.join(1000);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
@@ -96,6 +103,7 @@ public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectab
 
         log.info("⏹ SmartFusion остановлена ({})", symbol);
     }
+
 
     @Override
     public boolean isActive() {
