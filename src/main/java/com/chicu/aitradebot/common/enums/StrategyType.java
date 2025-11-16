@@ -1,4 +1,4 @@
-package com.chicu.aitradebot.common;
+package com.chicu.aitradebot.common.enums;
 
 /** Типы стратегий, поддерживаемые ботом */
 public enum StrategyType {

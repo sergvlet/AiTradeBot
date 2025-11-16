@@ -1,10 +1,127 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>$Title$</title>
-</head>
-<body>
-$END$
+<!doctype html>
+<html lang="ru" xmlns:th="http://www.thymeleaf.org">
+<body th:replace="~{layout :: layout(~{::title}, ~{::section}, 'strategies')}">
+
+<section>
+  <h2 class="fw-bold mb-4"><i class="bi bi-diagram-3"></i> Стратегии</h2>
+
+  <div class="row g-4">
+    <div class="col-md-4 col-sm-6" th:each="s : ${strategies}">
+      <div class="card card-theme h-100 shadow-sm border-0"
+           th:classappend="${s.active} ? 'border-success border-2' : ''">
+        <div class="card-body text-center">
+
+          <h5 class="card-title fw-semibold mb-2" th:text="${s.strategyName}">Strategy</h5>
+
+          <span class="badge px-3 py-2 mb-2"
+                th:classappend="${s.active} ? 'bg-success' : 'bg-secondary'"
+                th:text="${s.active} ? '🟢 Активна' : '⚫ Остановлена'">Активна</span>
+
+          <div class="small text-muted">
+            <div>PnL: <span th:text="${s.totalProfitPct}">—</span>%</div>
+            <div>ML доверие: <span th:text="${s.mlConfidence}">—</span></div>
+          </div>
+
+          <div class="mt-4 d-grid gap-2">
+
+            <!-- 🚀 Кнопка запуска / остановки -->
+            <button type="button" class="btn toggle-btn"
+                    th:classappend="${s.active} ? 'btn-outline-danger' : 'btn-outline-success'"
+                    th:data-type="${s.strategyType}"
+                    th:data-chat-id="${s.chatId != null ? s.chatId : 1}"
+                    th:data-symbol="${s.symbol != null ? s.symbol : 'BTCUSDT'}"
+                    th:data-active="${s.active}">
+              <i th:class="${s.active} ? 'bi bi-stop-fill' : 'bi bi-play-fill'"></i>
+              <span th:text="${s.active} ? 'Остановить' : 'Запустить'">Запустить</span>
+            </button>
+
+            <!-- ⚙️ Кнопка настройки -->
+            <a th:href="@{|/strategies/${s.strategyType.toLowerCase()}/settings|}"
+               class="btn btn-outline-primary">
+              <i class="bi bi-gear"></i> Настроить
+            </a>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 📜 JS-скрипт -->
+  <script>
+    document.addEventListener("DOMContentLoaded", () => {
+      document.querySelectorAll(".toggle-btn").forEach(btn => {
+        btn.addEventListener("click", async (e) => {
+          e.preventDefault();
+
+          const card = btn.closest(".card"); // родительская карточка
+          const badge = card?.querySelector(".badge"); // бейдж со статусом
+          const chatId = btn.dataset.chatId || 1;
+          const type = btn.dataset.type;
+          const symbol = btn.dataset.symbol || "BTCUSDT";
+          const active = btn.dataset.active === "true";
+
+          btn.disabled = true;
+          const icon = btn.querySelector("i");
+          const label = btn.querySelector("span");
+
+          if (icon && label) {
+            icon.className = active ? "bi bi-stop-fill" : "bi bi-play-fill";
+            label.textContent = active ? " Останавливаем..." : " Запускаем...";
+          }
+
+          try {
+            const res = await fetch(`/api/strategy/toggle?chatId=${chatId}&type=${type}&symbol=${symbol}`, {
+              method: "POST",
+              headers: { "Accept": "application/json" }
+            });
+
+            const contentType = res.headers.get("content-type") || "";
+            const data = contentType.includes("application/json")
+                    ? await res.json()
+                    : JSON.parse(await res.text());
+
+            if (!res.ok || data.status === "error") {
+              throw new Error(data.message || "Ошибка при переключении");
+            }
+
+            const started = data.status === "started";
+            btn.dataset.active = String(started);
+
+            // 🔄 меняем стиль кнопки
+            btn.classList.toggle("btn-outline-success", !started);
+            btn.classList.toggle("btn-outline-danger", started);
+            if (icon) icon.className = started ? "bi bi-stop-fill" : "bi bi-play-fill";
+            if (label) label.textContent = started ? " Остановить" : " Запустить";
+
+            // ✅ Мгновенно обновляем бейдж на карточке
+            if (badge) {
+              badge.textContent = started ? "🟢 Активна" : "⚫ Остановлена";
+              badge.classList.toggle("bg-success", started);
+              badge.classList.toggle("bg-secondary", !started);
+            }
+
+            if (window.showToast)
+              showToast(started ? "✅ Стратегия запущена" : "🛑 Стратегия остановлена", true);
+
+            // Редирект — только если сервер его прислал
+            if (data.redirect) window.location.href = data.redirect;
+
+          } catch (err) {
+            console.error("❌ Ошибка при переключении:", err);
+            if (window.showToast)
+              showToast("Ошибка при переключении стратегии", false);
+          } finally {
+            btn.disabled = false;
+          }
+        });
+      });
+    });
+  </script>
+
+
+
+
+</section>
+
 </body>
 </html>

@@ -1,10 +1,17 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>$Title$</title>
-</head>
-<body>
-$END$
+<!doctype html>
+<html lang="ru" xmlns:th="http://www.thymeleaf.org">
+<head><title>AI Trading — О проекте</title></head>
+<body th:replace="~{layout :: layout(~{::title}, ~{::section}, 'dashboard')}">
+<section>
+    <h2 class="fw-bold mb-4">О проекте</h2>
+    <div class="card card-theme p-4">
+        <p class="mb-2">AI Trading Bot — многоуровневая система стратегий с ML/RL, Telegram UI и веб-панелью.</p>
+        <ul class="muted">
+            <li>Стратегии: RSI/EMA, Scalping, Fibonacci Grid, Smart Fusion, ML Invest</li>
+            <li>Интеграции: Binance / Bybit (mainnet & testnet)</li>
+            <li>Бэктестинг, оркестратор стратегий, авто-перезапуск</li>
+        </ul>
+    </div>
+</section>
 </body>
 </html>

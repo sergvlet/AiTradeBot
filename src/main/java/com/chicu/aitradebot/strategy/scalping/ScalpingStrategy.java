@@ -1,4 +1,4 @@
-package com.chicu.aitradebot.strategy;
+package com.chicu.aitradebot.strategy.scalping;
 
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.strategy.core.TradingStrategy;

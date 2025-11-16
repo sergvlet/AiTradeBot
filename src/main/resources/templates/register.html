@@ -1,10 +1,38 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>$Title$</title>
-</head>
-<body>
-$END$
+<!doctype html>
+<html lang="ru" xmlns:th="http://www.thymeleaf.org">
+<head><title>AI Trading — Регистрация</title></head>
+<body th:replace="~{layout :: layout(~{::title}, ~{::section},${active})}">
+<section>
+    <h2 class="fw-bold mb-4">Регистрация пользователя</h2>
+
+    <div class="card card-theme p-4">
+        <form method="post" action="/api/user/register" class="row g-3">
+            <div class="col-md-6">
+                <label class="form-label">Имя</label>
+                <input class="form-control" name="username" required>
+            </div>
+            <div class="col-md-6">
+                <label class="form-label">Email</label>
+                <input type="email" class="form-control" name="email" required>
+            </div>
+            <div class="col-md-6">
+                <label class="form-label">Telegram Chat ID</label>
+                <input class="form-control" name="chatId" required>
+            </div>
+            <div class="col-md-6">
+                <label class="form-label">Биржа</label>
+                <select class="form-select" name="exchange">
+                    <option>Binance Mainnet</option>
+                    <option>Binance Testnet</option>
+                    <option>Bybit Mainnet</option>
+                    <option>Bybit Testnet</option>
+                </select>
+            </div>
+            <div class="col-12">
+                <button class="btn btn-theme">Создать профиль</button>
+            </div>
+        </form>
+    </div>
+</section>
 </body>
 </html>
