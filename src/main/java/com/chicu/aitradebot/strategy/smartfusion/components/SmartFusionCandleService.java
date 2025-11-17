@@ -22,8 +22,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * Сервис свечей для SmartFusion + дашборда.
  * Поддерживает:
  *  - загрузку истории с биржи (getCandles / getRecentCandles)
- *  - live 1s-свечи из BinancePublicTradeStreamService.onTrade(...)
- *  - отправку последней свечи в WebSocket /ws/candles
+ *  - live-свечи по разным таймфреймам (1s, 1m, 5m, 15m, 1h, ...)
+ *  - отправку последней свечи в WebSocket /ws/candles для нужного таймфрейма
  */
 @Service
 @Slf4j
@@ -32,10 +32,9 @@ public class SmartFusionCandleService implements TradeFeedListener {
 
     /**
      * DTO свечи для SmartFusion + графика.
-     * Важно: getTime() → Jackson/Map даёт поле "time", которое ожидает JS.
+     * time = millis → совпадает с тем, что ждет фронт.
      */
     public record Candle(Instant ts, double open, double high, double low, double close) {
-        /** time в миллисекундах для фронта. */
         public long getTime() {
             return ts.toEpochMilli();
         }
@@ -46,20 +45,34 @@ public class SmartFusionCandleService implements TradeFeedListener {
     private final SmartFusionStrategySettingsService settingsService;
     private final CandleWebSocketHandler candleWebSocketHandler;
 
-    /** Кэш свечей: key = exchange|network|symbol|timeframe */
+    /** Кэш исторических свечей: key = exchange|network|symbol|timeframe */
     private final Map<String, List<Candle>> cache = new ConcurrentHashMap<>();
 
-    /** Live 1-секундные свечи по символу (timeframe = 1s). */
+    /**
+     * Live-свеча в памяти.
+     * Используется для всех таймфреймов, не только 1s.
+     */
     private static class LiveCandle {
-        long openSec;
+        long bucketStartSec;  // начало интервала (в секундах от эпохи)
         double open;
         double high;
         double low;
         double close;
     }
 
-    /** key = SYMBOL (верхний регистр), только для 1s. */
-    private final Map<String, LiveCandle> live1s = new ConcurrentHashMap<>();
+    /**
+     * Live-кэш по таймфреймам:
+     *  key: SYMBOL (верхний регистр)
+     *  value: Map<timeframe, LiveCandle>
+     *
+     * Пример ключей timeframe: "1s", "1m", "5m", "15m", "1h"
+     */
+    private final Map<String, Map<String, LiveCandle>> liveByTf = new ConcurrentHashMap<>();
+
+    // Набор таймфреймов, которые мы хотим поддерживать live (можно расширить)
+    private static final List<String> LIVE_TIMEFRAMES = List.of(
+            "1s", "1m", "5m", "15m", "1h"
+    );
 
     // ======================================================================
     //  TradeFeedListener (из BinancePublicTradeStreamService)
@@ -71,56 +84,99 @@ public class SmartFusionCandleService implements TradeFeedListener {
         onTradeTick(symbol, ts, price.doubleValue());
     }
 
-
-
     // ======================================================================
-    //  PUBLIC: live тик с Binance → 1s свеча → WS
+    //  PUBLIC: live тик → обновление свечей по всем таймфреймам + WS
     // ======================================================================
 
     /**
-     * Собирает 1-секундную свечу и пушит её в WebSocket /ws/candles.
+     * Собирает live-свечи по всем поддерживаемым таймфреймам
+     * (1s, 1m, 5m, 15m, 1h, ...) и пушит в WebSocket /ws/candles.
      *
-     * @param symbol  "BTCUSDT"
+     * @param symbol   "BTCUSDT"
      * @param tsMillis timestamp трейда в миллисекундах
-     * @param price   цена сделки
+     * @param price    цена сделки
      */
     public void onTradeTick(String symbol, long tsMillis, double price) {
         if (symbol == null || symbol.isBlank()) return;
 
         String sym = symbol.toUpperCase(Locale.ROOT);
-        long sec = tsMillis / 1000L; // бакет 1 секунда
 
-        LiveCandle lc = live1s.compute(sym, (k, old) -> {
-            if (old == null || old.openSec != sec) {
-                LiveCandle nc = new LiveCandle();
-                nc.openSec = sec;
-                nc.open = price;
-                nc.high = price;
-                nc.low = price;
-                nc.close = price;
-                return nc;
-            } else {
-                old.close = price;
-                if (price > old.high) old.high = price;
-                if (price < old.low) old.low = price;
-                return old;
+        // Для каждого поддерживаемого таймфрейма считаем свой "бакет"
+        for (String tf : LIVE_TIMEFRAMES) {
+            long tfSec = timeframeToSeconds(tf);
+            if (tfSec <= 0) {
+                continue;
             }
-        });
 
-        Candle candle = new Candle(
-                Instant.ofEpochSecond(lc.openSec),
-                lc.open,
-                lc.high,
-                lc.low,
-                lc.close
-        );
+            long sec = tsMillis / 1000L;
+            long bucketStartSec = (sec / tfSec) * tfSec;
 
-        // отправляем только для timeframe=1s (именно его выбирает фронт для live)
-        try {
-            candleWebSocketHandler.broadcastTick(sym, "1s", candle);
-        } catch (Exception e) {
-            log.error("❌ Ошибка отправки WS свечи {}: {}", sym, e.getMessage());
+            Map<String, LiveCandle> byTf = liveByTf.computeIfAbsent(sym, k -> new ConcurrentHashMap<>());
+
+            LiveCandle lc = byTf.compute(tf, (key, old) -> {
+                if (old == null || old.bucketStartSec != bucketStartSec) {
+                    LiveCandle nc = new LiveCandle();
+                    nc.bucketStartSec = bucketStartSec;
+                    nc.open = price;
+                    nc.high = price;
+                    nc.low = price;
+                    nc.close = price;
+                    return nc;
+                } else {
+                    old.close = price;
+                    if (price > old.high) old.high = price;
+                    if (price < old.low)   old.low = price;
+                    return old;
+                }
+            });
+
+            SmartFusionCandleService.Candle candle = new SmartFusionCandleService.Candle(
+                    Instant.ofEpochSecond(lc.bucketStartSec),
+                    lc.open,
+                    lc.high,
+                    lc.low,
+                    lc.close
+            );
+
+            try {
+                // NEW API ✔
+                candleWebSocketHandler.broadcastTick(sym, tf, candle);
+            } catch (Exception e) {
+                log.error("❌ Ошибка отправки WS свечи {} {}: {}", sym, tf, e.getMessage());
+            }
         }
+    }
+
+    /**
+     * Перевод строки таймфрейма (1s, 1m, 5m, 1h, 1d, ...) в секунды.
+     * Поддерживает формат: <число><s|m|h|d|w>.
+     */
+    private long timeframeToSeconds(String tf) {
+        if (tf == null || tf.isBlank()) return 0L;
+
+        tf = tf.trim().toLowerCase(Locale.ROOT);
+        char unit = tf.charAt(tf.length() - 1);
+        String numPart = tf.substring(0, tf.length() - 1);
+
+        long amount;
+        try {
+            amount = Long.parseLong(numPart);
+        } catch (NumberFormatException e) {
+            log.warn("⚠️ Не удалось распарсить таймфрейм: {}", tf);
+            return 0L;
+        }
+
+        return switch (unit) {
+            case 's' -> amount;
+            case 'm' -> amount * 60L;
+            case 'h' -> amount * 3600L;
+            case 'd' -> amount * 86400L;
+            case 'w' -> amount * 7 * 86400L;
+            default -> {
+                log.warn("⚠️ Неизвестная единица таймфрейма: {} (tf={})", unit, tf);
+                yield 0L;
+            }
+        };
     }
 
     // ======================================================================
@@ -155,11 +211,10 @@ public class SmartFusionCandleService implements TradeFeedListener {
                     .findByChatIdAndExchangeAndNetwork(cfg.getChatId(), exchange, network)
                     .orElseThrow(() -> new IllegalStateException(
                             "Настройки не найдены: chatId=" + cfg.getChatId()
-                                    + ", exchange=" + exchange + ", network=" + network));
+                            + ", exchange=" + exchange + ", network=" + network));
 
             ExchangeClient client = clientFactory.getClient(settings);
 
-            // Если биржа не поддерживает timeframe — client сам бросит ошибку
             List<ExchangeClient.Kline> klines = client.getKlines(symbol, timeframe, limit);
 
             List<Candle> candles = new ArrayList<>();
@@ -183,13 +238,18 @@ public class SmartFusionCandleService implements TradeFeedListener {
         }
     }
 
-    /** Последняя цена символа (по кэшу + live 1s). */
+    /** Последняя цена символа (по live 1s, затем по кэшу). */
     public double getLastPrice(String symbol) {
         if (symbol == null) return 0.0;
         String sym = symbol.toUpperCase(Locale.ROOT);
 
-        LiveCandle lc = live1s.get(sym);
-        if (lc != null) return lc.close;
+        Map<String, LiveCandle> byTf = liveByTf.get(sym);
+        if (byTf != null) {
+            LiveCandle oneSec = byTf.get("1s");
+            if (oneSec != null) {
+                return oneSec.close;
+            }
+        }
 
         return cache.entrySet().stream()
                 .filter(e -> e.getKey().contains("|" + sym + "|"))
@@ -200,7 +260,7 @@ public class SmartFusionCandleService implements TradeFeedListener {
                 .orElse(0.0);
     }
 
-    /** Генератор фейковых свечей при недоступности API. */
+    /** Фоллбек-генератор свечей при недоступности API. */
     private List<Candle> generateFallbackData(String symbol, int limit) {
         List<Candle> candles = new ArrayList<>();
         Random rnd = new Random();

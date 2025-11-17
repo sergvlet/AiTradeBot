@@ -1,19 +1,24 @@
 package com.chicu.aitradebot.strategy.smartfusion;
 
+import com.chicu.aitradebot.strategy.smartfusion.components.SmartFusionCandleService;
+import com.chicu.aitradebot.strategy.smartfusion.components.SmartFusionOrderExecutor;
+import com.chicu.aitradebot.strategy.smartfusion.components.SmartFusionPnLTracker;
+
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.exchange.enums.OrderSide;
+import com.chicu.aitradebot.market.ws.TradeWebSocketHandler;   // ✔ НОВЫЙ ИМПОРТ
 import com.chicu.aitradebot.market.MarketStreamManager;
+
 import com.chicu.aitradebot.strategy.core.ContextAwareStrategy;
 import com.chicu.aitradebot.strategy.core.RuntimeIntrospectable;
 import com.chicu.aitradebot.strategy.core.TradingStrategy;
 import com.chicu.aitradebot.strategy.registry.StrategyBinding;
-import com.chicu.aitradebot.strategy.smartfusion.components.*;
+
 import jakarta.annotation.PostConstruct;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
@@ -21,11 +26,6 @@ import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/**
- * 🧠 SmartFusionStrategy — гибридная стратегия Smart Fusion AI:
- * RSI + EMA + Bollinger + ML-подтверждение.
- * Работает с реальными свечами, ордерами и статистикой.
- */
 @Component
 @StrategyBinding(StrategyType.SMART_FUSION)
 @RequiredArgsConstructor
@@ -36,9 +36,9 @@ public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectab
     private final SmartFusionOrderExecutor orderExecutor;
     private final SmartFusionPnLTracker pnlTracker;
     private final SmartFusionStrategySettingsService settingsService;
+
     private final MarketStreamManager marketStreamManager;
-
-
+    private final TradeWebSocketHandler tradeWebSocketHandler;   // ✔ ДОБАВИЛИ
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private Thread workerThread;
@@ -53,14 +53,10 @@ public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectab
     private Instant startedAt;
     private String threadName;
 
-    // ==================== Инициализация ====================
-
     @PostConstruct
     public void onInit() {
         log.info("🚀 SmartFusionStrategy инициализирована как Spring Bean!");
     }
-
-    // ==================== Методы TradingStrategy ====================
 
     @Override
     public synchronized void start() {
@@ -73,7 +69,6 @@ public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectab
         startedAt = Instant.now();
         threadName = "SmartFusion-" + symbol;
 
-        // 🟢 Подписка на WebSocket рыночных данных
         marketStreamManager.subscribeSymbol(symbol);
         log.info("▶️ Стратегия SmartFusion запущена: {} ({})", symbol, network);
 
@@ -81,7 +76,6 @@ public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectab
         workerThread.setDaemon(true);
         workerThread.start();
     }
-
 
     @Override
     public synchronized void stop() {
@@ -91,31 +85,20 @@ public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectab
         }
 
         running.set(false);
-
         if (workerThread != null && workerThread.isAlive()) {
             workerThread.interrupt();
-            try {
-                workerThread.join(1000);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
+            try { workerThread.join(1000); } catch (InterruptedException ignored) {}
         }
 
         log.info("⏹ SmartFusion остановлена ({})", symbol);
     }
 
-
-    @Override
-    public boolean isActive() {
-        return running.get();
-    }
+    @Override public boolean isActive() { return running.get(); }
 
     @Override
     public void onPriceUpdate(String symbol, double price) {
         log.debug("📈 Обновление цены [{}] = {}", symbol, price);
     }
-
-    // ==================== Контекст ====================
 
     @Override
     public void setContext(long chatId, String symbol) {
@@ -129,12 +112,7 @@ public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectab
         this.symbol = symbol.toUpperCase(Locale.ROOT);
         this.exchange = cfg.getExchange();
         this.network = cfg.getNetworkType();
-
-        log.info("⚙️ SmartFusion контекст установлен: chatId={} symbol={} exchange={} network={}",
-                chatId, this.symbol, exchange, network);
     }
-
-    // ==================== Основной цикл ====================
 
     private void runLoop() {
         try {
@@ -143,25 +121,19 @@ public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectab
                 Thread.sleep(10_000);
             }
         } catch (InterruptedException e) {
-            log.info("🛑 Поток SmartFusion ({}) прерван вручную", symbol);
-            Thread.currentThread().interrupt();
+            log.info("🛑 Поток SmartFusion прерван");
         } catch (Exception e) {
-            log.error("❌ Ошибка в цикле SmartFusion: {}", e.getMessage(), e);
+            log.error("❌ Ошибка в цикле SmartFusion: {}", e.getMessage());
         } finally {
             running.set(false);
-            log.info("■ SmartFusion завершена (symbol={})", symbol);
         }
     }
 
     private void executeCycle() {
-        if (!running.get()) return;
-
         SmartFusionStrategySettings cfg = settingsService.getOrCreate(chatId);
         List<SmartFusionCandleService.Candle> candles = candleService.getCandles(cfg);
-        if (candles.size() < 20) {
-            log.warn("⚠️ Недостаточно данных по свечам {}", symbol);
-            return;
-        }
+
+        if (candles.size() < 20) return;
 
         double[] closes = candles.stream().mapToDouble(SmartFusionCandleService.Candle::close).toArray();
         double lastPrice = closes[closes.length - 1];
@@ -191,38 +163,59 @@ public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectab
         } else {
             lastEvent = "HOLD";
         }
-
-        log.info("📊 [{}] RSI={}, EMAfast={}, EMAslow={}, Price={}, Event={}",
-                symbol, round(rsi), round(emaFast), round(emaSlow), round(lastPrice), lastEvent);
     }
-
-    // ==================== Торговля ====================
 
     private void executeTrade(OrderSide side, SmartFusionStrategySettings cfg, double lastPrice) {
         try {
             double capital = cfg.getCapitalUsd();
             double qty = capital / lastPrice;
-            BigDecimal qtyDec = BigDecimal.valueOf(qty);
 
-            orderExecutor.placeMarketOrder(chatId, exchange, cfg.getNetworkType(), symbol, side, qtyDec);
+            orderExecutor.placeMarketOrder(
+                    chatId,
+                    exchange,
+                    cfg.getNetworkType(),
+                    symbol,
+                    side,
+                    BigDecimal.valueOf(qty)
+            );
 
+            // ❗ PnL
             double profitUsd = (side == OrderSide.BUY ? -1 : 1) * (lastPrice * qty * 0.001);
             pnlTracker.recordTrade(chatId, symbol, lastPrice, qty, profitUsd > 0, profitUsd);
 
-            log.info("✅ Исполнен {} ордер по {}, qty={} profit={} USD", side, symbol, qty, round(profitUsd));
+            // 🟢 PUSH TRADE to WS
+            pushTradeToWs(symbol, lastPrice, qty, side.name());
+
         } catch (Exception e) {
             log.error("❌ Ошибка исполнения сделки: {}", e.getMessage());
         }
     }
 
-    // ==================== Индикаторы ====================
+    // ===================== WS PUSH =============================
+
+    private void pushTradeToWs(String symbol, double price, double qty, String side) {
+        try {
+            tradeWebSocketHandler.broadcastTrade(
+                    System.currentTimeMillis(),
+                    symbol.toUpperCase(),
+                    Map.of(
+                            "side", side,
+                            "price", price,
+                            "qty", qty
+                    )
+            );
+            log.info("📤 PUSH WS TRADE: {} {} price={} qty={}", side, symbol, price, qty);
+        } catch (Exception e) {
+            log.error("❌ Ошибка pushTradeToWs: {}", e.getMessage());
+        }
+    }
+
+    // ===================== Индикаторы ==========================
 
     private double ema(double[] data, int period) {
         double k = 2.0 / (period + 1);
         double ema = data[0];
-        for (int i = 1; i < data.length; i++) {
-            ema = data[i] * k + ema * (1 - k);
-        }
+        for (int i = 1; i < data.length; i++) ema = data[i] * k + ema * (1 - k);
         return ema;
     }
 
@@ -235,39 +228,24 @@ public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectab
         }
         if (loss == 0) return 100.0;
         double rs = gain / loss;
-        return 100.0 - (100.0 / (1 + rs));
+        return 100 - (100 / (1 + rs));
     }
 
     private double[] bollinger(double[] data, int period, double k) {
         if (data.length < period) return new double[]{0, 0, 0};
         double mean = Arrays.stream(data, data.length - period, data.length).average().orElse(0);
         double variance = Arrays.stream(data, data.length - period, data.length)
-                                  .map(v -> Math.pow(v - mean, 2))
-                                  .sum() / period;
+                                  .map(v -> Math.pow(v - mean, 2)).sum() / period;
         double std = Math.sqrt(variance);
         return new double[]{mean, mean + k * std, mean - k * std};
     }
 
-    private double round(double v) {
-        return Math.round(v * 100.0) / 100.0;
-    }
+    private double round(double v) { return Math.round(v * 100.0) / 100.0; }
 
-    // ==================== RuntimeIntrospectable ====================
+    @Override public String getSymbol() { return symbol; }
+    @Override public Instant getStartedAt() { return startedAt; }
+    @Override public String getThreadName() { return threadName; }
 
-    @Override
-    public String getSymbol() {
-        return symbol;
-    }
-
-    @Override
-    public Instant getStartedAt() {
-        return startedAt;
-    }
-
-    @Override
-    public String getThreadName() {
-        return threadName != null ? threadName : Thread.currentThread().getName();
-    }
     @Override
     public SmartFusionCandleService getCandleService() {
         return candleService;

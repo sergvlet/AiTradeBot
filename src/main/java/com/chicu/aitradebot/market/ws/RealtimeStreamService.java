@@ -6,6 +6,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -59,5 +60,19 @@ public class RealtimeStreamService {
             log.error("❌ sendCandle error {} {}: {}", symbol, timeframe, ex.getMessage());
         }
     }
+    public void pushTrade(String symbol, double price, double qty, String side) {
+        Map<String, Object> data = Map.of(
+                "side", side,           // BUY/SELL
+                "price", price,
+                "qty", qty
+        );
+
+        tradeHandler.broadcastTrade(
+                System.currentTimeMillis(),
+                symbol,
+                new HashMap<>(data)
+        );
+    }
+
 
 }

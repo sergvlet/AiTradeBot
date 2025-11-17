@@ -1,124 +1,210 @@
 package com.chicu.aitradebot.market.ws;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
-import org.springframework.web.socket.*;
-import org.springframework.web.socket.handler.TextWebSocketHandler;
+import org.springframework.web.socket.CloseStatus;
+import org.springframework.web.socket.TextMessage;
+import org.springframework.web.socket.WebSocketHandler;
+import org.springframework.web.socket.WebSocketMessage;
+import org.springframework.web.socket.WebSocketSession;
 
 import java.io.IOException;
 import java.net.URI;
-import java.util.*;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.util.Collections;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * WebSocket /ws/trades
- * Клиент: ws://host/ws/trades?chatId=123&symbol=BTCUSDT
- * Сервер шлёт сделки (ордеры/PNL) только тому, кто подписан на этот chatId+symbol.
+ * WebSocket-хэндлер для real-time сделок (BUY/SELL):
+ *
+ *   /ws/trades?symbol=BTCUSDT
+ *
+ * Вызывается из:
+ *    MarketStreamManager.pushTrade()
+ *    SmartFusionStrategy (когда делает ордер)
+ *
+ * Пушит JSON:
+ * {
+ *    "symbol": "BTCUSDT",
+ *    "price": 94800.5,
+ *    "qty": 0.002,
+ *    "side": "BUY",
+ *    "ts": 1731628400000
+ * }
  */
-@Component
 @Slf4j
-public class TradeWebSocketHandler extends TextWebSocketHandler {
-
-    private final ObjectMapper mapper = new ObjectMapper();
+@Component
+public class TradeWebSocketHandler implements WebSocketHandler {
 
     /**
-     * key = chatId|SYMBOL
+     * Каналы:
+     *   key:  SYMBOL → "BTCUSDT"
+     *   val:  Set<WebSocketSession>
      */
-    private final Map<String, Set<WebSocketSession>> subscribers = new ConcurrentHashMap<>();
+    private final Map<String, Set<WebSocketSession>> channels = new ConcurrentHashMap<>();
+
+    /**
+     * Обратный индекс для удаления:
+     *   sessionId → SYMBOL
+     */
+    private final Map<String, String> sessionChannel = new ConcurrentHashMap<>();
+
+    // ==========================================================================
+    // WebSocketHandler API
+    // ==========================================================================
 
     @Override
-    public void afterConnectionEstablished(WebSocketSession session) {
+    public void afterConnectionEstablished(WebSocketSession session) throws Exception {
         URI uri = session.getUri();
-        String query = uri != null ? uri.getQuery() : null;
+        Map<String, String> params = parseQuery(uri);
 
-        long chatId = 0L;
-        String symbol = "BTCUSDT";
+        String symbol = params.getOrDefault("symbol", "").trim().toUpperCase(Locale.ROOT);
 
-        if (query != null) {
-            Map<String, String> q = parseQuery(query);
-            if (q.containsKey("chatId")) {
-                try {
-                    chatId = Long.parseLong(q.get("chatId"));
-                } catch (NumberFormatException ignored) {}
-            }
-            if (q.containsKey("symbol")) {
-                symbol = q.get("symbol").toUpperCase(Locale.ROOT);
-            }
+        if (symbol.isBlank()) {
+            log.warn("❌ /ws/trades: symbol не указан, закрываю сессию {}", session.getId());
+            session.close(CloseStatus.BAD_DATA);
+            return;
         }
 
-        String key = buildKey(chatId, symbol);
-        session.getAttributes().put("chatId", chatId);
-        session.getAttributes().put("symbol", symbol);
-        session.getAttributes().put("subKey", key);
+        channels
+                .computeIfAbsent(symbol, k -> ConcurrentHashMap.newKeySet())
+                .add(session);
 
-        subscribers.computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet()).add(session);
+        sessionChannel.put(session.getId(), symbol);
 
-        log.info("🟢 WS TRADES подключен: {} chatId={} symbol={}", session.getId(), chatId, symbol);
+        log.info("🔌 WS /ws/trades CONNECT id={} symbol={}", session.getId(), symbol);
+    }
+
+    @Override
+    public void handleMessage(WebSocketSession session, WebSocketMessage<?> message) {
+        // Клиент нам ничего не должен слать
+        log.debug("📩 WS /ws/trades message from {}: {}", session.getId(), message.getPayload());
+    }
+
+    @Override
+    public void handleTransportError(WebSocketSession session, Throwable e) throws Exception {
+        log.warn("⚠️ WS /ws/trades transport error id={} : {}", session != null ? session.getId() : "null", e.getMessage());
+        if (session != null && session.isOpen()) {
+            session.close(CloseStatus.SERVER_ERROR);
+        }
+        removeSession(session);
     }
 
     @Override
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
-        Object keyObj = session.getAttributes().get("subKey");
-        if (keyObj != null) {
-            String key = keyObj.toString();
-            Set<WebSocketSession> set = subscribers.get(key);
-            if (set != null) {
-                set.remove(session);
-                if (set.isEmpty()) {
-                    subscribers.remove(key);
-                }
-            }
-        }
-        log.info("🔴 WS TRADES закрыт: {} ({})", session.getId(), status);
+        log.info("🔌 WS /ws/trades CLOSED id={} status={}", session.getId(), status);
+        removeSession(session);
     }
 
     @Override
-    protected void handleTextMessage(WebSocketSession session, TextMessage message) {
-        // Можно сделать ping/pong или фильтры, пока не нужно.
+    public boolean supportsPartialMessages() {
+        return false;
     }
 
-    private Map<String, String> parseQuery(String q) {
-        Map<String, String> map = new HashMap<>();
-        for (String part : q.split("&")) {
-            String[] kv = part.split("=", 2);
-            if (kv.length == 2) {
-                map.put(kv[0], kv[1]);
-            }
-        }
-        return map;
-    }
-
-    private String buildKey(long chatId, String symbol) {
-        return chatId + "|" + symbol.toUpperCase(Locale.ROOT);
-    }
+    // ==========================================================================
+    // Публичный метод для MarketStreamManager
+    // ==========================================================================
 
     /**
-     * Вызови это из OrderService / стратегии, когда создаётся или закрывается сделка.
-     * Поля подобраны под твой strategy-chart.js.
+     * Рассылка сделки всем подписчикам символа.
+     *
+     * @param tsMillis timestamp (millis)
+     * @param symbol   BTCUSDT
+     * @param data     поля: symbol, price, qty, side, ts
      */
-    public void broadcastTrade(long chatId, String symbol, Map<String, Object> tradePayload) {
-        String key = buildKey(chatId, symbol);
-        Set<WebSocketSession> set = subscribers.get(key);
-        if (set == null || set.isEmpty()) {
+    public void broadcastTrade(long tsMillis, String symbol, Map<String, Object> data) {
+        if (symbol == null || data == null) return;
+
+        String sym = symbol.toUpperCase(Locale.ROOT);
+
+        Set<WebSocketSession> sessions = channels.get(sym);
+        if (sessions == null || sessions.isEmpty()) {
             return;
         }
 
-        try {
-            String json = mapper.writeValueAsString(tradePayload);
-            TextMessage msg = new TextMessage(json);
+        String json = toJson(data);
 
-            for (WebSocketSession s : set) {
-                if (s.isOpen()) {
-                    try {
-                        s.sendMessage(msg);
-                    } catch (IOException e) {
-                        log.warn("WS TRADES send error {}: {}", s.getId(), e.getMessage());
-                    }
+        for (WebSocketSession s : sessions) {
+            if (!s.isOpen()) continue;
+            try {
+                s.sendMessage(new TextMessage(json));
+            } catch (IOException e) {
+                log.warn("⚠️ WS /ws/trades send error id={} : {}", s.getId(), e.getMessage());
+            }
+        }
+    }
+
+    // ==========================================================================
+    // HELPERS
+    // ==========================================================================
+
+    private void removeSession(WebSocketSession session) {
+        if (session == null) return;
+
+        String id = session.getId();
+        String symbol = sessionChannel.remove(id);
+
+        if (symbol != null) {
+            Set<WebSocketSession> set = channels.get(symbol);
+            if (set != null) {
+                set.remove(session);
+                if (set.isEmpty()) {
+                    channels.remove(symbol);
                 }
             }
-        } catch (Exception e) {
-            log.error("❌ broadcastTrade error chatId={} symbol={} : {}", chatId, symbol, e.getMessage());
+        } else {
+            // fallback
+            channels.values().forEach(set -> set.remove(session));
         }
+    }
+
+    private String toJson(Map<String, Object> map) {
+        StringBuilder sb = new StringBuilder("{");
+        boolean first = true;
+
+        for (var e : map.entrySet()) {
+            if (!first) sb.append(",");
+            first = false;
+
+            sb.append("\"").append(e.getKey()).append("\":");
+
+            Object v = e.getValue();
+            if (v instanceof Number || v instanceof Boolean) {
+                sb.append(v);
+            } else {
+                sb.append("\"").append(v).append("\"");
+            }
+        }
+        sb.append("}");
+        return sb.toString();
+    }
+
+    private Map<String, String> parseQuery(URI uri) {
+        if (uri == null) return Collections.emptyMap();
+        String q = uri.getQuery();
+        if (q == null || q.isBlank()) return Collections.emptyMap();
+
+        Map<String, String> res = new ConcurrentHashMap<>();
+        for (String p : q.split("&")) {
+            if (p.isBlank()) continue;
+
+            int idx = p.indexOf("=");
+            if (idx < 0) {
+                res.put(decode(p), "");
+            } else {
+                String key = decode(p.substring(0, idx));
+                String val = decode(p.substring(idx + 1));
+                res.put(key, val);
+            }
+        }
+        return res;
+    }
+
+    private String decode(String s) {
+        return URLDecoder.decode(s, StandardCharsets.UTF_8);
     }
 }
