@@ -1,42 +1,110 @@
 package com.chicu.aitradebot.market.aggregation;
 
-import com.chicu.aitradebot.strategy.smartfusion.components.SmartFusionCandleService;
+import com.chicu.aitradebot.market.MarketTickListener;
+import com.chicu.aitradebot.market.ws.RealtimeStreamService;
+import com.chicu.aitradebot.strategy.core.CandleProvider;
+import com.chicu.aitradebot.web.controller.web.dto.StrategyChartDto;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
 
-import java.time.Instant;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 
 @Slf4j
-public class CandleAggregator {
+@Component
+public class CandleAggregator implements MarketTickListener {
 
-    /** symbol -> текущая свеча */
-    private final ConcurrentMap<String, SmartFusionCandleService.Candle> current = new ConcurrentHashMap<>();
+    private static final long PUSH_DELAY = 300;
 
-    /** Новый тик → обновляем свечу */
-    public SmartFusionCandleService.Candle update(String symbol, long ts, double price) {
+    private final RealtimeStreamService stream;
+    private final Map<String, Map<String, LiveCandle>> live = new ConcurrentHashMap<>();
+    private final Map<String, Long> lastPush = new ConcurrentHashMap<>();
+    // текущие свечи по таймфреймам
+    private final Map<String, StrategyChartDto.CandleDto> current = new HashMap<>();
 
-        long sec = ts / 1000 * 1000;
-        String key = symbol;
-
-        return current.compute(key, (k, old) -> {
-            if (old == null || old.getTime() < sec) {
-                // новая свеча
-                return new SmartFusionCandleService.Candle(
-                        Instant.ofEpochMilli(sec),
-                        price, price, price, price
-                );
-            }
-            // обновляем существующую свечу
-            double open = old.open();
-            double high = Math.max(old.high(), price);
-            double low = Math.min(old.low(), price);
-            double close = price;
-
-            return new SmartFusionCandleService.Candle(
-                    Instant.ofEpochMilli(sec),
-                    open, high, low, close
-            );
-        });
+    private final Map<String, Long> tfMap = Map.of(
+            "1s", 1000L,
+            "3s", 3000L,
+            "5s", 5000L,
+            "15s", 15000L,
+            "1m", 60000L,
+            "3m", 180000L
+    );
+    private String symbol;
+    public CandleAggregator(RealtimeStreamService stream) {
+        this.stream = stream;
     }
+
+    @Override
+    public void onTick(String symbol, double volume, long ts, double price) {
+
+        for (var tf : tfMap.entrySet()) {
+            String code = tf.getKey();
+            long frame = tf.getValue();
+
+            long bucket = ts - (ts % frame);
+
+            Map<String, LiveCandle> map =
+                    live.computeIfAbsent(symbol, x -> new ConcurrentHashMap<>());
+
+            LiveCandle c = map.get(code);
+
+            // ---- закрытие свечи ----
+            if (c == null || c.bucket != bucket) {
+
+                if (c != null) {
+                    CandleProvider.Candle closed = new CandleProvider.Candle(
+                            c.bucket, c.open, c.high, c.low, c.close, c.volume
+                    );
+                    stream.sendCandle(symbol, code, closed);
+                }
+
+                c = new LiveCandle(bucket, price);
+                map.put(code, c);
+                continue;
+            }
+
+            // ---- обновление ----
+            c.close = price;
+            if (price > c.high) c.high = price;
+            if (price < c.low)  c.low = price;
+            c.volume += volume;
+
+            long now = System.currentTimeMillis();
+            long last = lastPush.getOrDefault(code, 0L);
+            if (now - last < PUSH_DELAY) continue;
+            lastPush.put(code, now);
+
+            CandleProvider.Candle liveC = new CandleProvider.Candle(
+                    bucket, c.open, c.high, c.low, c.close, c.volume
+            );
+
+            stream.sendCandle(symbol, code, liveC);
+        }
+    }
+
+    public String getSymbol() {
+        return symbol;
+    }
+
+    public void setSymbol(String symbol) {
+        this.symbol = symbol;
+    }
+
+    private static class LiveCandle {
+        long bucket;
+        double open, high, low, close, volume;
+
+        LiveCandle(long bucket, double price) {
+            this.bucket = bucket;
+            this.open = this.high = this.low = this.close = price;
+            this.volume = 0;
+        }
+    }
+    public void init(String symbol) {
+        log.info("🔄 CandleAggregator initialized for symbol {}", symbol);
+        this.symbol = symbol;
+        current.clear();
+    }
+
 }

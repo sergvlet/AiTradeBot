@@ -1,5 +1,7 @@
 package com.chicu.aitradebot.common.time;
 
+import lombok.Getter;
+
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Locale;
@@ -37,17 +39,17 @@ public enum Timeframe {
     W1(604800,   "1w"),
     MON1(2592000,"1M"); // условный месяц 30 дней
 
+    /**
+     * -- GETTER --
+     * Кол-во секунд в одном баре.
+     */
+    @Getter
     private final int stepSeconds;
     private final String binanceCode;
 
     Timeframe(int stepSeconds, String binanceCode) {
         this.stepSeconds = stepSeconds;
         this.binanceCode = binanceCode;
-    }
-
-    /** Кол-во секунд в одном баре. */
-    public int getStepSeconds() {
-        return stepSeconds;
     }
 
     /**

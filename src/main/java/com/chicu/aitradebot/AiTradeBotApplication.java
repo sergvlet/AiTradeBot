@@ -4,7 +4,9 @@ import com.chicu.aitradebot.util.TimeUtil;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.context.annotation.Bean;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
+@EnableScheduling
 @SpringBootApplication(scanBasePackages = "com.chicu.aitradebot")
 public class AiTradeBotApplication {
 

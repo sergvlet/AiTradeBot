@@ -117,42 +117,40 @@ public class CandleWebSocketHandler implements WebSocketHandler {
      * @param c         свеча SmartFusionCandleService.Candle (ts, o, h, l, c)
      */
     public void broadcastTick(String symbol, String timeframe, SmartFusionCandleService.Candle c) {
-        if (symbol == null || timeframe == null || c == null) {
-            return;
-        }
+        if (symbol == null || timeframe == null || c == null) return;
 
         String sym = symbol.toUpperCase(Locale.ROOT);
         String tf = timeframe.trim();
         String channel = channelKey(sym, tf);
 
         Set<WebSocketSession> sessions = channels.get(channel);
-        if (sessions == null || sessions.isEmpty()) {
-            // никого нет на этом канале — просто выходим
-            return;
-        }
+        if (sessions == null || sessions.isEmpty()) return;
 
-        // Небольшой цвет, чтобы фронт мог как-то различать (по желанию).
-        String color = "g";
+        // отправляем формат, который FRONT ожидает:
+        // type = "tick"
+        // candle = {time, open, high, low, close, volume}
 
-        // Фронт ждёт именно такое имя поля времени: "t" = millis.
-        String json = "{"
-                + "\"t\":" + c.getTime()
-                + ",\"o\":" + c.open()
-                + ",\"h\":" + c.high()
-                + ",\"l\":" + c.low()
-                + ",\"c\":" + c.close()
-                + ",\"tf\":\"" + tf + "\""
-                + ",\"s\":\"" + color + "\""
+        String json =
+                "{"
+                + "\"type\":\"tick\","
+                + "\"candle\":{"
+                +    "\"time\":" + c.getTime() + ","
+                +    "\"open\":" + c.open() + ","
+                +    "\"high\":" + c.high() + ","
+                +    "\"low\":" + c.low() + ","
+                +    "\"close\":" + c.close() + ","
+                +    "\"volume\":" + c.volume()
+                + "},"
+                + "\"symbol\":\"" + sym + "\","
+                + "\"tf\":\"" + tf + "\""
                 + "}";
 
         for (WebSocketSession s : sessions) {
-            if (!s.isOpen()) {
-                continue;
-            }
+            if (!s.isOpen()) continue;
             try {
                 s.sendMessage(new TextMessage(json));
             } catch (IOException e) {
-                log.warn("⚠️ WS /ws/candles push error to {}: {}", s.getId(), e.getMessage());
+                log.warn("⚠ WS push error to {}: {}", s.getId(), e.getMessage());
             }
         }
     }

@@ -23,7 +23,7 @@ import java.util.*;
 
 /**
  * 📊 Универсальный сервис формирования данных для дашборда стратегии.
- * Полностью исправлен для поддержки SmartFusion + новой модели Order.
+ * Полностью адаптирован под SmartFusionCandleService v12.
  */
 @Service
 @RequiredArgsConstructor
@@ -85,7 +85,7 @@ public class StrategyDashboardService {
 
         var candles = raw.stream()
                 .map(c -> StrategyChartDto.CandleDto.builder()
-                        .time(c.ts().toEpochMilli())
+                        .time(c.getTime())   // ← FIXED
                         .open(c.open())
                         .high(c.high())
                         .low(c.low())
@@ -152,7 +152,6 @@ public class StrategyDashboardService {
     }
 
     // ------------------ TIMEFRAMES ------------------
-
     private static final Set<String> ALLOWED_TF = Set.of(
             "1s","5s","10s","15s","30s",
             "1m","3m","5m","15m","30m",
@@ -171,11 +170,12 @@ public class StrategyDashboardService {
         double k = 2.0 / (period + 1);
         List<Point> out = new ArrayList<>();
         double prev = candles.get(0).close();
-        out.add(new Point(candles.get(0).ts().toEpochMilli(), prev));
+
+        out.add(new Point(candles.get(0).getTime(), prev));
 
         for (int i = 1; i < candles.size(); i++) {
             double v = candles.get(i).close() * k + prev * (1 - k);
-            out.add(new Point(candles.get(i).ts().toEpochMilli(), v));
+            out.add(new Point(candles.get(i).getTime(), v));
             prev = v;
         }
         return out;
@@ -184,6 +184,7 @@ public class StrategyDashboardService {
     // ------------------ EQUITY ------------------
     private List<Point> equitySeries(List<StrategyChartDto.CandleDto> candles,
                                      List<StrategyChartDto.TradeMarker> trades) {
+
         double equity = 100.0;
 
         Map<Long, List<StrategyChartDto.TradeMarker>> grouped = new HashMap<>();
@@ -191,6 +192,7 @@ public class StrategyDashboardService {
             grouped.computeIfAbsent(t.getTime(), k -> new ArrayList<>()).add(t);
 
         List<Point> out = new ArrayList<>();
+
         for (var c : candles) {
             long ts = c.getTime();
             double price = c.getClose();
@@ -205,11 +207,13 @@ public class StrategyDashboardService {
             }
             out.add(new Point(ts, equity));
         }
+
         return out;
     }
 
     // ------------------ KPI ------------------
     private Map<String, Double> computeKpis(long chatId, String symbol) {
+
         var orders = orderRepo.findByChatIdAndSymbolOrderByTimestampAsc(chatId, symbol);
 
         int wins = 0, losses = 0, cw = 0, cl = 0, maxW = 0, maxL = 0;
@@ -249,6 +253,7 @@ public class StrategyDashboardService {
             String ym = fmt.format(e.getCreatedAt().atZone(ZoneOffset.UTC));
             out.merge(ym, pnlOf(e), Double::sum);
         }
+
         return out;
     }
 
@@ -260,7 +265,13 @@ public class StrategyDashboardService {
                         smartCandle.buildSettings(chatId, symbol, timeframe, limit))
                 .stream()
                 .map(c -> new CandleProvider.Candle(
-                        c.ts(), c.open(), c.high(), c.low(), c.close(), 0))
+                        c.getTime(),
+                        c.open(),
+                        c.high(),
+                        c.low(),
+                        c.close(),
+                        0
+                ))
                 .toList();
     }
 

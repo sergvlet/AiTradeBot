@@ -1,0 +1,151 @@
+@startuml
+title AiTradeBot — Архитектура проекта
+
+skinparam componentStyle rectangle
+skinparam packageStyle rectangle
+skinparam shadowing false
+skinparam dpi 150
+
+' -----------------------------
+'  TELEGRAM
+' -----------------------------
+package "Telegram Layer" {
+  component TG as "TelegramBot"
+  component AiSelectStrategyState
+  component AiTradingFibonacciConfigState
+  component AiTradingScalpingConfigState
+}
+
+' -----------------------------
+'  WEB UI
+' -----------------------------
+package "Web UI (Thymeleaf)" {
+  component StrategyController
+  component StrategyDashboardController
+  component StrategyChartApiController
+  component HomeController
+}
+
+' -----------------------------
+'  REST API
+' -----------------------------
+package "REST API" {
+  component StrategyControlApiController
+  component ExchangeSymbolsApiController
+  component SmartFusionSettingsApiController
+  component RealtimeCandleApiController
+}
+
+' -----------------------------
+'  ORCHESTRATOR
+' -----------------------------
+package "Orchestrator" {
+  component StrategyFacade
+  component StrategyRegistry
+  component AiStrategyOrchestrator
+  component StrategySettingsService
+}
+
+' -----------------------------
+'  TRADING ENGINE
+' -----------------------------
+package "Trading Engine" {
+  component SchedulerServiceImpl
+  component OrderServiceImpl
+  component SmartFusionCandleService
+  component CandleStreamService
+  component MarketStreamManager
+}
+
+' -----------------------------
+'  STRATEGIES
+' -----------------------------
+package "Strategies" {
+  component FibonacciGridStrategy
+  component ScalpingStrategy
+  component RsiEmaStrategy
+  component MlInvestStrategy
+  component SmartFusionStrategy
+}
+
+' -----------------------------
+'  EXCHANGE
+' -----------------------------
+package "Exchange Clients" {
+  component BinanceExchangeClient
+  component BybitExchangeClient
+  component ExchangeClientFactory
+}
+
+' -----------------------------
+'  DOMAIN/PERSISTENCE
+' -----------------------------
+package "Domain & Persistence" {
+  component OrderEntity
+  component StrategySettings
+  component ExchangeSettings
+  component Balance
+  component UserProfile
+  component Repositories
+}
+
+' -----------------------------
+'  MARKET WEBSOCKET
+' -----------------------------
+package "Market WebSocket" {
+  component CandleWebSocketHandler
+  component TradeWebSocketHandler
+  component BinancePublicTradeStreamService
+  component BybitPublicTradeStreamService
+}
+
+' -----------------------------
+'  СВЯЗИ
+' -----------------------------
+
+' Telegram → Orchestrator
+TG --> AiSelectStrategyState
+AiSelectStrategyState --> StrategyFacade
+
+AiTradingFibonacciConfigState --> StrategyFacade
+AiTradingScalpingConfigState --> StrategyFacade
+
+' Web UI → Orchestrator
+StrategyController --> StrategyFacade
+StrategyDashboardController --> StrategyFacade
+StrategyChartApiController --> SmartFusionCandleService
+
+' REST → Orchestrator
+StrategyControlApiController --> StrategyFacade
+RealtimeCandleApiController --> SmartFusionCandleService
+SmartFusionSettingsApiController --> StrategySettingsService
+
+' Orchestrator → Engine
+StrategyFacade --> StrategyRegistry
+StrategyFacade --> SchedulerServiceImpl
+StrategyFacade --> OrderServiceImpl
+StrategyFacade --> SmartFusionCandleService
+StrategyFacade --> StrategySettingsService
+
+' Strategies → Engine
+FibonacciGridStrategy --> SmartFusionCandleService
+ScalpingStrategy --> SmartFusionCandleService
+RsiEmaStrategy --> SmartFusionCandleService
+MlInvestStrategy --> SmartFusionCandleService
+SmartFusionStrategy --> SmartFusionCandleService
+
+Strategies --> OrderServiceImpl
+
+' Exchange relations
+OrderServiceImpl --> ExchangeClientFactory
+ExchangeClientFactory --> BinanceExchangeClient
+ExchangeClientFactory --> BybitExchangeClient
+
+' Market WebSocket
+BinancePublicTradeStreamService --> SmartFusionCandleService
+BybitPublicTradeStreamService --> SmartFusionCandleService
+
+SmartFusionCandleService --> CandleWebSocketHandler
+SmartFusionCandleService --> TradeWebSocketHandler
+
+@enduml

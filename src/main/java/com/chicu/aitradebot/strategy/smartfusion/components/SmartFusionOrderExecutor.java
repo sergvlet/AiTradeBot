@@ -40,7 +40,7 @@ public class SmartFusionOrderExecutor {
      * @param side   "BUY" или "SELL"
      * @param qty    количество (в базовой валюте)
      */
-    public Order placeMarket(long chatId, String symbol, String side, double qty) throws Exception {
+    public void placeMarket(long chatId, String symbol, String side, double qty) throws Exception {
         // 1) Берём активные настройки для этой биржи
         ExchangeSettings settings = exchangeSettingsService
                 .findAllByChatId(chatId).stream()
@@ -76,7 +76,6 @@ public class SmartFusionOrderExecutor {
                 order.getSide(), order.getSymbol(), order.getQty(), order.getPrice(),
                 order.getStatus(), chatId);
 
-        return order;
     }
 
     /**

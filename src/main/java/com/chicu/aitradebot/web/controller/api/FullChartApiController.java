@@ -2,15 +2,21 @@ package com.chicu.aitradebot.web.controller.api;
 
 import com.chicu.aitradebot.domain.OrderEntity;
 import com.chicu.aitradebot.service.OrderService;
+import com.chicu.aitradebot.strategy.core.CandleProvider;
 import com.chicu.aitradebot.strategy.smartfusion.SmartFusionStrategySettings;
 import com.chicu.aitradebot.strategy.smartfusion.components.SmartFusionCandleService;
 import com.chicu.aitradebot.web.controller.web.dto.StrategyChartDto;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
 
 import java.time.ZoneId;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
 
 @Slf4j
 @RestController
@@ -34,42 +40,33 @@ public class FullChartApiController {
         SmartFusionStrategySettings cfg =
                 candleService.buildSettings(chatId, symbol, timeframe, limit);
 
-        var raw = candleService.getCandles(cfg);
+        // ❗ ТУТ БЫЛА ОШИБКА
+        List<CandleProvider.Candle> raw = candleService.getCandles(cfg);
+
         var ema20 = candleService.calculateEma(raw, 20);
         var ema50 = candleService.calculateEma(raw, 50);
 
-        // === BOLLINGER (20 periods) ======================================
-        var bb = calculateBollinger(raw, 20, 2);
-
-        // === ATR (14 periods) ============================================
+        var bb = calculateBollinger(raw, 20, 2.0);
         var atr = calculateATR(raw, 14);
-
-        // === SuperTrend (fast prototype) =================================
         var supertrend = calculateSupertrend(raw, atr);
 
-        // === TRADES =======================================================
         List<OrderEntity> orders =
                 orderService.getOrderEntitiesByChatIdAndSymbol(chatId, symbol);
 
         List<StrategyChartDto.TradeMarker> trades = orders.stream()
                 .map(o -> StrategyChartDto.TradeMarker.builder()
                         .time(resolveTime(o))
-                        .price(o.getPrice() != null ? o.getPrice().doubleValue() : 0)
-                        .qty(o.getQuantity() != null ? o.getQuantity().doubleValue() : 0)
+                        .price(o.getPrice() != null ? o.getPrice().doubleValue() : 0.0)
+                        .qty(o.getQuantity() != null ? o.getQuantity().doubleValue() : 0.0)
                         .side(o.getSide())
                         .build())
                 .toList();
 
-        // === KPI ==========================================================
-        double winRate = 0;
-        double roi = 0;
-
         Map<String, Double> stats = Map.of(
-                "winRate", winRate,
-                "roi", roi
+                "winRate", 0.0,
+                "roi", 0.0
         );
 
-        // === Candles DTO ==================================================
         List<StrategyChartDto.CandleDto> candles = raw.stream()
                 .map(c -> StrategyChartDto.CandleDto.builder()
                         .time(c.getTime())
@@ -93,19 +90,19 @@ public class FullChartApiController {
                 .trades(trades)
                 .tpLevels(orders.stream()
                         .filter(o -> o.getTakeProfitPrice() != null)
-                        .map(o -> o.getTakeProfitPrice().doubleValue()).toList())
+                        .map(o -> o.getTakeProfitPrice().doubleValue())
+                        .toList())
                 .slLevels(orders.stream()
                         .filter(o -> o.getStopLossPrice() != null)
-                        .map(o -> o.getStopLossPrice().doubleValue()).toList())
+                        .map(o -> o.getStopLossPrice().doubleValue())
+                        .toList())
                 .stats(stats)
                 .lastPrice(candleService.getLastPrice(symbol))
                 .serverTime(System.currentTimeMillis())
                 .build();
     }
 
-    // =====================================================================
-    // HELPERS
-    // =====================================================================
+    // ========== helpers ==========
 
     private long resolveTime(OrderEntity o) {
         if (o.getTimestamp() != null) return o.getTimestamp();
@@ -115,19 +112,24 @@ public class FullChartApiController {
     }
 
     private List<StrategyChartDto.LinePoint> toPoints(List<Map<String, Object>> src) {
-        return src.stream().map(m -> StrategyChartDto.LinePoint.builder()
-                .time(((Number) m.get("time")).longValue())
-                .value(((Number) m.get("value")).doubleValue())
-                .build()).toList();
+        return src.stream()
+                .map(m -> StrategyChartDto.LinePoint.builder()
+                        .time(((Number) m.get("time")).longValue())
+                        .value(((Number) m.get("value")).doubleValue())
+                        .build())
+                .toList();
     }
 
-    // =====================================================================
-    // INDICATORS
-    // =====================================================================
+    private StrategyChartDto.LinePoint pt(long t, double v) {
+        return StrategyChartDto.LinePoint.builder().time(t).value(v).build();
+    }
+
+    // ========== INDICATORS ==========
 
     private Map<String, List<StrategyChartDto.LinePoint>> calculateBollinger(
-            List<SmartFusionCandleService.Candle> candles,
-            int period, double k
+            List<CandleProvider.Candle> candles,
+            int period,
+            double k
     ) {
         List<StrategyChartDto.LinePoint> upper = new ArrayList<>();
         List<StrategyChartDto.LinePoint> lower = new ArrayList<>();
@@ -143,13 +145,13 @@ public class FullChartApiController {
             }
 
             List<Double> slice = candles.subList(i - period, i).stream()
-                    .map(SmartFusionCandleService.Candle::close)
+                    .map(CandleProvider.Candle::close)
                     .toList();
 
             double mean = slice.stream().mapToDouble(d -> d).average().orElse(0);
             double std = Math.sqrt(slice.stream()
-                    .mapToDouble(v -> Math.pow(v - mean, 2))
-                    .sum() / period);
+                                           .mapToDouble(v -> Math.pow(v - mean, 2))
+                                           .sum() / period);
 
             long t = candles.get(i).getTime();
 
@@ -166,26 +168,24 @@ public class FullChartApiController {
     }
 
     private List<Map<String, Object>> calculateATR(
-            List<SmartFusionCandleService.Candle> candles,
+            List<CandleProvider.Candle> candles,
             int period
     ) {
         List<Map<String, Object>> arr = new ArrayList<>();
-        double atr = 0;
+        double atr = 0.0;
 
         for (int i = 1; i < candles.size(); i++) {
-            var c = candles.get(i);
-            var p = candles.get(i - 1);
+            CandleProvider.Candle c = candles.get(i);
+            CandleProvider.Candle p = candles.get(i - 1);
 
             double tr = Math.max(
                     Math.max(c.high() - c.low(), Math.abs(c.high() - p.close())),
                     Math.abs(c.low() - p.close())
             );
 
-            if (i < period) {
-                atr = ((atr * (i - 1)) + tr) / i;
-            } else {
-                atr = (atr * (period - 1) + tr) / period;
-            }
+            atr = (i < period)
+                    ? ((atr * (i - 1)) + tr) / i
+                    : (atr * (period - 1) + tr) / period;
 
             arr.add(Map.of(
                     "time", c.getTime(),
@@ -197,20 +197,14 @@ public class FullChartApiController {
     }
 
     private List<Map<String, Object>> calculateSupertrend(
-            List<SmartFusionCandleService.Candle> candles,
+            List<CandleProvider.Candle> candles,
             List<Map<String, Object>> atr
     ) {
-        List<Map<String, Object>> out = new ArrayList<>();
-        for (int i = 0; i < atr.size(); i++) {
-            out.add(Map.of(
-                    "time", atr.get(i).get("time"),
-                    "value", ((Number) atr.get(i).get("value")).doubleValue()
-            ));
-        }
-        return out;
-    }
-
-    private StrategyChartDto.LinePoint pt(long t, double v) {
-        return StrategyChartDto.LinePoint.builder().time(t).value(v).build();
+        return atr.stream()
+                .map(m -> Map.of(
+                        "time", m.get("time"),
+                        "value", ((Number) m.get("value")).doubleValue()
+                ))
+                .toList();
     }
 }

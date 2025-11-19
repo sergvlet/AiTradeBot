@@ -1,6 +1,7 @@
 package com.chicu.aitradebot.market;
 
 import com.chicu.aitradebot.market.ws.binance.BinancePublicTradeStreamService;
+import com.chicu.aitradebot.strategy.smartfusion.components.SmartFusionCandleService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.annotation.Configuration;
@@ -12,21 +13,16 @@ import jakarta.annotation.PostConstruct;
 @RequiredArgsConstructor
 public class MarketStreamingConfig {
 
-    private final BinancePublicTradeStreamService binance;
-    private final MarketStreamManager streamManager;  // ✔ есть
+    private final BinancePublicTradeStreamService binanceStream;
+    private final SmartFusionCandleService candleService;
 
     @PostConstruct
     public void init() {
-        log.info("🔌 MarketStreamingConfig: привязываем MarketStreamManager");
+        log.info("🌐 MarketStreamingConfig: инициализация потоков...");
 
-        // ТЕПЕРЬ MarketStreamManager — это TradeFeedListener
-        binance.setListener(streamManager);
+        // Подключаем SmartFusionCandleService как listener (все трейды)
+        binanceStream.setListener(candleService);
 
-        // Для логов
-        streamManager.subscribeSymbol("BTCUSDT");
-        streamManager.subscribeSymbol("ETHUSDT");
-
-        // Стартуем поток
-        binance.subscribeSymbols(java.util.List.of("BTCUSDT", "ETHUSDT"));
+        log.info("✅ MarketStreamingConfig: готов.");
     }
 }
