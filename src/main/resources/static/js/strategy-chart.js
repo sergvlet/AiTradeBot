@@ -1,10 +1,10 @@
 "use strict";
 
-console.log("📈 strategy-chart.js loaded (FIXED EDITION v16)");
+console.log("📈 strategy-chart.js loaded (FIXED EDITION v19)");
 
-//
-// === ГЛОБАЛЬНОЕ СОСТОЯНИЕ ===
-//
+/**
+ * Глобальное состояние
+ */
 let currentWs = null;
 
 let chart,
@@ -28,26 +28,18 @@ let tradesGlobal   = [];
 let autoScrollToRealTime = true;
 let initialDataLoaded    = false;
 
-// Price lines (встроенные Lightweight Charts)
-let lastPriceLine      = null;
-let ema20PriceLine     = null;
-let ema50PriceLine     = null;
-let bbUpperPriceLine   = null;
-let bbLowerPriceLine   = null;
-let bbMiddlePriceLine  = null;
-
 let strategyRunning = false;
 
-// ограничения по глубине истории (защита памяти)
+// ограничения истории
 const MAX_CANDLES_HISTORY = 600;
 const MAX_TRADES_HISTORY  = 400;
 
-// внешний хук — НЕ ТРОГАЕМ
+// внешний хук — НЕ ТРОГАТЬ
 window.setStrategyRunning = f => (strategyRunning = !!f);
 
-// =====================================================================
-// PAGE INIT
-// =====================================================================
+// ==============================================================
+// INIT PAGE
+// ==============================================================
 document.addEventListener("DOMContentLoaded", () => {
     const root = document.getElementById("strategy-dashboard");
     if (!root) {
@@ -69,11 +61,14 @@ document.addEventListener("DOMContentLoaded", () => {
     loadFullChart(chatId, symbol, timeframe, { initial: true });
     subscribeLive(symbol, timeframe);
 
-    // периодический full-refresh (сверка с WS)
+    // периодический full-refresh
     setInterval(() => {
         const tf = getCurrentTf();
         loadFullChart(chatId, symbol, tf, { initial: false });
     }, 7000);
+
+    initExportPng();
+    initStartStopButtons();
 });
 
 function getCurrentTf() {
@@ -81,49 +76,88 @@ function getCurrentTf() {
     return s ? s.value || "1m" : "1m";
 }
 
-// =====================================================================
-// INIT CHART + контейнер с колонкой под подписи справа
-// =====================================================================
+// ==============================================================
+// FORMATTERS / HELPERS
+// ==============================================================
+function normalizeTimeMs(t) {
+    if (t == null) return null;
+    // если меньше триллиона — это секунды
+    return t < 1e12 ? t * 1000 : t;
+}
+
+function formatPrice(p, digits = 2) {
+    return typeof p === "number" ? p.toFixed(digits) : String(p);
+}
+
+/**
+ * Кастомный форматтер оси Y.
+ *
+ * Логика:
+ * 1. Берём последние значения:
+ *    - PRICE (close последней свечи)
+ *    - EMA20 / EMA50
+ *    - BB upper / lower / middle
+ * 2. Округляем всё до 2 знаков.
+ * 3. Если тик оси Y совпадает с каким-то из этих значений —
+ *    возвращаем "PRICE 67213.12", "EMA20 67205.44" и т.п.
+ * 4. Если ни с чем не совпало → обычное число.
+ */
+function customPriceFormatter(price) {
+    const pNum = Number(price);
+    if (!Number.isFinite(pNum)) {
+        return "";
+    }
+
+    const p2 = Number(pNum.toFixed(2));
+
+    const eq2 = (v) =>
+        v != null &&
+        Number.isFinite(v) &&
+        Number(v.toFixed(2)) === p2;
+
+    const lastCandle = candlesGlobal.length ? candlesGlobal[candlesGlobal.length - 1] : null;
+    const lastEma20  = ema20Global.length   ? ema20Global[ema20Global.length - 1]     : null;
+    const lastEma50  = ema50Global.length   ? ema50Global[ema50Global.length - 1]     : null;
+    const lastBBU    = bbUpperGlobal.length ? bbUpperGlobal[bbUpperGlobal.length - 1] : null;
+    const lastBBL    = bbLowerGlobal.length ? bbLowerGlobal[bbLowerGlobal.length - 1] : null;
+    const lastBBM    = bbMiddleGlobal.length? bbMiddleGlobal[bbMiddleGlobal.length - 1]: null;
+
+    if (lastCandle && eq2(lastCandle.close)) {
+        return "PRICE " + p2.toFixed(2);
+    }
+    if (lastEma20 && eq2(lastEma20.value)) {
+        return "EMA20 " + p2.toFixed(2);
+    }
+    if (lastEma50 && eq2(lastEma50.value)) {
+        return "EMA50 " + p2.toFixed(2);
+    }
+    if (lastBBU && eq2(lastBBU.value)) {
+        return "BB↑ " + p2.toFixed(2);
+    }
+    if (lastBBL && eq2(lastBBL.value)) {
+        return "BB↓ " + p2.toFixed(2);
+    }
+    if (lastBBM && eq2(lastBBM.value)) {
+        return "BB mid " + p2.toFixed(2);
+    }
+
+    // Если ни с чем не совпало → обычное число
+    return p2.toFixed(2);
+}
+
+// ==============================================================
+// INIT CHART
+// ==============================================================
 function initChart() {
-    const outer = document.getElementById("candles-chart");
-    if (!outer) {
+    const el = document.getElementById("candles-chart");
+    if (!el) {
         console.error("❗ candles-chart element missing");
         return;
     }
 
-    // Подготовим layout:
-    // [ chartHost | labelsPane ]
-    outer.innerHTML = "";
-    outer.style.position = "relative";
-    outer.style.height = outer.style.height || "520px";
-
-    const chartHost = document.createElement("div");
-    chartHost.id = "candles-chart-inner";
-    chartHost.style.position = "absolute";
-    chartHost.style.left = "0";
-    chartHost.style.top = "0";
-    chartHost.style.bottom = "0";
-    chartHost.style.right = "70px"; // место под надписи справа
-
-    const labelsPane = document.createElement("div");
-    labelsPane.id = "price-labels-pane";
-    labelsPane.style.position = "absolute";
-    labelsPane.style.top = "0";
-    labelsPane.style.bottom = "0";
-    labelsPane.style.right = "0";
-    labelsPane.style.width = "70px";
-    labelsPane.style.display = "block";
-    labelsPane.style.pointerEvents = "none";
-
-    outer.appendChild(chartHost);
-    outer.appendChild(labelsPane);
-
-    const width  = chartHost.clientWidth || 600;
-    const height = chartHost.clientHeight || 520;
-
-    chart = LightweightCharts.createChart(chartHost, {
-        width:  width,
-        height: height,
+    chart = LightweightCharts.createChart(el, {
+        width:  el.clientWidth,
+        height: 520,
         layout: {
             background: { color: "#0b0c0e" },
             textColor:  "#c7c7c7"
@@ -137,12 +171,11 @@ function initChart() {
             timeVisible:    true,
             secondsVisible: true,
             borderColor:    "rgba(255,255,255,0.2)",
-            rightOffset:    15,   // отступ вправо, чтобы последние свечи не упирались в край
-            barSpacing:     8,
-            minBarSpacing:  0.5
+            rightOffset:    0    // базовое значение, динамически добавим "пустое" место через setVisibleRange
         },
         rightPriceScale: {
-            borderColor: "rgba(255,255,255,0.2)"
+            borderColor:    "rgba(255,255,255,0.2)",
+            priceFormatter: customPriceFormatter
         }
     });
 
@@ -153,7 +186,8 @@ function initChart() {
         borderDownColor: "#e74c3c",
         wickUpColor:     "#2ecc71",
         wickDownColor:   "#e74c3c",
-        priceLineVisible: false // встроенную линию цены не показываем, используем свою
+        priceLineVisible: true,     // стандартная линия последней цены
+        // title не задаём, чтобы не рисовало "PRICE ..." поверх графика
     });
 
     ema20Series = chart.addLineSeries({
@@ -187,33 +221,28 @@ function initChart() {
         priceLineVisible: false
     });
 
-    // автоскролл: если пользователь ушёл влево — не тянем график назад
+    // автоскролл: если пользователь ушёл влево — не тянем назад
     chart.timeScale().subscribeVisibleTimeRangeChange(() => {
         const sc = chart.timeScale().scrollPosition();
         autoScrollToRealTime = sc < 0.5;
     });
 
-    // ресайз при изменении окна
-    window.addEventListener("resize", () => {
-        if (!chartHost || !chart) return;
-        const w = chartHost.clientWidth || 600;
-        const h = chartHost.clientHeight || 520;
-        chart.applyOptions({ width: w, height: h });
-    });
-
-    setupSmoothZoomAndScroll(chartHost);
+    setupSmoothZoomAndScroll(el);
     initTooltip();
 }
 
-// =====================================================================
-// SMOOTH ZOOM & SCROLL (TradingView-like)
-// =====================================================================
+// плавный zoom/scroll
 function setupSmoothZoomAndScroll(container) {
     if (!chart) return;
-
     const timeScale = chart.timeScale();
 
-    // Zoom колесом
+    timeScale.applyOptions({
+        rightOffset:   0,
+        barSpacing:    8,
+        minBarSpacing: 0.5
+    });
+
+    // zoom колесом
     let zoomTimeout = null;
 
     container.addEventListener("wheel", (event) => {
@@ -237,7 +266,7 @@ function setupSmoothZoomAndScroll(container) {
         }, 350);
     }, { passive: false });
 
-    // Scroll drag мышью
+    // drag scroll
     let isDragging = false;
     let lastX = 0;
 
@@ -253,7 +282,6 @@ function setupSmoothZoomAndScroll(container) {
         lastX = e.clientX;
 
         const pos = timeScale.scrollPosition();
-        // dx > 0 => двигаем в прошлое
         timeScale.scrollToPosition(pos - dx / 5, false);
     });
 
@@ -266,11 +294,11 @@ function setupSmoothZoomAndScroll(container) {
     });
 }
 
-// =====================================================================
+// ==============================================================
 // TOOLTIP
-// =====================================================================
+// ==============================================================
 function initTooltip() {
-    const container = document.getElementById("candles-chart-inner");
+    const container = document.getElementById("candles-chart");
     if (!container || !chart) return;
 
     container.style.position = "relative";
@@ -296,7 +324,6 @@ function initTooltip() {
             return;
         }
 
-        // time может быть числом или объектом с timestamp
         const timeSec = typeof param.time === "object" && "timestamp" in param.time
             ? param.time.timestamp
             : param.time;
@@ -312,7 +339,6 @@ function initTooltip() {
         const e20 = ema20Global.find(e => e.time === tMs);
         const e50 = ema50Global.find(e => e.time === tMs);
 
-        // сделка в пределах +-1500 ms
         let tr = null;
         for (const t of tradesGlobal) {
             if (Math.abs(t.time - tMs) <= 1500) {
@@ -352,9 +378,9 @@ function initTooltip() {
     });
 }
 
-// =====================================================================
+// ==============================================================
 // LOAD TIMEFRAMES
-// =====================================================================
+// ==============================================================
 async function loadTimeframes(exchange, network, currentTf) {
     try {
         const r = await fetch(
@@ -396,22 +422,9 @@ async function loadTimeframes(exchange, network, currentTf) {
     }
 }
 
-// =====================================================================
-// ВСПОМОГАТЕЛЬНЫЕ
-// =====================================================================
-function normalizeTimeMs(t) {
-    if (t == null) return null;
-    // если меньше триллиона — это, скорее всего, секунды
-    return t < 1e12 ? t * 1000 : t;
-}
-
-function formatPrice(p) {
-    return typeof p === "number" ? p.toFixed(2) : String(p);
-}
-
-// =====================================================================
+// ==============================================================
 // LOAD FULL CHART
-// =====================================================================
+// ==============================================================
 async function loadFullChart(chatId, symbol, timeframe, opts = {}) {
     const initial = !!opts.initial;
     try {
@@ -429,7 +442,7 @@ async function loadFullChart(chatId, symbol, timeframe, opts = {}) {
 
         const d = await r.json();
 
-        // -------- Candles --------
+        // Candles
         candlesGlobal = (d.candles || []).map(c => {
             const tMs = normalizeTimeMs(c.time);
             return {
@@ -455,7 +468,7 @@ async function loadFullChart(chatId, symbol, timeframe, opts = {}) {
             }))
         );
 
-        // -------- EMA --------
+        // EMA
         ema20Global = (d.ema20 || []).map(p => ({
             time:  normalizeTimeMs(p.time),
             value: p.value
@@ -468,7 +481,7 @@ async function loadFullChart(chatId, symbol, timeframe, opts = {}) {
         ema20Series.setData(ema20Global.map(p => ({ time: p.time / 1000, value: p.value })));
         ema50Series.setData(ema50Global.map(p => ({ time: p.time / 1000, value: p.value })));
 
-        // -------- Bollinger --------
+        // Bollinger
         const bb = d.bollinger || {};
         bbUpperGlobal  = (bb.upper  || []).map(p => ({ time: normalizeTimeMs(p.time), value: p.value }));
         bbLowerGlobal  = (bb.lower  || []).map(p => ({ time: normalizeTimeMs(p.time), value: p.value }));
@@ -478,7 +491,7 @@ async function loadFullChart(chatId, symbol, timeframe, opts = {}) {
         bbLowerSeries .setData(bbLowerGlobal .map(p => ({ time: p.time / 1000, value: p.value })));
         bbMiddleSeries.setData(bbMiddleGlobal.map(p => ({ time: p.time / 1000, value: p.value })));
 
-        // -------- Trades --------
+        // Trades
         tradesGlobal = (d.trades || []).map(t => ({
             time:  normalizeTimeMs(t.time),
             price: t.price,
@@ -490,36 +503,43 @@ async function loadFullChart(chatId, symbol, timeframe, opts = {}) {
         }
 
         updateTradeMarkers();
-        updatePriceLine();
-        updateIndicatorPriceLines();
         updateFrontStats();
-        renderIndicatorLabels(); // сразу обновить подписи
 
-        const ts = chart.timeScale();
+        // Сразу показываем последние свечи, окно ~120 баров + отступ справа
+        if (candlesGlobal.length) {
+            const lastIdx = candlesGlobal.length - 1;
+            const windowSize = Math.min(120, candlesGlobal.length);
+            const firstIdxInWindow = Math.max(0, lastIdx - windowSize + 1);
+
+            const last = candlesGlobal[lastIdx];
+            const prev = candlesGlobal[Math.max(0, lastIdx - 1)];
+
+            const lastTimeSec = last.time / 1000;
+            const prevTimeSec = prev.time / 1000;
+            const dt          = lastIdx > 0 ? (lastTimeSec - prevTimeSec) : 60; // шаг по времени
+            const extra       = dt * 5; // отступ справа ≈ 5 свечей
+
+            const from = candlesGlobal[firstIdxInWindow].time / 1000;
+            const to   = lastTimeSec + extra;
+
+            chart.timeScale().setVisibleRange({ from, to });
+        }
 
         if (!initialDataLoaded) {
-            // вместо fitContent — показываем только хвост истории
-            if (candlesGlobal.length) {
-                const bars = candlesGlobal.length;
-                const visibleBars = Math.min(80, bars); // сколько баров влезет из хвоста
-                const fromIndex = Math.max(0, bars - visibleBars);
-                const from = candlesGlobal[fromIndex].time / 1000;
-                const to   = candlesGlobal[bars - 1].time / 1000;
-                ts.setVisibleRange({ from, to });
-            }
-            ts.scrollToRealTime();
+            chart.timeScale().scrollToRealTime();
             initialDataLoaded = true;
         } else if (autoScrollToRealTime) {
-            ts.scrollToRealTime();
+            chart.timeScale().scrollToRealTime();
         }
+
     } catch (e) {
         console.error("❌ loadFullChart error:", e);
     }
 }
 
-// =====================================================================
-// UPDATE STATS (card сверху)
-// =====================================================================
+// ==============================================================
+// STATS (верхние карточки)
+// ==============================================================
 function updateFrontStats() {
     if (!candlesGlobal.length) return;
 
@@ -533,10 +553,25 @@ function updateFrontStats() {
     }
 
     const elChange = document.getElementById("stat-change-pct");
+    const elTrend  = document.getElementById("stat-trend");
+
     if (elChange && typeof first.close === "number" && first.close !== 0) {
         const pct = ((last.close - first.close) / first.close) * 100;
         elChange.textContent = pct.toFixed(2) + "%";
         elChange.style.color = pct >= 0 ? "#2ecc71" : "#e74c3c";
+
+        if (elTrend) {
+            if (pct > 0.4) {
+                elTrend.textContent = "Восходящий";
+                elTrend.style.color = "#2ecc71";
+            } else if (pct < -0.4) {
+                elTrend.textContent = "Нисходящий";
+                elTrend.style.color = "#e74c3c";
+            } else {
+                elTrend.textContent = "Боковой";
+                elTrend.style.color = "#f1c40f";
+            }
+        }
     }
 
     const elRange = document.getElementById("stat-range");
@@ -548,9 +583,9 @@ function updateFrontStats() {
     }
 }
 
-// =====================================================================
+// ==============================================================
 // TRADE MARKERS
-// =====================================================================
+// ==============================================================
 function updateTradeMarkers() {
     candleSeries.setMarkers(
         tradesGlobal.map(t => ({
@@ -563,219 +598,12 @@ function updateTradeMarkers() {
     );
 }
 
-// =====================================================================
-// PRICE LINE (цена свечи)
-// =====================================================================
-function updatePriceLine() {
-    const last = candlesGlobal[candlesGlobal.length - 1];
-    if (!last || typeof last.close !== "number") return;
-
-    if (lastPriceLine) {
-        try {
-            candleSeries.removePriceLine(lastPriceLine);
-        } catch (e) {
-            // уже удалён — ок
-        }
-    }
-
-    lastPriceLine = candleSeries.createPriceLine({
-        price:     last.close,
-        lineWidth: 2,
-        color:     "rgba(0,255,150,0.9)",
-        title:     `PRICE ${last.close.toFixed(2)}`
-    });
-}
-
-// =====================================================================
-// Встроенные priceLine для индикаторов (для совместимости, если надо)
-// =====================================================================
-function updateIndicatorPriceLines() {
-    // EMA20
-    if (ema20PriceLine) {
-        try { ema20Series.removePriceLine(ema20PriceLine); } catch (e) {}
-        ema20PriceLine = null;
-    }
-    if (ema20Global.length) {
-        const last = ema20Global[ema20Global.length - 1];
-        if (last && typeof last.value === "number") {
-            ema20PriceLine = ema20Series.createPriceLine({
-                price: last.value,
-                color: "#42a5f5",
-                lineWidth: 1,
-                title: `EMA20 ${formatPrice(last.value)}`
-            });
-        }
-    }
-
-    // EMA50
-    if (ema50PriceLine) {
-        try { ema50Series.removePriceLine(ema50PriceLine); } catch (e) {}
-        ema50PriceLine = null;
-    }
-    if (ema50Global.length) {
-        const last = ema50Global[ema50Global.length - 1];
-        if (last && typeof last.value === "number") {
-            ema50PriceLine = ema50Series.createPriceLine({
-                price: last.value,
-                color: "#ab47bc",
-                lineWidth: 1,
-                title: `EMA50 ${formatPrice(last.value)}`
-            });
-        }
-    }
-
-    // BB Upper
-    if (bbUpperPriceLine) {
-        try { bbUpperSeries.removePriceLine(bbUpperPriceLine); } catch (e) {}
-        bbUpperPriceLine = null;
-    }
-    if (bbUpperGlobal.length) {
-        const last = bbUpperGlobal[bbUpperGlobal.length - 1];
-        if (last && typeof last.value === "number") {
-            bbUpperPriceLine = bbUpperSeries.createPriceLine({
-                price: last.value,
-                color: "rgba(255,215,0,0.9)",
-                lineWidth: 1,
-                title: `BB↑ ${formatPrice(last.value)}`
-            });
-        }
-    }
-
-    // BB Lower
-    if (bbLowerPriceLine) {
-        try { bbLowerSeries.removePriceLine(bbLowerPriceLine); } catch (e) {}
-        bbLowerPriceLine = null;
-    }
-    if (bbLowerGlobal.length) {
-        const last = bbLowerGlobal[bbLowerGlobal.length - 1];
-        if (last && typeof last.value === "number") {
-            bbLowerPriceLine = bbLowerSeries.createPriceLine({
-                price: last.value,
-                color: "rgba(255,215,0,0.9)",
-                lineWidth: 1,
-                title: `BB↓ ${formatPrice(last.value)}`
-            });
-        }
-    }
-
-    // BB Middle
-    if (bbMiddlePriceLine) {
-        try { bbMiddleSeries.removePriceLine(bbMiddlePriceLine); } catch (e) {}
-        bbMiddlePriceLine = null;
-    }
-    if (bbMiddleGlobal.length) {
-        const last = bbMiddleGlobal[bbMiddleGlobal.length - 1];
-        if (last && typeof last.value === "number") {
-            bbMiddlePriceLine = bbMiddleSeries.createPriceLine({
-                price: last.value,
-                color: "rgba(255,255,255,0.7)",
-                lineWidth: 1,
-                title: `BB mid ${formatPrice(last.value)}`
-            });
-        }
-    }
-}
-
-// =====================================================================
-// КАСТОМНЫЕ НАДПИСИ СПРАВА (ОТДЕЛЬНАЯ КОЛОНКА, НЕ НА СВЕЧАХ)
-// =====================================================================
-function renderIndicatorLabels() {
-    if (!chart) return;
-
-    const labelsPane = document.getElementById("price-labels-pane");
-    if (!labelsPane) return;
-
-    // удаляем старые подписи
-    labelsPane.innerHTML = "";
-
-    const priceScale = chart.priceScale("right");
-    const priceToY = p => priceScale.priceToCoordinate(p);
-
-    function addLabel(text, color, y) {
-        if (y == null) return;
-        const div = document.createElement("div");
-        div.className = "indicator-label";
-        div.style.position = "absolute";
-        div.style.left = "4px";
-        div.style.right = "4px";
-        div.style.top = (y - 8) + "px";
-        div.style.padding = "2px 4px";
-        div.style.fontSize = "10px";
-        div.style.color = color;
-        div.style.background = "rgba(0,0,0,0.8)";
-        div.style.border = "1px solid rgba(255,255,255,0.15)";
-        div.style.borderRadius = "4px";
-        div.style.pointerEvents = "none";
-        div.style.zIndex = "9999";
-        div.innerText = text;
-        labelsPane.appendChild(div);
-    }
-
-    // === PRICE ===
-    if (candlesGlobal.length) {
-        const last = candlesGlobal[candlesGlobal.length - 1];
-        if (typeof last.close === "number") {
-            const y = priceToY(last.close);
-            addLabel(`PRICE ${last.close.toFixed(2)}`, "#00ff99", y);
-        }
-    }
-
-    // === EMA20 ===
-    if (ema20Global.length) {
-        const last = ema20Global[ema20Global.length - 1];
-        if (last && typeof last.value === "number") {
-            const y = priceToY(last.value);
-            addLabel(`EMA20 ${last.value.toFixed(2)}`, "#42a5f5", y);
-        }
-    }
-
-    // === EMA50 ===
-    if (ema50Global.length) {
-        const last = ema50Global[ema50Global.length - 1];
-        if (last && typeof last.value === "number") {
-            const y = priceToY(last.value);
-            addLabel(`EMA50 ${last.value.toFixed(2)}`, "#ab47bc", y);
-        }
-    }
-
-    // === BB UPPER ===
-    if (bbUpperGlobal.length) {
-        const last = bbUpperGlobal[bbUpperGlobal.length - 1];
-        if (last && typeof last.value === "number") {
-            const y = priceToY(last.value);
-            addLabel(`BB↑ ${last.value.toFixed(2)}`, "gold", y);
-        }
-    }
-
-    // === BB LOWER ===
-    if (bbLowerGlobal.length) {
-        const last = bbLowerGlobal[bbLowerGlobal.length - 1];
-        if (last && typeof last.value === "number") {
-            const y = priceToY(last.value);
-            addLabel(`BB↓ ${last.value.toFixed(2)}`, "gold", y);
-        }
-    }
-
-    // === BB MIDDLE ===
-    if (bbMiddleGlobal.length) {
-        const last = bbMiddleGlobal[bbMiddleGlobal.length - 1];
-        if (last && typeof last.value === "number") {
-            const y = priceToY(last.value);
-            addLabel(`BB MID ${last.value.toFixed(2)}`, "#cccccc", y);
-        }
-    }
-}
-
-// обновляем подписи регулярно (и при зуме/скролле всё будет переставляться)
-setInterval(renderIndicatorLabels, 200);
-
-// =====================================================================
+// ==============================================================
 // LIVE WEBSOCKET
-// =====================================================================
+// ==============================================================
 function subscribeLive(symbol, timeframe) {
     console.log("[WS] subscribeLive init", { symbol, timeframe });
 
-    // закрываем старый сокет
     if (currentWs) {
         console.log("[WS] closing previous websocket");
         try {
@@ -846,10 +674,8 @@ function subscribeLive(symbol, timeframe) {
             close: c.close
         };
 
-        // обновляем график
         candleSeries.update(candleForChart);
 
-        // обновляем историю свечей
         if (!Array.isArray(candlesGlobal)) candlesGlobal = [];
 
         if (candlesGlobal.length === 0) {
@@ -870,9 +696,7 @@ function subscribeLive(symbol, timeframe) {
         }
 
         updatePriceLabel(candleForState.close);
-        updatePriceLine();
         updateFrontStats();
-        renderIndicatorLabels();
 
         if (autoScrollToRealTime && chart && chart.timeScale) {
             chart.timeScale().scrollToRealTime();
@@ -880,9 +704,9 @@ function subscribeLive(symbol, timeframe) {
     };
 }
 
-// =====================================================================
-// LIVE STATUS INDICATORS
-// =====================================================================
+// ==============================================================
+// WS STATUS
+// ==============================================================
 function setLiveStatus(isOk) {
     const el = document.getElementById("live-status");
     if (!el) {
@@ -909,9 +733,9 @@ function setLiveStatusError(msg) {
     el.style.color = "#f1c40f";
 }
 
-// =====================================================================
-// PRICE LABEL (top-right карточка)
-// =====================================================================
+// ==============================================================
+// TOP-RIGHT LABEL
+// ==============================================================
 function updatePriceLabel(price) {
     const el = document.getElementById("stat-last-price");
     if (!el) return;
@@ -920,5 +744,70 @@ function updatePriceLabel(price) {
         el.textContent = price.toFixed(2);
     } else {
         el.textContent = String(price);
+    }
+}
+
+// ==============================================================
+// EXPORT PNG
+// ==============================================================
+function initExportPng() {
+    const btn = document.getElementById("btn-export-png");
+    if (!btn) return;
+
+    btn.addEventListener("click", async () => {
+        if (!window.html2canvas) {
+            console.warn("html2canvas not loaded");
+            return;
+        }
+        const el = document.querySelector(".chart-wrapper-main");
+        if (!el) return;
+
+        try {
+            const canvas = await window.html2canvas(el);
+            const link = document.createElement("a");
+            link.href = canvas.toDataURL("image/png");
+            link.download = "strategy-chart.png";
+            link.click();
+        } catch (e) {
+            console.error("Export PNG error", e);
+        }
+    });
+}
+
+// ==============================================================
+// START/STOP BUTTONS (минимальная логика)
+// ==============================================================
+function initStartStopButtons() {
+    const root = document.getElementById("strategy-dashboard");
+    if (!root) return;
+
+    const chatId = Number(root.dataset.chatId || "0");
+    const type   = root.dataset.type;
+
+    const btnStart = document.getElementById("btn-start");
+    const btnStop  = document.getElementById("btn-stop");
+
+    if (btnStart) {
+        btnStart.addEventListener("click", async () => {
+            try {
+                await fetch(`/api/strategy/start?chatId=${chatId}&type=${encodeURIComponent(type)}`, {
+                    method: "POST"
+                });
+            } catch (e) {
+                console.error("start strategy error", e);
+            }
+        });
+    }
+
+    if (btnStop) {
+        btnStop.addEventListener("click", async () => {
+            try {
+                await fetch(`/api/strategy/stop?chatId=${chatId}&type=${encodeURIComponent(type)}`, {
+                    method: "POST"
+                });
+            } catch (e) {
+                console.error("stop strategy error", e);
+            }
+        });
     }
 }

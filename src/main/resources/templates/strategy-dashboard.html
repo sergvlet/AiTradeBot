@@ -5,6 +5,9 @@
 <head>
   <meta charset="UTF-8"/>
   <title th:text="'Стратегия: ' + ${type} + ' • ' + (${symbol} ?: '—')">AI Trading Dashboard</title>
+
+  <!-- Предполагается, что Bootstrap, иконки и html2canvas уже подключены в layout -->
+  <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 
 <body>
@@ -146,8 +149,7 @@
                 OFFLINE
               </span>
             </div>
-            <!-- Кнопка экспорта PNG (опционально реализуешь позже) -->
-            <button class="btn btn-sm btn-outline-light border-opacity-25" id="btn-export-png" type="button">
+            <button class="btn btn-sm btn-outline-light border-opacity-25" id="btn-export-png">
               <i class="bi bi-download"></i>
             </button>
           </div>
@@ -173,7 +175,7 @@
                 <div class="metric-label mb-1">ROI / Доходность</div>
                 <div class="metric-value"
                      th:classappend="${info != null and info.totalProfitPct != null and info.totalProfitPct >= 0}
-                                     ? ' metric-positive' : ' metric-negative'"
+                                     ? ' metric-positive' : ' metric-negative' "
                      th:text="${(info != null and info.totalProfitPct != null)
                                  ? #numbers.formatDecimal(info.totalProfitPct,1,2) + '%'
                                  : '0.00%'}">0.00%</div>
@@ -350,7 +352,7 @@
               <td class="small"
                   th:text="${#numbers.formatDecimal(t.price,1,4)}">0.0000</td>
 
-              <!-- QUANTITY (исправлено qty → quantity) -->
+              <!-- QUANTITY -->
               <td class="small"
                   th:text="${#numbers.formatDecimal(t.quantity,1,4)}">0.0000</td>
 
@@ -382,7 +384,5 @@
   </div>
 
 </section>
-
-
 </body>
 </html>
