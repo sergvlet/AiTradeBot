@@ -131,22 +131,23 @@
           <div class="d-flex flex-wrap align-items-center gap-2">
             <div class="d-flex align-items-center gap-1">
               <span class="small-label me-1">Таймфрейм</span>
-              <label for="timeframe-select"></label><select id="timeframe-select"
-                                                            class="form-select form-select-sm"
-                                                            style="min-width: 90px;">
-              <option value="">…</option>
-            </select>
+              <label for="timeframe-select"></label>
+              <select id="timeframe-select"
+                      class="form-select form-select-sm"
+                      style="min-width: 90px;">
+                <option value="">…</option>
+              </select>
             </div>
             <!-- 🔵 WebSocket LIVE статус -->
             <div class="d-flex align-items-center gap-1">
               <span class="small-label">WS:</span>
               <span id="live-status"
                     style="font-weight:bold;color:#e74c3c;">
-          OFFLINE
-      </span>
+                OFFLINE
+              </span>
             </div>
-            <!-- Кнопка обновления убрана, график обновляется сам -->
-            <button class="btn btn-sm btn-outline-light border-opacity-25" id="btn-export-png">
+            <!-- Кнопка экспорта PNG (опционально реализуешь позже) -->
+            <button class="btn btn-sm btn-outline-light border-opacity-25" id="btn-export-png" type="button">
               <i class="bi bi-download"></i>
             </button>
           </div>
@@ -334,15 +335,15 @@
 
               <!-- SIDE -->
               <td>
-    <span th:if="${t.side == 'BUY'}"
-          class="badge-trade-buy small px-2 py-1">
-        <i class="bi bi-arrow-up-right me-1"></i>BUY
-    </span>
+                <span th:if="${t.side == 'BUY'}"
+                      class="badge-trade-buy small px-2 py-1">
+                  <i class="bi bi-arrow-up-right me-1"></i>BUY
+                </span>
 
                 <span th:if="${t.side == 'SELL'}"
                       class="badge-trade-sell small px-2 py-1">
-        <i class="bi bi-arrow-down-right me-1"></i>SELL
-    </span>
+                  <i class="bi bi-arrow-down-right me-1"></i>SELL
+                </span>
               </td>
 
               <!-- PRICE -->
@@ -365,7 +366,6 @@
 
             </tr>
 
-
             <tr th:if="${trades == null or #lists.isEmpty(trades)}">
               <td colspan="5" class="text-center text-secondary small py-4">
                 Сделок пока нет.
@@ -382,6 +382,7 @@
   </div>
 
 </section>
+
 
 </body>
 </html>
