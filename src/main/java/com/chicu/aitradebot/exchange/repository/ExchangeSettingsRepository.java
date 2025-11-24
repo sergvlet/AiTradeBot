@@ -15,5 +15,4 @@ public interface ExchangeSettingsRepository extends JpaRepository<ExchangeSettin
 
     List<ExchangeSettings> findAllByChatId(Long chatId);
 
-    // если где-то ещё используется старый метод — можно удалить или заменить им
 }

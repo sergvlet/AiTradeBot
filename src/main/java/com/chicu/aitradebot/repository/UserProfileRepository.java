@@ -9,9 +9,7 @@ import java.util.Optional;
 @Repository
 public interface UserProfileRepository extends JpaRepository<UserProfile, Long> {
 
-    Optional<UserProfile> findByUsernameIgnoreCase(String username);
 
-    boolean existsByChatId(Long chatId);
 
     /** Поиск пользователя по chatId */
     Optional<UserProfile> findByChatId(Long chatId);

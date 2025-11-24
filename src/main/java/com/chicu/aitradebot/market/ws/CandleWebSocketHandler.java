@@ -1,211 +1,205 @@
 package com.chicu.aitradebot.market.ws;
 
-import com.chicu.aitradebot.strategy.smartfusion.components.SmartFusionCandleService;
+import com.chicu.aitradebot.common.enums.NetworkType;
+import com.chicu.aitradebot.exchange.client.ExchangeClient;
+import com.chicu.aitradebot.exchange.client.ExchangeClientFactory;
+import com.chicu.aitradebot.strategy.core.CandleProvider;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
-import org.springframework.web.socket.CloseStatus;
-import org.springframework.web.socket.TextMessage;
-import org.springframework.web.socket.WebSocketHandler;
-import org.springframework.web.socket.WebSocketMessage;
-import org.springframework.web.socket.WebSocketSession;
+import org.springframework.util.MultiValueMap;
+import org.springframework.web.socket.*;
+import org.springframework.web.socket.handler.TextWebSocketHandler;
+import org.springframework.web.util.UriComponentsBuilder;
 
-import java.io.IOException;
 import java.net.URI;
-import java.net.URLDecoder;
-import java.nio.charset.StandardCharsets;
-import java.util.Collections;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.*;
+import java.util.concurrent.*;
 
 /**
- * WebSocket-хэндлер для стрима свечей:
- *
- *   /ws/candles?symbol=BTCUSDT&timeframe=1m
- *
- * SmartFusionCandleService вызывает broadcastTick(...), а этот класс
- * пушит JSON-ы всем подписанным клиентам по каналу "symbol|timeframe".
+ * Универсальный realtime WebSocket канал свечей
+ * Поддерживает:
+ *   - авто-poll Binance → tick сообщения
+ *   - внешнюю отправку tick (broadcastTick)
  */
 @Slf4j
 @Component
-public class CandleWebSocketHandler implements WebSocketHandler {
+@RequiredArgsConstructor
+public class CandleWebSocketHandler extends TextWebSocketHandler {
 
-    /**
-     * Канал = SYMBOL|TF → набор сессий.
-     *   key:  "BTCUSDT|1m"
-     *   val:  Set<WebSocketSession>
-     */
-    private final Map<String, Set<WebSocketSession>> channels = new ConcurrentHashMap<>();
+    private final ExchangeClientFactory exchangeClientFactory;
+    private final ObjectMapper mapper = new ObjectMapper();
 
-    /**
-     * Быстрый обратный индекс:
-     *   sessionId → channelKey
-     */
-    private final Map<String, String> sessionChannel = new ConcurrentHashMap<>();
+    /** CHANNEL = "BTCUSDT|1m" */
+    private final Map<String, ChannelState> channels = new ConcurrentHashMap<>();
 
-    // ==========================================================================
-    // WebSocketHandler API
-    // ==========================================================================
+    private final ScheduledExecutorService scheduler =
+            Executors.newScheduledThreadPool(2);
+
+    private static class ChannelState {
+        final Set<WebSocketSession> sessions = ConcurrentHashMap.newKeySet();
+        volatile ScheduledFuture<?> task;
+    }
+
+    // ======================================================
+    // 🔥 Публичный метод: позволяет вручную отправлять tick
+    // ======================================================
+    public void broadcastTick(String symbol, String timeframe, CandleProvider.Candle c) {
+        String key = symbol.toUpperCase() + "|" + timeframe;
+
+        ChannelState state = channels.get(key);
+        if (state == null || state.sessions.isEmpty()) {
+            return;
+        }
+
+        try {
+            Map<String, Object> candle = Map.of(
+                    "time", c.time(),
+                    "open", c.open(),
+                    "high", c.high(),
+                    "low",  c.low(),
+                    "close", c.close(),
+                    "volume", c.volume()
+            );
+
+            Map<String, Object> payload = Map.of(
+                    "type", "tick",
+                    "symbol", symbol,
+                    "timeframe", timeframe,
+                    "candle", candle
+            );
+
+            String json = mapper.writeValueAsString(payload);
+            TextMessage msg = new TextMessage(json);
+
+            for (WebSocketSession s : state.sessions) {
+                if (s.isOpen()) s.sendMessage(msg);
+            }
+
+        } catch (Exception e) {
+            log.error("broadcastTick error", e);
+        }
+    }
+
+    // ======================================================
+    // CONNECTION
+    // ======================================================
 
     @Override
     public void afterConnectionEstablished(WebSocketSession session) throws Exception {
+
         URI uri = session.getUri();
-        Map<String, String> params = parseQuery(uri);
-
-        String symbol = params.getOrDefault("symbol", "").trim();
-        String timeframe = params.getOrDefault("timeframe", "1m").trim();
-
-        if (symbol.isEmpty()) {
-            log.warn("❌ /ws/candles: symbol не передан, закрываю сессию {}", session.getId());
+        if (uri == null) {
             session.close(CloseStatus.BAD_DATA);
             return;
         }
 
-        String sym = symbol.toUpperCase(Locale.ROOT);
-        String tf = timeframe;
-        String channel = channelKey(sym, tf);
+        MultiValueMap<String, String> params =
+                UriComponentsBuilder.fromUri(uri).build().getQueryParams();
 
-        channels
-                .computeIfAbsent(channel, k -> ConcurrentHashMap.newKeySet())
-                .add(session);
+        String symbol = Optional.ofNullable(params.getFirst("symbol"))
+                .orElse("BTCUSDT").toUpperCase();
 
-        sessionChannel.put(session.getId(), channel);
+        String tf = Optional.ofNullable(params.getFirst("timeframe"))
+                .orElse("1m");
 
-        log.info("✅ WS /ws/candles CONNECT id={} channel={} (symbol={}, tf={})",
-                session.getId(), channel, sym, tf);
+        String key = symbol + "|" + tf;
+
+        ChannelState state = channels.computeIfAbsent(key, k -> new ChannelState());
+        state.sessions.add(session);
+
+        log.info("✅ WS CONNECT {} ({})", key, session.getId());
+
+        startPollingTaskIfNeeded(key, symbol, tf, state);
     }
 
     @Override
-    public void handleMessage(WebSocketSession session, WebSocketMessage<?> message) {
-        // Клиент нам ничего не должен отправлять — просто логируем на всякий.
-        log.debug("📩 WS /ws/candles message from {}: {}", session.getId(), message.getPayload());
-    }
+    public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
+        try {
+            URI uri = session.getUri();
+            if (uri == null) return;
 
-    @Override
-    public void handleTransportError(WebSocketSession session, Throwable exception) throws Exception {
-        log.warn("⚠️ WS /ws/candles transport error id={} : {}",
-                session != null ? session.getId() : "null",
-                exception.getMessage(), exception);
+            MultiValueMap<String, String> params =
+                    UriComponentsBuilder.fromUri(uri).build().getQueryParams();
 
-        if (session != null && session.isOpen()) {
-            session.close(CloseStatus.SERVER_ERROR);
-        }
-        removeSession(session);
-    }
+            String symbol = params.getFirst("symbol").toUpperCase();
+            String tf = params.getFirst("timeframe");
 
-    @Override
-    public void afterConnectionClosed(WebSocketSession session, CloseStatus closeStatus) {
-        log.info("🔌 WS /ws/candles CLOSED id={} status={}", session.getId(), closeStatus);
-        removeSession(session);
-    }
+            String key = symbol + "|" + tf;
 
-    @Override
-    public boolean supportsPartialMessages() {
-        return false;
-    }
+            ChannelState state = channels.get(key);
+            if (state != null) {
+                state.sessions.remove(session);
 
-    // ==========================================================================
-    // Паблик для свечей: вызывается из SmartFusionCandleService
-    // ==========================================================================
-
-    /**
-     * Пуш свечи всем подписчикам канала (symbol + timeframe).
-     *
-     * @param symbol    BTCUSDT
-     * @param timeframe 1s / 1m / 5m / ...
-     * @param c         свеча SmartFusionCandleService.Candle (ts, o, h, l, c)
-     */
-    public void broadcastTick(String symbol, String timeframe, SmartFusionCandleService.Candle c) {
-        if (symbol == null || timeframe == null || c == null) return;
-
-        String sym = symbol.toUpperCase(Locale.ROOT);
-        String tf = timeframe.trim();
-        String channel = channelKey(sym, tf);
-
-        Set<WebSocketSession> sessions = channels.get(channel);
-        if (sessions == null || sessions.isEmpty()) return;
-
-        // отправляем формат, который FRONT ожидает:
-        // type = "tick"
-        // candle = {time, open, high, low, close, volume}
-
-        String json =
-                "{"
-                + "\"type\":\"tick\","
-                + "\"candle\":{"
-                +    "\"time\":" + c.getTime() + ","
-                +    "\"open\":" + c.open() + ","
-                +    "\"high\":" + c.high() + ","
-                +    "\"low\":" + c.low() + ","
-                +    "\"close\":" + c.close() + ","
-                +    "\"volume\":" + c.volume()
-                + "},"
-                + "\"symbol\":\"" + sym + "\","
-                + "\"tf\":\"" + tf + "\""
-                + "}";
-
-        for (WebSocketSession s : sessions) {
-            if (!s.isOpen()) continue;
-            try {
-                s.sendMessage(new TextMessage(json));
-            } catch (IOException e) {
-                log.warn("⚠ WS push error to {}: {}", s.getId(), e.getMessage());
-            }
-        }
-    }
-
-    // ==========================================================================
-    // HELPERS
-    // ==========================================================================
-
-    private void removeSession(WebSocketSession session) {
-        if (session == null) return;
-
-        String id = session.getId();
-        String channel = sessionChannel.remove(id);
-
-        if (channel != null) {
-            Set<WebSocketSession> set = channels.get(channel);
-            if (set != null) {
-                set.remove(session);
-                if (set.isEmpty()) {
-                    channels.remove(channel);
+                if (state.sessions.isEmpty()) {
+                    if (state.task != null) state.task.cancel(false);
+                    channels.remove(key);
+                    log.info("🧹 WS channel {} stopped", key);
                 }
             }
-        } else {
-            // fallback — вдруг где-то не успели записать
-            channels.values().forEach(set -> set.remove(session));
+
+        } catch (Exception e) {
+            log.error("WS close error", e);
         }
     }
 
-    private String channelKey(String symbol, String timeframe) {
-        return symbol.toUpperCase(Locale.ROOT) + "|" + timeframe;
+    // ======================================================
+    // AUTO POLLING
+    // ======================================================
+
+    private void startPollingTaskIfNeeded(
+            String key,
+            String symbol,
+            String tf,
+            ChannelState state
+    ) {
+        if (state.task != null && !state.task.isCancelled()) return;
+
+        long period = switch (tf) {
+            case "1s" -> 1000;
+            case "1m" -> 3000;
+            case "5m" -> 5000;
+            case "15m" -> 10_000;
+            case "1h" -> 30_000;
+            default -> 4000;
+        };
+
+        state.task = scheduler.scheduleAtFixedRate(
+                () -> pollOne(symbol, tf, state),
+                0,
+                period,
+                TimeUnit.MILLISECONDS
+        );
+
+        log.info("▶️ Polling started {} ({} ms)", key, period);
     }
 
-    private Map<String, String> parseQuery(URI uri) {
-        if (uri == null) return Collections.emptyMap();
-        String q = uri.getQuery();
-        if (q == null || q.isBlank()) return Collections.emptyMap();
+    private void pollOne(String symbol, String tf, ChannelState state) {
+        try {
+            if (state.sessions.isEmpty()) return;
 
-        Map<String, String> res = new ConcurrentHashMap<>();
-        String[] parts = q.split("&");
-        for (String part : parts) {
-            if (part.isBlank()) continue;
-            int idx = part.indexOf('=');
-            if (idx < 0) {
-                String key = decode(part);
-                res.put(key, "");
-            } else {
-                String key = decode(part.substring(0, idx));
-                String val = decode(part.substring(idx + 1));
-                res.put(key, val);
-            }
+            ExchangeClient cl = exchangeClientFactory.getClient("BINANCE", NetworkType.MAINNET);
+
+            List<ExchangeClient.Kline> k = cl.getKlines(symbol, tf, 1);
+            if (k == null || k.isEmpty()) return;
+
+            ExchangeClient.Kline bar = k.get(0);
+
+            // создаём CandleProvider.Candle
+            CandleProvider.Candle c = new CandleProvider.Candle(
+                    bar.openTime(),
+                    bar.open(),
+                    bar.high(),
+                    bar.low(),
+                    bar.close(),
+                    bar.volume()
+            );
+
+            broadcastTick(symbol, tf, c);
+
+        } catch (Exception e) {
+            log.error("pollOne error {} {}", symbol, tf, e);
         }
-        return res;
-    }
-
-    private String decode(String s) {
-        return URLDecoder.decode(s, StandardCharsets.UTF_8);
     }
 }

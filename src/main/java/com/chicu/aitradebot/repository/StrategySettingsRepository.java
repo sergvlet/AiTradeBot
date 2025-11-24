@@ -12,7 +12,5 @@ public interface StrategySettingsRepository extends JpaRepository<StrategySettin
 
     List<StrategySettings> findByType(StrategyType type);
 
-    List<StrategySettings> findByActiveTrue();
 
-    List<StrategySettings> findBySymbolIgnoreCase(String symbol);
 }

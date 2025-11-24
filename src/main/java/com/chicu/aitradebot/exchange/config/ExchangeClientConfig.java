@@ -8,22 +8,43 @@ import com.chicu.aitradebot.exchange.service.ExchangeSettingsService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+
 @Slf4j
 @Configuration
 public class ExchangeClientConfig {
+
     @Bean
     public ExchangeClientFactory exchangeClientFactory(ExchangeSettingsService settingsService) {
-        ExchangeClientFactory factory = new ExchangeClientFactory();
 
-        factory.register("BINANCE", NetworkType.MAINNET, new BinanceExchangeClient(false, settingsService));
-        factory.register("BINANCE", NetworkType.TESTNET, new BinanceExchangeClient(true, settingsService));
+        // ✅ Передаем settingsService в конструктор — как требуется
+        ExchangeClientFactory factory = new ExchangeClientFactory(settingsService);
 
-        factory.register("BYBIT", NetworkType.MAINNET, new BybitExchangeClient(false, settingsService));
-        factory.register("BYBIT", NetworkType.TESTNET, new BybitExchangeClient(true, settingsService));
+        // ⬇ Регистрируем клиентов
+        factory.register(
+                "BINANCE",
+                NetworkType.MAINNET,
+                new BinanceExchangeClient(false, settingsService)
+        );
 
-        log.info("✅ ExchangeClientFactory инициализирована (4 клиентов)");
+        factory.register(
+                "BINANCE",
+                NetworkType.TESTNET,
+                new BinanceExchangeClient(true, settingsService)
+        );
+
+        factory.register(
+                "BYBIT",
+                NetworkType.MAINNET,
+                new BybitExchangeClient(false, settingsService)
+        );
+
+        factory.register(
+                "BYBIT",
+                NetworkType.TESTNET,
+                new BybitExchangeClient(true, settingsService)
+        );
+
+        log.info("✅ ExchangeClientFactory инициализирована (4 клиента)");
         return factory;
     }
-
-
 }

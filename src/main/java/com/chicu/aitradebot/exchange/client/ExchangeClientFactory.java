@@ -2,6 +2,8 @@ package com.chicu.aitradebot.exchange.client;
 
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.domain.ExchangeSettings;
+import com.chicu.aitradebot.exchange.service.ExchangeSettingsService;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
@@ -15,7 +17,11 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 @Slf4j
 @Component
+@RequiredArgsConstructor
 public class ExchangeClientFactory {
+
+    /** Сервис настроек биржи (что выбрал пользователь: BINANCE/BYBIT, MAINNET/TESTNET и т.д.) */
+    private final ExchangeSettingsService exchangeSettingsService;
 
     /** Все клиенты регистрируются в виде ключей: EXCHANGE_NETWORK (например: BINANCE_MAINNET) */
     private final Map<String, ExchangeClient> registry = new ConcurrentHashMap<>();
@@ -40,7 +46,7 @@ public class ExchangeClientFactory {
     }
 
     /**
-     * Получить клиента по настройкам пользователя.
+     * Получить клиента по сущности ExchangeSettings.
      */
     public ExchangeClient getClient(ExchangeSettings settings) {
         if (settings == null) {
@@ -50,15 +56,7 @@ public class ExchangeClientFactory {
             throw new IllegalArgumentException("ExchangeSettings не содержит exchange или network!");
         }
 
-        String key = buildKey(settings.getExchange(), settings.getNetwork());
-        ExchangeClient client = registry.get(key);
-
-        if (client == null) {
-            throw new IllegalArgumentException("❌ Клиент для " + key + " не найден!");
-        }
-
-        log.info("🔗 Выбран клиент {}", key);
-        return client;
+        return getClient(settings.getExchange(), settings.getNetwork());
     }
 
     /**
@@ -72,8 +70,28 @@ public class ExchangeClientFactory {
             throw new IllegalArgumentException("❌ Клиент для " + key + " не найден!");
         }
 
-        log.info("🔗 Выбран клиент {}", key);
+        log.debug("🔗 Выбран клиент {}", key);
         return client;
+    }
+
+    /**
+     * Получить клиента по chatId.
+     *
+     * ⚠️ ВРЕМЕННО:
+     *   если нет явных настроек, создаём/берём BINANCE + MAINNET.
+     *   Это совпадает с сигнатурой:
+     *     getOrCreate(Long chatId, String exchange, NetworkType networkType)
+     */
+    public ExchangeClient getClientByChatId(Long chatId) {
+        // TODO: позже можно подтянуть из выбранных пользователем настроек (UI),
+        // сейчас — дефолт: BINANCE + MAINNET
+        ExchangeSettings settings = exchangeSettingsService.getOrCreate(
+                chatId,
+                "BINANCE",
+                NetworkType.MAINNET
+        );
+
+        return getClient(settings);
     }
 
     /**
@@ -96,5 +114,4 @@ public class ExchangeClientFactory {
     public void printRegistry() {
         log.info("📋 Зарегистрированные клиенты: {}", registry.keySet());
     }
-
 }

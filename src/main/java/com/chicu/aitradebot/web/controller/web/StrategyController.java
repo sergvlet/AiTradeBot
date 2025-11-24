@@ -2,140 +2,168 @@ package com.chicu.aitradebot.web.controller.web;
 
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.service.UserProfileService;
-import com.chicu.aitradebot.strategy.smartfusion.SmartFusionStrategySettingsService; // <-- интерфейс
-import com.chicu.aitradebot.web.model.StrategyViewModel;
-import com.chicu.aitradebot.web.service.StrategyService;
+import com.chicu.aitradebot.web.facade.WebStrategyFacade;
+import com.chicu.aitradebot.web.view.StrategyConfigView;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Controller;
 import org.springframework.ui.Model;
 import org.springframework.web.bind.annotation.*;
 
-import java.util.Map;
-
-/**
- * 🌐 Контроллер управления стратегиями через веб-интерфейс.
- * /strategies — список
- * /strategies/{name} — дашборд (если понадобится)
- * /strategies/{name}/settings — страница настроек
- * /strategies/{id}/config — совместимость с маршрутом по id
- */
 @Controller
 @RequestMapping("/strategies")
 @RequiredArgsConstructor
 @Slf4j
 public class StrategyController {
 
-    private final StrategyService strategyService;
-    private final SmartFusionStrategySettingsService smartFusionSettingsService; // <-- интерфейс
+    private final WebStrategyFacade strategyFacade;
     private final UserProfileService userProfileService;
 
-    /**
-     * 📋 Список всех стратегий.
-     */
+    // ================================================================
+    // 📋 СПИСОК СТРАТЕГИЙ
+    // ================================================================
     @GetMapping
-    public String strategies(Model model) {
-        Long chatId = safeCurrentChatId();
-        log.debug("📋 Отображение стратегий для chatId={}", chatId);
+    public String strategies(Model model,
+                             @RequestParam(required = false) Long chatIdParam) {
+
+        Long chatId = (chatIdParam != null)
+                ? chatIdParam
+                : resolveCurrentChatIdOrThrow();
 
         model.addAttribute("active", "strategies");
         model.addAttribute("pageTitle", "AI Trading — Стратегии");
-        model.addAttribute("strategies", strategyService.getAllView());
-        model.addAttribute("chatId", chatId); // нужно для кнопок/JS в шаблоне
+        model.addAttribute("strategies", strategyFacade.getStrategies(chatId));
+        model.addAttribute("chatId", chatId);
+
         return "strategies";
     }
 
-    /**
-     * ⚙️ Универсальный маршрут настроек.
-     * Поддерживает:
-     *  - /strategies/{id}/config
-     *  - /strategies/{name}/settings
-     */
-    @GetMapping({"/{id}/config", "/{name}/settings"})
-    public String config(@PathVariable(value = "id", required = false) String id,
-                         @PathVariable(value = "name", required = false) String name,
-                         @RequestParam(value = "chatId", required = false) Long chatIdParam,
-                         @RequestParam(value = "symbol", required = false) String symbolParam,
-                         Model model) {
-        try {
-            StrategyViewModel strategyVm;
+    // ================================================================
+    // 📊 ДАШБОРД КОНКРЕТНОЙ СТРАТЕГИИ
+    // ================================================================
+    @GetMapping("/{type}")
+    public String strategyDashboard(@PathVariable StrategyType type,
+                                    @RequestParam(required = false) Long chatIdParam,
+                                    Model model) {
 
-            // Определяем: пришёл id (число) или имя
-            if (id != null && id.matches("\\d+")) {
-                Long parsedId = Long.parseLong(id);
-                strategyVm = strategyService.getByIdView(parsedId);
-            } else if (name != null && !name.isBlank()) {
-                strategyVm = strategyService.getByName(name);
-            } else {
-                throw new IllegalArgumentException("Стратегия не указана");
-            }
+        Long chatId = (chatIdParam != null)
+                ? chatIdParam
+                : resolveCurrentChatIdOrThrow();
 
-            if (strategyVm == null) {
-                throw new IllegalArgumentException("Стратегия не найдена");
-            }
+        var strategies = strategyFacade.getStrategies(chatId);
+        var uiOpt = strategies.stream()
+                .filter(s -> s.strategyType() == type)
+                .findFirst();
 
-            Long chatId = (chatIdParam != null) ? chatIdParam : safeCurrentChatId();
-            String symbol = (symbolParam != null && !symbolParam.isBlank())
-                    ? symbolParam
-                    : (strategyVm.getSymbol() != null ? strategyVm.getSymbol() : "BTCUSDT");
-
-            // Определяем тип стратегии (предпочтительно по machine-значению, а не по человеко читаемому имени)
-            StrategyType type = resolveType(strategyVm);
-
-            // Подгружаем настройки по типу
-            Object settings;
-            if (type == StrategyType.SMART_FUSION) {
-                settings = smartFusionSettingsService.getOrCreate(chatId);
-            } else {
-                // 🔸 Защита от null — создаём "пустые" настройки для других стратегий
-                settings = Map.of("symbol", symbol, "placeholder", true);
-            }
-            model.addAttribute("settings", settings);
-
-            model.addAttribute("strategy", strategyVm);
-            model.addAttribute("chatId", chatId);
-            model.addAttribute("pageTitle", "Настройка стратегии — " + strategyVm.getStrategyName());
+        if (uiOpt.isEmpty()) {
+            log.warn("Стратегия {} не найдена для chatId={}", type, chatId);
+            model.addAttribute("pageTitle", "Ошибка");
+            model.addAttribute("error", "Стратегия " + type + " не найдена для пользователя.");
             model.addAttribute("active", "strategies");
-
-            return "strategy-config";
-
-        } catch (Exception e) {
-            log.error("❌ Ошибка при загрузке конфигурации стратегии: {}", e.getMessage(), e);
-            model.addAttribute("error", e.getMessage());
-            model.addAttribute("pageTitle", "Ошибка — стратегия не найдена");
             return "error";
         }
+
+        var ui = uiOpt.get();
+
+        model.addAttribute("active", "strategies");
+        model.addAttribute("pageTitle", "Стратегия: " + type);
+        model.addAttribute("chatId", chatId);
+        model.addAttribute("type", type);
+        model.addAttribute("symbol", ui.symbol());
+
+        // info / trades пока берём из других слоёв позже → шаблон защищён проверками (info != null)
+        model.addAttribute("info", null);
+        model.addAttribute("trades", null);
+
+        return "dashboard";
     }
 
-    // --------- helpers ---------
+    // ================================================================
+    // ⚙️ НАСТРОЙКИ СТРАТЕГИИ (форма конфигурации)
+    // ================================================================
+    @GetMapping("/{type}/settings")
+    public String strategySettings(@PathVariable StrategyType type,
+                                   @RequestParam(required = false) Long chatIdParam,
+                                   Model model) {
 
-    private Long safeCurrentChatId() {
+        Long chatId = (chatIdParam != null)
+                ? chatIdParam
+                : resolveCurrentChatIdOrThrow();
+
+        var strategies = strategyFacade.getStrategies(chatId);
+        var uiOpt = strategies.stream()
+                .filter(s -> s.strategyType() == type)
+                .findFirst();
+
+        if (uiOpt.isEmpty()) {
+            log.warn("Стратегия {} не найдена для chatId={} (settings)", type, chatId);
+            model.addAttribute("pageTitle", "Ошибка");
+            model.addAttribute("error", "Стратегия " + type + " не найдена для пользователя.");
+            model.addAttribute("active", "strategies");
+            return "error";
+        }
+
+        var ui = uiOpt.get();
+
+        // то, что нужно шаблону strategy-config.html: strategy.strategyName, strategy.symbol и т.д.
+        StrategyConfigView view = StrategyConfigView.builder()
+                .strategyType(type)
+                .strategyName(ui.title())
+                .description(ui.description())
+                .chatId(chatId)
+                .symbol(ui.symbol())
+                .build();
+
+        model.addAttribute("active", "strategies");
+        model.addAttribute("pageTitle", "Настройки — " + type);
+        model.addAttribute("strategyType", type);
+        model.addAttribute("chatId", chatId);
+        model.addAttribute("strategy", view); // <== ВАЖНО для strategy.strategyName в шаблоне
+
+        // дальше сюда можно будет добавить реальные "settings" для конкретного типа стратегии
+        return "strategy-config";
+    }
+
+    // ================================================================
+    // ▶️ ЗАПУСК / ⏹ ОСТАНОВКА / 🔁 TOGGLE
+    // ================================================================
+    @PostMapping("/start")
+    public String startStrategy(@RequestParam Long chatId,
+                                @RequestParam StrategyType type) {
+        log.info("▶ Запуск стратегии {} для chatId={}", type, chatId);
+        strategyFacade.start(chatId, type);
+        return "redirect:/strategies?chatId=" + chatId;
+    }
+
+    @PostMapping("/stop")
+    public String stopStrategy(@RequestParam Long chatId,
+                               @RequestParam StrategyType type) {
+        log.info("⏹ Остановка стратегии {} для chatId={}", type, chatId);
+        strategyFacade.stop(chatId, type);
+        return "redirect:/strategies?chatId=" + chatId;
+    }
+
+    @PostMapping("/toggle")
+    public String toggleStrategy(@RequestParam Long chatId,
+                                 @RequestParam StrategyType type) {
+        log.info("🔁 Переключение стратегии {} для chatId={}", type, chatId);
+        strategyFacade.toggle(chatId, type);
+        return "redirect:/strategies?chatId=" + chatId;
+    }
+
+    // ================================================================
+    // 🧩 HELPERS
+    // ================================================================
+    private Long resolveCurrentChatIdOrThrow() {
         try {
             Long chatId = userProfileService.getCurrentChatId();
-            return (chatId != null && chatId > 0) ? chatId : 1L;
+            if (chatId == null || chatId <= 0) {
+                throw new IllegalStateException("Не найден активный пользователь (chatId).");
+            }
+            return chatId;
         } catch (Exception e) {
-            log.warn("⚠️ Не удалось получить текущий chatId: {}", e.getMessage());
-            return 1L;
+            log.warn("Не удалось получить текущий chatId: {}", e.getMessage());
+            throw new IllegalStateException("Не удалось определить текущего пользователя.", e);
         }
-    }
-
-    private StrategyType resolveType(StrategyViewModel vm) {
-        // Пытаемся сначала взять машинное имя типа (если оно есть в модели)
-        if (vm.getStrategyType() != null) {
-            try {
-                return StrategyType.valueOf(vm.getStrategyType().trim().toUpperCase());
-            } catch (Exception ignored) {
-            }
-        }
-        // Фоллбэк: пробуем по отображаемому имени
-        if (vm.getStrategyName() != null) {
-            try {
-                String normalized = vm.getStrategyName().trim().replace(' ', '_').toUpperCase();
-                return StrategyType.valueOf(normalized);
-            } catch (Exception ignored) {
-            }
-        }
-        log.warn("⚠️ Не удалось определить StrategyType для VM: {}", vm);
-        return null;
     }
 }

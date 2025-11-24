@@ -12,19 +12,21 @@
             overflow: auto;
             min-width: 240px;
             background: var(--bs-body-bg, #121212);
-            border: 1px solid rgba(255,255,255,.15);
+            border: 1px solid rgba(255, 255, 255, .15);
             border-radius: .375rem;
-            box-shadow: 0 6px 18px rgba(0,0,0,.25);
+            box-shadow: 0 6px 18px rgba(0, 0, 0, .25);
             z-index: 9999 !important;
         }
+
         #symbol-menu .dropdown-item.active,
         #symbol-menu .dropdown-item:active {
-            background-color: rgba(13,110,253,.15);
+            background-color: rgba(13, 110, 253, .15);
         }
     </style>
 
     <h2 class="fw-bold mb-4">
         <i class="bi bi-sliders"></i>
+        <!--/*@thymesVar id="strategyName" type=""*/-->
         <span th:text="${strategy.strategyName}">Smart Fusion</span> — настройки
     </h2>
 
@@ -36,11 +38,11 @@
                 <!-- Торговая пара -->
                 <div class="col-md-4 position-relative">
                     <label class="form-label">Торговая пара</label>
-                    <input type="text" class="form-control" id="symbol-input"
-                           name="symbol"
-                           th:value="${settings.symbol}"
-                           list="symbol-list"
-                           placeholder="BTCUSDT" autocomplete="off">
+                    <label for="symbol-input"></label><input type="text" class="form-control" id="symbol-input"
+                                                             name="symbol"
+                                                             th:value="${settings.symbol}"
+                                                             list="symbol-list"
+                                                             placeholder="BTCUSDT" autocomplete="off">
 
                     <datalist id="symbol-list"></datalist>
                     <div id="symbol-menu" class="dropdown-menu show"></div>
@@ -53,35 +55,40 @@
                 <!-- Биржа -->
                 <div class="col-md-4">
                     <label class="form-label">Биржа</label>
-                    <select class="form-select" name="exchange" id="exchange-select">
-                        <option value="BINANCE" th:selected="${settings.exchange=='BINANCE'}">BINANCE</option>
-                        <option value="BYBIT" th:selected="${settings.exchange=='BYBIT'}">BYBIT</option>
-                        <option value="OKX" th:selected="${settings.exchange=='OKX'}">OKX</option>
-                    </select>
+                    <label for="exchange-select"></label><select class="form-select" name="exchange"
+                                                                 id="exchange-select">
+                    <option value="BINANCE" th:selected="${settings.exchange=='BINANCE'}">BINANCE</option>
+                    <option value="BYBIT" th:selected="${settings.exchange=='BYBIT'}">BYBIT</option>
+                    <option value="OKX" th:selected="${settings.exchange=='OKX'}">OKX</option>
+                </select>
                 </div>
 
                 <!-- Сеть -->
                 <div class="col-md-4">
                     <label class="form-label">Сеть</label>
-                    <select class="form-select" name="networkType" id="network-select">
-                        <option value="TESTNET" th:selected="${settings.networkType?.name()=='TESTNET'}">TESTNET</option>
-                        <option value="MAINNET" th:selected="${settings.networkType?.name()=='MAINNET'}">MAINNET</option>
-                    </select>
+                    <label for="network-select"></label><select class="form-select" name="networkType"
+                                                                id="network-select">
+                    <option value="TESTNET" th:selected="${settings.networkType?.name()=='TESTNET'}">TESTNET</option>
+                    <option value="MAINNET" th:selected="${settings.networkType?.name()=='MAINNET'}">MAINNET</option>
+                </select>
                 </div>
 
                 <!-- Таймфрейм -->
                 <div class="col-md-4">
                     <label class="form-label">Таймфрейм</label>
-                    <select class="form-select" id="timeframe-select" name="timeframe">
-                        <option disabled selected>⏳ Загрузка...</option>
-                    </select>
+                    <label for="timeframe-select"></label><select class="form-select" id="timeframe-select"
+                                                                  name="timeframe">
+                    <option disabled selected>⏳ Загрузка...</option>
+                </select>
                 </div>
 
                 <!-- Свечи -->
                 <div class="col-md-4">
                     <label class="form-label">Свечи для анализа</label>
-                    <input type="number" class="form-control" name="candleLimit"
-                           min="100" max="1000" step="50" th:value="${settings.candleLimit}">
+                    <label>
+                        <input type="number" class="form-control" name="candleLimit"
+                               min="100" max="1000" step="50" th:value="${settings.candleLimit}">
+                    </label>
                 </div>
             </div>
 
@@ -92,22 +99,32 @@
             <div class="row g-3">
                 <div class="col-md-3">
                     <label class="form-label">Капитал, USDT</label>
-                    <input type="number" class="form-control" name="capitalUsd" th:value="${settings.capitalUsd}">
+                    <label>
+                        <input type="number" class="form-control" name="capitalUsd" th:value="${settings.capitalUsd}">
+                    </label>
                 </div>
 
                 <div class="col-md-3">
                     <label class="form-label">Плечо</label>
-                    <input type="number" class="form-control" name="leverage" th:value="${settings.leverage}">
+                    <label>
+                        <input type="number" class="form-control" name="leverage" th:value="${settings.leverage}">
+                    </label>
                 </div>
 
                 <div class="col-md-3">
                     <label class="form-label">Риск на сделку, %</label>
-                    <input type="number" class="form-control" name="riskPerTradePct" th:value="${settings.riskPerTradePct}">
+                    <label>
+                        <input type="number" class="form-control" name="riskPerTradePct"
+                               th:value="${settings.riskPerTradePct}">
+                    </label>
                 </div>
 
                 <div class="col-md-3">
                     <label class="form-label">Дневной лимит потерь, %</label>
-                    <input type="number" class="form-control" name="dailyLossLimitPct" th:value="${settings.dailyLossLimitPct}">
+                    <label>
+                        <input type="number" class="form-control" name="dailyLossLimitPct"
+                               th:value="${settings.dailyLossLimitPct}">
+                    </label>
                 </div>
 
                 <div class="col-md-3 d-flex align-items-end">
@@ -134,7 +151,7 @@
 
     <!-- === Скрипт Smart Fusion === -->
     <script>
-        (function(){
+        (function () {
             console.log("🧩 SmartFusion settings script загружен");
             document.addEventListener("DOMContentLoaded", () => {
                 const symbolInput = document.getElementById("symbol-input");
@@ -145,88 +162,95 @@
                 const symbolMenu = document.getElementById("symbol-menu");
                 const timeframeSelect = document.getElementById("timeframe-select");
 
-                if(!symbolInput || !exchangeSelect || !networkSelect) return;
+                if (!symbolInput || !exchangeSelect || !networkSelect) return;
 
                 // Переносим меню в body
-                requestAnimationFrame(()=>{ document.body.appendChild(symbolMenu); });
+                requestAnimationFrame(() => {
+                    document.body.appendChild(symbolMenu);
+                });
 
                 let currentSymbols = [];
                 const cache = {};
 
-                async function loadSymbols(exchange, network){
-                    const key = exchange+"_"+network;
-                    if(cache[key]) return cache[key];
-                    loadingText.style.display="block";
-                    try{
+                async function loadSymbols(exchange, network) {
+                    const key = exchange + "_" + network;
+                    if (cache[key]) return cache[key];
+                    loadingText.style.display = "block";
+                    try {
                         const res = await fetch(`/api/exchange/symbols?exchange=${exchange}&networkType=${network}`);
                         const data = await res.json();
-                        cache[key] = Array.isArray(data)?data:[];
+                        cache[key] = Array.isArray(data) ? data : [];
                         return cache[key];
-                    }catch(e){
+                    } catch (e) {
                         console.error("Ошибка загрузки символов", e);
-                        if(window.showToast) showToast("⚠️ Не удалось загрузить пары","danger");
+                        if (window.showToast) showToast("⚠️ Не удалось загрузить пары", "danger");
                         return [];
-                    }finally{ loadingText.style.display="none"; }
+                    } finally {
+                        loadingText.style.display = "none";
+                    }
                 }
 
-                function renderMenu(list){
-                    symbolMenu.innerHTML="";
-                    list.forEach(s=>{
-                        const b=document.createElement("button");
-                        b.className="dropdown-item";
-                        b.type="button"; b.textContent=s;
-                        b.addEventListener("mousedown",e=>{
+                function renderMenu(list) {
+                    symbolMenu.innerHTML = "";
+                    list.forEach(s => {
+                        const b = document.createElement("button");
+                        b.className = "dropdown-item";
+                        b.type = "button";
+                        b.textContent = s;
+                        b.addEventListener("mousedown", e => {
                             e.preventDefault();
-                            symbolInput.value=s;
-                            symbolMenu.style.display="none";
+                            symbolInput.value = s;
+                            symbolMenu.style.display = "none";
                         });
                         symbolMenu.appendChild(b);
                     });
                 }
 
-                async function showList(){
-                    const ex=exchangeSelect.value, net=networkSelect.value;
-                    const list=await loadSymbols(ex,net);
-                    currentSymbols=list;
+                async function showList() {
+                    const ex = exchangeSelect.value, net = networkSelect.value;
+                    const list = await loadSymbols(ex, net);
+                    currentSymbols = list;
                     renderMenu(list);
-                    const r=symbolInput.getBoundingClientRect();
-                    symbolMenu.style.left=r.left+"px";
-                    symbolMenu.style.top=r.bottom+window.scrollY+"px";
-                    symbolMenu.style.width=r.width+"px";
-                    symbolMenu.style.display="block";
+                    const r = symbolInput.getBoundingClientRect();
+                    symbolMenu.style.left = r.left + "px";
+                    symbolMenu.style.top = r.bottom + window.scrollY + "px";
+                    symbolMenu.style.width = r.width + "px";
+                    symbolMenu.style.display = "block";
                 }
 
-                symbolInput.addEventListener("focus",showList);
-                symbolInput.addEventListener("input",()=>{
-                    const q=symbolInput.value.toUpperCase();
-                    renderMenu(currentSymbols.filter(s=>s.includes(q)));
+                symbolInput.addEventListener("focus", showList);
+                symbolInput.addEventListener("input", () => {
+                    const q = symbolInput.value.toUpperCase();
+                    renderMenu(currentSymbols.filter(s => s.includes(q)));
                 });
-                document.addEventListener("click",e=>{
-                    if(!symbolMenu.contains(e.target)&&e.target!==symbolInput)
-                        symbolMenu.style.display="none";
+                document.addEventListener("click", e => {
+                    if (!symbolMenu.contains(e.target) && e.target !== symbolInput)
+                        symbolMenu.style.display = "none";
                 });
 
                 // Таймфреймы
-                async function updateTimeframes(){
-                    timeframeSelect.innerHTML='<option disabled selected>⏳ Загрузка...</option>';
-                    try{
-                        const ex=exchangeSelect.value, net=networkSelect.value;
-                        const res=await fetch(`/api/exchange/timeframes?exchange=${ex}&networkType=${net}`);
-                        const data=await res.json();
-                        timeframeSelect.innerHTML="";
-                        data.forEach(tf=>{
-                            const o=document.createElement("option");
-                            o.value=tf;o.textContent=tf;
+                async function updateTimeframes() {
+                    timeframeSelect.innerHTML = '<option disabled selected>⏳ Загрузка...</option>';
+                    try {
+                        const ex = exchangeSelect.value, net = networkSelect.value;
+                        const res = await fetch(`/api/exchange/timeframes?exchange=${ex}&networkType=${net}`);
+                        const data = await res.json();
+                        timeframeSelect.innerHTML = "";
+                        data.forEach(tf => {
+                            const o = document.createElement("option");
+                            o.value = tf;
+                            o.textContent = tf;
                             timeframeSelect.appendChild(o);
                         });
-                        if(data.length) timeframeSelect.value=data[0];
-                    }catch(e){
-                        console.error("Ошибка таймфреймов",e);
-                        if(window.showToast) showToast("⚠️ Не удалось загрузить таймфреймы","danger");
+                        if (data.length) timeframeSelect.value = data[0];
+                    } catch (e) {
+                        console.error("Ошибка таймфреймов", e);
+                        if (window.showToast) showToast("⚠️ Не удалось загрузить таймфреймы", "danger");
                     }
                 }
-                exchangeSelect.addEventListener("change",updateTimeframes);
-                networkSelect.addEventListener("change",updateTimeframes);
+
+                exchangeSelect.addEventListener("change", updateTimeframes);
+                networkSelect.addEventListener("change", updateTimeframes);
                 updateTimeframes();
             });
         })();

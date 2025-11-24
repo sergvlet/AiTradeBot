@@ -1,21 +1,16 @@
 package com.chicu.aitradebot.strategy.smartfusion;
 
-import com.chicu.aitradebot.strategy.smartfusion.components.SmartFusionCandleService;
-import com.chicu.aitradebot.strategy.smartfusion.components.SmartFusionOrderExecutor;
-import com.chicu.aitradebot.strategy.smartfusion.components.SmartFusionPnLTracker;
-
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.exchange.enums.OrderSide;
-
 import com.chicu.aitradebot.market.MarketStreamManager;
-
+import com.chicu.aitradebot.strategy.core.CandleProvider;
 import com.chicu.aitradebot.strategy.core.ContextAwareStrategy;
 import com.chicu.aitradebot.strategy.core.RuntimeIntrospectable;
 import com.chicu.aitradebot.strategy.core.TradingStrategy;
-import com.chicu.aitradebot.strategy.core.CandleProvider;
 import com.chicu.aitradebot.strategy.registry.StrategyBinding;
-
+import com.chicu.aitradebot.strategy.smartfusion.components.SmartFusionOrderExecutor;
+import com.chicu.aitradebot.strategy.smartfusion.components.SmartFusionPnLTracker;
 import jakarta.annotation.PostConstruct;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
@@ -36,7 +31,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 @Slf4j
 public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectable, ContextAwareStrategy {
 
-    private final SmartFusionCandleService candleService;
+    // Вместо SmartFusionCandleService используем универсальный CandleProvider
+    private final CandleProvider candleProvider;
     private final SmartFusionOrderExecutor orderExecutor;
     private final SmartFusionPnLTracker pnlTracker;
     private final SmartFusionStrategySettingsService settingsService;
@@ -85,15 +81,9 @@ public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectab
                 chatId, symbol, exchange, network);
 
         try {
-            // --------------------------------------------------------
-            // 🟢 ВАЖНО: единственный правильный вызов
-            // MarketStreamManager сам подключает CandleAggregator
-            // и BinanceWebSocketClient, передаёт тики в CandleAggregator
-            // а тот → RealtimeStreamService → frontend WebSocket
-            // --------------------------------------------------------
-            log.info("📡 Запуск Binance realtime stream через MarketStreamManager.start({})", symbol);
+            // MarketStreamManager сам поднимает стрим цен / свечей для symbol
+            log.info("📡 Запуск realtime stream через MarketStreamManager.start({})", symbol);
             marketStreamManager.start(symbol);
-
         } catch (Exception e) {
             log.error("❌ Ошибка запуска realtime stream: {}", e.getMessage(), e);
         }
@@ -200,7 +190,12 @@ public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectab
     private void executeCycle() {
         SmartFusionStrategySettings cfg = settingsService.getOrCreate(chatId);
 
-        List<CandleProvider.Candle> candles = candleService.getCandles(cfg);
+        // Берём свечи через универсальный CandleProvider
+        int limit = cfg.getCandleLimit() > 0 ? cfg.getCandleLimit() : 500;
+        String timeframe = cfg.getTimeframe() != null ? cfg.getTimeframe() : "1m";
+
+        List<CandleProvider.Candle> candles =
+                candleProvider.getRecentCandles(chatId, symbol, timeframe, limit);
 
         if (candles.isEmpty()) {
             log.warn("⚠️ Нет свечей для анализа ({})", symbol);
@@ -248,6 +243,7 @@ public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectab
         }
     }
 
+
     // =====================================================================
     // TRADE EXECUTION
     // =====================================================================
@@ -294,7 +290,8 @@ public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectab
         double gain = 0, loss = 0;
         for (int i = data.length - period; i < data.length; i++) {
             double d = data[i] - data[i - 1];
-            if (d > 0) gain += d; else loss -= d;
+            if (d > 0) gain += d;
+            else loss -= d;
         }
 
         if (loss == 0) return 100;
@@ -335,8 +332,4 @@ public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectab
         return threadName;
     }
 
-    @Override
-    public SmartFusionCandleService getCandleService() {
-        return candleService;
-    }
 }

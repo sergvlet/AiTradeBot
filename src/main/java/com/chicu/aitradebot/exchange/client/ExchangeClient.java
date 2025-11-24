@@ -27,12 +27,12 @@ import java.util.Map;
 public interface ExchangeClient {
 
     /**
-     * Возвращает имя биржи ("BINANCE", "BYBIT", ...)
+     * Возвращает имя биржи ("BINANCE", "BYBIT", ...).
      */
     String getExchangeName();
 
     /**
-     * Возвращает тип сети (MAINNET / TESTNET)
+     * Возвращает тип сети (MAINNET / TESTNET).
      */
     NetworkType getNetworkType();
 
@@ -41,9 +41,9 @@ public interface ExchangeClient {
     /**
      * Возвращает список свечей (klines) по символу.
      *
-     * @param symbol    Торговая пара (BTCUSDT, ETHUSDT, ...)
-     * @param interval  Таймфрейм ("1m", "1h", "4h", "1d", ...)
-     * @param limit     Количество свечей
+     * @param symbol    Торговая пара (BTCUSDT, ETHUSDT, ...).
+     * @param interval  Таймфрейм ("1m", "1h", "4h", "1d", ...).
+     * @param limit     Количество свечей.
      */
     List<Kline> getKlines(String symbol, String interval, int limit) throws Exception;
 
@@ -57,21 +57,26 @@ public interface ExchangeClient {
     /**
      * Размещает ордер (MARKET / LIMIT).
      *
-     * @param chatId Пользователь (из БД)
-     * @param symbol Торговая пара
-     * @param side   BUY / SELL
-     * @param type   MARKET / LIMIT
-     * @param qty    Количество
-     * @param price  Цена (для LIMIT)
+     * @param chatId Пользователь (из БД).
+     * @param symbol Торговая пара.
+     * @param side   BUY / SELL.
+     * @param type   MARKET / LIMIT.
+     * @param qty    Количество.
+     * @param price  Цена (для LIMIT).
      */
-    OrderResult placeOrder(Long chatId, String symbol, String side, String type, double qty, Double price) throws Exception;
+    OrderResult placeOrder(Long chatId,
+                           String symbol,
+                           String side,
+                           String type,
+                           double qty,
+                           Double price) throws Exception;
 
     /**
      * Размещает MARKET ордер в унифицированной форме.
      *
-     * @param symbol Торговая пара
-     * @param side   BUY / SELL
-     * @param qty    Количество
+     * @param symbol Торговая пара.
+     * @param side   BUY / SELL.
+     * @param qty    Количество.
      */
     Order placeMarketOrder(String symbol, OrderSide side, BigDecimal qty) throws Exception;
 
@@ -95,9 +100,18 @@ public interface ExchangeClient {
     // ==================== 🔹 DTO ====================
 
     /**
-     * DTO свечи.
+     * DTO свечи (kline).
+     * Используем double, чтобы было удобно кормить стратегии и графики.
      */
-    record Kline(long openTime, double open, double high, double low, double close, double volume) {}
+    record Kline(
+            long openTime,
+            double open,
+            double high,
+            double low,
+            double close,
+            double volume
+    ) {
+    }
 
     /**
      * DTO результата ордера.
@@ -111,7 +125,8 @@ public interface ExchangeClient {
             double price,
             String status,
             long timestamp
-    ) {}
+    ) {
+    }
 
     /**
      * DTO баланса.
@@ -121,8 +136,9 @@ public interface ExchangeClient {
             return free + locked;
         }
     }
+
     /**
-     * 📜 Получить список всех доступных торговых пар
+     * 📜 Получить список всех доступных торговых пар.
      */
     List<String> getAllSymbols();
 
@@ -130,8 +146,7 @@ public interface ExchangeClient {
      * Возвращает список поддерживаемых таймфреймов для этой биржи.
      */
     default List<String> getAvailableTimeframes() {
-        // По умолчанию — минимальный набор (для клиентов без реализации)
+        // По умолчанию — минимальный набор (для клиентов без реализации).
         return List.of("1m", "5m", "15m", "1h", "4h", "1d");
     }
-
 }

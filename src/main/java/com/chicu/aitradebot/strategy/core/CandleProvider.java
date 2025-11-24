@@ -1,10 +1,14 @@
 package com.chicu.aitradebot.strategy.core;
 
+import java.time.Instant;
 import java.util.List;
 
 /**
- * Универсальная свеча для дашбордов, стратегий, WebSocket и FullChartApiController.
- * Основана на long timestamp (в миллисекундах) – полностью совместима с frontend.
+ * Универсальный поставщик свечей для стратегий, графиков и сервисов.
+ *
+ * ОДИН общий тип свечи на весь проект:
+ *  - time в миллисекундах (long)
+ *  - цены и объём в double
  */
 public interface CandleProvider {
 
@@ -14,7 +18,7 @@ public interface CandleProvider {
      *  open / high / low / close / volume – double
      */
     record Candle(
-            long time,     // <-- миллисекунды, как в WebSocket и Binance
+            long time,     // миллисекунды, как в WebSocket и Binance
             double open,
             double high,
             double low,
@@ -30,11 +34,27 @@ public interface CandleProvider {
         public double getVolume(){ return volume; }
 
         /** Удобный конструктор для Instant → long */
-        public static Candle fromInstant(java.time.Instant i, double o, double h, double l, double c, double v) {
-            return new Candle(i.toEpochMilli(), o, h, l, c, v);
+        public static Candle fromInstant(
+                Instant instant,
+                double open,
+                double high,
+                double low,
+                double close,
+                double volume
+        ) {
+            return new Candle(
+                    instant.toEpochMilli(),
+                    open,
+                    high,
+                    low,
+                    close,
+                    volume
+            );
         }
     }
 
-    /** Стандартный метод получения свечей */
+    /**
+     * Стандартный метод получения последних свечей.
+     */
     List<Candle> getRecentCandles(long chatId, String symbol, String timeframe, int limit);
 }

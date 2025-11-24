@@ -3,7 +3,9 @@ package com.chicu.aitradebot.market.aggregation;
 import com.chicu.aitradebot.market.MarketTickListener;
 import com.chicu.aitradebot.market.ws.RealtimeStreamService;
 import com.chicu.aitradebot.strategy.core.CandleProvider;
-import com.chicu.aitradebot.web.controller.web.dto.StrategyChartDto;
+import com.chicu.aitradebot.web.dto.StrategyChartDto;
+import lombok.Getter;
+import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
@@ -30,6 +32,8 @@ public class CandleAggregator implements MarketTickListener {
             "1m", 60000L,
             "3m", 180000L
     );
+    @Getter
+    @Setter
     private String symbol;
     public CandleAggregator(RealtimeStreamService stream) {
         this.stream = stream;
@@ -81,14 +85,6 @@ public class CandleAggregator implements MarketTickListener {
 
             stream.sendCandle(symbol, code, liveC);
         }
-    }
-
-    public String getSymbol() {
-        return symbol;
-    }
-
-    public void setSymbol(String symbol) {
-        this.symbol = symbol;
     }
 
     private static class LiveCandle {

@@ -1,9 +1,16 @@
 package com.chicu.aitradebot.strategy.core;
 
 /**
- * Интерфейс для стратегий, которым нужен контекст (chatId, symbol).
- * Реализуется такими классами, как SmartFusion, Scalping и т.д.
+ * Минимальный интерфейс для стратегий, которым нужен контекст (chatId, symbol).
+ * Заглушка для совместимости со старыми стратегиями.
  */
 public interface ContextAwareStrategy {
+
+    /**
+     * Установить контекст для стратегии.
+     *
+     * @param chatId чат / пользователь
+     * @param symbol торговый инструмент, например "BTCUSDT"
+     */
     void setContext(long chatId, String symbol);
 }

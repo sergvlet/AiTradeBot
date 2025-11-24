@@ -2,7 +2,6 @@ package com.chicu.aitradebot.service;
 
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
-import java.util.List;
 
 public interface StrategySettingsService {
 

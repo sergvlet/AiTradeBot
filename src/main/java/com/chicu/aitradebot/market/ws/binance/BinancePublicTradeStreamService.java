@@ -1,15 +1,14 @@
 package com.chicu.aitradebot.market.ws.binance;
 
+import com.chicu.aitradebot.market.MarketLiveService;
 import com.chicu.aitradebot.market.ws.TradeFeedListener;
-import com.chicu.aitradebot.strategy.smartfusion.components.SmartFusionCandleService;
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.json.JSONObject;
 import org.springframework.stereotype.Service;
-
-import jakarta.annotation.PostConstruct;
-import jakarta.annotation.PreDestroy;
 
 import java.math.BigDecimal;
 import java.net.URI;
@@ -35,8 +34,8 @@ public class BinancePublicTradeStreamService {
     @Setter
     private volatile TradeFeedListener listener;
 
-    /** Используем для live-свечей SmartFusion по умолчанию */
-    private final SmartFusionCandleService candleService;
+    /** Live-рынок (храним последнюю цену по символу) */
+    private final MarketLiveService marketLiveService;
 
     /** Авто-реконнект */
     private final ScheduledExecutorService reconnectExecutor =
@@ -48,10 +47,12 @@ public class BinancePublicTradeStreamService {
 
     @PostConstruct
     public void init() {
-        // SmartFusionCandleService → дефолтный получатель трейдов,
-        // но MarketStreamManager заменит его через setListener()
-        this.listener = candleService;
-        log.info("✅ Binance WS listener = SmartFusionCandleService (default)");
+        // По умолчанию — прокидываем все трейды в MarketLiveService
+        this.listener = (symbol, price, ts) -> {
+            marketLiveService.updatePrice(symbol, price);
+            log.trace("🟢 Tick {} -> {}", symbol, price);
+        };
+        log.info("✅ Binance WS listener = MarketLiveService (default)");
     }
 
     // ===============================================================
@@ -63,7 +64,9 @@ public class BinancePublicTradeStreamService {
     }
 
     public void subscribeSymbols(Iterable<String> symbols) {
-        for (String s : symbols) subscribeSymbol(s);
+        for (String s : symbols) {
+            subscribeSymbol(s);
+        }
     }
 
     // ===============================================================
@@ -87,7 +90,9 @@ public class BinancePublicTradeStreamService {
     // INTERNAL
     // ===============================================================
     private void openSocketIfNeeded(String symbol) {
-        if (sockets.containsKey(symbol)) return;
+        if (sockets.containsKey(symbol)) {
+            return;
+        }
 
         String url = BINANCE_WS_URL + symbol.toLowerCase() + "@trade";
 
@@ -160,8 +165,10 @@ public class BinancePublicTradeStreamService {
     @PreDestroy
     public void shutdown() {
         sockets.values().forEach(ws -> {
-            try { ws.sendClose(WebSocket.NORMAL_CLOSURE, "shutdown"); }
-            catch (Exception ignored) {}
+            try {
+                ws.sendClose(WebSocket.NORMAL_CLOSURE, "shutdown");
+            } catch (Exception ignored) {
+            }
         });
         reconnectExecutor.shutdownNow();
     }

@@ -1,62 +1,34 @@
 package com.chicu.aitradebot.web.controller.web;
 
 import com.chicu.aitradebot.common.enums.StrategyType;
-import com.chicu.aitradebot.orchestrator.StrategyFacade;
-import com.chicu.aitradebot.orchestrator.dto.StrategyRunInfo;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Controller;
 import org.springframework.ui.Model;
 import org.springframework.web.bind.annotation.*;
 
-import java.util.List;
-
+@Slf4j
 @Controller
 @RequestMapping("/strategies")
-@RequiredArgsConstructor
-@Slf4j
 public class StrategyDashboardController {
-
-    private final StrategyFacade strategyFacade;
 
     @GetMapping("/{type}/dashboard")
     public String dashboard(
-            @PathVariable("type") String type,
-            @RequestParam long chatId,
-            @RequestParam(required = false) String symbol,
+            @PathVariable("type") StrategyType type,
+            @RequestParam("chatId") Long chatId,
+            @RequestParam("symbol") String symbol,
             Model model
     ) {
+        log.info("📊 Открытие дашборда стратегии {} chatId={} symbol={}", type, chatId, symbol);
 
-        StrategyType strategyType = StrategyType.valueOf(type.toUpperCase());
-
-        // ---------- SYMBOL ----------
-        if (symbol == null || symbol.isBlank()) {
-            symbol = strategyFacade.getSymbol(chatId, strategyType);
-        }
-
-        // ---------- STRATEGY INFO ----------
-        StrategyRunInfo info = strategyFacade.status(chatId, strategyType);
-
-        // ---------- TRADES ----------
-        // ⚠️ Метод может возвращать:
-        //  - List<OrderEntity>
-        //  - List<Order>
-        //  - смесь типов
-        //
-        //  Поэтому делаем универсально:
-        List<?> trades = strategyFacade.getTrades(chatId, symbol);
-
-        model.addAttribute("type", strategyType.name());
+        // эти атрибуты используются в шаблоне и JS (data-атрибуты)
         model.addAttribute("chatId", chatId);
         model.addAttribute("symbol", symbol);
-        model.addAttribute("info", info);
+        model.addAttribute("strategyType", type);
 
-        // Добавляем trades в модель (универсальный список)
-        model.addAttribute("trades", trades);
+        // можно позже добавить сюда статистику, состояние стратегии и т.п.
+        // model.addAttribute("runInfo", runInfoService.get(...));
 
-        log.info("📊 DASHBOARD {} chatId={}, symbol={}, trades={}",
-                type, chatId, symbol, trades != null ? trades.size() : 0);
-
-        return "strategy-dashboard";
+        // ищется шаблон: src/main/resources/templates/strategies/dashboard.html
+        return "strategies/dashboard";
     }
 }

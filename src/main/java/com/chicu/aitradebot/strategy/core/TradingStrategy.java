@@ -1,10 +1,8 @@
 package com.chicu.aitradebot.strategy.core;
 
-import com.chicu.aitradebot.strategy.smartfusion.components.SmartFusionCandleService;
-
 /**
  * Базовый интерфейс торговых стратегий.
- * Добавлены обязательные методы жизненного цикла и дефолтный onPriceUpdate.
+ * Минимальный контракт: старт, стоп, статус и опциональный callback цены.
  */
 public interface TradingStrategy {
 
@@ -18,19 +16,10 @@ public interface TradingStrategy {
     boolean isActive();
 
     /**
-     * Получение события изменения цены. По умолчанию — no-op,
-     * чтобы не ломать существующие реализации.
+     * Событие изменения цены (если кому-то нужно real-time).
+     * По умолчанию ничего не делает, чтобы не ломать реализации.
      */
     default void onPriceUpdate(String symbol, double price) {
         // no-op
     }
-    default SmartFusionCandleService getCandleService() {
-        return null;
-    }
-    default String getSymbol(long chatId) { return "BTCUSDT"; }
-
-    default double getTakeProfitPct(long chatId) { return 1.0; }
-
-    default double getStopLossPct(long chatId) { return 1.0; }
-
 }

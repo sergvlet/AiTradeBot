@@ -15,7 +15,6 @@ public class BinanceWebSocketClient {
     private static final String BASE_SPOT = "wss://stream.binance.com:9443/ws/";
 
     private final OkHttpClient client;
-    private MarketTickListener listener;
 
     public BinanceWebSocketClient() {
         this.client = new OkHttpClient.Builder()
@@ -25,7 +24,6 @@ public class BinanceWebSocketClient {
     }
 
     public void connect(String symbol, MarketTickListener listener) {
-        this.listener = listener;
 
         String pair = symbol.toLowerCase() + "@trade";
         Request req = new Request.Builder()

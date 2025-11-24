@@ -8,6 +8,8 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.util.Map;
+
 @Service
 @RequiredArgsConstructor
 @Slf4j
@@ -41,4 +43,18 @@ public class WebDashboardService {
                 .email("demo@aitrade.io")
                 .build();
     }
+    /**
+     * Временная заглушка для совместимости со старым кодом графиков.
+     * Позже будет заменено на полноценный ChartFacade.
+     */
+    public Object build(long chatId, String symbol, int limit, String timeframe) {
+        // TODO: заменить на ChartFacade v4
+        return Map.of(
+                "chatId", chatId,
+                "symbol", symbol,
+                "limit", limit,
+                "timeframe", timeframe
+        );
+    }
+
 }

@@ -17,16 +17,17 @@ import java.util.Optional;
 @RequiredArgsConstructor
 public class SmartFusionStrategySettingsServiceImpl
         implements SmartFusionStrategySettingsService,
-                   StrategySettingsProvider<SmartFusionStrategySettings> {
+        StrategySettingsProvider<SmartFusionStrategySettings> {
 
     private final SmartFusionStrategySettingsRepository repository;
 
     // =============================================================
-    // StrategySettingsProvider — load()
+    // StrategySettingsProvider — load(long chatId)
     // =============================================================
     @Override
-    public SmartFusionStrategySettings load(Long chatId) {
-        return repository.findLatestByChatId(chatId).orElse(null);
+    public SmartFusionStrategySettings load(long chatId) {
+        return repository.findLatestByChatId(chatId)
+                .orElse(null);
     }
 
     // =============================================================
@@ -86,7 +87,7 @@ public class SmartFusionStrategySettingsServiceImpl
         SmartFusionStrategySettings settings =
                 repository.findLatestByChatId(chatId).orElseGet(() -> getOrCreate(chatId));
 
-        // Создаём новую запись если изменён символ
+        // Создаём новую запись, если изменён символ
         if (dto.getSymbol() != null && !dto.getSymbol().equals(settings.getSymbol())) {
 
             settings = SmartFusionStrategySettings.builder()
@@ -131,7 +132,7 @@ public class SmartFusionStrategySettingsServiceImpl
     }
 
     // =============================================================
-    // ❗ правильная реализация findByChatId → Optional
+    // Корректная findByChatId
     // =============================================================
     @Override
     public Optional<Object> findByChatId(Long chatId) {
@@ -140,10 +141,11 @@ public class SmartFusionStrategySettingsServiceImpl
 
         if (all.isEmpty()) return Optional.empty();
 
-        return Optional.of(
+        SmartFusionStrategySettings newest =
                 all.stream()
                         .max(Comparator.comparing(SmartFusionStrategySettings::getId))
-                        .get()
-        );
+                        .orElse(null);
+
+        return Optional.ofNullable(newest);
     }
 }

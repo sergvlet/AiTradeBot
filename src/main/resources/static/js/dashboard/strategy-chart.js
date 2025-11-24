@@ -390,12 +390,20 @@ async function loadTimeframes(exchange, network, currentTf, chatId, symbol) {
 // =============================================================
 async function loadFullChart(chatId, symbol, timeframe, opts = {}) {
     const initial = !!opts.initial;
+
+    // Берём тип стратегии из data-атрибута корневого блока
+    const root = document.getElementById("strategy-dashboard");
+    const type = root?.dataset?.type || "SMART_FUSION";
+
     try {
         const url =
-            `/api/chart/full?chatId=${encodeURIComponent(chatId)}` +
+            `/api/chart/strategy` +
+            `?chatId=${encodeURIComponent(chatId)}` +
+            `&type=${encodeURIComponent(type)}` +
             `&symbol=${encodeURIComponent(symbol)}` +
             `&timeframe=${encodeURIComponent(timeframe)}` +
             `&limit=300`;
+
 
         const r = await fetch(url);
         if (!r.ok) {
