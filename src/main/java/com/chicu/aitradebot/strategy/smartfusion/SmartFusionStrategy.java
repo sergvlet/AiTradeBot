@@ -3,7 +3,6 @@ package com.chicu.aitradebot.strategy.smartfusion;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.exchange.enums.OrderSide;
-import com.chicu.aitradebot.market.MarketStreamManager;
 import com.chicu.aitradebot.strategy.core.CandleProvider;
 import com.chicu.aitradebot.strategy.core.ContextAwareStrategy;
 import com.chicu.aitradebot.strategy.core.RuntimeIntrospectable;
@@ -31,16 +30,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
 @Slf4j
 public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectable, ContextAwareStrategy {
 
-    // Вместо SmartFusionCandleService используем универсальный CandleProvider
     private final CandleProvider candleProvider;
     private final SmartFusionOrderExecutor orderExecutor;
     private final SmartFusionPnLTracker pnlTracker;
     private final SmartFusionStrategySettingsService settingsService;
 
-    private final MarketStreamManager marketStreamManager;
-
     private final AtomicBoolean running = new AtomicBoolean(false);
-    private Thread workerThread;
 
     private long chatId;
     private String symbol;
@@ -50,7 +45,6 @@ public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectab
     @Getter
     private String lastEvent = "INIT";
     private Instant startedAt;
-    private String threadName;
 
     @PostConstruct
     public void onInit() {
@@ -68,32 +62,11 @@ public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectab
             return;
         }
 
-        if (symbol == null) {
-            log.error("❌ Невозможно запустить SmartFusion: symbol == null (chatId={})", chatId);
-            return;
-        }
-
         running.set(true);
         startedAt = Instant.now();
-        threadName = "SmartFusion-" + symbol;
 
-        log.info("▶️ Запуск SmartFusion: chatId={}, symbol={}, exchange={}, network={}",
+        log.info("▶️ SmartFusion запущена: chatId={}, symbol={}, exchange={}, network={}",
                 chatId, symbol, exchange, network);
-
-        try {
-            // MarketStreamManager сам поднимает стрим цен / свечей для symbol
-            log.info("📡 Запуск realtime stream через MarketStreamManager.start({})", symbol);
-            marketStreamManager.start(symbol);
-        } catch (Exception e) {
-            log.error("❌ Ошибка запуска realtime stream: {}", e.getMessage(), e);
-        }
-
-        // Запускаем рабочий поток SmartFusion
-        workerThread = new Thread(this::runLoop, threadName);
-        workerThread.setDaemon(true);
-        workerThread.start();
-
-        log.info("✅ SmartFusion поток успешно запущен: {}", threadName);
     }
 
     // =====================================================================
@@ -106,32 +79,14 @@ public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectab
             return;
         }
 
-        log.info("⏹ Остановка SmartFusion: chatId={}, symbol={}", chatId, symbol);
-
         running.set(false);
-        if (workerThread != null && workerThread.isAlive()) {
-            workerThread.interrupt();
-            try {
-                workerThread.join(1000);
-            } catch (InterruptedException ignored) {
-                Thread.currentThread().interrupt();
-            }
-        }
 
-        log.info("✅ SmartFusion успешно остановлена (chatId={}, symbol={})", chatId, symbol);
+        log.info("⏹ SmartFusion остановлена: chatId={}, symbol={}", chatId, symbol);
     }
 
     @Override
     public boolean isActive() {
         return running.get();
-    }
-
-    // =====================================================================
-    // CALLBACK (если кто-то вызовет)
-    // =====================================================================
-    @Override
-    public void onPriceUpdate(String symbol, double price) {
-        log.debug("📈 onPriceUpdate: {} {}", symbol, price);
     }
 
     // =====================================================================
@@ -150,71 +105,44 @@ public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectab
         this.exchange = cfg.getExchange();
         this.network = cfg.getNetworkType();
 
-        log.info("⚙️ Контекст установлен: chatId={}, symbol={}, exchange={}, network={}",
-                this.chatId, this.symbol, this.exchange, this.network);
+        log.info("⚙️ Контекст SmartFusion установлен: chatId={}, symbol={}, exchange={}, network={}",
+                chatId, symbol, exchange, network);
     }
 
     // =====================================================================
-    // MAIN LOOP
+    // EVENT-DRIVEN
     // =====================================================================
-    private void runLoop() {
-        log.info("🔁 Старт цикла SmartFusion (thread={}) chatId={}, symbol={}",
-                Thread.currentThread().getName(), chatId, symbol);
+    @Override
+    public void onPriceUpdate(String symbol, double price) {
+        if (!running.get()) return;
 
         try {
-            while (running.get()) {
-                long start = System.currentTimeMillis();
-
-                try {
-                    executeCycle();
-                } catch (Exception e) {
-                    log.error("❌ Ошибка executeCycle: {}", e.getMessage(), e);
-                }
-
-                long elapsed = System.currentTimeMillis() - start;
-                log.debug("⏱ Цикл выполнен за {} ms (chatId={}, symbol={})", elapsed, chatId, symbol);
-
-                Thread.sleep(10_000);
-            }
-        } catch (InterruptedException ignored) {
-            Thread.currentThread().interrupt();
-        } finally {
-            running.set(false);
-            log.info("🔚 SmartFusion цикл завершён (chatId={}, symbol={})", chatId, symbol);
+            executeCycle();
+        } catch (Exception e) {
+            log.error("❌ SmartFusion onPriceUpdate error: {}", e.getMessage(), e);
         }
     }
 
     // =====================================================================
-    // ONE CYCLE
+    // ONE CYCLE — вызывается при каждом новом тике
     // =====================================================================
     private void executeCycle() {
+
         SmartFusionStrategySettings cfg = settingsService.getOrCreate(chatId);
 
-        // Берём свечи через универсальный CandleProvider
-        int limit = cfg.getCandleLimit() > 0 ? cfg.getCandleLimit() : 500;
+        int limit = cfg.getCandleLimit() > 0 ? cfg.getCandleLimit() : 300;
         String timeframe = cfg.getTimeframe() != null ? cfg.getTimeframe() : "1m";
 
         List<CandleProvider.Candle> candles =
                 candleProvider.getRecentCandles(chatId, symbol, timeframe, limit);
 
-        if (candles.isEmpty()) {
-            log.warn("⚠️ Нет свечей для анализа ({})", symbol);
-            return;
-        }
-
-        if (candles.size() < 20) {
-            log.debug("ℹ️ Недостаточно свечей: {}", candles.size());
-            return;
-        }
+        if (candles.size() < 20) return;
 
         double[] closes = candles.stream()
                 .mapToDouble(CandleProvider.Candle::close)
                 .toArray();
 
         double last = closes[closes.length - 1];
-        long ts = candles.get(candles.size() - 1).getTime();
-
-        log.debug("📊 Последняя свеча {}: ts={}, close={}", symbol, ts, last);
 
         double emaFast = ema(closes, cfg.getEmaFastPeriod());
         double emaSlow = ema(closes, cfg.getEmaSlowPeriod());
@@ -242,7 +170,6 @@ public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectab
             lastEvent = "HOLD";
         }
     }
-
 
     // =====================================================================
     // TRADE EXECUTION
@@ -274,7 +201,6 @@ public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectab
     // =====================================================================
     // INDICATORS
     // =====================================================================
-
     private double ema(double[] data, int period) {
         double k = 2.0 / (period + 1);
         double ema = data[0];
@@ -329,7 +255,6 @@ public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectab
 
     @Override
     public String getThreadName() {
-        return threadName;
+        return "SMARTFUSION-" + symbol;
     }
-
 }

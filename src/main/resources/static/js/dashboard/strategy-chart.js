@@ -53,6 +53,7 @@ function getCurrentTf() {
 
 function normalizeTimeMs(t) {
     if (t == null) return null;
+    // если пришло в секундах — переводим в миллисекунды
     return t < 1e12 ? t * 1000 : t;
 }
 
@@ -370,7 +371,8 @@ async function loadTimeframes(exchange, network, currentTf, chatId, symbol) {
             sel.appendChild(o);
         });
 
-        sel.addEventListener("change", () => {
+        // не плодим миллионы обработчиков
+        sel.onchange = () => {
             const tf = sel.value;
 
             initialDataLoaded    = false;
@@ -379,7 +381,7 @@ async function loadTimeframes(exchange, network, currentTf, chatId, symbol) {
 
             window.AiStrategyChart.loadFullChart(chatId, symbol, tf, { initial: true });
             window.AiStrategyChart.subscribeLive(symbol, tf);
-        });
+        };
     } catch (e) {
         console.error("❌ loadTimeframes error:", e);
     }
@@ -390,6 +392,14 @@ async function loadTimeframes(exchange, network, currentTf, chatId, symbol) {
 // =============================================================
 async function loadFullChart(chatId, symbol, timeframe, opts = {}) {
     const initial = !!opts.initial;
+
+    if (!chart) {
+        initChart();
+        if (!chart) {
+            console.error("❌ Chart not initialized");
+            return;
+        }
+    }
 
     // Берём тип стратегии из data-атрибута корневого блока
     const root = document.getElementById("strategy-dashboard");
@@ -403,7 +413,6 @@ async function loadFullChart(chatId, symbol, timeframe, opts = {}) {
             `&symbol=${encodeURIComponent(symbol)}` +
             `&timeframe=${encodeURIComponent(timeframe)}` +
             `&limit=300`;
-
 
         const r = await fetch(url);
         if (!r.ok) {
@@ -596,12 +605,7 @@ function subscribeLive(symbol, timeframe) {
     console.log("[WS] subscribeLive init", { symbol, timeframe });
 
     if (currentWs) {
-        console.log("[WS] closing previous websocket");
-        try {
-            currentWs.close(1000, "switch symbol/timeframe");
-        } catch (e) {
-            console.warn("[WS] error closing previous ws", e);
-        }
+        try { currentWs.close(1000, "switch"); } catch {}
         currentWs = null;
     }
 
@@ -611,8 +615,6 @@ function subscribeLive(symbol, timeframe) {
         `${protocol}://${loc.host}/ws/candles` +
         `?symbol=${encodeURIComponent(symbol)}` +
         `&timeframe=${encodeURIComponent(timeframe)}`;
-
-    console.log("[WS] connecting to", wsUrl);
 
     const ws = new WebSocket(wsUrl);
     currentWs = ws;
@@ -628,69 +630,91 @@ function subscribeLive(symbol, timeframe) {
     };
 
     ws.onclose = (evt) => {
-        console.log("[WS] CLOSE", { code: evt.code, reason: evt.reason });
+        console.log("[WS] CLOSE", evt.code, evt.reason);
         setLiveStatus(false);
     };
 
+    // ============================================================
+    //   🔥 Обработка всех форматов Binance + закрытия свечей
+    // ============================================================
     ws.onmessage = (event) => {
         let payload;
-        try {
-            payload = JSON.parse(event.data);
-        } catch (e) {
-            console.error("[WS] parse error", e);
-            return;
+        try { payload = JSON.parse(event.data); }
+        catch { return; }
+
+        // ---- Универсальная нормализация формата WS ----
+        let k = null;
+
+        // Binance format combined stream
+        if (payload && payload.data && payload.data.k) {
+            k = payload.data.k;
+        }
+// Single kline update
+        else if (payload && payload.k) {
+            k = payload.k;
+        }
+// Old format (если останется)
+        else if (payload.type === "tick" && payload.candle) {
+            k = payload.candle;
         }
 
-        if (!payload || payload.type !== "tick" || !payload.candle) {
-            return;
+        else if (payload.data && payload.data.k) {
+            k = payload.data.k;
+        }
+        else if (payload.k) {
+            k = payload.k;
         }
 
-        const c = payload.candle;
-        let timeMs = normalizeTimeMs(c.time);
-        if (timeMs == null) return;
+        if (!k) return;
 
-        const candleForState = {
-            time:  timeMs,
-            open:  c.open,
-            high:  c.high,
-            low:   c.low,
-            close: c.close
-        };
+        // ---- Важное поле "закрыта свеча" ----
+        const isClosed = k.x === true;
 
-        const candleForChart = {
-            time:  timeMs / 1000,
-            open:  c.open,
-            high:  c.high,
-            low:   c.low,
-            close: c.close
-        };
+        const timeMs = normalizeTimeMs(k.t);
+        const open   = parseFloat(k.o);
+        const high   = parseFloat(k.h);
+        const low    = parseFloat(k.l);
+        const close  = parseFloat(k.c);
 
-        candleSeries.update(candleForChart);
+        const stateCandle = { time: timeMs, open, high, low, close, closed: isClosed };
+        const chartCandle = { time: timeMs / 1000, open, high, low, close };
 
-        if (!Array.isArray(candlesGlobal)) candlesGlobal = [];
+        candleSeries.update(chartCandle);
 
+        // ============================================================
+        //             🔥 Правильная логика закрытия свечей
+        // ============================================================
         if (candlesGlobal.length === 0) {
-            candlesGlobal.push(candleForState);
+            candlesGlobal.push(stateCandle);
         } else {
             const last = candlesGlobal[candlesGlobal.length - 1];
-            if (last.time === candleForState.time) {
-                candlesGlobal[candlesGlobal.length - 1] = candleForState;
-            } else if (candleForState.time > last.time) {
-                candlesGlobal.push(candleForState);
-            } else {
-                console.warn("[WS] received out-of-order tick", { last, candle: candleForState });
+
+            // обновляем текущую свечу
+            if (last.time === stateCandle.time) {
+                candlesGlobal[candlesGlobal.length - 1] = stateCandle;
+
+                if (isClosed) {
+                    console.log("🟩 Свеча ЗАКРЫТА:", new Date(timeMs).toLocaleString());
+                    // На следующем тике Binance пришлёт новую t — сработает следующий блок
+                }
+            }
+            // новая свеча
+            else if (stateCandle.time > last.time) {
+                candlesGlobal.push(stateCandle);
+                console.log("🆕 Новая свеча", new Date(timeMs).toLocaleString());
             }
         }
 
+        // Ограничение памяти
         if (candlesGlobal.length > MAX_CANDLES_HISTORY) {
             candlesGlobal = candlesGlobal.slice(-MAX_CANDLES_HISTORY);
         }
 
-        updatePriceLabel(candleForState.close);
+        updatePriceLabel(close);
         updatePriceLine();
         updateFrontStats();
 
-        if (autoScrollToRealTime && chart && chart.timeScale) {
+        if (autoScrollToRealTime) {
             chart.timeScale().scrollToRealTime();
         }
     };

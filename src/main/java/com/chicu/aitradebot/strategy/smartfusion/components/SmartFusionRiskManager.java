@@ -1,5 +1,6 @@
 package com.chicu.aitradebot.strategy.smartfusion.components;
 
+import com.chicu.aitradebot.strategy.core.CandleProvider;
 import com.chicu.aitradebot.strategy.smartfusion.SmartFusionStrategySettings;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
@@ -21,7 +22,7 @@ import java.util.List;
  *  - SmartSizing (динамический размер позиции)
  *  - Расчёт ожидаемой чистой прибыли
  *
- * ⚙️ Без хардкода — все параметры подставляются из SmartFusionStrategySettings.
+ * ⚙️ Все параметры подставляются из SmartFusionStrategySettings.
  */
 @Component
 @RequiredArgsConstructor
@@ -84,6 +85,7 @@ public class SmartFusionRiskManager {
 
         // Комиссия из настроек
         double commissionPct = nz(cfg.getCommissionPct(), 0.1);
+
         double netProfitPct = ((tpPrice - entryPrice) / entryPrice) * 100.0 - commissionPct;
 
         TradePlan plan = TradePlan.builder()
@@ -101,12 +103,16 @@ public class SmartFusionRiskManager {
     }
 
     /**
-     * Расчёт волатильности (%) между последними двумя свечами.
+     * Рассчёт волатильности между двумя последними свечами (%).
+     *
+     * Переведено с SmartFusionCandleService → CandleProvider.Candle
      */
-    public double calcVolatilityPct(List<SmartFusionCandleService.Candle> candles) {
-        if (candles.size() < 2) return 0.0;
+    public double calcVolatilityPct(List<CandleProvider.Candle> candles) {
+        if (candles == null || candles.size() < 2) return 0.0;
+
         double last = candles.get(candles.size() - 1).close();
         double prev = candles.get(candles.size() - 2).close();
+
         return Math.abs((last - prev) / prev) * 100.0;
     }
 

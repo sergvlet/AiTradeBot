@@ -1,5 +1,6 @@
 package com.chicu.aitradebot.strategy.smartfusion.components;
 
+import com.chicu.aitradebot.strategy.core.CandleProvider;
 import com.chicu.aitradebot.strategy.smartfusion.SmartFusionStrategySettings;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
@@ -43,8 +44,9 @@ public class SmartFusionFilter {
     /**
      * Расчёт фильтра: EMA + RSI + ATR
      */
-    public FilterSignal evaluate(List<SmartFusionCandleService.Candle> candles,
+    public FilterSignal evaluate(List<CandleProvider.Candle> candles,
                                  SmartFusionStrategySettings cfg) {
+
         if (candles == null || candles.size() < 30) {
             return FilterSignal.builder()
                     .bullish(false).bearish(false)
@@ -52,9 +54,16 @@ public class SmartFusionFilter {
                     .trendStrength(0).build();
         }
 
-        List<Double> closes = candles.stream().map(SmartFusionCandleService.Candle::close).collect(Collectors.toList());
-        List<Double> highs  = candles.stream().map(SmartFusionCandleService.Candle::high).collect(Collectors.toList());
-        List<Double> lows   = candles.stream().map(SmartFusionCandleService.Candle::low).collect(Collectors.toList());
+        // ✅ Переход на CandleProvider.Candle
+        List<Double> closes = candles.stream()
+                .map(CandleProvider.Candle::close)
+                .collect(Collectors.toList());
+        List<Double> highs  = candles.stream()
+                .map(CandleProvider.Candle::high)
+                .collect(Collectors.toList());
+        List<Double> lows   = candles.stream()
+                .map(CandleProvider.Candle::low)
+                .collect(Collectors.toList());
 
         double emaFast = ema(closes, cfg.getEmaFastPeriod());
         double emaSlow = ema(closes, cfg.getEmaSlowPeriod());
