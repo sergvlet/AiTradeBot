@@ -572,6 +572,53 @@ function updateTradeMarkers() {
         }))
     );
 }
+// =============================================================
+// 🔥 ПЛАВНАЯ АНИМАЦИЯ ОБНОВЛЕНИЯ СВЕЧИ (ИСПРАВЛЕННАЯ)
+// =============================================================
+let animFrame = null;
+let lastAnimatedCandle = null;
+
+function smoothCandleUpdate(newCandle) {
+    // newCandle.time всегда в секундах → так и должно быть
+    if (!lastAnimatedCandle) {
+        lastAnimatedCandle = { ...newCandle };
+        candleSeries.update(newCandle);
+        return;
+    }
+
+    const start = { ...lastAnimatedCandle };
+    const end   = { ...newCandle };
+
+    const duration = 120;
+    const startTime = performance.now();
+
+    if (animFrame) cancelAnimationFrame(animFrame);
+
+    function animate(now) {
+        const progress = Math.min((now - startTime) / duration, 1);
+        const lerp = (a, b) => a + (b - a) * progress;
+
+        const frameCandle = {
+            time: end.time,              // ← главное исправление
+            open:  lerp(start.open,  end.open),
+            high:  lerp(start.high,  end.high),
+            low:   lerp(start.low,   end.low),
+            close: lerp(start.close, end.close)
+        };
+
+        candleSeries.update(frameCandle);
+
+        if (progress < 1) {
+            animFrame = requestAnimationFrame(animate);
+        } else {
+            lastAnimatedCandle = { ...end };
+        }
+    }
+
+    animFrame = requestAnimationFrame(animate);
+}
+
+
 
 // =============================================================
 // PRICE LINE
@@ -611,10 +658,7 @@ function subscribeLive(symbol, timeframe) {
 
     const loc      = window.location;
     const protocol = loc.protocol === "https:" ? "wss" : "ws";
-    const wsUrl    =
-        `${protocol}://${loc.host}/ws/candles` +
-        `?symbol=${encodeURIComponent(symbol)}` +
-        `&timeframe=${encodeURIComponent(timeframe)}`;
+    const wsUrl    = `${protocol}://${loc.host}/ws/candles?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}`;
 
     const ws = new WebSocket(wsUrl);
     currentWs = ws;
@@ -635,77 +679,80 @@ function subscribeLive(symbol, timeframe) {
     };
 
     // ============================================================
-    //   🔥 Обработка всех форматов Binance + закрытия свечей
+    // 🔥 УНИВЕРСАЛЬНЫЙ WS-ПАРСЕР
+    // Поддерживает ВСЕ форматы Binance + твой "tick"
     // ============================================================
     ws.onmessage = (event) => {
         let payload;
         try { payload = JSON.parse(event.data); }
         catch { return; }
 
-        // ---- Универсальная нормализация формата WS ----
         let k = null;
 
-        // Binance format combined stream
-        if (payload && payload.data && payload.data.k) {
-            k = payload.data.k;
-        }
-// Single kline update
-        else if (payload && payload.k) {
-            k = payload.k;
-        }
-// Old format (если останется)
-        else if (payload.type === "tick" && payload.candle) {
-            k = payload.candle;
+        // формат "tick"
+        if (payload.type === "tick" && payload.candle) {
+            k = {
+                t: payload.candle.time,
+                o: payload.candle.open,
+                h: payload.candle.high,
+                l: payload.candle.low,
+                c: payload.candle.close,
+                v: payload.candle.volume || 0,
+                x: payload.candle.closed || false
+            };
         }
 
+        // формат Binance WS: {stream:"", data:{k:{...}}}
         else if (payload.data && payload.data.k) {
             k = payload.data.k;
         }
+
+        // формат Binance одиночной свечи: {"e":"kline", "k":{...}}
         else if (payload.k) {
             k = payload.k;
         }
 
         if (!k) return;
 
-        // ---- Важное поле "закрыта свеча" ----
-        const isClosed = k.x === true;
-
+        // нормализация
         const timeMs = normalizeTimeMs(k.t);
         const open   = parseFloat(k.o);
         const high   = parseFloat(k.h);
         const low    = parseFloat(k.l);
         const close  = parseFloat(k.c);
+        const vol    = parseFloat(k.v);
+        const closed = k.x === true;
 
-        const stateCandle = { time: timeMs, open, high, low, close, closed: isClosed };
+        const stateCandle = { time: timeMs, open, high, low, close, volume: vol, closed };
         const chartCandle = { time: timeMs / 1000, open, high, low, close };
 
-        candleSeries.update(chartCandle);
+        // === обновление свечи на графике ===
+        smoothCandleUpdate(chartCandle);
+
 
         // ============================================================
-        //             🔥 Правильная логика закрытия свечей
+        // 🔥 Правильная логика закрытия + открытия новой свечи
         // ============================================================
         if (candlesGlobal.length === 0) {
             candlesGlobal.push(stateCandle);
         } else {
             const last = candlesGlobal[candlesGlobal.length - 1];
 
-            // обновляем текущую свечу
             if (last.time === stateCandle.time) {
+                // обновляем текущую
                 candlesGlobal[candlesGlobal.length - 1] = stateCandle;
 
-                if (isClosed) {
-                    console.log("🟩 Свеча ЗАКРЫТА:", new Date(timeMs).toLocaleString());
-                    // На следующем тике Binance пришлёт новую t — сработает следующий блок
+                if (closed) {
+                    console.log("🟩 Свеча закрыта:", new Date(timeMs).toLocaleString());
                 }
             }
-            // новая свеча
             else if (stateCandle.time > last.time) {
+                console.log("🆕 Новая свеча:", new Date(timeMs).toLocaleString());
                 candlesGlobal.push(stateCandle);
-                console.log("🆕 Новая свеча", new Date(timeMs).toLocaleString());
             }
         }
 
-        // Ограничение памяти
+        // ограничение
         if (candlesGlobal.length > MAX_CANDLES_HISTORY) {
             candlesGlobal = candlesGlobal.slice(-MAX_CANDLES_HISTORY);
         }
@@ -719,6 +766,7 @@ function subscribeLive(symbol, timeframe) {
         }
     };
 }
+
 
 // =============================================================
 // WS STATUS
