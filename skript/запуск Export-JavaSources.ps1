@@ -4,3 +4,6 @@
 
 
 .\Export-JavaSources.ps1 -FolderPath "src\main\java\com\chicu\aitradebot\web\controller\web"
+
+
+.\export-resources.ps1 -FolderPath "src\main\resources"

@@ -20,15 +20,10 @@ public class StrategyDashboardController {
     ) {
         log.info("📊 Открытие дашборда стратегии {} chatId={} symbol={}", type, chatId, symbol);
 
-        // эти атрибуты используются в шаблоне и JS (data-атрибуты)
         model.addAttribute("chatId", chatId);
         model.addAttribute("symbol", symbol);
         model.addAttribute("strategyType", type);
 
-        // можно позже добавить сюда статистику, состояние стратегии и т.п.
-        // model.addAttribute("runInfo", runInfoService.get(...));
-
-        // ищется шаблон: src/main/resources/templates/strategies/dashboard.html
         return "strategies/dashboard";
     }
 }

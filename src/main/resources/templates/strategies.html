@@ -57,12 +57,12 @@
               <i class="bi bi-graph-up"></i> Дашборд
             </a>
 
-
             <!-- ⚙️ Настройки -->
-            <a th:href="@{'/strategies/' + ${s.strategyType} + '/settings'(chatId=${s.chatId})}"
+            <a th:href="@{'/strategies/' + ${s.strategyType} + '/unified-settings'(chatId=${s.chatId})}"
                class="btn btn-outline-primary">
               <i class="bi bi-gear"></i> Настроить
             </a>
+
 
           </div>
 
@@ -96,7 +96,6 @@
 
           btn.disabled = true;
 
-          // временная визуальная блокировка
           if (icon) {
             icon.className = active ? "bi bi-stop-fill" : "bi bi-play-fill";
           }
@@ -123,7 +122,6 @@
             const started = data.status === "started";
             btn.dataset.active = String(started);
 
-            // кнопка
             btn.classList.toggle("btn-outline-success", !started);
             btn.classList.toggle("btn-outline-danger", started);
 
@@ -134,19 +132,16 @@
               label.textContent = started ? "Остановить" : "Запустить";
             }
 
-            // бейдж
             if (badge) {
               badge.textContent = started ? "🟢 Активна" : "⚫ Остановлена";
               badge.classList.toggle("bg-success", started);
               badge.classList.toggle("bg-secondary", !started);
             }
 
-            // toast, если есть
             if (window.showToast) {
               showToast(started ? "Стратегия запущена" : "Стратегия остановлена", started);
             }
 
-            // редирект, если сервер дал
             if (data.redirect) {
               window.location.href = data.redirect;
             }

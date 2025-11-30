@@ -55,6 +55,28 @@ public class StrategySettings {
     @Builder.Default
     private boolean active = true;
 
+    // =========================
+    // 🔹 ДОП. ПОЛЯ ДЛЯ unified-settings.html
+    // =========================
+
+    /** Капитал в USDT (может быть null для старых записей) */
+    @Column(precision = 18, scale = 6)
+    private BigDecimal capitalUsd;
+
+    /** Риск на сделку, % (может быть null для старых записей) */
+    @Column(precision = 10, scale = 4)
+    private BigDecimal riskPerTradePct;
+
+    /** Дневной лимит потерь, % (может быть null для старых записей) */
+    @Column(precision = 10, scale = 4)
+    private BigDecimal dailyLossLimitPct;
+
+    /** Реинвест прибыли */
+    @Builder.Default
+    private boolean reinvestProfit = false;
+
+    // =========================
+
     @Builder.Default
     @Column(nullable = false, updatable = false)
     private LocalDateTime createdAt = LocalDateTime.now();
@@ -70,7 +92,6 @@ public class StrategySettings {
     public void onUpdate() {
         updatedAt = LocalDateTime.now();
     }
-
 
     /** Совместимость со старым кодом: заменить getStrategyType() -> возвращает поле type */
     @Transient

@@ -1,5 +1,7 @@
 package com.chicu.aitradebot.strategy.smartfusion;
 
+
+
 import com.chicu.aitradebot.strategy.smartfusion.dto.SmartFusionUserSettingsDto;
 
 import java.util.Optional;
