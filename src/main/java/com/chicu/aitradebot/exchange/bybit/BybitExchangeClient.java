@@ -26,6 +26,7 @@ import java.util.stream.Collectors;
  * Полностью совместим с ExchangeClient V4
  */
 @Slf4j
+
 public class BybitExchangeClient implements ExchangeClient {
 
     private static final String MAINNET = "https://api.bybit.com";

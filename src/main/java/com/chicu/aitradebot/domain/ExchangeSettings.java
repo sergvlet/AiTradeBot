@@ -85,12 +85,7 @@ public class ExchangeSettings {
         return this.network == NetworkType.TESTNET;
     }
 
-    /** Ключ в формате EXCHANGE@NETWORK */
-    @Transient
-    public String exchangeKey() {
-        return (exchange == null ? "UNKNOWN" : exchange) + "@" +
-               (network == null ? "MAINNET" : network.name());
-    }
+
 
     // ===================== Методы совместимости =====================
 
@@ -100,13 +95,5 @@ public class ExchangeSettings {
         return isTestnet();
     }
 
-    /**
-     * Старый алиас для поля apiSecret.
-     * Используется для обратной совместимости со старым кодом,
-     * где использовался метод getSecretKey().
-     */
-    @Transient
-    public String getSecretKey() {
-        return this.apiSecret;
-    }
+
 }

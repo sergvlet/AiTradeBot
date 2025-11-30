@@ -2,6 +2,7 @@ package com.chicu.aitradebot.exchange.service;
 
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.domain.ExchangeSettings;
+import com.chicu.aitradebot.exchange.model.BinanceConnectionStatus;
 
 import java.util.List;
 import java.util.Optional;
@@ -15,7 +16,6 @@ public interface ExchangeSettingsService {
 
     ExchangeSettings getOrCreate(Long chatId, String exchange, NetworkType network);
 
-    boolean exists(Long chatId, String exchange, NetworkType network);
 
     void delete(Long chatId, String exchange, NetworkType network);
 
@@ -29,5 +29,7 @@ public interface ExchangeSettingsService {
     boolean testConnection(ExchangeSettings settings);
 
     Optional<ExchangeSettings> findByChatIdAndExchangeAndNetwork(Long chatId, String exchange, NetworkType network);
+
+    BinanceConnectionStatus testConnectionDetailed(ExchangeSettings settings);
 
 }

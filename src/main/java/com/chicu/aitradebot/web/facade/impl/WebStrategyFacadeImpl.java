@@ -3,153 +3,161 @@ package com.chicu.aitradebot.web.facade.impl;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
-import com.chicu.aitradebot.domain.UserProfile;
-import com.chicu.aitradebot.domain.UserStrategy;
-import com.chicu.aitradebot.orchestrator.AiStrategyOrchestrator;
 import com.chicu.aitradebot.repository.StrategySettingsRepository;
-import com.chicu.aitradebot.repository.UserProfileRepository;
-import com.chicu.aitradebot.repository.UserStrategyRepository;
+import com.chicu.aitradebot.service.StrategySettingsService;
+import com.chicu.aitradebot.service.UserProfileService;
+import com.chicu.aitradebot.orchestrator.AiStrategyOrchestrator;
 import com.chicu.aitradebot.web.facade.WebStrategyFacade;
+
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Service;
+import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
+import java.util.ArrayList;
 import java.util.List;
 
 @Slf4j
-@Service
+@Component
 @RequiredArgsConstructor
 public class WebStrategyFacadeImpl implements WebStrategyFacade {
 
-    private final UserProfileRepository userProfileRepository;
-    private final StrategySettingsRepository strategySettingsRepository;
-    private final UserStrategyRepository userStrategyRepository;
+    private final StrategySettingsRepository settingsRepo;
+    private final StrategySettingsService settingsService;
+    private final UserProfileService userProfileService;
+    private final AiStrategyOrchestrator orchestrator;
 
-    private final AiStrategyOrchestrator aiStrategyOrchestrator;
+    // =====================================================================
+    // 📌 Получение списка стратегий для UI
+    // =====================================================================
 
     @Override
     public List<StrategyUi> getStrategies(Long chatId) {
 
-        UserProfile user = userProfileRepository.findById(chatId)
-                .orElseThrow(() -> new IllegalArgumentException("UserProfile not found: " + chatId));
+        List<StrategySettings> list = settingsRepo.findByChatId(chatId);
 
-        NetworkType networkType = user.getNetworkType(); // ✅ требуется шаблоном
-
-        List<StrategySettings> allSettings = strategySettingsRepository.findAll();
-        if (allSettings.isEmpty()) {
-            log.warn("⚠ WebStrategyFacade: strategy_settings пустая, для chatId={} стратегий нет", chatId);
-            return List.of();
+        if (list.isEmpty()) {
+            log.warn("⚠ strategy_settings пустая → создаём дефолтные, chatId={}", chatId);
+            createDefaultStrategies(chatId);
+            list = settingsRepo.findByChatId(chatId);
         }
 
-        List<UserStrategy> userStrategies = userStrategyRepository.findByUser(user);
+        NetworkType network =
+                userProfileService.findByChatId(chatId) != null
+                        ? userProfileService.findByChatId(chatId).getNetworkType()
+                        : NetworkType.MAINNET;
 
-        return allSettings.stream()
-                .map(settings -> {
-                    StrategyType type = settings.getType();
+        List<StrategyUi> result = new ArrayList<>();
 
-                    UserStrategy us = userStrategies.stream()
-                            .filter(u ->
-                                    u.getStrategySettings() != null &&
-                                    u.getStrategySettings().getType() == type
-                            )
-                            .findFirst()
-                            .orElse(null);
+        for (StrategySettings s : list) {
 
-                    boolean active = us != null && us.isActive();
+            double profit = s.getTotalProfitPct() == null ? 0 : s.getTotalProfitPct().doubleValue();
+            double conf   = s.getMlConfidence()     == null ? 0 : s.getMlConfidence().doubleValue();
 
-                    BigDecimal totalProfitPct = (us != null && us.getTotalProfitPct() != null)
-                            ? us.getTotalProfitPct()
-                            : BigDecimal.ZERO;
+            result.add(new StrategyUi(
+                    s.getType(),
+                    s.isActive(),
+                    getTitle(s.getType()),
+                    getDescription(s.getType()),
+                    s.getChatId(),
+                    s.getSymbol(),
+                    profit,
+                    conf,
+                    network
+            ));
+        }
 
-                    BigDecimal mlConfidence = (us != null && us.getMlConfidence() != null)
-                            ? us.getMlConfidence()
-                            : BigDecimal.ZERO;
+        return result;
+    }
 
-                    String symbol = settings.getSymbol();
-                    if (symbol == null || symbol.isBlank()) {
-                        symbol = "BTCUSDT";
-                    }
+    // =====================================================================
+    // ▶️ СТАРТ / СТОП
+    // =====================================================================
 
-                    String title = resolveTitle(type);
-                    String description = resolveDescription(type);
-
-                    return new StrategyUi(
-                            type,                                // StrategyType
-                            active,                              // boolean active
-                            title,                               // UI title
-                            description,                         // UI description
-                            chatId,                              // Long chatId
-                            symbol,                              // String symbol
-                            totalProfitPct.doubleValue(),        // double totalProfitPct
-                            mlConfidence.doubleValue(),          // double mlConfidence
-                            networkType                          // ✅ NetworkType
-                    );
-                })
-                .toList();
+    @Override
+    public void start(Long chatId, StrategyType type) {
+        orchestrator.startStrategy(chatId, type);
     }
 
     @Override
-    public void start(Long chatId, StrategyType strategyType) {
-        log.info("▶ WebStrategyFacade.start chatId={}, type={}", chatId, strategyType);
-        aiStrategyOrchestrator.startStrategy(chatId, strategyType);
+    public void stop(Long chatId, StrategyType type) {
+        orchestrator.stopStrategy(chatId, type);
     }
 
     @Override
-    public void stop(Long chatId, StrategyType strategyType) {
-        log.info("⏹ WebStrategyFacade.stop chatId={}, type={}", chatId, strategyType);
-        aiStrategyOrchestrator.stopStrategy(chatId, strategyType);
-    }
+    public void toggle(Long chatId, StrategyType type) {
 
-    @Override
-    public void toggle(Long chatId, StrategyType strategyType) {
-        log.info("🔁 WebStrategyFacade.toggle chatId={}, type={}", chatId, strategyType);
+        StrategySettings s = settingsService.getSettings(chatId, type);
 
-        UserProfile user = userProfileRepository.findById(chatId)
-                .orElseThrow(() -> new IllegalArgumentException("UserProfile not found: " + chatId));
+        if (s == null) {
+            s = settingsService.getOrCreate(chatId, type);
+        }
 
-        List<UserStrategy> userStrategies = userStrategyRepository.findByUser(user);
-
-        UserStrategy us = userStrategies.stream()
-                .filter(u ->
-                        u.getStrategySettings() != null &&
-                        u.getStrategySettings().getType() == strategyType
-                )
-                .findFirst()
-                .orElse(null);
-
-        boolean currentlyActive = us != null && us.isActive();
-
-        if (currentlyActive) {
-            stop(chatId, strategyType);
+        if (s.isActive()) {
+            orchestrator.stopStrategy(chatId, type);
+            s.setActive(false);
         } else {
-            start(chatId, strategyType);
+            orchestrator.startStrategy(chatId, type);
+            s.setActive(true);
         }
+
+        settingsService.save(s);
     }
 
-    private String resolveTitle(StrategyType type) {
-        if (type == null) return "UNKNOWN";
+    // =====================================================================
+    // 🎯 СОЗДАНИЕ ДЕФОЛТНЫХ ЗАПИСЕЙ
+    // =====================================================================
+
+    private void createDefaultStrategies(Long chatId) {
+
+        for (StrategyType type : StrategyType.values()) {
+
+            StrategySettings s = StrategySettings.builder()
+                    .chatId(chatId)
+                    .type(type)
+                    .symbol("BTCUSDT")
+                    .timeframe("1h")
+                    .cachedCandlesLimit(500)
+                    .capitalUsd(BigDecimal.valueOf(100))
+                    .commissionPct(BigDecimal.valueOf(0.05))
+                    .takeProfitPct(BigDecimal.valueOf(1))
+                    .stopLossPct(BigDecimal.valueOf(1))
+                    .riskPerTradePct(BigDecimal.valueOf(1))
+                    .dailyLossLimitPct(BigDecimal.valueOf(20))
+                    .reinvestProfit(false)
+                    .leverage(1)
+                    .active(false)
+                    .totalProfitPct(BigDecimal.ZERO)
+                    .mlConfidence(BigDecimal.ZERO)
+                    .build();
+
+            settingsRepo.save(s);
+        }
+
+        log.info("✔ Созданы дефолтные StrategySettings для chatId={}", chatId);
+    }
+
+    // =====================================================================
+    // 📝 UI labels
+    // =====================================================================
+
+    private String getTitle(StrategyType type) {
         return switch (type) {
             case SMART_FUSION -> "Smart Fusion AI";
+            case SCALPING -> "Scalping";
             case FIBONACCI_GRID -> "Fibonacci Grid";
-            case SCALPING -> "Scalping Pro";
-            case ML_INVEST -> "ML Invest";
+            case RSI_EMA -> "RSI + EMA";
             default -> type.name();
         };
     }
 
-    private String resolveDescription(StrategyType type) {
-        if (type == null) return "Автоматическая торговая стратегия.";
+    private String getDescription(StrategyType type) {
         return switch (type) {
-            case SMART_FUSION ->
-                    "Мультиуровневая AI-стратегия с фильтрацией шума и RL-оркестратором.";
-            case FIBONACCI_GRID ->
-                    "Сеточная стратегия по уровням Фибоначчи с адаптивным TP/SL.";
-            case SCALPING ->
-                    "Быстрые сделки по импульсу цены и объёмам.";
-            case ML_INVEST ->
-                    "Среднесрочные позиции по сигналам ML-модели.";
-            default -> "Автоматическая торговая стратегия.";
+            case SMART_FUSION -> "AI стратегия Multi-Filter + ML + ATR";
+            case SCALPING -> "Скальпинг 30-300 сек";
+            case FIBONACCI_GRID -> "Сетка уровней Фибоначчи";
+            case RSI_EMA -> "Индикаторы RSI/EMA";
+            default -> "Стратегия " + type.name();
         };
     }
 }

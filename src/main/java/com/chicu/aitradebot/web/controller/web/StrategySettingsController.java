@@ -4,6 +4,7 @@ import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.ExchangeSettings;
 import com.chicu.aitradebot.domain.StrategySettings;
+import com.chicu.aitradebot.exchange.model.BinanceConnectionStatus;
 import com.chicu.aitradebot.exchange.service.ExchangeSettingsService;
 import com.chicu.aitradebot.service.StrategySettingsService;
 import lombok.RequiredArgsConstructor;
@@ -12,7 +13,7 @@ import org.springframework.stereotype.Controller;
 import org.springframework.ui.Model;
 import org.springframework.web.bind.annotation.*;
 
-import java.util.Map;
+import java.util.*;
 
 @Slf4j
 @Controller
@@ -23,74 +24,193 @@ public class StrategySettingsController {
     private final StrategySettingsService strategySettingsService;
     private final ExchangeSettingsService exchangeSettingsService;
 
-    // ===============================================================
-    // GET — открыть страницу настройки стратегии
-    // ===============================================================
+    // =========================================================================
+    // GET — ОТКРЫТИЕ СТРАНИЦЫ
+    // =========================================================================
     @GetMapping
     public String openSettings(
             @PathVariable("type") String type,
             @RequestParam("chatId") long chatId,
+            @RequestParam(value = "exchange", required = false) String exchangeParam,
+            @RequestParam(value = "network", required = false) NetworkType networkParam,
             Model model
     ) {
+
         StrategyType strategyType = StrategyType.valueOf(type);
 
-        // --- 1. Грузим StrategySettings ---
+        // 1) Загружаем стратегию
         StrategySettings strategy = strategySettingsService.getOrCreate(chatId, strategyType);
 
-        // --- 2. Грузим ExchangeSettings (по умолчанию BINANCE + MAINNET) ---
+        // 2) Список поддерживаемых бирж
+        List<String> availableExchanges = List.of("BINANCE", "BYBIT", "OKX");
+
+        // 3) Все сохранённые ключи пользователя
+        List<ExchangeSettings> userExchanges =
+                exchangeSettingsService.findAllByChatId(chatId);
+
+        // ----------------------------------------------------------
+        // 4) Определяем выбранную биржу + сеть
+        // ----------------------------------------------------------
+        String selectedExchange = exchangeParam;
+        NetworkType selectedNetwork = networkParam;
+
+        if (selectedExchange == null || selectedNetwork == null) {
+
+            Optional<ExchangeSettings> active = userExchanges.stream()
+                    .filter(ExchangeSettings::isEnabled)
+                    .findFirst();
+
+            ExchangeSettings picked = active.orElse(
+                    userExchanges.isEmpty() ? null : userExchanges.get(0)
+            );
+
+            if (picked != null) {
+                if (selectedExchange == null) selectedExchange = picked.getExchange();
+                if (selectedNetwork == null) selectedNetwork = picked.getNetwork();
+            }
+        }
+
+        if (selectedExchange == null) selectedExchange = "BINANCE";
+        if (selectedNetwork == null) selectedNetwork = NetworkType.MAINNET;
+
+        // ----------------------------------------------------------
+        // 5) ExchangeSettings строго под выбранную биржу/сеть
+        // ----------------------------------------------------------
         ExchangeSettings exchangeSettings =
-                exchangeSettingsService.getOrCreate(chatId, "BINANCE", NetworkType.MAINNET);
+                exchangeSettingsService.getOrCreate(chatId, selectedExchange, selectedNetwork);
 
-        // --- 3. Тест подключения к бирже ---
-        boolean connectionOk = exchangeSettingsService.testConnection(exchangeSettings);
+        // ----------------------------------------------------------
+        // 6) Проверяем ключи
+        // ----------------------------------------------------------
+        boolean hasKeys =
+                notBlank(exchangeSettings.getApiKey()) &&
+                notBlank(exchangeSettings.getApiSecret());
 
-        // --- 4. Генерируем динамические поля стратегии ---
-        Map<String, Object> dynamicFields = Map.of(); // временно пусто
+        // ----------------------------------------------------------
+        // 7) Проверка подключения
+        // ----------------------------------------------------------
+        BinanceConnectionStatus diagnostics = null;
+        boolean connectionOk = false;
 
-        // --- 5. Передаём всё в шаблон ---
+        if (selectedExchange.equalsIgnoreCase("BINANCE") && hasKeys) {
+
+            diagnostics = exchangeSettingsService.testConnectionDetailed(exchangeSettings);
+
+            if (diagnostics != null) {
+                connectionOk = diagnostics.isOk();
+            }
+
+            log.info("🔍 Diagnostics for BINANCE {}: {}", selectedNetwork, diagnostics);
+
+        } else {
+            connectionOk = hasKeys && exchangeSettingsService.testConnection(exchangeSettings);
+        }
+
+        // ----------------------------------------------------------
+        // 8) Передаём всё в UI
+        // ----------------------------------------------------------
         model.addAttribute("chatId", chatId);
         model.addAttribute("type", strategyType);
         model.addAttribute("strategy", strategy);
 
+        model.addAttribute("availableExchanges", availableExchanges);
+        model.addAttribute("selectedExchange", selectedExchange);
+        model.addAttribute("selectedNetwork", selectedNetwork);
+
         model.addAttribute("exchangeSettings", exchangeSettings);
         model.addAttribute("connectionOk", connectionOk);
 
-        model.addAttribute("dynamicFields", dynamicFields);
+        model.addAttribute("diagnostics", diagnostics);
+        model.addAttribute("dynamicFields", Map.of());
 
-        log.debug("⚙ Loaded settings: chatId={}, type={}, strategyId={}, exchangeId={}",
-                chatId, strategyType, strategy.getId(), exchangeSettings.getId());
+        log.debug(
+                "⚙ Unified settings loaded: chatId={}, strategy={}, exchange={}@{}, enabled={}",
+                chatId, strategyType, selectedExchange, selectedNetwork, connectionOk
+        );
 
         return "strategies/unified-settings";
     }
 
-    // ===============================================================
-    // POST — сохранить настройки
-    // ===============================================================
+    // =========================================================================
+    // POST — СОХРАНЕНИЕ НАСТРОЕК
+    // =========================================================================
     @PostMapping
     public String saveSettings(
             @PathVariable("type") String type,
             @RequestParam("chatId") long chatId,
-            @ModelAttribute("strategy") StrategySettings strategy,
+            @ModelAttribute("strategy") StrategySettings posted,
             @RequestParam Map<String, String> params
     ) {
+
         StrategyType strategyType = StrategyType.valueOf(type);
-        strategy.setType(strategyType);
 
-        // --- 1. Сохраняем StrategySettings ---
-        strategySettingsService.save(strategy);
+        // Загружаем старую стратегию (чтобы не затронуть active!)
+        StrategySettings existing = strategySettingsService.getOrCreate(chatId, strategyType);
 
-        // --- 2. Сохраняем ExchangeSettings ---
-        ExchangeSettings ex = new ExchangeSettings();
-        ex.setChatId(chatId);
-        ex.setExchange(params.get("exchange"));
-        ex.setNetwork(NetworkType.valueOf(params.get("network")));
+        boolean oldActive = existing.isActive();
+
+        // Обновляем поля
+        existing.setSymbol(posted.getSymbol());
+        existing.setTimeframe(posted.getTimeframe());
+        existing.setCachedCandlesLimit(posted.getCachedCandlesLimit());
+        existing.setCapitalUsd(posted.getCapitalUsd());
+        existing.setCommissionPct(posted.getCommissionPct());
+        existing.setReinvestProfit(posted.isReinvestProfit());
+        existing.setTakeProfitPct(posted.getTakeProfitPct());
+        existing.setStopLossPct(posted.getStopLossPct());
+        existing.setRiskPerTradePct(posted.getRiskPerTradePct());
+        existing.setDailyLossLimitPct(posted.getDailyLossLimitPct());
+        existing.setLeverage(posted.getLeverage());
+
+        // ВОССТАНАВЛИВАЕМ ПРЕЖНЕЕ active
+        existing.setActive(oldActive);
+
+        // Сохраняем
+        strategySettingsService.save(existing);
+
+        // ----------------------------------------------------------
+        // Обновляем данные биржи
+        // ----------------------------------------------------------
+        String exchangeName = params.get("exchange");
+        NetworkType networkType = NetworkType.valueOf(params.get("network"));
+
+        ExchangeSettings ex =
+                exchangeSettingsService.getOrCreate(chatId, exchangeName, networkType);
+
         ex.setApiKey(params.get("apiKey"));
         ex.setApiSecret(params.get("apiSecret"));
         ex.setPassphrase(params.get("passphrase"));
-        ex.setEnabled(true);
 
+        boolean hasKeys =
+                notBlank(ex.getApiKey()) &&
+                        notBlank(ex.getApiSecret());
+
+        boolean connectionOk = false;
+
+        if (exchangeName.equalsIgnoreCase("BINANCE") && hasKeys) {
+
+            BinanceConnectionStatus diag =
+                    exchangeSettingsService.testConnectionDetailed(ex);
+
+            connectionOk = (diag != null && diag.isOk());
+
+        } else {
+            connectionOk = hasKeys && exchangeSettingsService.testConnection(ex);
+        }
+
+        ex.setEnabled(connectionOk);
         exchangeSettingsService.save(ex);
 
-        return "redirect:/strategies";
+        log.info("💾 Saved exchange settings: {}@{}, enabled={}",
+                exchangeName, networkType, ex.isEnabled());
+
+        return "redirect:/strategies/" + type + "/unified-settings"
+                + "?chatId=" + chatId
+                + "&exchange=" + exchangeName
+                + "&network=" + networkType;
+    }
+
+    private static boolean notBlank(String s) {
+        return s != null && !s.trim().isEmpty();
     }
 }

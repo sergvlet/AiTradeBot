@@ -8,66 +8,79 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.math.BigDecimal;
 import java.util.List;
 
-/**
- * Базовый сервис работы с таблицей StrategySettings.
- * Сейчас реализован минимально: без привязки к chatId,
- * просто оперирует записями по типу стратегии.
- *
- * Позже сюда можно будет добавить:
- *  - связи с пользователем / chatId
- *  - маппинг на конкретные таблицы настроек стратегий (SmartFusion, Scalping, Fibonacci и т.д.)
- */
 @Service
 @RequiredArgsConstructor
 @Slf4j
 public class StrategySettingsServiceImpl implements StrategySettingsService {
 
-    private final StrategySettingsRepository repository;
+    private final StrategySettingsRepository repo;
 
     @Override
-    public StrategySettings save(StrategySettings settings) {
-        return repository.save(settings);
+    public StrategySettings save(StrategySettings s) {
+        return repo.save(s);
     }
 
-    /**
-     * ⚠️ ВРЕМЕННО:
-     * chatId пока НЕ используется, так как в StrategySettingsRepository
-     * нет методов findByChatId..., и сама сущность StrategySettings
-     * (вероятно) пока не содержит поля chatId.
-     *
-     * Поэтому просто берём первую запись по типу стратегии.
-     */
+    @Override
+    public List<StrategySettings> findAllByChatId(long chatId) {
+        return repo.findByChatId(chatId);
+    }
+
     @Override
     public StrategySettings getSettings(long chatId, StrategyType type) {
-        List<StrategySettings> list = repository.findByType(type);
-        StrategySettings result = list.isEmpty() ? null : list.get(0);
 
-        if (result == null) {
-            log.debug("⚙️ StrategySettings не найдены: type={}, chatId={}", type, chatId);
-        } else {
-            log.debug("⚙️ StrategySettings найдены: id={}, type={}, chatId={}",
-                    result.getId(), result.getType(), chatId);
+        List<StrategySettings> list = repo.findByChatIdAndType(chatId, type);
+
+        if (list.isEmpty()) return null;
+
+        if (list.size() > 1) {
+            log.error("❌ НАЙДЕНО {} StrategySettings для chatId={} type={}. Лишние будут удалены.",
+                    list.size(), chatId, type);
+
+            StrategySettings keep = list.get(0);
+
+            for (int i = 1; i < list.size(); i++) {
+                repo.delete(list.get(i));
+            }
+
+            return keep;
         }
 
-        return result;
+        return list.get(0);
     }
 
-    /**
-     * ⚠️ ВРЕМЕННО:
-     * Если настроек нет — просто логируем и возвращаем null.
-     * Реальное auto-create будет сделано позже, когда будет
-     * понятна структура StrategySettings (symbol, параметры и т.д.).
-     */
     @Override
     public StrategySettings getOrCreate(long chatId, StrategyType type) {
-        StrategySettings existing = getSettings(chatId, type);
-        if (existing != null) {
-            return existing;
-        }
 
-        log.warn("⚠️ getOrCreate: нет StrategySettings для type={} chatId={}, авто-создание пока не реализовано", type, chatId);
-        return null;
+        StrategySettings existing = getSettings(chatId, type);
+        if (existing != null) return existing;
+
+        log.warn("⚠ Создаём новый StrategySettings (chatId={}, type={})", chatId, type);
+
+        StrategySettings s = StrategySettings.builder()
+                .chatId(chatId)
+                .type(type)
+
+                .symbol("BTCUSDT")
+                .timeframe("1m")
+                .cachedCandlesLimit(500)
+
+                .capitalUsd(BigDecimal.valueOf(100))
+                .commissionPct(BigDecimal.valueOf(0.05))
+
+                .takeProfitPct(BigDecimal.valueOf(1))
+                .stopLossPct(BigDecimal.valueOf(1))
+                .riskPerTradePct(BigDecimal.valueOf(1))
+                .dailyLossLimitPct(BigDecimal.valueOf(20))
+
+                .reinvestProfit(false)
+                .leverage(1)
+                .active(false)
+
+                .build();
+
+        return repo.save(s);
     }
 }
