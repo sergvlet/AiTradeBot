@@ -3,43 +3,79 @@
 <body th:replace="~{layout :: layout(~{::title}, ~{::section}, 'strategies')}">
 
 <section>
+
+  <style>
+    .strategy-card {
+      background: #15171a !important;
+      border: 1px solid #2b2e33;
+      border-radius: 14px;
+      color: #f1f1f1 !important;
+      transition: .25s;
+    }
+
+    .strategy-card:hover {
+      transform: translateY(-3px);
+      border-color: #3c8aff;
+      box-shadow: 0 14px 30px rgba(0, 0, 0, .55);
+    }
+
+    .strategy-title {
+      color: #f9fafb !important;
+      font-weight: 600;
+    }
+
+    .strategy-card .small {
+      color: #a0aec0 !important;
+    }
+
+    .pnl-green {
+      color: #14c784 !important;
+    }
+
+    .pnl-red {
+      color: #ff5b5b !important;
+    }
+  </style>
+
   <h2 class="fw-bold mb-4">
     <i class="bi bi-diagram-3"></i> Стратегии
   </h2>
 
   <div class="row g-4">
 
-    <!-- Карточка стратегии -->
+    <!-- ОДНА КАРТОЧКА НА СТРАТЕГИЮ -->
     <div class="col-md-4 col-sm-6" th:each="s : ${strategies}">
 
-      <div class="card card-theme h-100 shadow-sm border-0"
+      <div class="card strategy-card h-100 shadow-sm"
            th:classappend="${s.active} ? ' border-success border-2' : ''">
 
         <div class="card-body text-center">
 
           <!-- Название стратегии -->
-          <h5 class="card-title fw-semibold mb-2"
-              th:text="${s.title}">Strategy</h5>
+          <h5 class="strategy-title mb-2" th:text="${s.title}">Strategy</h5>
 
           <!-- Статус -->
           <span class="badge px-3 py-2 mb-2"
-                th:classappend="${s.active} ? ' bg-success' : ' bg-secondary'"
-                th:text="${s.active} ? '🟢 Активна' : '⚫ Остановлена'">
-            ⚫ Остановлена
-          </span>
+                th:classappend="${s.active} ? ' bg-success' : ' bg-secondary'">
+                        <span th:text="${s.active} ? '🟢 Активна' : '⚫ Остановлена'">⚫ Остановлена</span>
+                    </span>
 
-          <!-- Информация -->
-          <div class="small text-muted">
-            <div>PnL: <span th:text="${s.totalProfitPct}">—</span>%</div>
-            <div>ML доверие: <span th:text="${s.mlConfidence}">—</span></div>
-            <div>Сеть: <span th:text="${s.networkType}">MAINNET</span></div>
-            <div>Пара: <span th:text="${s.symbol}">BTCUSDT</span></div>
+          <!-- Основная инфа -->
+          <div class="small">
+            <div>
+              PnL:
+              <span th:text="${s.totalProfitPct}"
+                    th:classappend="${s.totalProfitPct >= 0} ? ' pnl-green' : ' pnl-red'">0</span>%
+            </div>
+            <div>ML доверие: <strong th:text="${s.mlConfidence}">0</strong></div>
+            <div>Пара: <strong th:text="${s.symbol}">BTCUSDT</strong></div>
+            <div>Сеть: <strong th:text="${s.networkType}">MAINNET</strong></div>
           </div>
 
-          <!-- Кнопки -->
+          <!-- КНОПКИ -->
           <div class="mt-4 d-grid gap-2">
 
-            <!-- 🚀 Запуск / Остановка -->
+            <!-- 🚀 Запустить / Остановить -->
             <button type="button"
                     class="btn toggle-btn"
                     th:classappend="${s.active} ? ' btn-outline-danger' : ' btn-outline-success'"
@@ -58,23 +94,21 @@
             </a>
 
             <!-- ⚙️ Настройки -->
-            <a th:href="@{'/strategies/' + ${s.strategyType} + '/unified-settings'(chatId=${s.chatId})}"
-               class="btn btn-outline-primary">
-              <i class="bi bi-gear"></i> Настроить
+            <a class="btn btn-outline-primary"
+               th:href="@{'/strategies/' + ${s.strategyType} + '/unified-settings'(chatId=${s.chatId})}">
+              <i class="bi bi-gear"></i> Настройки
             </a>
-
 
           </div>
 
         </div>
       </div>
+
     </div>
 
   </div>
 
-  <!-- ===========================
-       JS TOGGLE
-  ============================ -->
+  <!-- =========================== JS: TOGGLE =========================== -->
   <script>
     document.addEventListener("DOMContentLoaded", () => {
 
@@ -90,66 +124,57 @@
 
           const card = btn.closest(".card");
           const badge = card.querySelector(".badge");
-
           const icon = btn.querySelector("i");
           const label = btn.querySelector("span");
 
           btn.disabled = true;
 
-          if (icon) {
-            icon.className = active ? "bi bi-stop-fill" : "bi bi-play-fill";
-          }
-          if (label) {
-            label.textContent = active ? " Останавливаем..." : " Запускаем...";
-          }
+          // временная анимация
+          label.textContent = active ? "Останавливаем..." : "Запускаем...";
+          icon.className = "bi bi-hourglass-split";
 
           try {
-            const res = await fetch(
+            const response = await fetch(
                     `/api/strategy/toggle?chatId=${chatId}&type=${type}&symbol=${symbol}`,
-                    {
-                      method: "POST",
-                      headers: { "Accept": "application/json" }
-                    }
+                    { method: "POST" }
             );
 
-            const text = await res.text();
-            const data = JSON.parse(text || "{}");
+            const data = await response.json();
 
-            if (!res.ok || data.status === "error") {
-              throw new Error(data.message || "Ошибка при переключении");
+            if (!response.ok || data.status === "error") {
+              throw new Error(data.message || "Ошибка переключения");
             }
 
             const started = data.status === "started";
             btn.dataset.active = String(started);
 
+            // кнопка
             btn.classList.toggle("btn-outline-success", !started);
             btn.classList.toggle("btn-outline-danger", started);
+            icon.className = started ? "bi bi-stop-fill" : "bi bi-play-fill";
+            label.textContent = started ? "Остановить" : "Запустить";
 
-            if (icon) {
-              icon.className = started ? "bi bi-stop-fill" : "bi bi-play-fill";
-            }
-            if (label) {
-              label.textContent = started ? "Остановить" : "Запустить";
-            }
-
+            // бейдж
             if (badge) {
               badge.textContent = started ? "🟢 Активна" : "⚫ Остановлена";
               badge.classList.toggle("bg-success", started);
               badge.classList.toggle("bg-secondary", !started);
             }
 
+            // твои кастомные алерты, если есть
             if (window.showToast) {
               showToast(started ? "Стратегия запущена" : "Стратегия остановлена", started);
             }
 
+            // если бек отдаст redirect
             if (data.redirect) {
               window.location.href = data.redirect;
             }
 
           } catch (err) {
-            console.error("Ошибка:", err);
+            console.error("Ошибка переключения стратегии", err);
             if (window.showToast) {
-              showToast("Ошибка при переключении стратегии", false);
+              showToast("Ошибка переключения стратегии", false);
             }
           } finally {
             btn.disabled = false;

@@ -2,20 +2,23 @@ package com.chicu.aitradebot.web.facade.impl;
 
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
+import com.chicu.aitradebot.domain.ExchangeSettings;
 import com.chicu.aitradebot.domain.StrategySettings;
+import com.chicu.aitradebot.exchange.service.ExchangeSettingsService;
+import com.chicu.aitradebot.orchestrator.AiStrategyOrchestrator;
 import com.chicu.aitradebot.repository.StrategySettingsRepository;
 import com.chicu.aitradebot.service.StrategySettingsService;
 import com.chicu.aitradebot.service.UserProfileService;
-import com.chicu.aitradebot.orchestrator.AiStrategyOrchestrator;
 import com.chicu.aitradebot.web.facade.WebStrategyFacade;
-
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Optional;
 
 @Slf4j
 @Component
@@ -25,79 +28,122 @@ public class WebStrategyFacadeImpl implements WebStrategyFacade {
     private final StrategySettingsRepository settingsRepo;
     private final StrategySettingsService settingsService;
     private final UserProfileService userProfileService;
+    private final ExchangeSettingsService exchangeSettingsService;
     private final AiStrategyOrchestrator orchestrator;
 
     // =====================================================================
-    // 📌 Получение списка стратегий для UI
+    // 📋 Список стратегий для страницы /strategies
     // =====================================================================
-
     @Override
     public List<StrategyUi> getStrategies(Long chatId) {
 
-        List<StrategySettings> list = settingsRepo.findByChatId(chatId);
+        // 1) Берём настройки стратегий строго по chatId
+        List<StrategySettings> list = settingsService.findAllByChatId(chatId);
 
         if (list.isEmpty()) {
             log.warn("⚠ strategy_settings пустая → создаём дефолтные, chatId={}", chatId);
             createDefaultStrategies(chatId);
-            list = settingsRepo.findByChatId(chatId);
+            list = settingsService.findAllByChatId(chatId);
         }
 
-        NetworkType network =
-                userProfileService.findByChatId(chatId) != null
-                        ? userProfileService.findByChatId(chatId).getNetworkType()
-                        : NetworkType.MAINNET;
+        // 2) Определяем основную биржу/сеть пользователя
+        NetworkType networkType = resolvePrimaryNetwork(chatId);
 
         List<StrategyUi> result = new ArrayList<>();
 
         for (StrategySettings s : list) {
 
-            double profit = s.getTotalProfitPct() == null ? 0 : s.getTotalProfitPct().doubleValue();
-            double conf   = s.getMlConfidence()     == null ? 0 : s.getMlConfidence().doubleValue();
+            double profit = s.getTotalProfitPct() == null
+                    ? 0.0
+                    : s.getTotalProfitPct().doubleValue();
+
+            double conf = s.getMlConfidence() == null
+                    ? 0.0
+                    : s.getMlConfidence().doubleValue();
+
+            boolean active = orchestrator.isActive(chatId, s.getType());
 
             result.add(new StrategyUi(
                     s.getType(),
-                    s.isActive(),
+                    active,
                     getTitle(s.getType()),
                     getDescription(s.getType()),
-                    s.getChatId(),
+                    chatId,
                     s.getSymbol(),
                     profit,
                     conf,
-                    network
+                    networkType
             ));
         }
+
+        // 3) Активные стратегии наверх
+        result.sort(Comparator.comparing(StrategyUi::active).reversed());
 
         return result;
     }
 
-    // =====================================================================
-    // ▶️ СТАРТ / СТОП
-    // =====================================================================
+    /**
+     * Определяем "главную" сеть пользователя по его биржевым подключениями.
+     * 1) Если есть включённое подключение — его network.
+     * 2) Иначе берём первое.
+     * 3) Если вообще нет записей — MAINNET.
+     */
+    private NetworkType resolvePrimaryNetwork(Long chatId) {
+        List<ExchangeSettings> exchanges = exchangeSettingsService.findAllByChatId(chatId);
 
-    @Override
-    public void start(Long chatId, StrategyType type) {
-        orchestrator.startStrategy(chatId, type);
-    }
-
-    @Override
-    public void stop(Long chatId, StrategyType type) {
-        orchestrator.stopStrategy(chatId, type);
-    }
-
-    @Override
-    public void toggle(Long chatId, StrategyType type) {
-
-        StrategySettings s = settingsService.getSettings(chatId, type);
-
-        if (s == null) {
-            s = settingsService.getOrCreate(chatId, type);
+        if (exchanges.isEmpty()) {
+            return NetworkType.MAINNET;
         }
 
-        if (s.isActive()) {
-            orchestrator.stopStrategy(chatId, type);
+        Optional<ExchangeSettings> enabled = exchanges.stream()
+                .filter(ExchangeSettings::isEnabled)
+                .findFirst();
+
+        return enabled
+                .map(ExchangeSettings::getNetwork)
+                .orElseGet(() -> exchanges.get(0).getNetwork());
+    }
+
+    // =====================================================================
+    // ▶️ Запуск/остановка стратегий
+    // =====================================================================
+
+    @Override
+    public void start(Long chatId, StrategyType strategyType) {
+        log.info("▶️ Web → START strategy {} for chatId={}", strategyType, chatId);
+
+        StrategySettings s = settingsService.getOrCreate(chatId, strategyType);
+        s.setActive(true);
+        settingsService.save(s);
+
+        orchestrator.startStrategy(chatId, strategyType);
+    }
+
+    @Override
+    public void stop(Long chatId, StrategyType strategyType) {
+        log.info("⏹ Web → STOP strategy {} for chatId={}", strategyType, chatId);
+
+        StrategySettings s = settingsService.getOrCreate(chatId, strategyType);
+        s.setActive(false);
+        settingsService.save(s);
+
+        orchestrator.stopStrategy(chatId, strategyType);
+    }
+
+    @Override
+    public void toggle(Long chatId, StrategyType strategyType) {
+
+        StrategySettings s = settingsService.getOrCreate(chatId, strategyType);
+
+        boolean nowActive = orchestrator.isActive(chatId, strategyType);
+
+        if (nowActive) {
+            log.info("⏸ TOGGLE: останавливаем {} для chatId={}", strategyType, chatId);
+            orchestrator.stopStrategy(chatId, strategyType);
             s.setActive(false);
         } else {
-            orchestrator.startStrategy(chatId, type);
+            log.info("▶️ TOGGLE: запускаем {} для chatId={}", strategyType, chatId);
+            orchestrator.startStrategy(chatId, strategyType);
             s.setActive(true);
         }
 
@@ -105,18 +151,24 @@ public class WebStrategyFacadeImpl implements WebStrategyFacade {
     }
 
     // =====================================================================
-    // 🎯 СОЗДАНИЕ ДЕФОЛТНЫХ ЗАПИСЕЙ
+    // ⚙ Создание дефолтных стратегий (одна запись на type для chatId)
     // =====================================================================
 
     private void createDefaultStrategies(Long chatId) {
 
         for (StrategyType type : StrategyType.values()) {
 
+            // если вдруг уже есть — не дублируем
+            StrategySettings existing = settingsService.getSettings(chatId, type);
+            if (existing != null) {
+                continue;
+            }
+
             StrategySettings s = StrategySettings.builder()
                     .chatId(chatId)
                     .type(type)
                     .symbol("BTCUSDT")
-                    .timeframe("1h")
+                    .timeframe("1m")
                     .cachedCandlesLimit(500)
                     .capitalUsd(BigDecimal.valueOf(100))
                     .commissionPct(BigDecimal.valueOf(0.05))
@@ -138,7 +190,7 @@ public class WebStrategyFacadeImpl implements WebStrategyFacade {
     }
 
     // =====================================================================
-    // 📝 UI labels
+    // Текстовые названия и описания для UI
     // =====================================================================
 
     private String getTitle(StrategyType type) {
@@ -154,7 +206,7 @@ public class WebStrategyFacadeImpl implements WebStrategyFacade {
     private String getDescription(StrategyType type) {
         return switch (type) {
             case SMART_FUSION -> "AI стратегия Multi-Filter + ML + ATR";
-            case SCALPING -> "Скальпинг 30-300 сек";
+            case SCALPING -> "Скальпинг 30–300 сек";
             case FIBONACCI_GRID -> "Сетка уровней Фибоначчи";
             case RSI_EMA -> "Индикаторы RSI/EMA";
             default -> "Стратегия " + type.name();
