@@ -63,7 +63,7 @@ public class ExchangeDiagnosticsApiController {
         ExchangeSettings s = opt.get();
 
         // 2. Получаем клиента Binance для нужной сети из фабрики
-        ExchangeClient client = clientFactory.getClient("BINANCE", network);
+        ExchangeClient client = clientFactory.get("BINANCE", network);
 
         if (!(client instanceof BinanceExchangeClient binanceClient)) {
             log.error("❌ Клиент для BINANCE не является BinanceExchangeClient: {}", client.getClass().getName());

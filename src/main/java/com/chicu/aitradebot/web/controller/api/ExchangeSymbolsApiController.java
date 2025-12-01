@@ -29,7 +29,7 @@ public class ExchangeSymbolsApiController {
             @RequestParam(defaultValue = "MAINNET") NetworkType networkType
     ) {
         try {
-            ExchangeClient client = clientFactory.getClient(exchange, networkType); // ✅ исправлено
+            ExchangeClient client = clientFactory.get(exchange, networkType); // ✅ исправлено
             List<String> symbols = client.getAllSymbols();
             log.info("📊 Загружено {} пар с {} ({})", symbols.size(), exchange, networkType);
             return ResponseEntity.ok(symbols);

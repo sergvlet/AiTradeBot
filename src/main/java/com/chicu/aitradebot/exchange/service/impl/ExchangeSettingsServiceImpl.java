@@ -28,12 +28,10 @@ import java.util.Optional;
 public class ExchangeSettingsServiceImpl implements ExchangeSettingsService {
 
     private final ExchangeSettingsRepository repository;
-
-    /** Лёгкий HTTP-клиент */
     private final RestTemplate restTemplate = new RestTemplate();
 
     // ========================================================================
-    // SECTION 1 — getOrCreate
+    // getOrCreate
     // ========================================================================
     @Override
     @Transactional
@@ -42,37 +40,61 @@ public class ExchangeSettingsServiceImpl implements ExchangeSettingsService {
                 .orElseGet(() -> {
                     ExchangeSettings s = new ExchangeSettings();
                     s.setChatId(chatId);
-                    s.setExchange(exchange);
+                    s.setExchange(exchange.toUpperCase());
                     s.setNetwork(network);
 
                     s.setApiKey("");
                     s.setApiSecret("");
                     s.setPassphrase("");
                     s.setSubAccount("");
-
                     s.setEnabled(false);
+
                     s.setCreatedAt(Instant.now());
                     s.setUpdatedAt(Instant.now());
 
                     repository.save(s);
-                    log.info("🆕 Созданы новые ExchangeSettings {}@{} (chatId={})",
+
+                    log.info("🆕 Созданы ExchangeSettings {}@{} (chatId={})",
                             exchange, network, chatId);
+
                     return s;
                 });
     }
 
     // ========================================================================
-    // SECTION 2 — получение
+    // getOrThrow (старый — MAINNET)
     // ========================================================================
     @Override
     public ExchangeSettings getOrThrow(Long chatId, String exchange) {
         return repository.findByChatIdAndExchangeAndNetwork(chatId, exchange, NetworkType.MAINNET)
-                .orElseThrow(() -> new IllegalStateException(
-                        "Настройки не найдены: chatId=" + chatId + ", exchange=" + exchange));
+                .orElseThrow(() ->
+                        new IllegalStateException(
+                                "Настройки не найдены: chatId=" + chatId + ", exchange=" + exchange
+                        )
+                );
     }
 
     // ========================================================================
-    // SECTION 3 — сохранение
+    // getOrThrow (НОВЫЙ — с NetworkType)
+    // ========================================================================
+    @Override
+    public ExchangeSettings getOrThrow(Long chatId, String exchange, NetworkType network) {
+
+        return repository.findByChatIdAndExchangeAndNetwork(
+                chatId,
+                exchange.toUpperCase(),
+                network
+        ).orElseThrow(() ->
+                new IllegalStateException(
+                        "Настройки не найдены: chatId=" + chatId +
+                                ", exchange=" + exchange +
+                                ", network=" + network
+                )
+        );
+    }
+
+    // ========================================================================
+    // save
     // ========================================================================
     @Override
     @Transactional
@@ -88,7 +110,7 @@ public class ExchangeSettingsServiceImpl implements ExchangeSettingsService {
         ExchangeSettings target = existingOpt.orElseGet(ExchangeSettings::new);
 
         target.setChatId(incoming.getChatId());
-        target.setExchange(incoming.getExchange());
+        target.setExchange(incoming.getExchange().toUpperCase());
         target.setNetwork(incoming.getNetwork());
         target.setApiKey(incoming.getApiKey());
         target.setApiSecret(incoming.getApiSecret());
@@ -110,7 +132,7 @@ public class ExchangeSettingsServiceImpl implements ExchangeSettingsService {
     }
 
     // ========================================================================
-    // SECTION 4 — util read/delete
+    // find-all
     // ========================================================================
     @Override
     public List<ExchangeSettings> findAllByChatId(Long chatId) {
@@ -146,7 +168,7 @@ public class ExchangeSettingsServiceImpl implements ExchangeSettingsService {
     }
 
     // ========================================================================
-    // SECTION 5 — testConnection (общий)
+    // testConnection
     // ========================================================================
     @Override
     public boolean testConnection(ExchangeSettings s) {
@@ -160,15 +182,16 @@ public class ExchangeSettingsServiceImpl implements ExchangeSettingsService {
         return switch (s.getExchange().toUpperCase()) {
             case "BINANCE" -> testBinanceConnection(s);
             case "BYBIT"   -> testBybitConnection(s);
-            case "OKX"     -> false; // пока заглушка
+            case "OKX"     -> false;
             default -> false;
         };
     }
 
     // ========================================================================
-    // BINANCE simple test
+    // Binance simple test
     // ========================================================================
     private boolean testBinanceConnection(ExchangeSettings s) {
+
         String baseUrl = s.getNetwork() == NetworkType.TESTNET
                 ? "https://testnet.binance.vision"
                 : "https://api.binance.com";
@@ -194,7 +217,7 @@ public class ExchangeSettingsServiceImpl implements ExchangeSettingsService {
     }
 
     // ========================================================================
-    // BYBIT simple test
+    // Bybit simple test
     // ========================================================================
     private boolean testBybitConnection(ExchangeSettings s) {
         String baseUrl = s.getNetwork() == NetworkType.TESTNET
@@ -232,7 +255,7 @@ public class ExchangeSettingsServiceImpl implements ExchangeSettingsService {
     }
 
     // ========================================================================
-    // SECTION 6 — Binance DETAILED DIAGNOSTICS
+    // Detailed diagnostics
     // ========================================================================
     @Override
     public BinanceConnectionStatus testConnectionDetailed(ExchangeSettings settings) {
@@ -249,8 +272,7 @@ public class ExchangeSettingsServiceImpl implements ExchangeSettingsService {
         }
 
         try {
-            BinanceExchangeClient client =
-                    new BinanceExchangeClient( this);
+            BinanceExchangeClient client = new BinanceExchangeClient(this);
 
             return client.extendedTestConnection(
                     settings.getApiKey(),

@@ -36,7 +36,7 @@ public class MarketServiceImpl implements MarketService {
      * (Публичные /api/v3/klines и /ticker/price не требуют ключей.)
      */
     private ExchangeClient client() {
-        return exchangeClientFactory.getClient("BINANCE", NetworkType.MAINNET);
+        return exchangeClientFactory.get("BINANCE", NetworkType.MAINNET);
     }
 
     // -----------------------------------------------------

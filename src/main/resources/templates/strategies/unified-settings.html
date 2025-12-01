@@ -223,11 +223,18 @@
 
             <div class="row g-4">
                 <div class="col-md-4">
-                    <label class="form-label">Капитал (USDT)</label>
+                    <label class="form-label d-flex align-items-center justify-content-between">
+                        <span>Капитал (USDT)</span>
+                        <span class="text-info small">
+                            💰 Доступно: <b th:text="${#numbers.formatDecimal(usdtBalance, 1, 4)}"></b> USDT
+                        </span>
+                    </label>
+
                     <input type="number" step="0.01" min="0"
                            class="form-control"
                            name="capitalUsd"
                            th:value="${strategy.capitalUsd}">
+
                 </div>
 
                 <div class="col-md-4">
@@ -236,6 +243,12 @@
                            class="form-control"
                            name="commissionPct"
                            th:value="${strategy.commissionPct}">
+                    <button type="button"
+                            id="refreshFeeBtn"
+                            class="btn btn-sm btn-outline-info mt-3">
+                        🔄 Обновить комиссию
+                    </button>
+
                 </div>
 
                 <div class="col-md-4 d-flex align-items-end">
@@ -311,26 +324,37 @@
         <!-- ======================== TAB 4 — TRADE ======================== -->
         <div class="tab-pane" id="trade">
 
-            <div class="section-title">Торговые параметры</div>
+            <div class="section-title">Выбор торговой пары</div>
 
             <div class="row g-4">
 
+                <!-- Symbol -->
                 <div class="col-md-4">
                     <label class="form-label">Пара</label>
                     <input type="text"
                            class="form-control"
+                           id="symbolInput"
                            name="symbol"
-                           th:value="${strategy.symbol}">
+                           th:value="${strategy.symbol}"
+                           placeholder="BTCUSDT">
                 </div>
 
+                <!-- Timeframe -->
                 <div class="col-md-4">
                     <label class="form-label">Таймфрейм</label>
-                    <input type="text"
-                           class="form-control"
-                           name="timeframe"
-                           th:value="${strategy.timeframe}">
+                    <select class="form-select" id="timeframeSelect" name="timeframe">
+                        <option th:each="tf : ${availableTimeframes}"
+                                th:value="${tf}"
+                                th:text="${tf}"
+                                th:selected="${tf == strategy.timeframe}">
+                        </option>
+                    </select>
+                    <div class="form-text text-secondary">
+                        Примеры: 1s, 5s, 15s, 1m, 3m, 5m, 15m, 30m, 1h, 4h, 1d
+                    </div>
                 </div>
 
+                <!-- Candles -->
                 <div class="col-md-4">
                     <label class="form-label">Свечей в кэше</label>
                     <input type="number"
@@ -341,10 +365,27 @@
                            name="cachedCandlesLimit"
                            th:value="${strategy.cachedCandlesLimit}">
                 </div>
+            </div>
 
+            <hr class="my-4">
+
+            <div class="section-title">Поиск монет</div>
+
+            <input id="marketSearch"
+                   class="form-control mb-3"
+                   placeholder="Поиск: BTC, ETH, XRP...">
+
+            <div id="marketResults"
+                 class="table-responsive"
+                 style="max-height: 420px; overflow-y: auto; border:1px solid #222; border-radius:8px;">
+                <!-- Таблица будет вставляться JS-кодом -->
+                <div class="text-center text-secondary p-3">
+                    Введите поисковый запрос…
+                </div>
             </div>
 
         </div>
+
 
         <!-- ======================== TAB 5 — ADVANCED ======================== -->
         <div class="tab-pane" id="advanced">
@@ -375,12 +416,25 @@
     <script th:inline="javascript">
         document.addEventListener("DOMContentLoaded", () => {
 
+            // ----------------------------------------------------
+            // ГЛАВНЫЕ ПЕРЕМЕННЫЕ
+            // ----------------------------------------------------
             const chatId = /*[[${chatId}]]*/ 0;
             const type   = /*[[${type}]]*/ "SMART_FUSION";
 
             const exSel = document.getElementById("exchangeSelect");
             const ntSel = document.getElementById("networkSelect");
 
+            const commissionInput = document.querySelector("input[name='commissionPct']");
+            const refreshBtn = document.getElementById("refreshFeeBtn");
+
+            const marketSearch = document.getElementById("marketSearch");
+            const marketResults = document.getElementById("marketResults");
+            const symbolInput = document.getElementById("symbolInput");
+
+            // ----------------------------------------------------
+            // ЛОАДЕР
+            // ----------------------------------------------------
             function showLoader(text = "Загрузка…") {
                 let loader = document.getElementById("loader-overlay");
                 if (!loader) {
@@ -391,12 +445,14 @@
                         "background:rgba(0,0,0,0.45);backdrop-filter:blur(3px);" +
                         "display:flex;align-items:center;justify-content:center;" +
                         "z-index:9999;opacity:0;transition:opacity .25s;";
+
                     const box = document.createElement("div");
                     box.style.cssText =
                         "padding:20px 40px;background:rgba(20,20,20,0.85);" +
                         "border-radius:12px;color:#fff;font-size:22px;font-weight:600;";
                     box.innerText = text;
                     loader.appendChild(box);
+
                     document.body.appendChild(loader);
                     setTimeout(() => loader.style.opacity = "1", 10);
                 } else {
@@ -404,32 +460,222 @@
                 }
             }
 
+            function hideLoader() {
+                const loader = document.getElementById("loader-overlay");
+                if (!loader) return;
+                loader.style.opacity = "0";
+                setTimeout(() => loader.remove(), 250);
+            }
+
+            // ----------------------------------------------------
+            // ПЕРЕГРУЗКА ПРИ СМЕНЕ БИРЖИ/СЕТИ
+            // ----------------------------------------------------
             function reloadWithParams() {
                 showLoader("Перезагрузка…");
+
                 const ex = exSel.value;
                 const nt = ntSel.value;
+
                 setTimeout(() => {
                     window.location.href =
                         `/strategies/${type}/unified-settings?chatId=${chatId}&exchange=${ex}&network=${nt}`;
-                }, 300);
+                }, 200);
             }
 
             if (exSel) exSel.addEventListener("change", reloadWithParams);
             if (ntSel) ntSel.addEventListener("change", reloadWithParams);
 
-            const tabs = document.querySelectorAll(".tab-btn");
+            // ----------------------------------------------------
+            // ВКЛАДКИ
+            // ----------------------------------------------------
+            const tabs  = document.querySelectorAll(".tab-btn");
             const panes = document.querySelectorAll(".tab-pane");
 
             tabs.forEach(btn => {
                 btn.addEventListener("click", () => {
                     tabs.forEach(t => t.classList.remove("active"));
                     panes.forEach(p => p.classList.remove("active"));
+
                     btn.classList.add("active");
-                    document.getElementById(btn.dataset.tab)?.classList.add("active");
+                    const pane = document.getElementById(btn.dataset.tab);
+                    if (pane) pane.classList.add("active");
                 });
             });
 
-        });
+            // ----------------------------------------------------
+            // РЕАЛЬНАЯ КОМИССИЯ (АВТОПОДГРУЗКА)
+            // ----------------------------------------------------
+            async function loadRealFee() {
+                try {
+                    const exchange = exSel.value;
+                    const network  = ntSel.value;
+
+                    const url =
+                        `/strategies/${type}/unified-settings/real-fee?chatId=${chatId}&exchange=${exchange}&network=${network}`;
+
+                    const res  = await fetch(url);
+                    const data = await res.json();
+
+                    const feeField = document.querySelector("input[name='commissionPct']");
+                    if (!feeField) return;
+
+                    feeField.value = Number(data.fee).toFixed(3);
+
+                    if (data.ok && window.showToast)
+                        showToast(`Комиссия обновлена (VIP${data.vipLevel}, BNB=${data.bnb})`, true);
+
+                } catch (e) {
+                    console.error("Ошибка загрузки комиссии:", e);
+                }
+            }
+
+            if (commissionInput) loadRealFee();
+
+            // ----------------------------------------------------
+            // КНОПКА "ОБНОВИТЬ КОМИССИЮ"
+            // ----------------------------------------------------
+            if (refreshBtn) {
+                refreshBtn.addEventListener("click", async () => {
+
+                    refreshBtn.disabled = true;
+                    refreshBtn.innerText = "Обновляем…";
+
+                    try {
+                        const ex = exSel.value;
+                        const nt = ntSel.value;
+
+                        const res = await fetch(
+                            `/strategies/${type}/unified-settings/real-fee?chatId=${chatId}&exchange=${ex}&network=${nt}`
+                        );
+
+                        const data = await res.json();
+
+                        const feeField = document.querySelector("input[name='commissionPct']");
+                        if (feeField)
+                            feeField.value = Number(data.fee).toFixed(3);
+
+                        if (window.showToast)
+                            showToast("Комиссия обновлена", true);
+
+                    } catch (e) {
+                        if (window.showToast)
+                            showToast("Ошибка обновления комиссии", false);
+                    }
+
+                    refreshBtn.disabled = false;
+                    refreshBtn.innerText = "🔄 Обновить комиссию";
+                });
+            }
+
+            // ----------------------------------------------------
+// ВКЛАДКА ТОРГОВЛЯ — ПОИСК МОНЕТ  ⚡ Ускоренная версия
+// ----------------------------------------------------
+            let searchTimer = null;
+
+            async function loadMarketSearch(query) {
+
+                if (!marketResults) return;
+
+                if (!query || query.trim().length < 1) {
+                    marketResults.innerHTML = `
+            <div class="text-center text-secondary p-3">
+                Введите поисковый запрос…
+            </div>`;
+                    return;
+                }
+
+                const ex = exSel.value;
+                const nt = ntSel.value;
+
+                const url = `/api/market/search?exchange=${ex}&network=${nt}&q=${encodeURIComponent(query)}`;
+
+                try {
+                    // loader внутри блока списка
+                    marketResults.innerHTML = `
+            <div class="text-center text-info p-3">
+                Поиск…
+            </div>`;
+
+                    const res = await fetch(url);
+                    const list = await res.json();
+
+                    // Backend ТЕПЕРЬ отдаёт только подходящие пары → не фильтруем снова
+
+                    if (!Array.isArray(list) || list.length === 0) {
+                        marketResults.innerHTML = `
+                <div class="text-center text-secondary p-3">
+                    Ничего не найдено
+                </div>`;
+                        return;
+                    }
+
+                    let html = `
+        <table class="table table-dark table-sm table-striped mb-0">
+            <thead>
+                <tr>
+                    <th>Пара</th>
+                    <th>Цена</th>
+                    <th>24h %</th>
+                    <th>Объём</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>`;
+
+                    list.forEach(s => {
+                        const pct = Number(s.changePct || 0);
+                        const pctColor = pct >= 0 ? "text-success" : "text-danger";
+
+                        html += `
+                <tr>
+                    <td>${s.symbol}</td>
+                    <td>${Number(s.price).toFixed(6)}</td>
+                    <td class="${pctColor}">${pct.toFixed(2)}%</td>
+                    <td>${Number(s.volume).toFixed(2)}</td>
+                    <td>
+                        <button class="btn btn-sm btn-primary select-symbol" data-symbol="${s.symbol}">
+                            Выбрать
+                        </button>
+                    </td>
+                </tr>`;
+                    });
+
+                    html += "</tbody></table>";
+                    marketResults.innerHTML = html;
+
+                    document.querySelectorAll(".select-symbol").forEach(btn => {
+                        btn.addEventListener("click", () => {
+                            if (symbolInput)
+                                symbolInput.value = btn.dataset.symbol;
+
+                            if (window.showToast)
+                                showToast(`Выбрана пара: ${btn.dataset.symbol}`, true);
+                        });
+                    });
+
+                } catch (e) {
+                    console.error("Ошибка поиска:", e);
+                    marketResults.innerHTML =
+                        `<div class="text-danger text-center p-3">
+                Ошибка загрузки данных
+            </div>`;
+                }
+            }
+
+
+// ----------------------------------------------------
+// Debounce 200ms
+// ----------------------------------------------------
+            if (marketSearch) {
+                marketSearch.addEventListener("input", () => {
+                    const q = marketSearch.value.trim();
+                    clearTimeout(searchTimer);
+                    searchTimer = setTimeout(() => loadMarketSearch(q), 200);
+                });
+            }
+
+
+        }); // END DOMContentLoaded
     </script>
 
 </section>

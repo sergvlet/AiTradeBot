@@ -17,65 +17,80 @@ public class ExchangeClientFactory {
 
     private final ExchangeSettingsService exchangeSettingsService;
 
+    /**
+     * ЕДИНЫЙ реестр клиентов:
+     *   "BINANCE_MAINNET"  → client
+     *   "BINANCE_TESTNET"  → client
+     *   "BYBIT_MAINNET"    → client
+     *   "BYBIT_TESTNET"    → client
+     */
     private final Map<String, ExchangeClient> registry = new ConcurrentHashMap<>();
 
-    public void register(String exchange, NetworkType networkType, ExchangeClient client) {
-        String key = buildKey(exchange, networkType);
+    // -------------------------------------------------------
+    // R E G I S T E R
+    // -------------------------------------------------------
+    public void register(String exchange, NetworkType network, ExchangeClient client) {
+        String key = buildKey(exchange, network);
 
         if (registry.containsKey(key)) {
-            log.warn("⚠️ Клиент {} уже зарегистрирован — пропускаем", key);
+            log.warn("⚠️ Клиент уже зарегистрирован: {}", key);
             return;
         }
 
         registry.put(key, client);
-        log.info("🔹 Зарегистрирован клиент {}", key);
+        log.info("✅ Зарегистрирован клиент: {} -> {}", key, client.getClass().getSimpleName());
     }
 
+    // -------------------------------------------------------
+    // G E T  — по ExchangeSettings
+    // -------------------------------------------------------
     public ExchangeClient getClient(ExchangeSettings settings) {
+
         if (settings == null)
             throw new IllegalArgumentException("ExchangeSettings не может быть null");
 
-        return getClient(settings.getExchange(), settings.getNetwork());
+        return get(settings.getExchange(), settings.getNetwork());
     }
 
-    public ExchangeClient getClient(String exchange, NetworkType networkType) {
-        String key = buildKey(exchange, networkType);
+    // -------------------------------------------------------
+    // G E T  — по имени биржи и сети
+    // -------------------------------------------------------
+    public ExchangeClient get(String exchange, NetworkType network) {
+
+        String key = buildKey(exchange, network);
 
         ExchangeClient client = registry.get(key);
-        if (client == null) {
-            throw new IllegalArgumentException("❌ Клиент для " + key + " не найден!");
-        }
 
-        log.debug("🔗 Выбран клиент {}", key);
+        if (client == null)
+            throw new IllegalArgumentException("❌ Клиент не зарегистрирован: " + key);
+
         return client;
     }
 
-    /**
-     * Получить клиента по chatId (автоматический выбор настроек).
-     */
+    // -------------------------------------------------------
+    // G E T  — по chatId (выбор активного подключения)
+    // -------------------------------------------------------
     public ExchangeClient getClientByChatId(Long chatId) {
 
-        // Берём активную биржу.
-        ExchangeSettings settings = exchangeSettingsService.findAllByChatId(chatId)
+        ExchangeSettings s = exchangeSettingsService.findAllByChatId(chatId)
                 .stream()
                 .filter(ExchangeSettings::isEnabled)
                 .findFirst()
                 .orElseGet(() ->
-                        exchangeSettingsService.getOrCreate(chatId, "BINANCE", NetworkType.MAINNET)
+                        exchangeSettingsService.getOrCreate(
+                                chatId,
+                                "BINANCE",
+                                NetworkType.MAINNET
+                        )
                 );
 
-        return getClient(settings);
+        return getClient(s);
     }
 
-    private String buildKey(String exchange, NetworkType networkType) {
-        return exchange.toUpperCase() + "_" + networkType.name();
-    }
-
-    public boolean hasClient(String exchange, NetworkType networkType) {
-        return registry.containsKey(buildKey(exchange, networkType));
-    }
-
-    public void printRegistry() {
-        log.info("📋 Зарегистрированные клиенты: {}", registry.keySet());
+    // -------------------------------------------------------
+    // KEY BUILDER
+    // -------------------------------------------------------
+    private String buildKey(String exchange, NetworkType network) {
+        return exchange.toUpperCase() + "_" + network.name();
     }
 }

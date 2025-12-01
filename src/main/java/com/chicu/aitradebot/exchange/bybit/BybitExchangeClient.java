@@ -4,7 +4,7 @@ import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.domain.ExchangeSettings;
 import com.chicu.aitradebot.exchange.client.ExchangeClient;
 import com.chicu.aitradebot.exchange.enums.OrderSide;
-import com.chicu.aitradebot.exchange.model.Kline;
+import com.chicu.aitradebot.exchange.model.AccountInfo;
 import com.chicu.aitradebot.exchange.model.Order;
 import com.chicu.aitradebot.exchange.service.ExchangeSettingsService;
 import lombok.extern.slf4j.Slf4j;
@@ -26,85 +26,89 @@ import java.util.stream.Collectors;
  * Полностью совместим с ExchangeClient V4
  */
 @Slf4j
-
 public class BybitExchangeClient implements ExchangeClient {
 
-    private static final String MAINNET = "https://api.bybit.com";
-    private static final String TESTNET = "https://api-testnet.bybit.com";
+    private static final String MAIN = "https://api.bybit.com";
+    private static final String TEST = "https://api-testnet.bybit.com";
     private static final String RECV_WINDOW = "5000";
 
-    private final RestTemplate restTemplate = new RestTemplate();
+    private final RestTemplate rest = new RestTemplate();
     private final ExchangeSettingsService settingsService;
-    private final boolean testnet;
 
     public BybitExchangeClient(ExchangeSettingsService settingsService) {
-        this(false, settingsService);
-    }
-
-    public BybitExchangeClient(boolean testnet, ExchangeSettingsService settingsService) {
-        this.testnet = testnet;
         this.settingsService = settingsService;
-        log.info("✅ BybitExchangeClient [{}] инициализирован", testnet ? "TESTNET" : "MAINNET");
+        log.info("✅ BybitExchangeClient инициализирован");
     }
 
     @Override
-    public String getExchangeName() { return "BYBIT"; }
+    public String getExchangeName() {
+        return "BYBIT";
+    }
 
     @Override
     public NetworkType getNetworkType() {
-        return testnet ? NetworkType.TESTNET : NetworkType.MAINNET;
+        return NetworkType.MAINNET;
     }
 
-    private String baseUrl() {
-        return testnet ? TESTNET : MAINNET;
+    private String baseUrl(NetworkType net) {
+        return net == NetworkType.TESTNET ? TEST : MAIN;
+    }
+
+    private ExchangeSettings resolve(long chatId, NetworkType net) {
+        return settingsService.getOrCreate(chatId, "BYBIT", net);
     }
 
     // =============================================================
     // MARKET DATA
     // =============================================================
     @Override
-    public double getPrice(String symbol) throws Exception {
-        String url = baseUrl() + "/spot/v3/public/quote/ticker/price?symbol=" + symbol.toUpperCase();
-
-        ResponseEntity<String> resp = restTemplate.getForEntity(url, String.class);
-        JSONObject json = new JSONObject(resp.getBody());
-        JSONObject result = json.optJSONObject("result");
-
-        return result != null ? result.optDouble("price", 0.0) : 0.0;
+    public double getPrice(String symbol) {
+        try {
+            String url = MAIN + "/spot/v3/public/quote/ticker/price?symbol=" + symbol.toUpperCase();
+            JSONObject json = new JSONObject(rest.getForObject(url, String.class));
+            JSONObject r = json.optJSONObject("result");
+            return r != null ? r.optDouble("price", 0.0) : 0.0;
+        } catch (Exception e) {
+            log.error("❌ getPrice Bybit: {}", e.getMessage());
+            return 0;
+        }
     }
 
     @Override
-    public List<Kline> getKlines(String symbol, String interval, int limit) throws Exception {
-        String iv = mapInterval(interval);
+    public List<Kline> getKlines(String symbol, String interval, int limit) {
+        try {
+            String iv = mapInterval(interval);
 
-        String url = baseUrl() +
-                "/spot/v3/public/quote/kline?symbol=" + symbol.toUpperCase()
-                + "&interval=" + iv
-                + "&limit=" + limit;
+            String url = MAIN +
+                         "/spot/v3/public/quote/kline?symbol=" + symbol +
+                         "&interval=" + iv +
+                         "&limit=" + limit;
 
-        ResponseEntity<String> resp = restTemplate.getForEntity(url, String.class);
-        JSONObject json = new JSONObject(resp.getBody());
-        JSONObject result = json.optJSONObject("result");
+            JSONObject json = new JSONObject(rest.getForObject(url, String.class));
+            JSONObject result = json.optJSONObject("result");
+            if (result == null) return List.of();
 
-        if (result == null) return List.of();
+            JSONArray arr = result.optJSONArray("list");
+            if (arr == null) return List.of();
 
-        JSONArray arr = result.optJSONArray("list");
-        if (arr == null) return List.of();
+            List<Kline> out = new ArrayList<>();
+            for (int i = 0; i < arr.length(); i++) {
+                JSONArray k = arr.getJSONArray(i);
+                out.add(new Kline(
+                        Long.parseLong(k.getString(0)),
+                        Double.parseDouble(k.getString(1)),
+                        Double.parseDouble(k.getString(2)),
+                        Double.parseDouble(k.getString(3)),
+                        Double.parseDouble(k.getString(4)),
+                        Double.parseDouble(k.getString(5))
+                ));
+            }
+            return out;
 
-        List<Kline> out = new ArrayList<>(arr.length());
-        for (int i = 0; i < arr.length(); i++) {
-            JSONArray k = arr.getJSONArray(i);
-
-            out.add(new Kline(
-                    Long.parseLong(k.getString(0)), // openTime
-                    Double.parseDouble(k.getString(1)),
-                    Double.parseDouble(k.getString(2)),
-                    Double.parseDouble(k.getString(3)),
-                    Double.parseDouble(k.getString(4)),
-                    Double.parseDouble(k.getString(5))
-            ));
+        } catch (Exception e) {
+            log.error("❌ getKlines Bybit: {}", e.getMessage());
+            return List.of();
         }
-        return out;
     }
 
     private String mapInterval(String tf) {
@@ -125,31 +129,25 @@ public class BybitExchangeClient implements ExchangeClient {
     // =============================================================
     // ORDERS
     // =============================================================
-
     @Override
-    public OrderResult placeOrder(Long chatId,
-                                  String symbol,
-                                  String side,
-                                  String type,
-                                  double qty,
-                                  Double price) throws Exception {
+    public OrderResult placeOrder(Long chatId, String symbol, String side, String type, double qty, Double price) {
 
-        ExchangeSettings s = settingsService.getOrThrow(chatId, "BYBIT");
+        ExchangeSettings s = resolve(chatId, NetworkType.MAINNET);
 
-        Map<String, String> params = new LinkedHashMap<>();
-        params.put("symbol", symbol.toUpperCase());
-        params.put("side", side);
-        params.put("orderType", type);
-        params.put("qty", strip(qty));
+        Map<String, String> p = new LinkedHashMap<>();
+        p.put("symbol", symbol.toUpperCase());
+        p.put("side", side);
+        p.put("orderType", type);
+        p.put("qty", strip(qty));
 
         if ("LIMIT".equalsIgnoreCase(type) && price != null) {
-            params.put("price", strip(price));
-            params.put("timeInForce", "GTC");
+            p.put("price", strip(price));
+            p.put("timeInForce", "GTC");
         }
 
-        String result = signedRequest(s, "/spot/v3/private/order", params, HttpMethod.POST);
+        String response = signed(s, "/spot/v3/private/order", p, HttpMethod.POST);
 
-        JSONObject json = new JSONObject(result);
+        JSONObject json = new JSONObject(response);
         JSONObject r = json.optJSONObject("result");
 
         return new OrderResult(
@@ -158,23 +156,15 @@ public class BybitExchangeClient implements ExchangeClient {
                 side,
                 type,
                 qty,
-                price != null ? price : 0.0,
+                price != null ? price : 0,
                 r != null ? r.optString("orderStatus", "NEW") : "NEW",
                 System.currentTimeMillis()
         );
     }
 
     @Override
-    public Order placeMarketOrder(String symbol, OrderSide side, BigDecimal qty) throws Exception {
-
-        OrderResult r = placeOrder(
-                0L,
-                symbol,
-                side.name(),
-                "MARKET",
-                qty.doubleValue(),
-                null
-        );
+    public Order placeMarketOrder(String symbol, OrderSide side, BigDecimal qty) {
+        OrderResult r = placeOrder(0L, symbol, side.name(), "MARKET", qty.doubleValue(), null);
 
         Order o = new Order();
         o.setOrderId(r.orderId());
@@ -193,68 +183,85 @@ public class BybitExchangeClient implements ExchangeClient {
     @Override
     public boolean cancelOrder(Long chatId, String symbol, String orderId) throws Exception {
 
-        ExchangeSettings s = settingsService.getOrThrow(chatId, "BYBIT");
+        ExchangeSettings s = resolve(chatId, NetworkType.MAINNET);
 
-        Map<String, String> params = new LinkedHashMap<>();
-        params.put("symbol", symbol.toUpperCase());
-        params.put("orderId", orderId);
+        Map<String, String> p = new LinkedHashMap<>();
+        p.put("symbol", symbol.toUpperCase());
+        p.put("orderId", orderId);
 
-        String res = signedRequest(s, "/spot/v3/private/cancel-order", params, HttpMethod.POST);
+        String res = signed(s, "/spot/v3/private/cancel-order", p, HttpMethod.POST);
 
         return res != null && res.contains("orderId");
     }
 
     // =============================================================
-    // BALANCE
+    // BALANCE (НОВАЯ ЛОГИКА)
     // =============================================================
+    @Override
+    public Balance getBalance(Long chatId, String asset) {
+        return getBalance(chatId, asset, NetworkType.MAINNET);
+    }
 
     @Override
-    public Balance getBalance(Long chatId, String asset) throws Exception {
-
-        ExchangeSettings s = settingsService.getOrThrow(chatId, "BYBIT");
-
-        Map<String, String> params = Map.of("accountType", "UNIFIED");
-
-        String result = signedRequest(s, "/v5/account/wallet-balance", params, HttpMethod.GET);
-
-        JSONObject json = new JSONObject(result);
-        JSONObject res = json.optJSONObject("result");
-
-        if (res == null) return new Balance(asset, 0, 0);
-
-        JSONArray list = res.optJSONArray("list");
-        if (list == null || list.isEmpty()) return new Balance(asset, 0, 0);
-
-        JSONArray coins = list.getJSONObject(0).optJSONArray("coin");
-        if (coins == null) return new Balance(asset, 0, 0);
-
-        for (int i = 0; i < coins.length(); i++) {
-            JSONObject c = coins.getJSONObject(i);
-            if (!asset.equalsIgnoreCase(c.getString("coin"))) continue;
-
-            double free = c.optDouble("availableToWithdraw", 0.0);
-            double total = c.optDouble("walletBalance", 0.0);
-
-            return new Balance(asset, free, Math.max(0, total - free));
+    public Balance getBalance(Long chatId, String asset, NetworkType network) {
+        try {
+            Map<String, Balance> all = getFullBalance(chatId, network);
+            return all.getOrDefault(asset, new Balance(asset, 0, 0));
+        } catch (Exception e) {
+            return new Balance(asset, 0, 0);
         }
-
-        return new Balance(asset, 0, 0);
     }
 
     @Override
     public Map<String, Balance> getFullBalance(Long chatId) {
-        log.warn("⚠️ getFullBalance() для Bybit пока не реализован");
-        return new LinkedHashMap<>();
+        return getFullBalance(chatId, NetworkType.MAINNET);
+    }
+
+    @Override
+    public Map<String, Balance> getFullBalance(Long chatId, NetworkType network) {
+
+        ExchangeSettings s = resolve(chatId, network);
+
+        try {
+            Map<String, String> params = Map.of("accountType", "UNIFIED");
+
+            String response = signed(s, "/v5/account/wallet-balance", params, HttpMethod.GET);
+
+            Map<String, Balance> out = new LinkedHashMap<>();
+
+            JSONObject json = new JSONObject(response);
+            JSONObject res = json.optJSONObject("result");
+            if (res == null) return out;
+
+            JSONArray list = res.optJSONArray("list");
+            if (list == null || list.isEmpty()) return out;
+
+            JSONArray coins = list.getJSONObject(0).optJSONArray("coin");
+            if (coins == null) return out;
+
+            for (int i = 0; i < coins.length(); i++) {
+                JSONObject c = coins.getJSONObject(i);
+                String coin = c.optString("coin");
+
+                double free = c.optDouble("availableToWithdraw", 0.0);
+                double total = c.optDouble("walletBalance", 0.0);
+                double locked = Math.max(0, total - free);
+
+                out.put(coin, new Balance(coin, free, locked));
+            }
+
+            return out;
+
+        } catch (Exception e) {
+            log.error("❌ getFullBalance Bybit: {}", e.getMessage());
+            return new LinkedHashMap<>();
+        }
     }
 
     // =============================================================
     // SIGNED REQUEST
     // =============================================================
-
-    private String signedRequest(ExchangeSettings s,
-                                 String endpoint,
-                                 Map<String, String> params,
-                                 HttpMethod method) {
+    private String signed(ExchangeSettings s, String endpoint, Map<String, String> params, HttpMethod method) {
 
         try {
             long ts = System.currentTimeMillis();
@@ -271,11 +278,10 @@ public class BybitExchangeClient implements ExchangeClient {
             headers.set("X-BAPI-RECV-WINDOW", RECV_WINDOW);
             headers.setContentType(MediaType.APPLICATION_FORM_URLENCODED);
 
-            String url = baseUrl() + endpoint + (method == HttpMethod.GET && !query.isEmpty()
-                    ? "?" + query
-                    : "");
+            String url = baseUrl(s.getNetwork()) + endpoint +
+                         (method == HttpMethod.GET && !query.isEmpty() ? "?" + query : "");
 
-            ResponseEntity<String> resp = restTemplate.exchange(
+            ResponseEntity<String> resp = rest.exchange(
                     url,
                     method,
                     new HttpEntity<>(method == HttpMethod.POST ? query : "", headers),
@@ -289,10 +295,6 @@ public class BybitExchangeClient implements ExchangeClient {
             throw new RuntimeException(e);
         }
     }
-
-    // =============================================================
-    // HELPERS
-    // =============================================================
 
     private String strip(double d) {
         return BigDecimal.valueOf(d).stripTrailingZeros().toPlainString();
@@ -318,23 +320,21 @@ public class BybitExchangeClient implements ExchangeClient {
             StringBuilder sb = new StringBuilder();
             for (byte b : h) sb.append(String.format("%02x", b));
             return sb.toString();
+
         } catch (Exception e) {
             throw new RuntimeException("Ошибка подписи BYBIT", e);
         }
     }
 
     // =============================================================
-    // SYMBOLS / TIMEFRAMES
+    // SYMBOLS
     // =============================================================
-
     @Override
     public List<String> getAllSymbols() {
         try {
-            String url = baseUrl() + "/spot/v3/public/symbols";
+            String url = MAIN + "/spot/v3/public/symbols";
 
-            ResponseEntity<String> resp = restTemplate.getForEntity(url, String.class);
-
-            JSONObject json = new JSONObject(resp.getBody());
+            JSONObject json = new JSONObject(rest.getForObject(url, String.class));
             JSONObject result = json.optJSONObject("result");
 
             JSONArray arr = result != null ? result.optJSONArray("list") : null;
@@ -344,21 +344,104 @@ public class BybitExchangeClient implements ExchangeClient {
 
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject o = arr.getJSONObject(i);
-                if ("Trading".equalsIgnoreCase(o.optString("status")))
+
+                if ("Trading".equalsIgnoreCase(o.optString("status"))) {
                     out.add(o.getString("name").toUpperCase());
+                }
             }
 
             out.sort(String::compareTo);
             return out;
 
         } catch (Exception e) {
-            log.error("❌ Ошибка getAllSymbols Bybit: {}", e.getMessage());
+            log.error("❌ getAllSymbols Bybit: {}", e.getMessage());
             return List.of();
         }
     }
 
+    // =============================================================
+    // ACCOUNT INFO
+    // =============================================================
     @Override
-    public List<String> getAvailableTimeframes() {
-        return List.of("1", "3", "5", "15", "30", "60", "240", "D", "W", "M");
+    public AccountInfo getAccountInfo(long chatId, NetworkType net) {
+        try {
+            ExchangeSettings s = resolve(chatId, net);
+
+            Map<String, String> params = Map.of("accountType", "UNIFIED");
+            String response = signed(s, "/v5/account/wallet-balance", params, HttpMethod.GET);
+
+            JSONObject json = new JSONObject(response);
+            JSONObject res = json.optJSONObject("result");
+
+            if (res == null) return defaultFees();
+
+            boolean hasBNB = false;
+
+            JSONArray list = res.optJSONArray("list");
+            if (list != null && !list.isEmpty()) {
+                JSONArray coins = list.getJSONObject(0).optJSONArray("coin");
+
+                if (coins != null) {
+                    for (int i = 0; i < coins.length(); i++) {
+                        JSONObject c = coins.getJSONObject(i);
+
+                        if ("BNB".equalsIgnoreCase(c.optString("coin"))
+                            && c.optDouble("walletBalance", 0) > 0.0001) {
+                            hasBNB = true;
+                        }
+                    }
+                }
+            }
+
+            int vip = res.optInt("feeTier", 0);
+
+            double maker = bybitMaker(vip);
+            double taker = bybitTaker(vip);
+
+            double makerDiscount = hasBNB ? maker * 0.75 : maker;
+            double takerDiscount = hasBNB ? taker * 0.75 : taker;
+
+            return AccountInfo.builder()
+                    .makerFee(maker)
+                    .takerFee(taker)
+                    .makerFeeWithDiscount(makerDiscount)
+                    .takerFeeWithDiscount(takerDiscount)
+                    .vipLevel(vip)
+                    .usingBnbDiscount(hasBNB)
+                    .build();
+
+        } catch (Exception e) {
+            log.error("❌ getAccountInfo Bybit: {}", e.getMessage());
+            return defaultFees();
+        }
+    }
+
+    private AccountInfo defaultFees() {
+        return AccountInfo.builder()
+                .makerFee(0.1)
+                .takerFee(0.1)
+                .makerFeeWithDiscount(0.1)
+                .takerFeeWithDiscount(0.1)
+                .vipLevel(0)
+                .usingBnbDiscount(false)
+                .build();
+    }
+
+    private double bybitMaker(int vip) {
+        return switch (vip) {
+            case 1 -> 0.1;
+            case 2 -> 0.08;
+            case 3 -> 0.06;
+            default -> 0.1;
+        };
+    }
+
+    private double bybitTaker(int vip) {
+        return switch (vip) {
+            case 1 -> 0.1;
+            case 2 -> 0.1;
+            case 3 -> 0.07;
+            default -> 0.1;
+        };
     }
 }

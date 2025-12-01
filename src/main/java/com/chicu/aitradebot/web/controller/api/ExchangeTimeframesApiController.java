@@ -23,7 +23,7 @@ public class ExchangeTimeframesApiController {
             @RequestParam NetworkType networkType
     ) {
         try {
-            ExchangeClient client = clientFactory.getClient(exchange, networkType);
+            ExchangeClient client = clientFactory.get(exchange, networkType);
             if (client == null) {
                 log.warn("⚠️ Клиент {} [{}] не найден", exchange, networkType);
                 return List.of();

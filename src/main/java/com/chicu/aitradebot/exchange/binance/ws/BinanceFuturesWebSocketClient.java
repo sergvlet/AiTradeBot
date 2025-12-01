@@ -44,7 +44,6 @@ public class BinanceFuturesWebSocketClient {
                 Consumer<String> cb = listeners.get(key);
                 if (cb != null) cb.accept(text);
 
-                log.info("📩 WS MESSAGE {}", text);
             }
 
             @Override

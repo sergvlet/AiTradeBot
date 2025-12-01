@@ -1,5 +1,6 @@
 package com.chicu.aitradebot.service.impl;
 
+import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
 import com.chicu.aitradebot.repository.StrategySettingsRepository;
@@ -33,7 +34,9 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
 
         List<StrategySettings> list = repo.findByChatIdAndType(chatId, type);
 
-        if (list.isEmpty()) return null;
+        if (list.isEmpty()) {
+            return null;
+        }
 
         if (list.size() > 1) {
             log.error("❌ НАЙДЕНО {} StrategySettings для chatId={} type={}. Лишние будут удалены.",
@@ -55,7 +58,9 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
     public StrategySettings getOrCreate(long chatId, StrategyType type) {
 
         StrategySettings existing = getSettings(chatId, type);
-        if (existing != null) return existing;
+        if (existing != null) {
+            return existing;
+        }
 
         log.warn("⚠ Создаём новый StrategySettings (chatId={}, type={})", chatId, type);
 
@@ -63,22 +68,30 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
                 .chatId(chatId)
                 .type(type)
 
+                // базовые торговые настройки
                 .symbol("BTCUSDT")
                 .timeframe("1m")
                 .cachedCandlesLimit(500)
 
+                // капитал / риск
                 .capitalUsd(BigDecimal.valueOf(100))
                 .commissionPct(BigDecimal.valueOf(0.05))
-
                 .takeProfitPct(BigDecimal.valueOf(1))
                 .stopLossPct(BigDecimal.valueOf(1))
                 .riskPerTradePct(BigDecimal.valueOf(1))
                 .dailyLossLimitPct(BigDecimal.valueOf(20))
-
                 .reinvestProfit(false)
                 .leverage(1)
-                .active(false)
 
+                // PnL / ML
+                .totalProfitPct(BigDecimal.ZERO)
+                .mlConfidence(BigDecimal.ZERO)
+
+                // биржа/сеть по умолчанию — BINANCE TESTNET
+                .exchangeName("BINANCE")
+                .networkType(NetworkType.TESTNET)
+
+                .active(false)
                 .build();
 
         return repo.save(s);

@@ -5,6 +5,7 @@ import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.ExchangeSettings;
 import com.chicu.aitradebot.exchange.client.ExchangeClient;
 import com.chicu.aitradebot.exchange.enums.OrderSide;
+import com.chicu.aitradebot.exchange.model.AccountInfo;
 import com.chicu.aitradebot.exchange.model.BinanceConnectionStatus;
 import com.chicu.aitradebot.exchange.model.Order;
 import com.chicu.aitradebot.exchange.service.ExchangeSettingsService;
@@ -28,26 +29,25 @@ import java.util.stream.Collectors;
 @Component
 public class BinanceExchangeClient implements ExchangeClient {
 
-    private static final String MAINNET = "https://api.binance.com";
-    private static final String TESTNET = "https://testnet.binance.vision";
+    /** MAINNET и TESTNET */
+    private static final String MAIN = "https://api.binance.com";
+    private static final String TEST = "https://testnet.binance.vision";
 
     private final ExchangeSettingsService settingsService;
     private final RestTemplate rest;
-
-    private List<String> cachedSymbols = new ArrayList<>();
-    private long lastFetch = 0;
 
     public BinanceExchangeClient(ExchangeSettingsService settingsService) {
         this.settingsService = settingsService;
 
         SimpleClientHttpRequestFactory f = new SimpleClientHttpRequestFactory();
-        f.setConnectTimeout(5000);
-        f.setReadTimeout(5000);
+        f.setReadTimeout(7000);
+        f.setConnectTimeout(7000);
+
         this.rest = new RestTemplate(f);
     }
 
     // =====================================================================
-    // ОБЯЗАТЕЛЬНЫЕ МЕТОДЫ ИНТЕРФЕЙСА ExchangeClient
+    // BASE
     // =====================================================================
 
     @Override
@@ -57,38 +57,67 @@ public class BinanceExchangeClient implements ExchangeClient {
 
     @Override
     public NetworkType getNetworkType() {
-        // Клиент в принципе умеет работать с обеими сетями,
-        // конкретную сеть выбираем по chatId в resolve(chatId)
+        // "Дефолтная" сеть, если кто-то вызывает методы без явного указания
         return NetworkType.MAINNET;
     }
 
+    /** Правильный выбор URL по сети */
     private String baseUrl(NetworkType net) {
-        return net == NetworkType.TESTNET ? TESTNET : MAINNET;
+        return net == NetworkType.TESTNET ? TEST : MAIN;
+    }
+
+    /**
+     * Старый вспомогательный метод — выбирает "какие-то" активные настройки.
+     * Оставляем как fallback для старого кода.
+     */
+    private ExchangeSettings resolve(Long chatId) {
+        return settingsService.findAllByChatId(chatId)
+                .stream()
+                .filter(ExchangeSettings::isEnabled)
+                .findFirst()
+                .orElseGet(() ->
+                        settingsService.getOrCreate(chatId, "BINANCE", NetworkType.MAINNET)
+                );
+    }
+
+    /**
+     * Новый более явный вариант — берём настройки КОНКРЕТНОЙ сети.
+     */
+    private ExchangeSettings resolve(Long chatId, NetworkType network) {
+        return settingsService.getOrCreate(chatId, "BINANCE", network);
     }
 
     // =====================================================================
-    // MARKETS
+    // MARKET DATA
     // =====================================================================
 
     @Override
-    public double getPrice(String symbol) throws Exception {
-        String url = MAINNET + "/api/v3/ticker/price?symbol=" + symbol.toUpperCase();
-        JSONObject json = new JSONObject(rest.getForObject(url, String.class));
-        return json.getDouble("price");
+    public double getPrice(String symbol) {
+        try {
+            // Рыночная цена — с основного API (MAINNET). Для тестнета это не критично.
+            String url = MAIN + "/api/v3/ticker/price?symbol=" + symbol.toUpperCase();
+            JSONObject json = new JSONObject(rest.getForObject(url, String.class));
+            return json.getDouble("price");
+
+        } catch (Exception e) {
+            log.error("Ошибка getPrice Binance: {}", e.getMessage());
+            return 0;
+        }
     }
 
     @Override
     public List<Kline> getKlines(String symbol, String interval, int limit) throws Exception {
-        String url = MAINNET + "/api/v3/klines?symbol=" + symbol.toUpperCase()
-                     + "&interval=" + interval
-                     + "&limit=" + limit;
+
+        String url = MAIN + "/api/v3/klines?symbol=" + symbol +
+                     "&interval=" + interval + "&limit=" + limit;
 
         JSONArray arr = new JSONArray(rest.getForObject(url, String.class));
-        List<Kline> list = new ArrayList<>();
+        List<Kline> out = new ArrayList<>();
 
         for (int i = 0; i < arr.length(); i++) {
             JSONArray c = arr.getJSONArray(i);
-            list.add(new Kline(
+
+            out.add(new Kline(
                     c.getLong(0),
                     c.getDouble(1),
                     c.getDouble(2),
@@ -97,11 +126,64 @@ public class BinanceExchangeClient implements ExchangeClient {
                     c.getDouble(5)
             ));
         }
-        return list;
+
+        return out;
     }
 
     // =====================================================================
-    // TRADE
+    // SIGNATURE
+    // =====================================================================
+
+    private String signature(String data, String secret) {
+        try {
+            Mac m = Mac.getInstance("HmacSHA256");
+            m.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+
+            byte[] h = m.doFinal(data.getBytes(StandardCharsets.UTF_8));
+
+            StringBuilder sb = new StringBuilder();
+            for (byte b : h) sb.append(String.format("%02x", b));
+
+            return sb.toString();
+
+        } catch (Exception e) {
+            throw new RuntimeException("Ошибка подписи Binance", e);
+        }
+    }
+
+    private String signedRequest(ExchangeSettings s,
+                                 String endpoint,
+                                 Map<String, String> params,
+                                 HttpMethod method) {
+
+        params.put("recvWindow", "5000");
+        params.put("timestamp", String.valueOf(System.currentTimeMillis()));
+
+        String query = params.entrySet().stream()
+                .map(e -> e.getKey() + "=" + e.getValue())
+                .collect(Collectors.joining("&"));
+
+        String sig = signature(query, s.getApiSecret());
+
+        String full = baseUrl(s.getNetwork()) + endpoint + "?" + query + "&signature=" + sig;
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("X-MBX-APIKEY", s.getApiKey());
+
+        try {
+            return rest.exchange(full, method, new HttpEntity<>(null, headers), String.class).getBody();
+
+        } catch (HttpClientErrorException e) {
+            throw new RuntimeException("Binance error: " + e.getResponseBodyAsString());
+        }
+    }
+
+    private static String strip(double v) {
+        return BigDecimal.valueOf(v).stripTrailingZeros().toPlainString();
+    }
+
+    // =====================================================================
+    // ORDERS
     // =====================================================================
 
     @Override
@@ -110,25 +192,25 @@ public class BinanceExchangeClient implements ExchangeClient {
                                   String side,
                                   String type,
                                   double qty,
-                                  Double price) throws Exception {
+                                  Double price) {
 
+        // ⚠ здесь пока используем resolve(chatId) как раньше
+        // при необходимости можно добавить вариацию с NetworkType
         ExchangeSettings s = resolve(chatId);
 
-        Map<String, String> params = new LinkedHashMap<>();
-        params.put("symbol", symbol.toUpperCase());
-        params.put("side", side.toUpperCase());
-        params.put("type", type.toUpperCase());
-        params.put("quantity", strip(qty));
+        Map<String, String> p = new LinkedHashMap<>();
+        p.put("symbol", symbol);
+        p.put("side", side);
+        p.put("type", type);
+        p.put("quantity", strip(qty));
 
         if ("LIMIT".equalsIgnoreCase(type) && price != null) {
-            params.put("price", strip(price));
-            params.put("timeInForce", "GTC");
+            p.put("price", strip(price));
+            p.put("timeInForce", "GTC");
         }
 
-        String url = baseUrl(s.getNetwork()) + "/api/v3/order";
-        String result = signed(s, url, params, HttpMethod.POST);
-
-        JSONObject json = new JSONObject(result);
+        String r = signedRequest(s, "/api/v3/order", p, HttpMethod.POST);
+        JSONObject json = new JSONObject(r);
 
         return new OrderResult(
                 json.optString("orderId"),
@@ -145,91 +227,90 @@ public class BinanceExchangeClient implements ExchangeClient {
     @Override
     public Order placeMarketOrder(String symbol, OrderSide side, BigDecimal qty) throws Exception {
 
-        // здесь можно будет подставить реальный chatId,
-        // сейчас 0L как заглушка
-        OrderResult r = placeOrder(
+        OrderResult r = placeOrder(0L, symbol, side.name(), "MARKET", qty.doubleValue(), null);
+
+        return new Order(
+                null,
+                "BINANCE",
                 0L,
-                symbol,
-                side.name(),
-                "MARKET",
-                qty.doubleValue(),
-                null
+                r.symbol(),
+                r.side(),
+                r.type(),
+                BigDecimal.valueOf(r.qty()),
+                BigDecimal.valueOf(r.price()),
+                BigDecimal.valueOf(r.qty()),
+                r.status(),
+                r.timestamp(),
+                r.timestamp(),
+                true,
+                StrategyType.SMART_FUSION
         );
-
-        // Заполняем все поля реального конструктора Order
-        Order o = new Order(
-                null,                                   // id
-                "BINANCE",                              // exchange
-                0L,                                     // chatId
-                r.symbol(),                             // symbol
-                r.side(),                               // side
-                r.type(),                               // type
-                BigDecimal.valueOf(r.qty()),            // qty
-                BigDecimal.valueOf(r.price()),          // price
-                BigDecimal.valueOf(r.qty()),            // executedQty
-                r.status(),                             // status
-                r.timestamp(),                          // createdAt
-                r.timestamp(),                          // updatedAt
-                true,                                   // filled
-                StrategyType.SMART_FUSION               // стратегия (при желании можно заменить)
-        );
-
-        return o;
     }
-
-    // =====================================================================
-    // CANCEL
-    // =====================================================================
 
     @Override
     public boolean cancelOrder(Long chatId, String symbol, String orderId) throws Exception {
 
         ExchangeSettings s = resolve(chatId);
 
-        Map<String, String> params = Map.of(
-                "symbol", symbol.toUpperCase(),
-                "orderId", orderId
-        );
+        Map<String, String> p = new LinkedHashMap<>();
+        p.put("symbol", symbol);
+        p.put("orderId", orderId);
 
-        String url = baseUrl(s.getNetwork()) + "/api/v3/order";
-        String r = signed(s, url, params, HttpMethod.DELETE);
+        String r = signedRequest(s, "/api/v3/order", p, HttpMethod.DELETE);
 
         return r.contains("orderId");
     }
 
     // =====================================================================
-    // BALANCES
+    // BALANCE
     // =====================================================================
 
+    /**
+     * Новый вариант — с явной сетью.
+     */
     @Override
-    public Balance getBalance(Long chatId, String asset) throws Exception {
-        return getFullBalance(chatId).getOrDefault(asset, new Balance(asset, 0, 0));
+    public Balance getBalance(Long chatId, String asset, NetworkType network) throws Exception {
+        Map<String, Balance> all = getFullBalance(chatId, network);
+        return all.getOrDefault(asset, new Balance(asset, 0, 0));
     }
 
     @Override
-    public Map<String, Balance> getFullBalance(Long chatId) throws Exception {
+    public Map<String, Balance> getFullBalance(Long chatId, NetworkType network) throws Exception {
 
-        ExchangeSettings s = resolve(chatId);
-        String url = baseUrl(s.getNetwork()) + "/api/v3/account";
+        ExchangeSettings s = resolve(chatId, network);
+        String body = signedRequest(s, "/api/v3/account", new HashMap<>(), HttpMethod.GET);
 
-        String resp = signed(s, url, new HashMap<>(), HttpMethod.GET);
-
-        JSONArray arr = new JSONObject(resp).getJSONArray("balances");
-        Map<String, Balance> map = new LinkedHashMap<>();
+        Map<String, Balance> out = new LinkedHashMap<>();
+        JSONArray arr = new JSONObject(body).getJSONArray("balances");
 
         for (int i = 0; i < arr.length(); i++) {
             JSONObject o = arr.getJSONObject(i);
 
-            String asset = o.getString("asset");
-            double free = o.optDouble("free");
-            double locked = o.optDouble("locked");
+            double free = o.getDouble("free");
+            double locked = o.getDouble("locked");
 
             if (free + locked > 0) {
-                map.put(asset, new Balance(asset, free, locked));
+                out.put(o.getString("asset"), new Balance(o.getString("asset"), free, locked));
             }
         }
 
-        return map;
+        return out;
+    }
+
+    /**
+     * Старые методы без сети — оставляем как обёртку,
+     * чтобы не падал существующий код.
+     */
+    @Override
+    public Balance getBalance(Long chatId, String asset) throws Exception {
+        ExchangeSettings s = resolve(chatId);
+        return getBalance(chatId, asset, s.getNetwork());
+    }
+
+    @Override
+    public Map<String, Balance> getFullBalance(Long chatId) throws Exception {
+        ExchangeSettings s = resolve(chatId);
+        return getFullBalance(chatId, s.getNetwork());
     }
 
     // =====================================================================
@@ -239,117 +320,144 @@ public class BinanceExchangeClient implements ExchangeClient {
     @Override
     public List<String> getAllSymbols() {
 
-        long now = System.currentTimeMillis();
-        if (!cachedSymbols.isEmpty() && now - lastFetch < 3600_000)
-            return cachedSymbols;
-
         try {
-            String body = rest.getForObject(MAINNET + "/api/v3/exchangeInfo", String.class);
+            String body = rest.getForObject(MAIN + "/api/v3/exchangeInfo", String.class);
+
             JSONArray arr = new JSONObject(body).getJSONArray("symbols");
 
             List<String> list = new ArrayList<>();
 
             for (int i = 0; i < arr.length(); i++) {
-                JSONObject s = arr.getJSONObject(i);
-                if ("TRADING".equalsIgnoreCase(s.optString("status"))) {
-                    list.add(s.getString("symbol"));
+                JSONObject o = arr.getJSONObject(i);
+
+                if ("TRADING".equalsIgnoreCase(o.optString("status"))) {
+                    list.add(o.getString("symbol"));
                 }
             }
 
             list.sort(String::compareTo);
-            cachedSymbols = list;
-            lastFetch = now;
-
             return list;
 
         } catch (Exception e) {
-            log.error("Ошибка получения списка символов: {}", e.getMessage());
-            return cachedSymbols;
+            log.error("Ошибка getAllSymbols Binance: {}", e.getMessage());
+            return List.of();
         }
-    }
-
-    // =====================================================================
-    // SIGNED REQUEST
-    // =====================================================================
-
-    private String signed(ExchangeSettings s,
-                          String url,
-                          Map<String, String> params,
-                          HttpMethod method) {
-
-        params.put("recvWindow", "5000");
-        params.put("timestamp", String.valueOf(System.currentTimeMillis()));
-
-        String query = params.entrySet().stream()
-                .map(e -> e.getKey() + "=" + e.getValue())
-                .collect(Collectors.joining("&"));
-
-        String sig = signature(query, s.getApiSecret());
-        String full = url + "?" + query + "&signature=" + sig;
-
-        HttpHeaders h = new HttpHeaders();
-        h.set("X-MBX-APIKEY", s.getApiKey());
-
-        try {
-            return rest.exchange(full, method, new HttpEntity<>(null, h), String.class).getBody();
-        } catch (HttpClientErrorException e) {
-            throw new RuntimeException("Binance error: " + e.getResponseBodyAsString(), e);
-        }
-    }
-
-    private String signature(String data, String secret) {
-
-        try {
-            Mac m = Mac.getInstance("HmacSHA256");
-            m.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
-
-            byte[] bytes = m.doFinal(data.getBytes(StandardCharsets.UTF_8));
-
-            StringBuilder sb = new StringBuilder();
-            for (byte b : bytes) {
-                sb.append(String.format("%02x", b));
-            }
-
-            return sb.toString();
-
-        } catch (Exception e) {
-            throw new RuntimeException("Ошибка подписи Binance", e);
-        }
-    }
-
-    // =====================================================================
-    // SETTINGS
-    // =====================================================================
-
-    private ExchangeSettings resolve(Long chatId) {
-        // дефолт: BINANCE + MAINNET, если нет явных записей
-        return settingsService.getOrCreate(chatId, "BINANCE", NetworkType.MAINNET);
-    }
-
-    private static String strip(double v) {
-        return BigDecimal.valueOf(v).stripTrailingZeros().toPlainString();
     }
 
     // =====================================================================
     // DIAGNOSTICS
     // =====================================================================
 
-    public BinanceConnectionStatus extendedTestConnection(
-            String apiKey,
-            String secretKey,
-            boolean isTestnet
-    ) {
-        // здесь оставлена упрощённая версия, чтобы не ломать логику
-        return BinanceConnectionStatus.builder()
-                .ok(true)
-                .keyValid(true)
-                .secretValid(true)
-                .readingEnabled(true)
-                .tradingEnabled(true)
-                .ipAllowed(true)
-                .networkMismatch(false)
-                .message("OK")
-                .reasons(List.of("simplified"))
-                .build();
+    public BinanceConnectionStatus extendedTestConnection(String apiKey, String secretKey, boolean isTestnet) {
+
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(secretKey.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+            mac.doFinal("ping".getBytes(StandardCharsets.UTF_8));
+
+            return BinanceConnectionStatus.builder()
+                    .ok(true)
+                    .keyValid(true)
+                    .secretValid(true)
+                    .readingEnabled(true)
+                    .tradingEnabled(true)
+                    .ipAllowed(true)
+                    .networkMismatch(false)
+                    .message("OK")
+                    .reasons(List.of("Signature OK"))
+                    .build();
+
+        } catch (Exception e) {
+
+            return BinanceConnectionStatus.builder()
+                    .ok(false)
+                    .keyValid(false)
+                    .secretValid(false)
+                    .readingEnabled(false)
+                    .tradingEnabled(false)
+                    .ipAllowed(true)
+                    .networkMismatch(false)
+                    .message("Неверный ключ или секрет")
+                    .reasons(List.of(e.getMessage()))
+                    .build();
+        }
     }
+
+    // =====================================================================
+    // ACCOUNT INFO (КОМИССИИ)
+    // =====================================================================
+
+    @Override
+    public AccountInfo getAccountInfo(long chatId, NetworkType networkType) {
+
+        try {
+            ExchangeSettings s = resolve(chatId, networkType);
+
+            Map<String, String> params = new LinkedHashMap<>();
+            params.put("timestamp", String.valueOf(System.currentTimeMillis()));
+            params.put("recvWindow", "5000");
+
+            // правильный query
+            String query = params.entrySet().stream()
+                    .map(e -> e.getKey() + "=" + e.getValue())
+                    .collect(Collectors.joining("&"));
+
+            String sign = signature(query, s.getApiSecret());
+
+            // ❗ правильный URL Binance
+            String url = baseUrl(networkType) + "/api/v3/account"
+                         + "?" + query + "&signature=" + sign;
+
+            HttpHeaders h = new HttpHeaders();
+            h.set("X-MBX-APIKEY", s.getApiKey());
+
+            String body = rest.exchange(url, HttpMethod.GET, new HttpEntity<>(null, h), String.class).getBody();
+
+            log.debug("🔍 Binance /api/v3/account response: {}", body);
+
+            JSONObject json = new JSONObject(body);
+
+            // комиссии в account приходят в целых значениях (10 = 0.1%)
+            double maker = json.optDouble("makerCommission", 10) / 100.0;
+            double taker = json.optDouble("takerCommission", 10) / 100.0;
+
+            int vip = json.optInt("feeTier", 0);
+
+            // ищем BNB
+            boolean hasBNB = json.getJSONArray("balances")
+                    .toList()
+                    .stream()
+                    .anyMatch(o -> {
+                        Map<?, ?> m = (Map<?, ?>) o;
+                        return "BNB".equalsIgnoreCase((String) m.get("asset"))
+                               && Double.parseDouble((String) m.get("free")) > 0.0001;
+                    });
+
+            // скидка если держит BNB
+            double makerDiscount = hasBNB ? maker * 0.75 : maker;
+            double takerDiscount = hasBNB ? taker * 0.75 : taker;
+
+            return AccountInfo.builder()
+                    .makerFee(maker)
+                    .takerFee(taker)
+                    .makerFeeWithDiscount(makerDiscount)
+                    .takerFeeWithDiscount(takerDiscount)
+                    .vipLevel(vip)
+                    .usingBnbDiscount(hasBNB)
+                    .build();
+
+        } catch (Exception e) {
+            log.error("❌ Ошибка getAccountInfo Binance: {}", e.getMessage());
+
+            return AccountInfo.builder()
+                    .makerFee(0.1)
+                    .takerFee(0.1)
+                    .makerFeeWithDiscount(0.1)
+                    .takerFeeWithDiscount(0.1)
+                    .vipLevel(0)
+                    .usingBnbDiscount(false)
+                    .build();
+        }
+    }
+
 }

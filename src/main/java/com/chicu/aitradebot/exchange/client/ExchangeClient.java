@@ -2,6 +2,7 @@ package com.chicu.aitradebot.exchange.client;
 
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.exchange.enums.OrderSide;
+import com.chicu.aitradebot.exchange.model.AccountInfo;
 import com.chicu.aitradebot.exchange.model.Order;
 
 import java.math.BigDecimal;
@@ -33,6 +34,7 @@ public interface ExchangeClient {
 
     /**
      * Возвращает тип сети (MAINNET / TESTNET).
+     * Может использоваться как "дефолтная" сеть, если не передана явно.
      */
     NetworkType getNetworkType();
 
@@ -88,14 +90,31 @@ public interface ExchangeClient {
     // ==================== 🔹 BALANCE ====================
 
     /**
-     * Возвращает баланс пользователя по конкретному активу.
+     * Возвращает баланс пользователя по конкретному активу
+     * в КОНКРЕТНОЙ сети.
      */
-    Balance getBalance(Long chatId, String asset) throws Exception;
+    Balance getBalance(Long chatId, String asset, NetworkType network) throws Exception;
 
     /**
-     * Возвращает все активные балансы пользователя (только активы с total > 0).
+     * Возвращает все активные балансы пользователя
+     * (только активы с total > 0) в КОНКРЕТНОЙ сети.
      */
-    Map<String, Balance> getFullBalance(Long chatId) throws Exception;
+    Map<String, Balance> getFullBalance(Long chatId, NetworkType network) throws Exception;
+
+    /**
+     * Старый вариант без указания сети — оставляем как default
+     * для обратной совместимости. По умолчанию использует getNetworkType().
+     */
+    default Balance getBalance(Long chatId, String asset) throws Exception {
+        return getBalance(chatId, asset, getNetworkType());
+    }
+
+    /**
+     * Старый вариант без указания сети — оставляем как default.
+     */
+    default Map<String, Balance> getFullBalance(Long chatId) throws Exception {
+        return getFullBalance(chatId, getNetworkType());
+    }
 
     // ==================== 🔹 DTO ====================
 
@@ -149,4 +168,12 @@ public interface ExchangeClient {
         // По умолчанию — минимальный набор (для клиентов без реализации).
         return List.of("1m", "5m", "15m", "1h", "4h", "1d");
     }
+
+    /**
+     * Возвращает информацию об аккаунте:
+     * - VIP level
+     * - комиссии maker/taker
+     * - наличие BNB (для Binance)
+     */
+    AccountInfo getAccountInfo(long chatId, NetworkType network);
 }

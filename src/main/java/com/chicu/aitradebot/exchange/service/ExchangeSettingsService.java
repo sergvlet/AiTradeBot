@@ -31,5 +31,6 @@ public interface ExchangeSettingsService {
     Optional<ExchangeSettings> findByChatIdAndExchangeAndNetwork(Long chatId, String exchange, NetworkType network);
 
     BinanceConnectionStatus testConnectionDetailed(ExchangeSettings settings);
+    ExchangeSettings getOrThrow(Long chatId, String exchange, NetworkType network);
 
 }

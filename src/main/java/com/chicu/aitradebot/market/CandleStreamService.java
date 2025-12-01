@@ -32,7 +32,7 @@ public class CandleStreamService {
         String tf = sf.getTimeframe();
         int limit = sf.getCandleLimit();
 
-        ExchangeClient client = clientFactory.getClient(exchange, network);
+        ExchangeClient client = clientFactory.get(exchange, network);
 
         try {
             List<ExchangeClient.Kline> list = client.getKlines(symbol, tf, limit);
