@@ -1,0 +1,1513 @@
+@startuml
+
+!theme plain
+top to bottom direction
+skinparam linetype ortho
+
+class AccessLogFilter {
+  + AccessLogFilter(): 
+  - log: Logger
+}
+enum Action << enumeration >> {
+  + Action(): 
+  + BUY: 
+  + HOLD: 
+  + SELL: 
+}
+class AiStrategyOrchestrator {
+  + AiStrategyOrchestrator(StrategyRegistry, OrderService): 
+  - orderService: OrderService
+  - activeStrategies: Map<Long, Set<StrategyType>>
+  - log: Logger
+  - strategyRegistry: StrategyRegistry
+  - activeOrchestrators: Map<Long, Boolean>
+}
+class AiTradeBotApplication {
+  + AiTradeBotApplication(): 
+}
+class AiTradeBotApplicationTests {
+  + AiTradeBotApplicationTests(): 
+}
+class ApiErrorHandler {
+  + ApiErrorHandler(): 
+  - log: Logger
+}
+class Balance {
+  + Balance(): 
+  + Balance(Long, Long, String, BigDecimal, BigDecimal): 
+  - id: Long
+  - free: BigDecimal
+  - locked: BigDecimal
+  - asset: String
+  - userId: Long
+}
+entity Balance << record >> {
+  + Balance(String, double, double): 
+  - asset: String
+  - locked: double
+  - free: double
+}
+class BalanceBuilder {
+  ~ BalanceBuilder(): 
+  - userId: Long
+  - free$set: boolean
+  - id: Long
+  - free$value: BigDecimal
+  - asset: String
+  - locked$value: BigDecimal
+  - locked$set: boolean
+}
+class BalanceInfo {
+  + BalanceInfo(BigDecimal, BigDecimal): 
+  + BalanceInfo(): 
+  - free: BigDecimal
+  - locked: BigDecimal
+}
+class BalanceInfoBuilder {
+  ~ BalanceInfoBuilder(): 
+  - free$set: boolean
+  - free$value: BigDecimal
+  - locked$set: boolean
+  - locked$value: BigDecimal
+}
+interface BalanceRepository << interface >>
+interface BalanceService << interface >>
+class BalanceServiceImpl {
+  + BalanceServiceImpl(BalanceRepository): 
+  - balanceRepository: BalanceRepository
+  - log: Logger
+}
+class BinanceExchangeClient {
+  + BinanceExchangeClient(ExchangeSettingsService): 
+  + BinanceExchangeClient(boolean, ExchangeSettingsService): 
+  - restTemplate: RestTemplate
+  - settingsService: ExchangeSettingsService
+  - lastSymbolsFetch: long
+  - log: Logger
+  - cachedSymbols: List<String>
+  - TESTNET: String
+  - MAINNET: String
+  - testnet: boolean
+}
+class BinanceKeyCheck {
+  + BinanceKeyCheck(): 
+}
+class BinancePublicTradeStreamService {
+  + BinancePublicTradeStreamService(SmartFusionCandleService): 
+  - log: Logger
+  - candleService: SmartFusionCandleService
+  - listener: TradeFeedListener
+  - sockets: Map<String, WebSocket>
+  - BINANCE_WS_URL: String
+  - reconnectExecutor: ScheduledExecutorService
+  - httpClient: HttpClient
+}
+class BinanceWebSocketClient {
+  + BinanceWebSocketClient(): 
+  - listener: MarketTickListener
+  - log: Logger
+  - BASE_SPOT: String
+  - client: OkHttpClient
+}
+class Bucket {
+  ~ Bucket(long): 
+  ~ close: double
+  ~ open: double
+  ~ high: double
+  ~ low: double
+  ~ second: long
+  ~ first: boolean
+  ~ volume: double
+}
+class Builder {
+  + Builder(): 
+  - timestamp: Long
+  - action: Action
+  - price: BigDecimal
+  - symbol: String
+  - confidence: BigDecimal
+}
+class BybitExchangeClient {
+  + BybitExchangeClient(ExchangeSettingsService): 
+  + BybitExchangeClient(boolean, ExchangeSettingsService): 
+  - MAINNET: String
+  - TESTNET: String
+  - RECV_WINDOW: String
+  - restTemplate: RestTemplate
+  - log: Logger
+  - settingsService: ExchangeSettingsService
+  - testnet: boolean
+}
+class BybitListener {
+  + BybitListener(String): 
+  - symbol: String
+}
+class BybitPublicTradeStreamService {
+  + BybitPublicTradeStreamService(): 
+  - log: Logger
+  - reconnectExecutor: ScheduledExecutorService
+  - httpClient: HttpClient
+  - sockets: Map<String, WebSocket>
+  - listener: TradeFeedListener
+}
+entity Candle << record >> {
+  + Candle(long, double, double, double, double, double): 
+  - low: double
+  - close: double
+  - time: long
+  - open: double
+  - high: double
+  - volume: double
+}
+class CandleAggregator {
+  + CandleAggregator(RealtimeStreamService): 
+  - log: Logger
+  - lastPush: Map<String, Long>
+  - stream: RealtimeStreamService
+  - live: Map<String, Map<String, LiveCandle>>
+  - tfMap: Map<String, Long>
+  - PUSH_DELAY: long
+  - current: Map<String, CandleDto>
+  - symbol: String
+}
+class CandleDto {
+  + CandleDto(long, double, double, double, double, double): 
+  + CandleDto(): 
+  - open: double
+  - low: double
+  - volume: double
+  - high: double
+  - close: double
+  - time: long
+}
+class CandleDtoBuilder {
+  ~ CandleDtoBuilder(): 
+  - low: double
+  - open: double
+  - high: double
+  - close: double
+  - volume: double
+  - time: long
+}
+interface CandleProvider << interface >>
+class CandleResampler {
+  + CandleResampler(): 
+}
+interface CandleServiceAdapter<C> << interface >>
+class CandleStreamService {
+  + CandleStreamService(ExchangeClientFactory, SmartFusionStrategySettingsService): 
+  - log: Logger
+  - sfSettingsService: SmartFusionStrategySettingsService
+  - clientFactory: ExchangeClientFactory
+}
+class CandleWebSocketHandler {
+  + CandleWebSocketHandler(): 
+  - sessionChannel: Map<String, String>
+  - channels: Map<String, Set<WebSocketSession>>
+  - log: Logger
+}
+interface ContextAwareStrategy << interface >>
+class DashboardStats {
+  ~ DashboardStats(long, long, double, double, int): 
+  - totalProfit: double
+  - totalStrategies: long
+  - usersCount: int
+  - avgConfidence: double
+  - activeStrategies: long
+}
+class DashboardStatsBuilder {
+  ~ DashboardStatsBuilder(): 
+  - activeStrategies: long
+  - totalStrategies: long
+  - usersCount: int
+  - avgConfidence: double
+  - totalProfit: double
+}
+interface DashboardSupport << interface >>
+interface ExchangeClient << interface >>
+class ExchangeClientConfig {
+  + ExchangeClientConfig(): 
+  - log: Logger
+}
+class ExchangeClientFactory {
+  + ExchangeClientFactory(): 
+  - log: Logger
+  - registry: Map<String, ExchangeClient>
+}
+class ExchangeSettings {
+  + ExchangeSettings(Long, Long, String, NetworkType, String, String, String, String, boolean, Instant, Instant): 
+  + ExchangeSettings(): 
+  - apiKey: String
+  - createdAt: Instant
+  - chatId: Long
+  - id: Long
+  - exchange: String
+  - apiSecret: String
+  - network: NetworkType
+  - subAccount: String
+  - passphrase: String
+  - enabled: boolean
+  - updatedAt: Instant
+}
+class ExchangeSettingsBuilder {
+  ~ ExchangeSettingsBuilder(): 
+  - passphrase: String
+  - exchange: String
+  - createdAt: Instant
+  - subAccount: String
+  - id: Long
+  - apiKey: String
+  - chatId: Long
+  - updatedAt: Instant
+  - enabled$set: boolean
+  - network: NetworkType
+  - apiSecret: String
+  - enabled$value: boolean
+}
+interface ExchangeSettingsRepository << interface >>
+interface ExchangeSettingsService << interface >>
+interface ExchangeSettingsService << interface >>
+class ExchangeSettingsServiceImpl {
+  + ExchangeSettingsServiceImpl(ExchangeSettingsRepository): 
+  - repository: ExchangeSettingsRepository
+  - log: Logger
+}
+class ExchangeSymbolsApiController {
+  + ExchangeSymbolsApiController(ExchangeClientFactory): 
+  - log: Logger
+  - clientFactory: ExchangeClientFactory
+}
+class ExchangeTimeframesApiController {
+  + ExchangeTimeframesApiController(ExchangeClientFactory): 
+  - clientFactory: ExchangeClientFactory
+  - log: Logger
+}
+class FibonacciGridStrategy {
+  + FibonacciGridStrategy(): 
+  - log: Logger
+  - active: boolean
+}
+class FilterSignal {
+  + FilterSignal(boolean, boolean, double, double, double, double, double): 
+  - rsi: double
+  - bearish: boolean
+  - atr: double
+  - emaFast: double
+  - trendStrength: double
+  - bullish: boolean
+  - emaSlow: double
+}
+class FilterSignalBuilder {
+  ~ FilterSignalBuilder(): 
+  - emaSlow: double
+  - rsi: double
+  - atr: double
+  - bullish: boolean
+  - emaFast: double
+  - trendStrength: double
+  - bearish: boolean
+}
+class FullChartApiController {
+  + FullChartApiController(SmartFusionCandleService, OrderService): 
+  - orderService: OrderService
+  - candleService: SmartFusionCandleService
+  - log: Logger
+}
+class HomeController {
+  + HomeController(WebDashboardService): 
+  - dashboardService: WebDashboardService
+}
+class HttpLoggingConfig {
+  + HttpLoggingConfig(): 
+}
+class Kline {
+  + Kline(long, double, double, double, double, double): 
+  + Kline(): 
+  - high: double
+  - open: double
+  - openTime: long
+  - low: double
+  - close: double
+  - volume: double
+}
+entity Kline << record >> {
+  + Kline(long, double, double, double, double, double): 
+  - open: double
+  - openTime: long
+  - volume: double
+  - high: double
+  - low: double
+  - close: double
+}
+class LinePoint {
+  + LinePoint(long, double): 
+  + LinePoint(): 
+  - time: long
+  - value: double
+}
+class LinePointBuilder {
+  ~ LinePointBuilder(): 
+  - value: double
+  - time: long
+}
+class LiveCandle {
+  ~ LiveCandle(long, double): 
+  ~ open: double
+  ~ low: double
+  ~ high: double
+  ~ close: double
+  ~ bucket: long
+  ~ volume: double
+}
+class LiveCandle {
+  + LiveCandle(): 
+  ~ open: double
+  ~ bucket: long
+  ~ high: double
+  ~ low: double
+  ~ close: double
+  ~ volume: double
+}
+class MarketStreamManager {
+  + MarketStreamManager(BinanceWebSocketClient, CandleAggregator): 
+  - binanceWs: BinanceWebSocketClient
+  - aggregator: CandleAggregator
+  - log: Logger
+}
+class MarketStreamWebSocketHandler {
+  + MarketStreamWebSocketHandler(): 
+  - log: Logger
+  - sessions: Set<WebSocketSession>
+}
+class MarketStreamingConfig {
+  + MarketStreamingConfig(BinancePublicTradeStreamService, SmartFusionCandleService): 
+  - binanceStream: BinancePublicTradeStreamService
+  - candleService: SmartFusionCandleService
+  - log: Logger
+}
+interface MarketTickListener << interface >>
+class MlInvestStrategy {
+  + MlInvestStrategy(): 
+  - active: boolean
+  - log: Logger
+}
+enum NetworkType << enumeration >> {
+  + NetworkType(): 
+  + TESTNET: 
+  + MAINNET: 
+}
+class Order {
+  + Order(Long, String, Long, String, String, String, BigDecimal, BigDecimal, BigDecimal, String, Long, Long, boolean, StrategyType): 
+  + Order(): 
+  - timestamp: Long
+  - quantity: BigDecimal
+  - filled: boolean
+  - time: Long
+  - side: String
+  - qty: BigDecimal
+  - strategyType: StrategyType
+  - symbol: String
+  - status: String
+  - type: String
+  - id: Long
+  - price: BigDecimal
+  - orderId: String
+  - chatId: Long
+}
+class OrderBuilder {
+  ~ OrderBuilder(): 
+  - type: String
+  - status: String
+  - strategyType: StrategyType
+  - price: BigDecimal
+  - symbol: String
+  - quantity: BigDecimal
+  - timestamp: Long
+  - id: Long
+  - side: String
+  - qty: BigDecimal
+  - filled: boolean
+  - orderId: String
+  - time: Long
+  - chatId: Long
+}
+class OrderEntity {
+  + OrderEntity(): 
+  + OrderEntity(Long, Long, Long, String, String, BigDecimal, BigDecimal, BigDecimal, String, String, Boolean, Long, LocalDateTime, LocalDateTime, String, String, BigDecimal, BigDecimal, BigDecimal, Long, BigDecimal, BigDecimal, Boolean, Boolean, BigDecimal): 
+  - exitReason: String
+  - symbol: String
+  - timestamp: Long
+  - total: BigDecimal
+  - realizedPnlPct: BigDecimal
+  - id: Long
+  - takeProfitPrice: BigDecimal
+  - exitTimestamp: Long
+  - chatId: Long
+  - side: String
+  - updatedAt: LocalDateTime
+  - createdAt: LocalDateTime
+  - status: String
+  - exitPrice: BigDecimal
+  - entryReason: String
+  - stopLossPrice: BigDecimal
+  - tpHit: Boolean
+  - userId: Long
+  - mlConfidence: BigDecimal
+  - strategyType: String
+  - price: BigDecimal
+  - slHit: Boolean
+  - realizedPnlUsd: BigDecimal
+  - filled: Boolean
+  - quantity: BigDecimal
+}
+interface OrderRepository << interface >>
+entity OrderResult << record >> {
+  + OrderResult(String, String, String, String, double, double, String, long): 
+  - price: double
+  - qty: double
+  - orderId: String
+  - symbol: String
+  - status: String
+  - side: String
+  - type: String
+  - timestamp: long
+}
+interface OrderService << interface >>
+class OrderServiceImpl {
+  + OrderServiceImpl(OrderRepository): 
+  - orderRepository: OrderRepository
+  - log: Logger
+}
+enum OrderSide << enumeration >> {
+  + OrderSide(): 
+  + SELL: 
+  + BUY: 
+}
+entity Point << record >> {
+  - Point(long, double): 
+  - value: double
+  - time: long
+}
+entity PricePoint << record >> {
+  - PricePoint(Instant, double): 
+  - timestamp: Instant
+  - price: double
+}
+class ProfileController {
+  + ProfileController(WebDashboardService): 
+  - dashboardService: WebDashboardService
+}
+class RealtimeCandleApiController {
+  + RealtimeCandleApiController(CandleStreamService): 
+  - candleStream: CandleStreamService
+}
+class RealtimeStreamService {
+  + RealtimeStreamService(CandleWebSocketHandler, TradeWebSocketHandler): 
+  - log: Logger
+  - tradeHandler: TradeWebSocketHandler
+  - candleHandler: CandleWebSocketHandler
+}
+class RlDecision {
+  + RlDecision(): 
+  + RlDecision(double, double, double, double): 
+  - sizePct: double
+  - tpAtrMult: double
+  - slAtrMult: double
+  - avgReward: double
+}
+class RlDecisionBuilder {
+  ~ RlDecisionBuilder(): 
+  - slAtrMult: double
+  - tpAtrMult: double
+  - sizePct: double
+  - avgReward: double
+}
+class RlState {
+  + RlState(double, double, double, double): 
+  + RlState(): 
+  ~ slAtrMult: double
+  ~ tpAtrMult: double
+  ~ sizePct: double
+  ~ avgReward: double
+}
+class RlStateBuilder {
+  ~ RlStateBuilder(): 
+  - slAtrMult: double
+  - avgReward: double
+  - sizePct: double
+  - tpAtrMult: double
+}
+class RsiEmaStrategy {
+  + RsiEmaStrategy(): 
+  - active: boolean
+  - log: Logger
+}
+interface RuntimeIntrospectable << interface >>
+class ScalpingStrategy {
+  + ScalpingStrategy(): 
+  - active: boolean
+  - log: Logger
+}
+interface SchedulerService << interface >>
+class SchedulerServiceImpl {
+  + SchedulerServiceImpl(): 
+  - executor: ExecutorService
+  - runningTasks: ConcurrentMap<Long, ConcurrentMap<StrategyType, Future<?>>>
+  - log: Logger
+}
+class SignalDecision {
+  + SignalDecision(String, BigDecimal): 
+  - action: String
+  - confidence: BigDecimal
+}
+class SmartFusionCandleService {
+  + SmartFusionCandleService(ExchangeClientFactory, ExchangeSettingsService, SmartFusionStrategySettingsService, CandleWebSocketHandler, RealtimeStreamService): 
+  - log: Logger
+  - live: Map<String, Map<String, LiveCandle>>
+  - settingsService: SmartFusionStrategySettingsService
+  - clientFactory: ExchangeClientFactory
+  - exchangeSettingsService: ExchangeSettingsService
+  - realtime: RealtimeStreamService
+  - ws: CandleWebSocketHandler
+  - LIVE_TF: List<String>
+  - LIVE_PUSH_INTERVAL_MS: long
+  - historyCache: Map<String, List<Candle>>
+  - lastPush: Map<String, Long>
+}
+class SmartFusionFilter {
+  + SmartFusionFilter(): 
+  - log: Logger
+}
+class SmartFusionMlService {
+  + SmartFusionMlService(): 
+  - log: Logger
+}
+class SmartFusionOrderExecutor {
+  + SmartFusionOrderExecutor(ExchangeSettingsService, ExchangeClientFactory): 
+  - exchangeSettingsService: ExchangeSettingsService
+  - log: Logger
+  - exchangeClientFactory: ExchangeClientFactory
+  - recentTrades: Deque<Order>
+}
+class SmartFusionPnLTracker {
+  + SmartFusionPnLTracker(): 
+  - pnlHistory: Map<String, List<Double>>
+  - log: Logger
+}
+class SmartFusionRiskManager {
+  + SmartFusionRiskManager(SmartFusionPnLTracker): 
+  - pnlTracker: SmartFusionPnLTracker
+  - log: Logger
+}
+class SmartFusionRlAgent {
+  + SmartFusionRlAgent(): 
+  - stateMap: Map<String, RlState>
+  - log: Logger
+}
+class SmartFusionSettingsApiController {
+  + SmartFusionSettingsApiController(SmartFusionStrategySettingsService): 
+  - settingsService: SmartFusionStrategySettingsService
+  - log: Logger
+}
+class SmartFusionStrategy {
+  + SmartFusionStrategy(SmartFusionCandleService, SmartFusionOrderExecutor, SmartFusionPnLTracker, SmartFusionStrategySettingsService, MarketStreamManager): 
+  - candleService: SmartFusionCandleService
+  - network: NetworkType
+  - pnlTracker: SmartFusionPnLTracker
+  - settingsService: SmartFusionStrategySettingsService
+  - marketStreamManager: MarketStreamManager
+  - threadName: String
+  - running: AtomicBoolean
+  - orderExecutor: SmartFusionOrderExecutor
+  - workerThread: Thread
+  - symbol: String
+  - lastEvent: String
+  - startedAt: Instant
+  - exchange: String
+  - log: Logger
+  - chatId: long
+}
+class SmartFusionStrategySettings {
+  + SmartFusionStrategySettings(Long, Long, String, String, NetworkType, String, int, double, double, int, double, double, double, double, int, BigDecimal, double, double, double, double, double, double, double, double, double, double, double, double, double, double, int, int, int, int, double, double, int, double, double, double, boolean, boolean): 
+  + SmartFusionStrategySettings(): 
+  - stopLossAtrMult: double
+  - rlMinTpMult: double
+  - riskPerTradePct: double
+  - volatilityWindowSec: int
+  - rsiSellThreshold: double
+  - symbol: String
+  - smartSizingStartPct: double
+  - mlBuyMin: double
+  - rlStepTp: double
+  - leverage: double
+  - rlMaxTpMult: double
+  - chatId: Long
+  - autoRetrain: boolean
+  - tickIntervalSec: int
+  - rsiPeriod: int
+  - rlMaxSlMult: double
+  - reinvestProfit: boolean
+  - networkType: NetworkType
+  - rlStepSl: double
+  - emaSlowPeriod: int
+  - rsiBuyThreshold: double
+  - timeframe: String
+  - capitalUsd: double
+  - volatilityThresholdPct: double
+  - rlStepSize: double
+  - bollingerK: double
+  - exchange: String
+  - mlSellMin: double
+  - rlMinSlMult: double
+  - emaFastPeriod: int
+  - volatilityShieldPct: BigDecimal
+  - commissionPct: double
+  - smartSizingMaxPct: double
+  - dailyLossLimitPct: double
+  - takeProfitAtrMult: double
+  - rlDrawdownPenaltyFloor: double
+  - atrPeriod: int
+  - candleLimit: int
+  - smartSizingMinPct: double
+  - bollingerPeriod: int
+  - rlAlpha: double
+  - id: Long
+}
+class SmartFusionStrategySettingsBuilder {
+  ~ SmartFusionStrategySettingsBuilder(): 
+  - networkType$set: boolean
+  - rlStepSl$value: double
+  - rlDrawdownPenaltyFloor$set: boolean
+  - rlStepTp$value: double
+  - rsiBuyThreshold$value: double
+  - emaSlowPeriod$set: boolean
+  - rlMaxTpMult$set: boolean
+  - bollingerPeriod$set: boolean
+  - mlBuyMin$value: double
+  - mlSellMin$value: double
+  - rlStepSize$value: double
+  - bollingerK$set: boolean
+  - networkType$value: NetworkType
+  - chatId: Long
+  - volatilityShieldPct$value: BigDecimal
+  - emaSlowPeriod$value: int
+  - leverage$value: double
+  - rlStepSize$set: boolean
+  - rlMinTpMult$value: double
+  - rlMinSlMult$set: boolean
+  - dailyLossLimitPct$value: double
+  - bollingerPeriod$value: int
+  - autoRetrain$set: boolean
+  - reinvestProfit$value: boolean
+  - volatilityThresholdPct$set: boolean
+  - rlMaxSlMult$value: double
+  - stopLossAtrMult$set: boolean
+  - timeframe$value: String
+  - rlAlpha$set: boolean
+  - rsiSellThreshold$value: double
+  - timeframe$set: boolean
+  - smartSizingStartPct$set: boolean
+  - candleLimit$value: int
+  - rlDrawdownPenaltyFloor$value: double
+  - rsiPeriod$set: boolean
+  - commissionPct$value: double
+  - stopLossAtrMult$value: double
+  - smartSizingMaxPct$set: boolean
+  - smartSizingMaxPct$value: double
+  - emaFastPeriod$value: int
+  - id: Long
+  - rlMinSlMult$value: double
+  - mlBuyMin$set: boolean
+  - rlAlpha$value: double
+  - rlMaxTpMult$value: double
+  - volatilityWindowSec$value: int
+  - autoRetrain$value: boolean
+  - symbol: String
+  - rlStepSl$set: boolean
+  - riskPerTradePct$set: boolean
+  - rlMinTpMult$set: boolean
+  - exchange$set: boolean
+  - dailyLossLimitPct$set: boolean
+  - volatilityShieldPct$set: boolean
+  - tickIntervalSec$value: int
+  - takeProfitAtrMult$value: double
+  - exchange$value: String
+  - rlMaxSlMult$set: boolean
+  - smartSizingMinPct$set: boolean
+  - atrPeriod$value: int
+  - rsiPeriod$value: int
+  - reinvestProfit$set: boolean
+  - commissionPct$set: boolean
+  - rsiBuyThreshold$set: boolean
+  - rsiSellThreshold$set: boolean
+  - smartSizingStartPct$value: double
+  - takeProfitAtrMult$set: boolean
+  - tickIntervalSec$set: boolean
+  - capitalUsd$value: double
+  - rlStepTp$set: boolean
+  - mlSellMin$set: boolean
+  - riskPerTradePct$value: double
+  - volatilityThresholdPct$value: double
+  - emaFastPeriod$set: boolean
+  - smartSizingMinPct$value: double
+  - leverage$set: boolean
+  - atrPeriod$set: boolean
+  - volatilityWindowSec$set: boolean
+  - candleLimit$set: boolean
+  - bollingerK$value: double
+  - capitalUsd$set: boolean
+}
+interface SmartFusionStrategySettingsRepository << interface >>
+interface SmartFusionStrategySettingsService << interface >>
+class SmartFusionStrategySettingsServiceImpl {
+  + SmartFusionStrategySettingsServiceImpl(SmartFusionStrategySettingsRepository): 
+  - log: Logger
+  - repository: SmartFusionStrategySettingsRepository
+}
+class SmartFusionUserSettingsDto {
+  + SmartFusionUserSettingsDto(): 
+  + SmartFusionUserSettingsDto(String, String, NetworkType, String, int, double, double, double, double, double, double, int, int, int, double, double, int, double, double, double, boolean, boolean): 
+  - mlSellMin: double
+  - stopLossAtrMult: double
+  - autoRetrain: boolean
+  - mlBuyMin: double
+  - rsiBuyThreshold: double
+  - emaFastPeriod: int
+  - bollingerK: double
+  - rsiSellThreshold: double
+  - reinvestProfit: boolean
+  - emaSlowPeriod: int
+  - bollingerPeriod: int
+  - candleLimit: int
+  - networkType: NetworkType
+  - dailyLossLimitPct: double
+  - capitalUsd: double
+  - timeframe: String
+  - takeProfitAtrMult: double
+  - exchange: String
+  - symbol: String
+  - atrPeriod: int
+  - riskPerTradePct: double
+  - leverage: double
+}
+class SmartFusionUserSettingsDtoBuilder {
+  ~ SmartFusionUserSettingsDtoBuilder(): 
+  - capitalUsd: double
+  - symbol: String
+  - mlBuyMin: double
+  - emaSlowPeriod: int
+  - rsiBuyThreshold: double
+  - timeframe: String
+  - exchange: String
+  - takeProfitAtrMult: double
+  - networkType: NetworkType
+  - mlSellMin: double
+  - bollingerPeriod: int
+  - reinvestProfit: boolean
+  - leverage: double
+  - stopLossAtrMult: double
+  - autoRetrain: boolean
+  - atrPeriod: int
+  - rsiSellThreshold: double
+  - riskPerTradePct: double
+  - candleLimit: int
+  - bollingerK: double
+  - dailyLossLimitPct: double
+  - emaFastPeriod: int
+}
+class SmartFusionVolatilityShield {
+  + SmartFusionVolatilityShield(): 
+  - log: Logger
+  - priceHistory: Map<String, Deque<PricePoint>>
+}
+annotation StrategyBinding << annotation >>
+class StrategyChartApiController {
+  + StrategyChartApiController(StrategyDashboardService): 
+  - dashboardService: StrategyDashboardService
+  - log: Logger
+}
+class StrategyChartDto {
+  + StrategyChartDto(String, String, List<LinePoint>, Map<String, Double>, List<CandleDto>, Map<String, Double>, List<LinePoint>, List<LinePoint>, List<LinePoint>, List<LinePoint>, Map<String, List<LinePoint>>, List<LinePoint>, List<LinePoint>, List<TradeMarker>, List<Double>, List<Double>, Map<String, Double>, double, long): 
+  + StrategyChartDto(): 
+  - slLevels: List<Double>
+  - serverTime: long
+  - monthlyPnl: Map<String, Double>
+  - timeframe: String
+  - emaSlow: List<LinePoint>
+  - trades: List<TradeMarker>
+  - tpLevels: List<Double>
+  - atr: List<LinePoint>
+  - emaFast: List<LinePoint>
+  - symbol: String
+  - ema20: List<LinePoint>
+  - ema50: List<LinePoint>
+  - lastPrice: double
+  - stats: Map<String, Double>
+  - supertrend: List<LinePoint>
+  - candles: List<CandleDto>
+  - bollinger: Map<String, List<LinePoint>>
+  - equity: List<LinePoint>
+  - kpis: Map<String, Double>
+}
+class StrategyChartDtoBuilder {
+  ~ StrategyChartDtoBuilder(): 
+  - kpis: Map<String, Double>
+  - slLevels: List<Double>
+  - ema50: List<LinePoint>
+  - atr: List<LinePoint>
+  - supertrend: List<LinePoint>
+  - timeframe: String
+  - monthlyPnl: Map<String, Double>
+  - symbol: String
+  - tpLevels: List<Double>
+  - emaFast: List<LinePoint>
+  - candles: List<CandleDto>
+  - trades: List<TradeMarker>
+  - lastPrice: double
+  - bollinger: Map<String, List<LinePoint>>
+  - emaSlow: List<LinePoint>
+  - ema20: List<LinePoint>
+  - equity: List<LinePoint>
+  - stats: Map<String, Double>
+  - serverTime: long
+}
+class StrategyConfig {
+  + StrategyConfig(): 
+  - log: Logger
+}
+class StrategyControlApiController {
+  + StrategyControlApiController(StrategyFacade): 
+  - facade: StrategyFacade
+  - log: Logger
+}
+class StrategyController {
+  + StrategyController(StrategyService, SmartFusionStrategySettingsService, UserProfileService): 
+  - smartFusionSettingsService: SmartFusionStrategySettingsService
+  - strategyService: StrategyService
+  - log: Logger
+  - userProfileService: UserProfileService
+}
+class StrategyDashboardController {
+  + StrategyDashboardController(StrategyFacade): 
+  - strategyFacade: StrategyFacade
+  - log: Logger
+}
+class StrategyDashboardService {
+  + StrategyDashboardService(StrategyRegistry, StrategySettingsService, SmartFusionStrategySettingsService, SmartFusionCandleService, OrderService, OrderRepository): 
+  - sfSettingsService: SmartFusionStrategySettingsService
+  - orderRepo: OrderRepository
+  - smartCandle: SmartFusionCandleService
+  - ALLOWED_TF: Set<String>
+  - settingsService: StrategySettingsService
+  - orderService: OrderService
+  - registry: StrategyRegistry
+}
+class StrategyFacade {
+  + StrategyFacade(StrategyRegistry, SchedulerService, StrategySettingsResolver, ApplicationContext, AiStrategyOrchestrator, OrderService): 
+  - orderService: OrderService
+  - schedulerService: SchedulerService
+  - strategyRegistry: StrategyRegistry
+  - instances: Map<Long, Map<StrategyType, TradingStrategy>>
+  - applicationContext: ApplicationContext
+  - settingsResolver: StrategySettingsResolver
+  - log: Logger
+  - aiOrchestrator: AiStrategyOrchestrator
+}
+class StrategyRegistry {
+  + StrategyRegistry(ApplicationContext): 
+  - strategyClasses: Map<StrategyType, Class<TradingStrategy>>
+  - context: ApplicationContext
+  - log: Logger
+}
+class StrategyRunInfo {
+  + StrategyRunInfo(): 
+  + StrategyRunInfo(Long, Long, StrategyType, String, boolean, boolean, Instant, Instant, Instant, Instant, String, String, BigDecimal, BigDecimal, long, BigDecimal, BigDecimal, BigDecimal, BigDecimal, BigDecimal, Integer, String, BigDecimal, BigDecimal, BigDecimal, List<String>, List<Double>, List<Integer>, List<Integer>, String, NetworkType): 
+  - serialVersionUID: long
+  - tpPct: BigDecimal
+  - stoppedAt: Instant
+  - prices: List<Double>
+  - id: Long
+  - running: boolean
+  - initialEquity: BigDecimal
+  - symbol: String
+  - type: StrategyType
+  - threadName: String
+  - timestamps: List<String>
+  - chatId: Long
+  - timeframe: String
+  - mlConfidence: BigDecimal
+  - totalProfitPct: BigDecimal
+  - networkType: NetworkType
+  - pnlUsd: BigDecimal
+  - sellIndexes: List<Integer>
+  - buyIndexes: List<Integer>
+  - riskPerTradePct: BigDecimal
+  - startedAt: Instant
+  - winRatePct: BigDecimal
+  - version: Integer
+  - balanceUsd: BigDecimal
+  - lastTickAt: Instant
+  - lastEvent: String
+  - active: boolean
+  - totalTrades: long
+  - exchange: String
+  - lastUpdate: Instant
+  - currentEquity: BigDecimal
+  - slPct: BigDecimal
+}
+class StrategyRunInfoBuilder {
+  ~ StrategyRunInfoBuilder(): 
+  - initialEquity: BigDecimal
+  - stoppedAt: Instant
+  - version: Integer
+  - sellIndexes: List<Integer>
+  - prices: List<Double>
+  - exchange: String
+  - lastTickAt: Instant
+  - tpPct: BigDecimal
+  - winRatePct: BigDecimal
+  - chatId: Long
+  - riskPerTradePct: BigDecimal
+  - timestamps: List<String>
+  - networkType: NetworkType
+  - lastUpdate: Instant
+  - id: Long
+  - totalTrades: long
+  - startedAt: Instant
+  - lastEvent: String
+  - symbol: String
+  - timeframe: String
+  - currentEquity: BigDecimal
+  - buyIndexes: List<Integer>
+  - type: StrategyType
+  - running: boolean
+  - threadName: String
+  - mlConfidence: BigDecimal
+  - active: boolean
+  - totalProfitPct: BigDecimal
+  - slPct: BigDecimal
+  - balanceUsd: BigDecimal
+  - pnlUsd: BigDecimal
+}
+class StrategyService {
+  + StrategyService(StrategyRegistry, ApplicationContext, SmartFusionStrategySettingsRepository, UserProfileRepository): 
+  - userProfileRepository: UserProfileRepository
+  - strategyRegistry: StrategyRegistry
+  - smartFusionRepo: SmartFusionStrategySettingsRepository
+  - context: ApplicationContext
+  - log: Logger
+}
+class StrategySettings {
+  + StrategySettings(Long, StrategyType, String, String, Integer, BigDecimal, BigDecimal, BigDecimal, int, int, boolean, LocalDateTime, LocalDateTime): 
+  + StrategySettings(): 
+  - commissionPct: BigDecimal
+  - active: boolean
+  - timeframe: String
+  - createdAt: LocalDateTime
+  - version: int
+  - takeProfitPct: BigDecimal
+  - cachedCandlesLimit: Integer
+  - symbol: String
+  - id: Long
+  - type: StrategyType
+  - updatedAt: LocalDateTime
+  - stopLossPct: BigDecimal
+  - leverage: int
+}
+class StrategySettingsBuilder {
+  ~ StrategySettingsBuilder(): 
+  - type: StrategyType
+  - cachedCandlesLimit$set: boolean
+  - version$set: boolean
+  - cachedCandlesLimit$value: Integer
+  - timeframe: String
+  - commissionPct$set: boolean
+  - active$value: boolean
+  - symbol: String
+  - takeProfitPct$set: boolean
+  - stopLossPct$value: BigDecimal
+  - id: Long
+  - createdAt$value: LocalDateTime
+  - updatedAt: LocalDateTime
+  - active$set: boolean
+  - stopLossPct$set: boolean
+  - takeProfitPct$value: BigDecimal
+  - leverage$set: boolean
+  - leverage$value: int
+  - createdAt$set: boolean
+  - version$value: int
+  - commissionPct$value: BigDecimal
+}
+class StrategySettingsMapper {
+  + StrategySettingsMapper(): 
+  - log: Logger
+}
+interface StrategySettingsProvider<T> << interface >>
+interface StrategySettingsRepository << interface >>
+class StrategySettingsResolver {
+  + StrategySettingsResolver(ApplicationContext): 
+  - context: ApplicationContext
+  - providers: Map<StrategyType, StrategySettingsProvider<?>>
+  - log: Logger
+}
+interface StrategySettingsService << interface >>
+class StrategySettingsServiceImpl {
+  + StrategySettingsServiceImpl(StrategySettingsRepository): 
+  - repository: StrategySettingsRepository
+  - log: Logger
+}
+class StrategyStatus {
+  + StrategyStatus(StrategyType, String, String): 
+  - type: StrategyType
+  - state: String
+  - symbol: String
+}
+class StrategyThreadFactory {
+  + StrategyThreadFactory(): 
+  - ctr: AtomicLong
+}
+enum StrategyType << enumeration >> {
+  + StrategyType(): 
+  + SMART_FUSION: 
+  + ML_INVEST: 
+  + FIBONACCI_GRID: 
+  + SCALPING: 
+  + RSI_EMA: 
+}
+class StrategyViewModel {
+  + StrategyViewModel(): 
+  + StrategyViewModel(Long, Long, String, String, String, boolean, BigDecimal, BigDecimal, String, String): 
+  - detailsUrl: String
+  - id: Long
+  - mlConfidence: BigDecimal
+  - symbol: String
+  - chatId: Long
+  - strategyType: String
+  - active: boolean
+  - settingsUrl: String
+  - strategyName: String
+  - totalProfitPct: BigDecimal
+}
+class StrategyViewModelBuilder {
+  ~ StrategyViewModelBuilder(): 
+  - strategyType: String
+  - settingsUrl: String
+  - strategyName: String
+  - symbol: String
+  - totalProfitPct: BigDecimal
+  - chatId: Long
+  - mlConfidence: BigDecimal
+  - active: boolean
+  - detailsUrl: String
+  - id: Long
+}
+interface Tick << interface >>
+class TimeUtil {
+  + TimeUtil(): 
+}
+enum Timeframe << enumeration >> {
+  - Timeframe(int, String): 
+  + M30: 
+  - binanceCode: String
+  + H1: 
+  + M3: 
+  + M15: 
+  + S5: 
+  + H4: 
+  + D1: 
+  + MON1: 
+  + H2: 
+  + D3: 
+  + H6: 
+  + S15: 
+  + M1: 
+  + M5: 
+  + H12: 
+  + S1: 
+  + W1: 
+  - LOOKUP: Map<String, Timeframe>
+  + S10: 
+  + S30: 
+  - stepSeconds: int
+}
+class TradeCacheService {
+  + TradeCacheService(): 
+  - RETAIN: Duration
+  - map: Map<String, ConcurrentLinkedQueue<TradeTick>>
+}
+interface TradeFeedListener << interface >>
+class TradeHistory {
+  + TradeHistory(Long, Long, String, String, BigDecimal, BigDecimal, LocalDateTime, LocalDateTime): 
+  + TradeHistory(): 
+  - id: Long
+  - strategyType: String
+  - pnlUsd: BigDecimal
+  - openedAt: LocalDateTime
+  - userId: Long
+  - symbol: String
+  - profitPct: BigDecimal
+  - closedAt: LocalDateTime
+}
+class TradeHistoryBuilder {
+  ~ TradeHistoryBuilder(): 
+  - symbol: String
+  - closedAt: LocalDateTime
+  - pnlUsd: BigDecimal
+  - profitPct: BigDecimal
+  - strategyType: String
+  - openedAt: LocalDateTime
+  - id: Long
+  - userId: Long
+}
+class TradeMarker {
+  + TradeMarker(long, double, double, String): 
+  + TradeMarker(): 
+  - side: String
+  - price: double
+  - qty: double
+  - time: long
+}
+class TradeMarkerBuilder {
+  ~ TradeMarkerBuilder(): 
+  - time: long
+  - qty: double
+  - side: String
+  - price: double
+}
+class TradePlan {
+  + TradePlan(double, double, double, double, double, double, double): 
+  - sizePct: double
+  - tpPrice: double
+  - commissionPct: double
+  - entryPrice: double
+  - slPrice: double
+  - positionValue: double
+  - expectedNetProfitPct: double
+}
+class TradePlanBuilder {
+  ~ TradePlanBuilder(): 
+  - expectedNetProfitPct: double
+  - slPrice: double
+  - commissionPct: double
+  - tpPrice: double
+  - positionValue: double
+  - sizePct: double
+  - entryPrice: double
+}
+entity TradeTick << record >> {
+  + TradeTick(String, Instant, double, double, boolean): 
+  - qty: double
+  - price: double
+  - symbol: String
+  - ts: Instant
+  - isBuy: boolean
+}
+class TradeWebSocketHandler {
+  + TradeWebSocketHandler(): 
+  - channels: Map<String, Set<WebSocketSession>>
+  - sessionChannel: Map<String, String>
+  - log: Logger
+}
+class TradingSignal {
+  - TradingSignal(Builder): 
+  - timestamp: long
+  - action: Action
+  - price: BigDecimal
+  - confidence: BigDecimal
+  - symbol: String
+}
+interface TradingStrategy << interface >>
+class UserProfile {
+  + UserProfile(Long, String, String, String, NetworkType, BigDecimal, boolean, String, LocalDateTime, LocalDateTime): 
+  + UserProfile(): 
+  - registeredAt: LocalDateTime
+  - lastActiveAt: LocalDateTime
+  - locale: String
+  - chatId: Long
+  - username: String
+  - balanceUsd: BigDecimal
+  - lastName: String
+  - firstName: String
+  - networkType: NetworkType
+  - active: boolean
+}
+class UserProfileBuilder {
+  ~ UserProfileBuilder(): 
+  - networkType$set: boolean
+  - active$set: boolean
+  - networkType$value: NetworkType
+  - firstName: String
+  - balanceUsd: BigDecimal
+  - locale$set: boolean
+  - registeredAt$value: LocalDateTime
+  - username: String
+  - lastName: String
+  - chatId: Long
+  - active$value: boolean
+  - locale$value: String
+  - registeredAt$set: boolean
+  - lastActiveAt: LocalDateTime
+}
+interface UserProfileRepository << interface >>
+interface UserProfileService << interface >>
+class UserProfileServiceImpl {
+  + UserProfileServiceImpl(UserProfileRepository): 
+  - repository: UserProfileRepository
+  - log: Logger
+}
+class UserProfileView {
+  ~ UserProfileView(String, Long, String, String): 
+  - chatId: Long
+  - username: String
+  - exchange: String
+  - email: String
+}
+class UserProfileViewBuilder {
+  ~ UserProfileViewBuilder(): 
+  - username: String
+  - chatId: Long
+  - exchange: String
+  - email: String
+}
+class UserStrategy {
+  + UserStrategy(Long, UserProfile, StrategySettings, boolean, LocalDateTime, LocalDateTime, long, BigDecimal, BigDecimal): 
+  + UserStrategy(): 
+  - totalProfitPct: BigDecimal
+  - active: boolean
+  - stoppedAt: LocalDateTime
+  - totalTrades: long
+  - strategySettings: StrategySettings
+  - user: UserProfile
+  - mlConfidence: BigDecimal
+  - id: Long
+  - startedAt: LocalDateTime
+}
+class UserStrategyBuilder {
+  ~ UserStrategyBuilder(): 
+  - mlConfidence$value: BigDecimal
+  - totalProfitPct$set: boolean
+  - mlConfidence$set: boolean
+  - strategySettings: StrategySettings
+  - active$set: boolean
+  - active$value: boolean
+  - startedAt: LocalDateTime
+  - totalProfitPct$value: BigDecimal
+  - stoppedAt: LocalDateTime
+  - totalTrades$set: boolean
+  - id: Long
+  - user: UserProfile
+  - totalTrades$value: long
+}
+interface UserStrategyRepository << interface >>
+interface UserStrategyService << interface >>
+class UserStrategyServiceImpl {
+  + UserStrategyServiceImpl(UserStrategyRepository): 
+  - repository: UserStrategyRepository
+}
+class WebConfig {
+  + WebConfig(): 
+}
+class WebDashboardService {
+  + WebDashboardService(UserStrategyRepository): 
+  - log: Logger
+  - userStrategyRepository: UserStrategyRepository
+}
+class WebSocketConfig {
+  + WebSocketConfig(CandleWebSocketHandler, TradeWebSocketHandler): 
+  - candleWebSocketHandler: CandleWebSocketHandler
+  - log: Logger
+  - tradeWebSocketHandler: TradeWebSocketHandler
+}
+
+Action                                  +-[#820000,plain]-  TradingSignal                          
+AiStrategyOrchestrator                 "1" *-[#595959,plain]-> "orderService\n1" OrderService                           
+AiStrategyOrchestrator                 "1" *-[#595959,plain]-> "strategyRegistry\n1" StrategyRegistry                       
+AiStrategyOrchestrator                  -[#595959,dashed]->  StrategyStatus                         : "«create»"
+AiTradeBotApplication                   -[#595959,dashed]->  TimeUtil                               : "«create»"
+Balance                                 +-[#820000,plain]-  ExchangeClient                         
+BalanceBuilder                          +-[#820000,plain]-  Balance                                
+BalanceInfoBuilder                      +-[#820000,plain]-  BalanceInfo                            
+BalanceServiceImpl                     "1" *-[#595959,plain]-> "balanceRepository\n1" BalanceRepository                      
+BalanceServiceImpl                      -[#008200,dashed]-^  BalanceService                         
+BinanceExchangeClient                   -[#595959,dashed]->  Balance                                : "«create»"
+BinanceExchangeClient                   -[#008200,dashed]-^  ExchangeClient                         
+BinanceExchangeClient                  "1" *-[#595959,plain]-> "settingsService\n1" ExchangeSettingsService                
+BinanceExchangeClient                   -[#595959,dashed]->  Kline                                  : "«create»"
+BinanceExchangeClient                   -[#595959,dashed]->  Order                                  : "«create»"
+BinanceExchangeClient                   -[#595959,dashed]->  OrderResult                            : "«create»"
+BinancePublicTradeStreamService        "1" *-[#595959,plain]-> "candleService\n1" SmartFusionCandleService               
+BinancePublicTradeStreamService        "1" *-[#595959,plain]-> "listener\n1" TradeFeedListener                      
+BinanceWebSocketClient                 "1" *-[#595959,plain]-> "listener\n1" MarketTickListener                     
+Bucket                                  -[#595959,dashed]->  Candle                                 : "«create»"
+Bucket                                  +-[#820000,plain]-  CandleResampler                        
+Builder                                "1" *-[#595959,plain]-> "action\n1" Action                                 
+Builder                                 +-[#820000,plain]-  TradingSignal                          
+Builder                                 -[#595959,dashed]->  TradingSignal                          : "«create»"
+BybitExchangeClient                     -[#595959,dashed]->  Balance                                : "«create»"
+BybitExchangeClient                     -[#008200,dashed]-^  ExchangeClient                         
+BybitExchangeClient                    "1" *-[#595959,plain]-> "settingsService\n1" ExchangeSettingsService                
+BybitExchangeClient                     -[#595959,dashed]->  Kline                                  : "«create»"
+BybitExchangeClient                     -[#595959,dashed]->  Order                                  : "«create»"
+BybitExchangeClient                     -[#595959,dashed]->  OrderResult                            : "«create»"
+BybitListener                           +-[#820000,plain]-  BybitPublicTradeStreamService          
+BybitPublicTradeStreamService           -[#595959,dashed]->  BybitListener                          : "«create»"
+BybitPublicTradeStreamService          "1" *-[#595959,plain]-> "listener\n1" TradeFeedListener                      
+Candle                                  +-[#820000,plain]-  CandleProvider                         
+CandleAggregator                        -[#595959,dashed]->  Candle                                 : "«create»"
+CandleAggregator                       "1" *-[#595959,plain]-> "current\n*" CandleDto                              
+CandleAggregator                        -[#595959,dashed]->  LiveCandle                             : "«create»"
+CandleAggregator                        -[#008200,dashed]-^  MarketTickListener                     
+CandleAggregator                       "1" *-[#595959,plain]-> "stream\n1" RealtimeStreamService                  
+CandleDto                               +-[#820000,plain]-  StrategyChartDto                       
+CandleDtoBuilder                        +-[#820000,plain]-  CandleDto                              
+CandleStreamService                    "1" *-[#595959,plain]-> "clientFactory\n1" ExchangeClientFactory                  
+CandleStreamService                    "1" *-[#595959,plain]-> "sfSettingsService\n1" SmartFusionStrategySettingsService     
+DashboardStatsBuilder                   +-[#820000,plain]-  DashboardStats                         
+ExchangeClientConfig                    -[#595959,dashed]->  BinanceExchangeClient                  : "«create»"
+ExchangeClientConfig                    -[#595959,dashed]->  BybitExchangeClient                    : "«create»"
+ExchangeClientConfig                    -[#595959,dashed]->  ExchangeClientFactory                  : "«create»"
+ExchangeClientFactory                  "1" *-[#595959,plain]-> "registry\n*" ExchangeClient                         
+ExchangeSettings                       "1" *-[#595959,plain]-> "network\n1" NetworkType                            
+ExchangeSettingsBuilder                 +-[#820000,plain]-  ExchangeSettings                       
+ExchangeSettingsServiceImpl             -[#595959,dashed]->  ExchangeSettings                       : "«create»"
+ExchangeSettingsServiceImpl            "1" *-[#595959,plain]-> "repository\n1" ExchangeSettingsRepository             
+ExchangeSettingsServiceImpl             -[#008200,dashed]-^  ExchangeSettingsService                
+ExchangeSymbolsApiController           "1" *-[#595959,plain]-> "clientFactory\n1" ExchangeClientFactory                  
+ExchangeTimeframesApiController        "1" *-[#595959,plain]-> "clientFactory\n1" ExchangeClientFactory                  
+FibonacciGridStrategy                   -[#999900,dotted]-  StrategyBinding                        
+FibonacciGridStrategy                   -[#008200,dashed]-^  TradingStrategy                        
+FilterSignal                            +-[#820000,plain]-  SmartFusionFilter                      
+FilterSignalBuilder                     +-[#820000,plain]-  FilterSignal                           
+FullChartApiController                 "1" *-[#595959,plain]-> "orderService\n1" OrderService                           
+FullChartApiController                 "1" *-[#595959,plain]-> "candleService\n1" SmartFusionCandleService               
+HomeController                         "1" *-[#595959,plain]-> "dashboardService\n1" WebDashboardService                    
+Kline                                   +-[#820000,plain]-  ExchangeClient                         
+LinePoint                               +-[#820000,plain]-  StrategyChartDto                       
+LinePointBuilder                        +-[#820000,plain]-  LinePoint                              
+LiveCandle                              +-[#820000,plain]-  CandleAggregator                       
+LiveCandle                              +-[#820000,plain]-  SmartFusionCandleService               
+MarketStreamManager                    "1" *-[#595959,plain]-> "binanceWs\n1" BinanceWebSocketClient                 
+MarketStreamManager                    "1" *-[#595959,plain]-> "aggregator\n1" CandleAggregator                       
+MarketStreamingConfig                  "1" *-[#595959,plain]-> "binanceStream\n1" BinancePublicTradeStreamService        
+MarketStreamingConfig                  "1" *-[#595959,plain]-> "candleService\n1" SmartFusionCandleService               
+MlInvestStrategy                        -[#999900,dotted]-  StrategyBinding                        
+MlInvestStrategy                        -[#008200,dashed]-^  TradingStrategy                        
+Order                                  "1" *-[#595959,plain]-> "strategyType\n1" StrategyType                           
+OrderBuilder                            +-[#820000,plain]-  Order                                  
+OrderResult                             +-[#820000,plain]-  ExchangeClient                         
+OrderServiceImpl                        -[#595959,dashed]->  Order                                  : "«create»"
+OrderServiceImpl                        -[#595959,dashed]->  OrderEntity                            : "«create»"
+OrderServiceImpl                       "1" *-[#595959,plain]-> "orderRepository\n1" OrderRepository                        
+OrderServiceImpl                        -[#008200,dashed]-^  OrderService                           
+Point                                   +-[#820000,plain]-  StrategyDashboardService               
+PricePoint                              +-[#820000,plain]-  SmartFusionVolatilityShield            
+ProfileController                      "1" *-[#595959,plain]-> "dashboardService\n1" WebDashboardService                    
+RealtimeCandleApiController            "1" *-[#595959,plain]-> "candleStream\n1" CandleStreamService                    
+RealtimeStreamService                  "1" *-[#595959,plain]-> "candleHandler\n1" CandleWebSocketHandler                 
+RealtimeStreamService                  "1" *-[#595959,plain]-> "tradeHandler\n1" TradeWebSocketHandler                  
+RlDecision                              +-[#820000,plain]-  SmartFusionRlAgent                     
+RlDecisionBuilder                       +-[#820000,plain]-  RlDecision                             
+RlState                                 +-[#820000,plain]-  SmartFusionRlAgent                     
+RlStateBuilder                          +-[#820000,plain]-  RlState                                
+RsiEmaStrategy                          -[#999900,dotted]-  StrategyBinding                        
+RsiEmaStrategy                          -[#008200,dashed]-^  TradingStrategy                        
+ScalpingStrategy                        -[#999900,dotted]-  StrategyBinding                        
+ScalpingStrategy                        -[#008200,dashed]-^  TradingStrategy                        
+SchedulerServiceImpl                    -[#008200,dashed]-^  SchedulerService                       
+SchedulerServiceImpl                    -[#595959,dashed]->  StrategyThreadFactory                  : "«create»"
+SmartFusionCandleService                -[#595959,dashed]->  Candle                                 : "«create»"
+SmartFusionCandleService                -[#008200,dashed]-^  CandleProvider                         
+SmartFusionCandleService               "1" *-[#595959,plain]-> "ws\n1" CandleWebSocketHandler                 
+SmartFusionCandleService               "1" *-[#595959,plain]-> "clientFactory\n1" ExchangeClientFactory                  
+SmartFusionCandleService               "1" *-[#595959,plain]-> "exchangeSettingsService\n1" ExchangeSettingsService                
+SmartFusionCandleService                -[#595959,dashed]->  LiveCandle                             : "«create»"
+SmartFusionCandleService               "1" *-[#595959,plain]-> "realtime\n1" RealtimeStreamService                  
+SmartFusionCandleService                -[#595959,dashed]->  SmartFusionStrategySettings            : "«create»"
+SmartFusionCandleService               "1" *-[#595959,plain]-> "settingsService\n1" SmartFusionStrategySettingsService     
+SmartFusionCandleService                -[#008200,dashed]-^  TradeFeedListener                      
+SmartFusionOrderExecutor               "1" *-[#595959,plain]-> "exchangeClientFactory\n1" ExchangeClientFactory                  
+SmartFusionOrderExecutor               "1" *-[#595959,plain]-> "exchangeSettingsService\n1" ExchangeSettingsService                
+SmartFusionOrderExecutor               "1" *-[#595959,plain]-> "recentTrades\n*" Order                                  
+SmartFusionRiskManager                 "1" *-[#595959,plain]-> "pnlTracker\n1" SmartFusionPnLTracker                  
+SmartFusionRlAgent                     "1" *-[#595959,plain]-> "stateMap\n*" RlState                                
+SmartFusionSettingsApiController       "1" *-[#595959,plain]-> "settingsService\n1" SmartFusionStrategySettingsService     
+SmartFusionStrategy                     -[#008200,dashed]-^  ContextAwareStrategy                   
+SmartFusionStrategy                    "1" *-[#595959,plain]-> "marketStreamManager\n1" MarketStreamManager                    
+SmartFusionStrategy                    "1" *-[#595959,plain]-> "network\n1" NetworkType                            
+SmartFusionStrategy                     -[#008200,dashed]-^  RuntimeIntrospectable                  
+SmartFusionStrategy                    "1" *-[#595959,plain]-> "candleService\n1" SmartFusionCandleService               
+SmartFusionStrategy                    "1" *-[#595959,plain]-> "orderExecutor\n1" SmartFusionOrderExecutor               
+SmartFusionStrategy                    "1" *-[#595959,plain]-> "pnlTracker\n1" SmartFusionPnLTracker                  
+SmartFusionStrategy                    "1" *-[#595959,plain]-> "settingsService\n1" SmartFusionStrategySettingsService     
+SmartFusionStrategy                     -[#999900,dotted]-  StrategyBinding                        
+SmartFusionStrategy                     -[#008200,dashed]-^  TradingStrategy                        
+SmartFusionStrategySettings            "1" *-[#595959,plain]-> "networkType\n1" NetworkType                            
+SmartFusionStrategySettingsBuilder      +-[#820000,plain]-  SmartFusionStrategySettings            
+SmartFusionStrategySettingsServiceImpl "1" *-[#595959,plain]-> "repository\n1" SmartFusionStrategySettingsRepository  
+SmartFusionStrategySettingsServiceImpl  -[#008200,dashed]-^  SmartFusionStrategySettingsService     
+SmartFusionStrategySettingsServiceImpl  -[#008200,dashed]-^  StrategySettingsProvider               
+SmartFusionUserSettingsDto             "1" *-[#595959,plain]-> "networkType\n1" NetworkType                            
+SmartFusionUserSettingsDtoBuilder       +-[#820000,plain]-  SmartFusionUserSettingsDto             
+SmartFusionVolatilityShield             -[#595959,dashed]->  PricePoint                             : "«create»"
+StrategyChartApiController             "1" *-[#595959,plain]-> "dashboardService\n1" StrategyDashboardService               
+StrategyChartDto                       "1" *-[#595959,plain]-> "candles\n*" CandleDto                              
+StrategyChartDto                       "1" *-[#595959,plain]-> "equity\n*" LinePoint                              
+StrategyChartDto                       "1" *-[#595959,plain]-> "trades\n*" TradeMarker                            
+StrategyChartDtoBuilder                 +-[#820000,plain]-  StrategyChartDto                       
+StrategyControlApiController           "1" *-[#595959,plain]-> "facade\n1" StrategyFacade                         
+StrategyController                     "1" *-[#595959,plain]-> "smartFusionSettingsService\n1" SmartFusionStrategySettingsService     
+StrategyController                     "1" *-[#595959,plain]-> "strategyService\n1" StrategyService                        
+StrategyController                     "1" *-[#595959,plain]-> "userProfileService\n1" UserProfileService                     
+StrategyDashboardController            "1" *-[#595959,plain]-> "strategyFacade\n1" StrategyFacade                         
+StrategyDashboardService                -[#595959,dashed]->  Candle                                 : "«create»"
+StrategyDashboardService               "1" *-[#595959,plain]-> "orderRepo\n1" OrderRepository                        
+StrategyDashboardService               "1" *-[#595959,plain]-> "orderService\n1" OrderService                           
+StrategyDashboardService                -[#595959,dashed]->  Point                                  : "«create»"
+StrategyDashboardService               "1" *-[#595959,plain]-> "smartCandle\n1" SmartFusionCandleService               
+StrategyDashboardService               "1" *-[#595959,plain]-> "sfSettingsService\n1" SmartFusionStrategySettingsService     
+StrategyDashboardService               "1" *-[#595959,plain]-> "registry\n1" StrategyRegistry                       
+StrategyDashboardService               "1" *-[#595959,plain]-> "settingsService\n1" StrategySettingsService                
+StrategyFacade                         "1" *-[#595959,plain]-> "aiOrchestrator\n1" AiStrategyOrchestrator                 
+StrategyFacade                         "1" *-[#595959,plain]-> "orderService\n1" OrderService                           
+StrategyFacade                         "1" *-[#595959,plain]-> "schedulerService\n1" SchedulerService                       
+StrategyFacade                         "1" *-[#595959,plain]-> "strategyRegistry\n1" StrategyRegistry                       
+StrategyFacade                         "1" *-[#595959,plain]-> "settingsResolver\n1" StrategySettingsResolver               
+StrategyRegistry                       "1" *-[#595959,plain]-> "strategyClasses\n*" StrategyType                           
+StrategyRunInfo                        "1" *-[#595959,plain]-> "networkType\n1" NetworkType                            
+StrategyRunInfo                        "1" *-[#595959,plain]-> "type\n1" StrategyType                           
+StrategyRunInfoBuilder                  +-[#820000,plain]-  StrategyRunInfo                        
+StrategyService                        "1" *-[#595959,plain]-> "smartFusionRepo\n1" SmartFusionStrategySettingsRepository  
+StrategyService                        "1" *-[#595959,plain]-> "strategyRegistry\n1" StrategyRegistry                       
+StrategyService                        "1" *-[#595959,plain]-> "userProfileRepository\n1" UserProfileRepository                  
+StrategySettings                       "1" *-[#595959,plain]-> "type\n1" StrategyType                           
+StrategySettingsBuilder                 +-[#820000,plain]-  StrategySettings                       
+StrategySettingsResolver               "1" *-[#595959,plain]-> "providers\n*" StrategySettingsProvider               
+StrategySettingsResolver               "1" *-[#595959,plain]-> "providers\n*" StrategyType                           
+StrategySettingsServiceImpl            "1" *-[#595959,plain]-> "repository\n1" StrategySettingsRepository             
+StrategySettingsServiceImpl             -[#008200,dashed]-^  StrategySettingsService                
+StrategyStatus                          +-[#820000,plain]-  AiStrategyOrchestrator                 
+StrategyStatus                         "1" *-[#595959,plain]-> "type\n1" StrategyType                           
+StrategyThreadFactory                   +-[#820000,plain]-  SchedulerServiceImpl                   
+StrategyViewModelBuilder                +-[#820000,plain]-  StrategyViewModel                      
+Tick                                    +-[#820000,plain]-  CandleResampler                        
+TradeHistoryBuilder                     +-[#820000,plain]-  TradeHistory                           
+TradeMarker                             +-[#820000,plain]-  StrategyChartDto                       
+TradeMarkerBuilder                      +-[#820000,plain]-  TradeMarker                            
+TradePlan                               +-[#820000,plain]-  SmartFusionRiskManager                 
+TradePlanBuilder                        +-[#820000,plain]-  TradePlan                              
+TradingSignal                          "1" *-[#595959,plain]-> "action\n1" Action                                 
+TradingSignal                           -[#595959,dashed]->  Builder                                : "«create»"
+UserProfile                            "1" *-[#595959,plain]-> "networkType\n1" NetworkType                            
+UserProfileBuilder                      +-[#820000,plain]-  UserProfile                            
+UserProfileServiceImpl                 "1" *-[#595959,plain]-> "repository\n1" UserProfileRepository                  
+UserProfileServiceImpl                  -[#008200,dashed]-^  UserProfileService                     
+UserProfileViewBuilder                  +-[#820000,plain]-  UserProfileView                        
+UserStrategy                           "1" *-[#595959,plain]-> "strategySettings\n1" StrategySettings                       
+UserStrategy                           "1" *-[#595959,plain]-> "user\n1" UserProfile                            
+UserStrategyBuilder                     +-[#820000,plain]-  UserStrategy                           
+UserStrategyServiceImpl                "1" *-[#595959,plain]-> "repository\n1" UserStrategyRepository                 
+UserStrategyServiceImpl                 -[#008200,dashed]-^  UserStrategyService                    
+WebDashboardService                    "1" *-[#595959,plain]-> "userStrategyRepository\n1" UserStrategyRepository                 
+WebSocketConfig                        "1" *-[#595959,plain]-> "candleWebSocketHandler\n1" CandleWebSocketHandler                 
+WebSocketConfig                        "1" *-[#595959,plain]-> "tradeWebSocketHandler\n1" TradeWebSocketHandler                  
+@enduml
