@@ -4,29 +4,50 @@ import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.exchange.binance.BinanceExchangeClient;
 import com.chicu.aitradebot.exchange.bybit.BybitExchangeClient;
 import com.chicu.aitradebot.exchange.client.ExchangeClientFactory;
-import com.chicu.aitradebot.exchange.service.ExchangeSettingsService;
-import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.annotation.Configuration;
-@Slf4j
+
+import jakarta.annotation.PostConstruct;
+
+/**
+ * Регистрация всех клиентов (Binance, Bybit)
+ * Фабрика становится универсальной, без хардкода Binance.
+ */
 @Configuration
 @RequiredArgsConstructor
 public class ExchangeClientConfig {
 
-    private final ExchangeClientFactory factory;
-    private final ExchangeSettingsService settingsService;
+    private final ExchangeClientFactory clientFactory;
+    private final BinanceExchangeClient binanceClient;
+    private final BybitExchangeClient bybitClient;
 
     @PostConstruct
-    public void init() {
+    public void registerClients() {
 
-        BinanceExchangeClient binance = new BinanceExchangeClient(settingsService);
+        // ===== Binance main/test =====
+        clientFactory.register(
+                "BINANCE",
+                NetworkType.MAINNET,
+                binanceClient
+        );
 
-        // Регистрация одна и та же (сам клиент), отличие в URL будет через settings
-        factory.register("BINANCE", NetworkType.MAINNET, binance);
-        factory.register("BINANCE", NetworkType.TESTNET, binance);
+        clientFactory.register(
+                "BINANCE",
+                NetworkType.TESTNET,
+                binanceClient
+        );
 
-        log.info("✔ BinanceExchangeClient registered for MAINNET & TESTNET");
+        // ===== Bybit main/test =====
+        clientFactory.register(
+                "BYBIT",
+                NetworkType.MAINNET,
+                bybitClient
+        );
+
+        clientFactory.register(
+                "BYBIT",
+                NetworkType.TESTNET,
+                bybitClient
+        );
     }
 }
-
