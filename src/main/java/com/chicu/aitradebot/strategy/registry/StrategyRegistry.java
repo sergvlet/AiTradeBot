@@ -1,15 +1,19 @@
 package com.chicu.aitradebot.strategy.registry;
 
 import com.chicu.aitradebot.common.enums.StrategyType;
+import com.chicu.aitradebot.strategy.core.TradingStrategy;
 import lombok.AllArgsConstructor;
 import lombok.Data;
-import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
 import java.util.*;
 
+@Slf4j
 @Component
 public class StrategyRegistry {
+
+    // ========= СТАРЫЙ UI-ФУНКЦИОНАЛ (оставляем полностью) =========
 
     @Data
     @AllArgsConstructor
@@ -22,7 +26,6 @@ public class StrategyRegistry {
     private final Map<StrategyType, List<FieldMeta>> fields = new HashMap<>();
 
     public StrategyRegistry() {
-        // ---- SMART FUSION ----
         fields.put(StrategyType.SMART_FUSION, List.of(
                 new FieldMeta("emaPeriod", "EMA период", "number"),
                 new FieldMeta("atrPeriod", "ATR период", "number"),
@@ -30,7 +33,6 @@ public class StrategyRegistry {
                 new FieldMeta("slPct", "Stop Loss (%)", "number")
         ));
 
-        // ---- SCALPING ----
         fields.put(StrategyType.SCALPING, List.of(
                 new FieldMeta("windowSize", "Окно анализа", "number"),
                 new FieldMeta("priceChangeThreshold", "Порог движения (%)", "number"),
@@ -38,7 +40,6 @@ public class StrategyRegistry {
                 new FieldMeta("orderVolume", "Объём ордера", "number")
         ));
 
-        // ---- FIBONACCI GRID ----
         fields.put(StrategyType.FIBONACCI_GRID, List.of(
                 new FieldMeta("gridLevels", "Количество уровней", "number"),
                 new FieldMeta("distancePct", "Шаг сетки (%)", "number"),
@@ -46,7 +47,6 @@ public class StrategyRegistry {
                 new FieldMeta("stopLossPct", "SL (%)", "number")
         ));
 
-        // ---- ML INVEST ----
         fields.put(StrategyType.ML_INVEST, List.of(
                 new FieldMeta("confidenceThreshold", "Порог уверенности ML", "number"),
                 new FieldMeta("lookback", "Lookback", "number"),
@@ -56,5 +56,21 @@ public class StrategyRegistry {
 
     public List<FieldMeta> getFields(StrategyType type) {
         return fields.getOrDefault(type, List.of());
+    }
+
+    // ========= НОВАЯ ЧАСТЬ — РЕЕСТР СТРАТЕГИЙ ДЛЯ ENGINE =========
+
+    /** Реестр настоящих Java-объектов стратегий */
+    private final Map<StrategyType, TradingStrategy> strategies = new EnumMap<>(StrategyType.class);
+
+    /** StrategyBindingProcessor вызывает это автоматически */
+    public void register(StrategyType type, TradingStrategy strategy) {
+        strategies.put(type, strategy);
+        log.info("📌 Strategy registered: {} → {}", type, strategy.getClass().getSimpleName());
+    }
+
+    /** Получить стратегию по типу (для StrategyEngine) */
+    public TradingStrategy getStrategy(StrategyType type) {
+        return strategies.get(type);
     }
 }

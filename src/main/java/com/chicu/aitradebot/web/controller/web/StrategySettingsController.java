@@ -29,7 +29,6 @@ public class StrategySettingsController {
     private final RealFeeService realFeeService;
     private final ExchangeClientFactory clientFactory;
 
-    /** Дефолтные таймфреймы, если биржа ничего не вернула */
     private static final List<String> DEFAULT_TIMEFRAMES = List.of(
             "1s", "5s", "15s",
             "1m", "3m", "5m", "15m", "30m",
@@ -45,107 +44,72 @@ public class StrategySettingsController {
             @RequestParam("chatId") long chatId,
             @RequestParam(value = "exchange", required = false) String exchangeParam,
             @RequestParam(value = "network", required = false) NetworkType networkParam,
+            @RequestParam(value = "tab", required = false) String tab,
             Model model
     ) {
 
         StrategyType strategyType = StrategyType.valueOf(type);
 
-        // 1) Загружаем стратегию с auto-create
         StrategySettings strategy = strategySettingsService.getOrCreate(chatId, strategyType);
-
-        // 2) Список поддерживаемых бирж
         List<String> availableExchanges = List.of("BINANCE", "BYBIT", "OKX");
+        List<ExchangeSettings> userExchanges = exchangeSettingsService.findAllByChatId(chatId);
 
-        // 3) Все сохранённые ключи пользователя
-        List<ExchangeSettings> userExchanges =
-                exchangeSettingsService.findAllByChatId(chatId);
+        // ---------------------- Биржа -------------------------
+        String selectedExchange = exchangeParam != null
+                ? exchangeParam
+                : (strategy.getExchangeName() != null
+                ? strategy.getExchangeName()
+                : userExchanges.stream().findFirst().map(ExchangeSettings::getExchange).orElse("BINANCE"));
 
-        // ----------------------------------------------------------
-        // 4) Определяем выбранную биржу + сеть
-        // ----------------------------------------------------------
-        String selectedExchange = exchangeParam;
-        NetworkType selectedNetwork = networkParam;
+        // ---------------------- Сеть ---------------------------
+        NetworkType selectedNetwork = networkParam != null
+                ? networkParam
+                : (strategy.getNetworkType() != null
+                ? strategy.getNetworkType()
+                : userExchanges.stream().findFirst().map(ExchangeSettings::getNetwork).orElse(NetworkType.TESTNET));
 
-        if (selectedExchange == null) {
-            if (strategy.getExchangeName() != null) {
-                selectedExchange = strategy.getExchangeName();
-            } else {
-                Optional<ExchangeSettings> anyEx = userExchanges.stream().findFirst();
-                selectedExchange = anyEx.map(ExchangeSettings::getExchange)
-                        .orElse("BINANCE");
-            }
-        }
-
-        if (selectedNetwork == null) {
-            if (strategy.getNetworkType() != null) {
-                selectedNetwork = strategy.getNetworkType();
-            } else {
-                Optional<ExchangeSettings> anyEx = userExchanges.stream().findFirst();
-                selectedNetwork = anyEx.map(ExchangeSettings::getNetwork)
-                        .orElse(NetworkType.TESTNET);
-            }
-        }
-
-        // ----------------------------------------------------------
-        // 5) Загружаем ExchangeSettings под выбранную биржу/сеть
-        // ----------------------------------------------------------
+        // ---------------------- ExchangeSettings ----------------
         ExchangeSettings exchangeSettings =
                 exchangeSettingsService.getOrCreate(chatId, selectedExchange, selectedNetwork);
 
-        // ----------------------------------------------------------
-        // 6) Проверяем наличие ключей
-        // ----------------------------------------------------------
         boolean hasKeys =
-                !isBlank(exchangeSettings.getApiKey()) &&
-                !isBlank(exchangeSettings.getApiSecret());
+                exchangeSettings.getApiKey() != null &&
+                !exchangeSettings.getApiKey().isBlank() &&
+                exchangeSettings.getApiSecret() != null &&
+                !exchangeSettings.getApiSecret().isBlank();
 
-        // ----------------------------------------------------------
-        // 7) ДЕТАЛЬНАЯ диагностика (только Binance)
-        // ----------------------------------------------------------
         BinanceConnectionStatus diagnostics = null;
         boolean connectionOk = false;
 
         if (selectedExchange.equalsIgnoreCase("BINANCE") && hasKeys) {
-
             diagnostics = exchangeSettingsService.testConnectionDetailed(exchangeSettings);
-
-            if (diagnostics != null) {
-                connectionOk = diagnostics.isOk();
-            }
-
-            log.info("🔍 Diagnostics for BINANCE {}: {}", selectedNetwork, diagnostics);
-
+            if (diagnostics != null) connectionOk = diagnostics.isOk();
         } else {
             connectionOk = hasKeys && exchangeSettingsService.testConnection(exchangeSettings);
         }
 
-        // ----------------------------------------------------------
-        // 8) Баланс USDT + доступные таймфреймы
-        // ----------------------------------------------------------
+        // ---------------------- Баланс ------------------------
         double usdtBalance = 0.0;
         List<String> availableTimeframes = new ArrayList<>(DEFAULT_TIMEFRAMES);
 
         try {
             ExchangeClient client = clientFactory.get(selectedExchange, selectedNetwork);
 
-            // баланс
-            var bal = client.getBalance(chatId, "USDT");
-            if (bal != null) {
-                usdtBalance = bal.free();
-            }
+            var bal = client.getBalance(chatId, "USDT", selectedNetwork);
+            if (bal != null) usdtBalance = bal.free();
 
-            // таймфреймы от биржи (если реализовано)
             List<String> fromClient = client.getAvailableTimeframes();
-            if (fromClient != null && !fromClient.isEmpty()) {
-                availableTimeframes = fromClient;
-            }
+            if (fromClient != null && !fromClient.isEmpty()) availableTimeframes = fromClient;
+
         } catch (Exception e) {
             log.warn("Не удалось загрузить баланс/таймфреймы: {}", e.getMessage());
         }
 
-        // ----------------------------------------------------------
-        // 9) Передаём всё в UI
-        // ----------------------------------------------------------
+        // ---------------------- Активная вкладка ----------------
+        if (tab == null || tab.isBlank()) tab = "network";
+        model.addAttribute("activeTab", tab);
+
+        // ---------------------- MODEL --------------------------
         model.addAttribute("chatId", chatId);
         model.addAttribute("type", strategyType);
         model.addAttribute("strategy", strategy);
@@ -161,13 +125,7 @@ public class StrategySettingsController {
         model.addAttribute("usdtBalance", usdtBalance);
         model.addAttribute("availableTimeframes", availableTimeframes);
 
-        // пока отключено — подставишь позже
         model.addAttribute("dynamicFields", Map.of());
-
-        log.debug(
-                "⚙ Unified settings loaded: chatId={}, strategy={}, exchange={}@{}, enabled={}, usdt={}, tf={}",
-                chatId, strategyType, selectedExchange, selectedNetwork, connectionOk, usdtBalance, availableTimeframes
-        );
 
         return "strategies/unified-settings";
     }
@@ -179,22 +137,24 @@ public class StrategySettingsController {
     public String saveSettings(
             @PathVariable("type") String type,
             @RequestParam("chatId") long chatId,
+            @RequestParam(value = "tab", required = false) String tab,
             @ModelAttribute("strategy") StrategySettings form,
             @RequestParam Map<String, String> params
     ) {
 
         StrategyType strategyType = StrategyType.valueOf(type);
 
-        // 1) Биржа / сеть из формы
         String exchangeName = params.get("exchange");
-        String networkStr = params.get("network");
-        NetworkType networkType = NetworkType.valueOf(networkStr);
+        NetworkType networkType = NetworkType.valueOf(params.get("network"));
 
-        // 2) Загружаем реальную сущность
+        // -------------- Активная вкладка после POST --------------
+        if (tab == null || tab.isBlank()) tab = "general";
+
+        // -------------- Сохраняем StrategySettings ----------------
         StrategySettings s = strategySettingsService.getOrCreate(chatId, strategyType);
 
         s.setSymbol(form.getSymbol());
-        s.setTimeframe(form.getTimeframe());               // <- универсальный формат (1m, 1h и т.д.)
+        s.setTimeframe(form.getTimeframe());
         s.setCachedCandlesLimit(form.getCachedCandlesLimit());
 
         s.setCapitalUsd(form.getCapitalUsd());
@@ -213,23 +173,21 @@ public class StrategySettingsController {
 
         strategySettingsService.save(s);
 
-        // 3) Обновляем ExchangeSettings
-        ExchangeSettings ex =
-                exchangeSettingsService.getOrCreate(chatId, exchangeName, networkType);
+        // -------------- Сохраняем ExchangeSettings ----------------
+        ExchangeSettings ex = exchangeSettingsService.getOrCreate(chatId, exchangeName, networkType);
 
         ex.setApiKey(params.get("apiKey"));
         ex.setApiSecret(params.get("apiSecret"));
         ex.setPassphrase(params.get("passphrase"));
 
         boolean hasKeys =
-                !isBlank(ex.getApiKey()) &&
-                !isBlank(ex.getApiSecret());
+                ex.getApiKey() != null && !ex.getApiKey().isBlank() &&
+                ex.getApiSecret() != null && !ex.getApiSecret().isBlank();
 
         boolean connectionOk = false;
 
         if (exchangeName.equalsIgnoreCase("BINANCE") && hasKeys) {
-            BinanceConnectionStatus diag =
-                    exchangeSettingsService.testConnectionDetailed(ex);
+            BinanceConnectionStatus diag = exchangeSettingsService.testConnectionDetailed(ex);
             connectionOk = (diag != null && diag.isOk());
         } else {
             connectionOk = hasKeys && exchangeSettingsService.testConnection(ex);
@@ -241,14 +199,16 @@ public class StrategySettingsController {
         log.info("💾 Saved exchange settings: {}@{}, enabled={}",
                 exchangeName, networkType, ex.isEnabled());
 
+        // -------------- РЕДИРЕКТ НА ТУ ЖЕ ВКЛАДКУ ----------------
         return "redirect:/strategies/" + type + "/unified-settings"
                + "?chatId=" + chatId
                + "&exchange=" + exchangeName
-               + "&network=" + networkType;
+               + "&network=" + networkType
+               + "&tab=" + tab;
     }
 
     // =========================================================================
-    // REAL FEE
+    // REAL FEE API
     // =========================================================================
     @GetMapping("/real-fee")
     @ResponseBody
@@ -257,6 +217,7 @@ public class StrategySettingsController {
             @RequestParam("exchange") String exchange,
             @RequestParam("network") NetworkType network
     ) {
+
         ExchangeSettings settings =
                 exchangeSettingsService.getOrCreate(chatId, exchange, network);
 

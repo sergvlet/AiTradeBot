@@ -4,50 +4,37 @@ import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.exchange.binance.BinanceExchangeClient;
 import com.chicu.aitradebot.exchange.bybit.BybitExchangeClient;
 import com.chicu.aitradebot.exchange.client.ExchangeClientFactory;
+import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.annotation.Configuration;
 
-import jakarta.annotation.PostConstruct;
-
 /**
- * Регистрация всех клиентов (Binance, Bybit)
- * Фабрика становится универсальной, без хардкода Binance.
+ * Регистрирует всех биржевых клиентов в единой фабрике ExchangeClientFactory
+ * согласно архитектуре v4.
  */
+@Slf4j
 @Configuration
 @RequiredArgsConstructor
 public class ExchangeClientConfig {
 
-    private final ExchangeClientFactory clientFactory;
+    private final ExchangeClientFactory factory;
+
     private final BinanceExchangeClient binanceClient;
     private final BybitExchangeClient bybitClient;
 
     @PostConstruct
-    public void registerClients() {
+    public void register() {
+        log.info("🔧 Регистрация клиентов бирж…");
 
-        // ===== Binance main/test =====
-        clientFactory.register(
-                "BINANCE",
-                NetworkType.MAINNET,
-                binanceClient
-        );
+        // BINANCE
+        factory.register("BINANCE", NetworkType.MAINNET, binanceClient);
+        factory.register("BINANCE", NetworkType.TESTNET, binanceClient);
 
-        clientFactory.register(
-                "BINANCE",
-                NetworkType.TESTNET,
-                binanceClient
-        );
+        // BYBIT
+        factory.register("BYBIT", NetworkType.MAINNET, bybitClient);
+        factory.register("BYBIT", NetworkType.TESTNET, bybitClient);
 
-        // ===== Bybit main/test =====
-        clientFactory.register(
-                "BYBIT",
-                NetworkType.MAINNET,
-                bybitClient
-        );
-
-        clientFactory.register(
-                "BYBIT",
-                NetworkType.TESTNET,
-                bybitClient
-        );
+        log.info("✅ Клиенты бирж успешно зарегистрированы");
     }
 }

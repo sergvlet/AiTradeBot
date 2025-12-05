@@ -2,6 +2,7 @@ package com.chicu.aitradebot.web.facade;
 
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
+import com.chicu.aitradebot.orchestrator.dto.StrategyRunInfo;
 
 import java.util.List;
 
@@ -22,8 +23,17 @@ public interface WebStrategyFacade {
     /** Остановить стратегию */
     void stop(Long chatId, StrategyType strategyType);
 
-    /** Вкл/Выкл */
+    /** Вкл/Выкл (старый вариант, без символа/таймфрейма) */
     void toggle(Long chatId, StrategyType strategyType);
+
+    /**
+     * 🔄 Вкл/выкл c учётом symbol/timeframe, возвращает детальный статус.
+     * Этот метод используется Web API (/api/strategy/toggle).
+     */
+    StrategyRunInfo toggleStrategy(Long chatId,
+                                   StrategyType strategyType,
+                                   String symbol,
+                                   String timeframe);
 
     // =============================================================
     // DTO → используется в strategies.html
@@ -39,4 +49,7 @@ public interface WebStrategyFacade {
             double mlConfidence,
             NetworkType networkType      // ⚠ было отсутствовало — добавлено
     ) {}
+    StrategyRunInfo getRunInfo(Long chatId, StrategyType type);
+
+
 }

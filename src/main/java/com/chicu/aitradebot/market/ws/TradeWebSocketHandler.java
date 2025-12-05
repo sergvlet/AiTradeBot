@@ -2,102 +2,80 @@ package com.chicu.aitradebot.market.ws;
 
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
-import org.springframework.web.socket.CloseStatus;
-import org.springframework.web.socket.TextMessage;
-import org.springframework.web.socket.WebSocketHandler;
-import org.springframework.web.socket.WebSocketMessage;
-import org.springframework.web.socket.WebSocketSession;
+import org.springframework.web.socket.*;
 
 import java.io.IOException;
 import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
-import java.util.Collections;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * WebSocket-хэндлер для real-time сделок (BUY/SELL):
+ * 💸 WebSocket для стрима сделок по символам.
  *
- *   /ws/trades?symbol=BTCUSDT
+ * Маршрут: /ws/trades?symbol=BTCUSDC
  *
- * Вызывается из:
- *    MarketStreamManager.pushTrade()
- *    SmartFusionStrategy (когда делает ордер)
+ * Логика:
+ *  - при подключении клиент указывает symbol;
+ *  - храним сессии по symbol;
+ *  - метод broadcastTrade(symbol, payload) шлёт событие только тем, кто слушает этот symbol.
  *
- * Пушит JSON:
- * {
- *    "symbol": "BTCUSDT",
- *    "price": 94800.5,
- *    "qty": 0.002,
- *    "side": "BUY",
- *    "ts": 1731628400000
- * }
+ * ВАЖНО:
+ *  - здесь нет логики стратегий / ордеров;
+ *  - это чистый транспорт от backend → браузер.
  */
 @Slf4j
 @Component
 public class TradeWebSocketHandler implements WebSocketHandler {
 
     /**
-     * Каналы:
-     *   key:  SYMBOL → "BTCUSDT"
-     *   val:  Set<WebSocketSession>
+     * Каналы: symbol → множество сессий, подписанных на этот символ.
+     * symbol в верхнем регистре (BTCUSDC, ETHUSDT и т.п.).
      */
-    private final Map<String, Set<WebSocketSession>> channels = new ConcurrentHashMap<>();
-
-    /**
-     * Обратный индекс для удаления:
-     *   sessionId → SYMBOL
-     */
-    private final Map<String, String> sessionChannel = new ConcurrentHashMap<>();
-
-    // ==========================================================================
-    // WebSocketHandler API
-    // ==========================================================================
+    private static final Map<String, Set<WebSocketSession>> CHANNELS = new ConcurrentHashMap<>();
 
     @Override
-    public void afterConnectionEstablished(WebSocketSession session) throws Exception {
+    public void afterConnectionEstablished(WebSocketSession session) {
         URI uri = session.getUri();
-        Map<String, String> params = parseQuery(uri);
+        String query = uri != null && uri.getQuery() != null ? uri.getQuery() : "";
 
-        String symbol = params.getOrDefault("symbol", "").trim().toUpperCase(Locale.ROOT);
+        Map<String, String> params = parseQuery(query);
+        String symbol = Optional.ofNullable(params.get("symbol"))
+                .map(s -> s.toUpperCase(Locale.ROOT))
+                .orElse("BTCUSDT");
 
-        if (symbol.isBlank()) {
-            log.warn("❌ /ws/trades: symbol не указан, закрываю сессию {}", session.getId());
-            session.close(CloseStatus.BAD_DATA);
-            return;
-        }
-
-        channels
-                .computeIfAbsent(symbol, k -> ConcurrentHashMap.newKeySet())
+        CHANNELS.computeIfAbsent(symbol, k -> Collections.newSetFromMap(new ConcurrentHashMap<>()))
                 .add(session);
 
-        sessionChannel.put(session.getId(), symbol);
-
-        log.info("🔌 WS /ws/trades CONNECT id={} symbol={}", session.getId(), symbol);
+        log.info("🔌 [WS-TRADES] CONNECT symbol={} from {} (subscribers={})",
+                symbol, session.getRemoteAddress(), CHANNELS.get(symbol).size());
     }
 
     @Override
     public void handleMessage(WebSocketSession session, WebSocketMessage<?> message) {
-        // Клиент нам ничего не должен слать
-        log.debug("📩 WS /ws/trades message from {}: {}", session.getId(), message.getPayload());
+        // Обычно клиент сюда ничего важного не шлёт, можно игнорировать либо логировать пинги.
+        if (message instanceof TextMessage text) {
+            log.debug("💬 [WS-TRADES] msg from {}: {}",
+                    session.getRemoteAddress(), text.getPayload());
+        }
     }
 
     @Override
-    public void handleTransportError(WebSocketSession session, Throwable e) throws Exception {
-        log.warn("⚠️ WS /ws/trades transport error id={} : {}", session != null ? session.getId() : "null", e.getMessage());
-        if (session != null && session.isOpen()) {
-            session.close(CloseStatus.SERVER_ERROR);
-        }
-        removeSession(session);
+    public void handleTransportError(WebSocketSession session, Throwable exception) {
+        log.warn("⚠️ [WS-TRADES] Transport error from {}: {}",
+                session.getRemoteAddress(), exception.getMessage(), exception);
     }
 
     @Override
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
-        log.info("🔌 WS /ws/trades CLOSED id={} status={}", session.getId(), status);
-        removeSession(session);
+        // Удаляем сессию из всех каналов (обычно ровно из одного).
+        CHANNELS.forEach((symbol, sessions) -> {
+            if (sessions.remove(session)) {
+                log.info("❌ [WS-TRADES] DISCONNECT {} from symbol={} (subscribers={})",
+                        session.getRemoteAddress(), symbol, sessions.size());
+            }
+        });
     }
 
     @Override
@@ -105,94 +83,61 @@ public class TradeWebSocketHandler implements WebSocketHandler {
         return false;
     }
 
-    // ==========================================================================
-    // Публичный метод для MarketStreamManager
-    // ==========================================================================
-
     /**
-     * Рассылка сделки всем подписчикам символа.
+     * Глобальный метод для отправки сделки по конкретному символу.
      *
-     * @param tsMillis timestamp (millis)
-     * @param symbol   BTCUSDT
-     * @param data     поля: symbol, price, qty, side, ts
+     * @param symbol  символ (BTCUSDC и т.п., регистр не важен)
+     * @param payload строка JSON или любой объект (toString()).
      */
-    public void broadcastTrade(long tsMillis, String symbol, Map<String, Object> data) {
-        if (symbol == null || data == null) return;
+    public static void broadcastTrade(String symbol, Object payload) {
+        if (symbol == null || symbol.isBlank()) {
+            return;
+        }
 
-        String sym = symbol.toUpperCase(Locale.ROOT);
-
-        Set<WebSocketSession> sessions = channels.get(sym);
+        String key = symbol.toUpperCase(Locale.ROOT);
+        Set<WebSocketSession> sessions = CHANNELS.get(key);
         if (sessions == null || sessions.isEmpty()) {
             return;
         }
 
-        String json = toJson(data);
-
-        for (WebSocketSession s : sessions) {
-            if (!s.isOpen()) continue;
-            try {
-                s.sendMessage(new TextMessage(json));
-            } catch (IOException e) {
-                log.warn("⚠️ WS /ws/trades send error id={} : {}", s.getId(), e.getMessage());
-            }
-        }
-    }
-
-    // ==========================================================================
-    // HELPERS
-    // ==========================================================================
-
-    private void removeSession(WebSocketSession session) {
-        if (session == null) return;
-
-        String id = session.getId();
-        String symbol = sessionChannel.remove(id);
-
-        if (symbol != null) {
-            Set<WebSocketSession> set = channels.get(symbol);
-            if (set != null) {
-                set.remove(session);
-                if (set.isEmpty()) {
-                    channels.remove(symbol);
-                }
-            }
+        String text;
+        if (payload == null) {
+            text = "";
+        } else if (payload instanceof String s) {
+            text = s;
         } else {
-            // fallback
-            channels.values().forEach(set -> set.remove(session));
+            text = payload.toString();
         }
-    }
 
-    private String toJson(Map<String, Object> map) {
-        StringBuilder sb = new StringBuilder("{");
-        boolean first = true;
+        TextMessage msg = new TextMessage(text);
 
-        for (var e : map.entrySet()) {
-            if (!first) sb.append(",");
-            first = false;
-
-            sb.append("\"").append(e.getKey()).append("\":");
-
-            Object v = e.getValue();
-            if (v instanceof Number || v instanceof Boolean) {
-                sb.append(v);
-            } else {
-                sb.append("\"").append(v).append("\"");
+        sessions.forEach(session -> {
+            if (!session.isOpen()) {
+                return;
             }
-        }
-        sb.append("}");
-        return sb.toString();
+            try {
+                session.sendMessage(msg);
+            } catch (IOException e) {
+                log.warn("⚠️ [WS-TRADES] Ошибка при отправке сделки [{}] клиенту {}: {}",
+                        key, session.getRemoteAddress(), e.getMessage());
+            }
+        });
     }
 
-    private Map<String, String> parseQuery(URI uri) {
-        if (uri == null) return Collections.emptyMap();
-        String q = uri.getQuery();
-        if (q == null || q.isBlank()) return Collections.emptyMap();
+    // ====================== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ======================
 
-        Map<String, String> res = new ConcurrentHashMap<>();
-        for (String p : q.split("&")) {
-            if (p.isBlank()) continue;
+    private Map<String, String> parseQuery(String query) {
+        if (query == null || query.isBlank()) {
+            return Collections.emptyMap();
+        }
 
-            int idx = p.indexOf("=");
+        String[] pairs = query.split("&");
+        Map<String, String> res = new HashMap<>();
+
+        for (String p : pairs) {
+            if (p.isEmpty()) continue;
+
+            int idx = p.indexOf('=');
             if (idx < 0) {
                 res.put(decode(p), "");
             } else {

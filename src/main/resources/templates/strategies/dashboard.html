@@ -8,11 +8,9 @@
     AI Trading Dashboard
   </title>
 
-  <!-- LightweightCharts (в layout уже есть, но дубль безопасен) -->
   <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 
-<!-- ВАЖНО: layout подключается здесь, НЕ в <html> -->
 <body th:replace="~{layout :: layout(~{::title}, ~{::section}, 'strategies')}">
 
 <section id="strategy-dashboard"
@@ -20,12 +18,13 @@
          th:attr="data-chat-id=${chatId},
                   data-type=${type},
                   data-symbol=${symbol},
-                  data-exchange=${'BINANCE'},
-                  data-network=${info != null and info.networkType != null ? info.networkType : 'MAINNET'},
-                  data-timeframe=${info != null and info.timeframe != null ? info.timeframe : '15m'}">
+                  data-exchange=${info?.exchangeName ?: ''},
+                  data-network=${info?.networkType ?: 'MAINNET'},
+                  data-timeframe=${info?.timeframe ?: '15m'}">
 
-  <!-- HEADER =============================================================== -->
+  <!-- HEADER -->
   <div class="d-flex flex-wrap justify-content-between align-items-center mb-4">
+
     <div class="d-flex flex-wrap align-items-center gap-3">
       <div>
         <div class="section-title mb-1">AI Trading Dashboard</div>
@@ -40,62 +39,70 @@
       <div>
         <div class="small-label mb-1">Символ</div>
         <span class="pill-badge bg-primary-subtle text-primary-emphasis"
-              th:text="${symbol} ?: '—'">BTCUSDT</span>
+              th:text="${symbol ?: '—'}">BTCUSDT</span>
       </div>
 
       <div class="vr d-none d-md-block mx-3"></div>
 
       <div>
         <div class="small-label mb-1">Статус</div>
-        <span class="pill-badge"
-              th:classappend="${info != null and info.running}
-              ? ' bg-success-subtle text-success-emphasis'
-              : ' bg-danger-subtle text-danger-emphasis'">
+        <span id="strategy-status-pill"
+              class="pill-badge"
+              th:classappend="${info?.active}
+                  ? ' bg-success-subtle text-success-emphasis'
+                  : ' bg-danger-subtle text-danger-emphasis'">
+
           <span class="status-dot"
-                th:classappend="${info != null and info.running} ? ' status-dot-running'
-                                                                 : ' status-dot-stopped'"></span>
-          <span th:text="${info != null and info.running} ? 'Работает' : 'Остановлена'">Работает</span>
+                th:classappend="${info?.active}
+                  ? ' status-dot-running'
+                  : ' status-dot-stopped'"></span>
+
+          <span th:text="${info?.active} ? 'Работает' : 'Остановлена'">Работает</span>
         </span>
       </div>
     </div>
 
     <div class="d-flex flex-wrap align-items-center gap-2 mt-3 mt-md-0">
+
       <div class="badge-network">
         <i class="bi bi-hdd-network me-1"></i>
-        <span th:text="${info != null and info.networkType != null} ? info.networkType : 'UNKNOWN'">MAINNET</span>
+        <span th:text="${info?.networkType ?: 'UNKNOWN'}">MAINNET</span>
       </div>
 
+      <!-- START -->
       <button class="btn-toggle btn-run"
-              th:if="${info == null || !info.running}"
+              id="btn-start"
               th:data-chat-id="${chatId}"
               th:data-type="${type}"
-              id="btn-start">
+              th:classappend="${info?.active} ? ' d-none' : ''">
         <i class="bi bi-play-fill me-1"></i>Запустить
       </button>
 
+      <!-- STOP -->
       <button class="btn-toggle btn-stop"
-              th:if="${info != null && info.running}"
+              id="btn-stop"
               th:data-chat-id="${chatId}"
               th:data-type="${type}"
-              id="btn-stop">
+              th:classappend="${info?.active} ? '' : ' d-none'">
         <i class="bi bi-stop-fill me-1"></i>Остановить
       </button>
+
     </div>
   </div>
 
-  <!-- MARKET SNAPSHOT ====================================================== -->
+  <!-- MARKET SNAPSHOT -->
   <div class="row g-3 mb-3">
     <div class="col-6 col-md-3">
       <div class="card-theme p-2 h-100">
         <div class="small-label mb-1">Последняя цена</div>
         <div class="fs-5 fw-semibold" id="stat-last-price">—</div>
-        <div class="metric-sub" th:text="${symbol} ?: '—'">BTCUSDT</div>
+        <div class="metric-sub" th:text="${symbol}">BTCUSDT</div>
       </div>
     </div>
 
     <div class="col-6 col-md-3">
       <div class="card-theme p-2 h-100">
-        <div class="small-label mb-1">Изменение (диапазон графика)</div>
+        <div class="small-label mb-1">Изменение</div>
         <div class="fs-6 fw-semibold" id="stat-change-pct">—</div>
         <div class="metric-sub">от первой до последней свечи</div>
       </div>
@@ -105,7 +112,7 @@
       <div class="card-theme p-2 h-100">
         <div class="small-label mb-1">Диапазон цен</div>
         <div class="fs-6 fw-semibold" id="stat-range">—</div>
-        <div class="metric-sub">min–max на текущем диапазоне</div>
+        <div class="metric-sub">min–max за период</div>
       </div>
     </div>
 
@@ -113,55 +120,46 @@
       <div class="card-theme p-2 h-100">
         <div class="small-label mb-1">Тренд</div>
         <div class="fs-6 fw-semibold" id="stat-trend">—</div>
-        <div class="metric-sub">по изменению цены</div>
+        <div class="metric-sub">по динамике цены</div>
       </div>
     </div>
   </div>
 
-  <!-- TOP ROW =============================================================== -->
+  <!-- TOP ROW -->
   <div class="row g-4 mb-4">
 
     <!-- CHART -->
     <div class="col-lg-8">
       <div class="card-theme p-3 h-100">
-        <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
 
+        <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
           <div>
             <div class="small-label mb-1">График цены</div>
             <h5 class="mb-0">
               <i class="bi bi-graph-up-arrow text-info me-2"></i>
-              <span th:text="${symbol} ?: 'График'">BTCUSDT</span>
+              <span th:text="${symbol}">BTCUSDT</span>
             </h5>
           </div>
 
-          <div class="d-flex flex-wrap align-items-center gap-2">
+          <div class="d-flex align-items-center gap-2">
             <div class="d-flex align-items-center gap-1">
               <span class="small-label me-1">Таймфрейм</span>
-              <label for="timeframe-select"></label>
-              <select id="timeframe-select"
-                      class="form-select form-select-sm"
-                      style="min-width: 90px;">
-                <option value="">…</option>
-              </select>
+              <select id="timeframe-select" class="form-select form-select-sm" style="min-width: 90px;"></select>
             </div>
 
             <div class="d-flex align-items-center gap-1">
               <span class="small-label">WS:</span>
-              <span id="live-status"
-                    style="font-weight:bold;color:#e74c3c;">
-                OFFLINE
-              </span>
+              <span id="live-status" style="font-weight:bold;color:#e74c3c;">OFFLINE</span>
             </div>
 
-            <button class="btn btn-sm btn-outline-light border-opacity-25" id="btn-export-png">
+            <button class="btn btn-sm btn-outline-light" id="btn-export-png">
               <i class="bi bi-download"></i>
             </button>
           </div>
         </div>
 
-        <div class="chart-wrapper-main">
-          <div id="candles-chart"></div>
-        </div>
+        <div class="chart-wrapper-main"><div id="candles-chart"></div></div>
+
       </div>
     </div>
 
@@ -173,149 +171,176 @@
 
         <div class="row g-3">
 
+          <!-- ROI -->
           <div class="col-12">
             <div class="d-flex justify-content-between align-items-center">
+
               <div>
                 <div class="metric-label mb-1">ROI / Доходность</div>
                 <div class="metric-value"
-                     th:classappend="${info != null and info.totalProfitPct != null and info.totalProfitPct >= 0}
-                                     ? ' metric-positive' : ' metric-negative' "
-                     th:text="${(info != null and info.totalProfitPct != null)
-                                 ? #numbers.formatDecimal(info.totalProfitPct,1,2) + '%'
-                                 : '0.00%'}">0.00%</div>
+                     th:classappend="${info?.totalProfitPct >= 0} ? ' metric-positive' : ' metric-negative'"
+                     th:text="${info?.totalProfitPct != null
+                                ? #numbers.formatDecimal(info.totalProfitPct,1,2) + '%'
+                                : '0.00%'}">
+                </div>
               </div>
+
               <i class="bi bi-activity fs-3 text-info"></i>
             </div>
-            <div class="metric-sub mt-1">Накопленный результат по всем сделкам.</div>
+            <div class="metric-sub mt-1">Накопленный результат.</div>
           </div>
 
+          <!-- BALANCE -->
           <div class="col-12">
             <div class="d-flex justify-content-between align-items-center">
+
               <div>
-                <div class="metric-label mb-1">Текущий баланс</div>
+                <div class="metric-label mb-1">Текущий капитал</div>
                 <div class="metric-value text-info"
-                     th:text="${(info != null and info.currentEquity != null)
-                                  ? #numbers.formatDecimal(info.currentEquity,1,2)
-                                  : '—'}">—</div>
+                     th:text="${info?.equityUsd != null
+                                ? #numbers.formatDecimal(info.equityUsd,1,2)
+                                : '—'}">
+                </div>
               </div>
+
               <div class="text-end">
                 <div class="metric-label mb-1">Стартовый</div>
                 <div class="metric-sub"
-                     th:text="${(info != null and info.initialEquity != null)
-                                  ? #numbers.formatDecimal(info.initialEquity,1,2)
-                                  : '—'}">—</div>
+                     th:text="${info?.capitalUsd != null
+                                ? #numbers.formatDecimal(info.capitalUsd,1,2)
+                                : '—'}">
+                </div>
               </div>
+
             </div>
           </div>
 
+          <!-- TRADES -->
           <div class="col-12">
             <div class="d-flex justify-content-between align-items-center">
+
               <div>
                 <div class="metric-label mb-1">Всего сделок</div>
                 <div class="metric-value"
-                     th:text="${(info != null and info.totalTrades != null) ? info.totalTrades : 0}">0</div>
+                     th:text="${info?.totalTrades ?: 0}">
+                </div>
               </div>
+
               <div class="text-end">
                 <div class="metric-label mb-1">Win rate</div>
-                <div class="metric-sub"
-                     th:text="${(info != null and info.winRatePct != null)
-                                  ? #numbers.formatDecimal(info.winRatePct,1,1) + '%'
-                                  : '—'}">—</div>
+                <div class="metric-sub text-secondary">—</div>
               </div>
+
             </div>
           </div>
 
         </div>
       </div>
 
+      <!-- AI block -->
       <div class="card-theme p-3">
         <div class="small-label mb-2">AI слой</div>
         <p class="small text-secondary mb-2">
-          Мета-оркестратор анализирует рынок, фильтрует шум и адаптирует параметры.
+          Мета-оркестратор анализирует рынок и адаптирует стратегию.
         </p>
+
         <div class="d-flex justify-content-between align-items-center mb-1">
           <span class="text-secondary small">ML/AI confidence</span>
           <span class="fw-semibold"
-                th:text="${(info != null and info.mlConfidence != null)
+                th:text="${info?.mlConfidence != null
                             ? #numbers.formatDecimal(info.mlConfidence,1,3)
-                            : '—'}">—</span>
+                            : '—'}">
+          </span>
         </div>
+
         <div class="small text-secondary">
-          <span class="text-secondary">Риск на сделку:</span>
-          <span class="ms-1 fw-semibold"
-                th:text="${(info != null and info.riskPerTradePct != null)
+          Риск на сделку:
+          <span class="fw-semibold ms-1"
+                th:text="${info?.riskPerTradePct != null
                             ? #numbers.formatDecimal(info.riskPerTradePct,1,2) + '%'
-                            : '—'}">—</span>
+                            : '—'}">
+          </span>
         </div>
       </div>
 
     </div>
+
   </div>
 
-  <!-- BOTTOM ROW =========================================================== -->
+  <!-- BOTTOM ROW -->
   <div class="row g-4 mb-4">
 
-    <!-- LEFT SETTINGS -->
+    <!-- SETTINGS -->
     <div class="col-lg-4">
+
       <div class="card-theme p-3 mb-3">
 
         <div class="d-flex justify-content-between align-items-center mb-2">
           <div class="small-label">Настройки стратегии</div>
           <span class="badge bg-info-subtle text-info-emphasis">
-              <i class="bi bi-gear-wide-connected me-1"></i>
-              <span th:text="${(info != null and info.version != null) ? 'v' + info.version : 'v1'}">v1</span>
+            <i class="bi bi-gear-wide-connected me-1"></i>
+            <span th:text="${info?.version != null ? 'v' + info.version : 'v1'}">v1</span>
           </span>
         </div>
 
         <ul class="list-unstyled mb-0 small">
+
           <li class="mb-1">
             <span class="text-secondary">Символ:</span>
-            <span class="ms-1 fw-semibold" th:text="${symbol} ?: '—'">BTCUSDT</span>
+            <span class="fw-semibold ms-1" th:text="${symbol}">BTCUSDT</span>
           </li>
+
           <li class="mb-1">
             <span class="text-secondary">Таймфрейм:</span>
-            <span class="ms-1 fw-semibold"
-                  th:text="${(info != null and info.timeframe != null) ? info.timeframe : '—'}">15m</span>
+            <span class="fw-semibold ms-1"
+                  th:text="${info?.timeframe ?: '—'}">15m</span>
           </li>
+
           <li class="mb-1">
             <span class="text-secondary">TP / SL:</span>
-            <span class="ms-1 fw-semibold"
-                  th:text="${(info != null and info.tpPct != null)
-                              ? #numbers.formatDecimal(info.tpPct,1,2) + '% / ' +
-                                #numbers.formatDecimal(info.slPct,1,2) + '%'
-                              : '—'}">—</span>
+            <span class="fw-semibold ms-1"
+                  th:text="${info?.takeProfitPct != null
+                              ? #numbers.formatDecimal(info.takeProfitPct,1,2) + '% / ' +
+                                #numbers.formatDecimal(info.stopLossPct,1,2) + '%'
+                              : '—'}">
+            </span>
           </li>
+
           <li class="mb-1">
             <span class="text-secondary">Риск на сделку:</span>
-            <span class="ms-1 fw-semibold"
-                  th:text="${(info != null and info.riskPerTradePct != null)
+            <span class="fw-semibold ms-1"
+                  th:text="${info?.riskPerTradePct != null
                               ? #numbers.formatDecimal(info.riskPerTradePct,1,2) + '%'
-                              : '—'}">—</span>
+                              : '—'}">
+            </span>
           </li>
+
         </ul>
+
       </div>
 
     </div>
 
-    <!-- TRADES TABLE ======================================================= -->
+    <!-- TRADES TABLE -->
     <div class="col-lg-8">
       <div class="card-theme p-3 h-100 d-flex flex-column">
 
         <div class="d-flex justify-content-between align-items-center mb-2">
           <div class="small-label">Журнал сделок</div>
-          <div class="d-flex gap-2">
-            <span class="badge bg-success-subtle text-success-emphasis">
-                <i class="bi bi-arrow-up-right-circle me-1"></i>
-                Профит:
-                <span th:text="${(info != null and info.totalProfitPct != null)
-                                  ? #numbers.formatDecimal(info.totalProfitPct,1,2) + '%'
-                                  : '0.00%'}">0.00%</span>
+
+          <span class="badge bg-success-subtle text-success-emphasis">
+            <i class="bi bi-arrow-up-right-circle me-1"></i>
+            Профит:
+            <span th:text="${info?.totalProfitPct != null
+                              ? #numbers.formatDecimal(info.totalProfitPct,1,2) + '%'
+                              : '0.00%'}">
             </span>
-          </div>
+          </span>
         </div>
 
         <div class="table-responsive flex-grow-1" style="max-height:260px;overflow-y:auto;">
           <table class="table table-sm align-middle table-dark-custom mb-0">
+
             <thead class="sticky-top" style="background:#050814;">
             <tr>
               <th class="text-secondary small">Время</th>
@@ -332,42 +357,36 @@
 
               <!-- TIME -->
               <td class="small"
-                  th:text="${t.timestamp != null
-                  ? #temporals.format(@timeUtil.fromMillis(t.timestamp),'dd.MM HH:mm')
-                  : (t.createdAt != null
-                       ? #temporals.format(t.createdAt,'dd.MM HH:mm')
-                       : '—')}">
+                  th:text="${t.createdAt != null
+                    ? #temporals.format(t.createdAt,'dd.MM HH:mm')
+                    : '—'}">
               </td>
 
               <!-- SIDE -->
               <td>
-                <span th:if="${t.side == 'BUY'}"
-                      class="badge-trade-buy small px-2 py-1">
+                <span th:if="${t.side == 'BUY'}" class="badge-trade-buy small px-2 py-1">
                   <i class="bi bi-arrow-up-right me-1"></i>BUY
                 </span>
 
-                <span th:if="${t.side == 'SELL'}"
-                      class="badge-trade-sell small px-2 py-1">
+                <span th:if="${t.side == 'SELL'}" class="badge-trade-sell small px-2 py-1">
                   <i class="bi bi-arrow-down-right me-1"></i>SELL
                 </span>
               </td>
 
               <!-- PRICE -->
               <td class="small"
-                  th:text="${#numbers.formatDecimal(t.price,1,4)}">0.0000</td>
+                  th:text="${#numbers.formatDecimal(t.price,1,4)}"></td>
 
-              <!-- QUANTITY -->
+              <!-- QTY -->
               <td class="small"
-                  th:text="${#numbers.formatDecimal(t.quantity,1,4)}">0.0000</td>
+                  th:text="${#numbers.formatDecimal(t.quantity,1,4)}"></td>
 
               <!-- PNL -->
               <td class="small"
-                  th:classappend="${t.realizedPnlUsd != null and t.realizedPnlUsd >= 0}
-                        ? ' text-success'
-                        : ' text-danger'"
+                  th:classappend="${t.realizedPnlUsd >= 0} ? ' text-success' : ' text-danger'"
                   th:text="${t.realizedPnlUsd != null
-                 ? #numbers.formatDecimal(t.realizedPnlUsd,1,4)
-                 : '0.0000'}">
+                            ? #numbers.formatDecimal(t.realizedPnlUsd,1,4)
+                            : '0.0000'}">
               </td>
 
             </tr>
@@ -379,9 +398,9 @@
             </tr>
 
             </tbody>
-
           </table>
         </div>
+
       </div>
     </div>
 

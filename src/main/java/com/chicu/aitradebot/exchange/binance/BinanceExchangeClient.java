@@ -57,9 +57,12 @@ public class BinanceExchangeClient implements ExchangeClient {
 
     @Override
     public NetworkType getNetworkType() {
-        // "Дефолтная" сеть, если кто-то вызывает методы без явного указания
-        return NetworkType.MAINNET;
+        // Никогда не используем дефолт — это опасно.
+        throw new UnsupportedOperationException(
+                "BinanceExchangeClient: используйте resolve(chatId) для получения network"
+        );
     }
+
 
     /** Правильный выбор URL по сети */
     private String baseUrl(NetworkType net) {

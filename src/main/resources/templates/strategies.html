@@ -57,8 +57,8 @@
           <!-- Статус -->
           <span class="badge px-3 py-2 mb-2"
                 th:classappend="${s.active} ? ' bg-success' : ' bg-secondary'">
-                        <span th:text="${s.active} ? '🟢 Активна' : '⚫ Остановлена'">⚫ Остановлена</span>
-                    </span>
+            <span th:text="${s.active} ? '🟢 Активна' : '⚫ Остановлена'">⚫ Остановлена</span>
+          </span>
 
           <!-- Основная инфа -->
           <div class="small">
@@ -141,11 +141,13 @@
 
             const data = await response.json();
 
-            if (!response.ok || data.status === "error") {
+            // проверяем success из ToggleResponse
+            if (!response.ok || data.success === false) {
               throw new Error(data.message || "Ошибка переключения");
             }
 
-            const started = data.status === "started";
+            // новый источник истины — data.active
+            const started = data.active === true;
             btn.dataset.active = String(started);
 
             // кнопка
@@ -154,6 +156,12 @@
             icon.className = started ? "bi bi-stop-fill" : "bi bi-play-fill";
             label.textContent = started ? "Остановить" : "Запустить";
 
+            // бордер карточки
+            if (card) {
+              card.classList.toggle("border-success", started);
+              card.classList.toggle("border-2", started);
+            }
+
             // бейдж
             if (badge) {
               badge.textContent = started ? "🟢 Активна" : "⚫ Остановлена";
@@ -161,12 +169,13 @@
               badge.classList.toggle("bg-secondary", !started);
             }
 
-            // твои кастомные алерты, если есть
+            // тост
             if (window.showToast) {
-              showToast(started ? "Стратегия запущена" : "Стратегия остановлена", started);
+              const msg = data.message || (started ? "Стратегия запущена" : "Стратегия остановлена");
+              showToast(msg, started);
             }
 
-            // если бек отдаст redirect
+            // возможный redirect с бэка
             if (data.redirect) {
               window.location.href = data.redirect;
             }

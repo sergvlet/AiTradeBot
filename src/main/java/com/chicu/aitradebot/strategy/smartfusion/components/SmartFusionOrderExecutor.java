@@ -50,7 +50,7 @@ public class SmartFusionOrderExecutor {
                 .orElseThrow(() -> new IllegalStateException("Не найдены активные ключи BINANCE для chatId=" + chatId));
 
         // 2) Получаем подходящий клиент
-        ExchangeClient client = exchangeClientFactory.getClient(settings);
+        ExchangeClient client = exchangeClientFactory.getByChat(chatId);
 
         // 3) Размещаем РЕАЛЬНЫЙ ордер
         ExchangeClient.OrderResult result =
@@ -89,7 +89,7 @@ public class SmartFusionOrderExecutor {
                 .findFirst()
                 .orElseThrow(() -> new IllegalStateException("Не найдены активные ключи BINANCE для chatId=" + chatId));
 
-        ExchangeClient client = exchangeClientFactory.getClient(settings);
+        ExchangeClient client = exchangeClientFactory.getByChat(chatId);
 
         ExchangeClient.OrderResult result =
                 client.placeOrder(chatId, symbol, side, "LIMIT", qty, price);
@@ -126,7 +126,7 @@ public class SmartFusionOrderExecutor {
                 .findFirst()
                 .orElseThrow(() -> new IllegalStateException("Не найдены активные ключи BINANCE для chatId=" + chatId));
 
-        ExchangeClient client = exchangeClientFactory.getClient(settings);
+        ExchangeClient client = exchangeClientFactory.getByChat(chatId);
         boolean ok = client.cancelOrder(chatId, symbol, orderId);
         log.info("🛑 Cancel {} {} -> {}", symbol, orderId, ok ? "OK" : "FAIL");
         return ok;
