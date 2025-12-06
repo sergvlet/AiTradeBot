@@ -1,95 +1,146 @@
 package com.chicu.aitradebot.orchestrator;
 
 import com.chicu.aitradebot.common.enums.StrategyType;
+import com.chicu.aitradebot.domain.StrategySettings;
+import com.chicu.aitradebot.engine.StrategyEngine;
 import com.chicu.aitradebot.exchange.model.Order;
+import com.chicu.aitradebot.market.stream.StreamConnectionManager;
+import com.chicu.aitradebot.orchestrator.dto.StrategyRunInfo;
 import com.chicu.aitradebot.service.OrderService;
+import com.chicu.aitradebot.service.StrategySettingsService;
+import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
-import jakarta.annotation.PostConstruct;
 import java.math.BigDecimal;
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
 
-/**
- * AiStrategyOrchestrator (v4)
- *
- * Чистая централизованная точка управления стратегиями + ордерами.
- * НЕ создаёт экземпляры стратегий.
- * НЕ знает про Binance/Bybit.
- * НЕ выполняет циклы стратегий.
- *
- * Все методы совместимы с твоим OrderService и Web-фасадами.
- */
 @Slf4j
 @Component
 @RequiredArgsConstructor
 public class AiStrategyOrchestrator {
 
     private final OrderService orderService;
-
-    /** Активные стратегии: chatId → StrategyType */
-    private final Map<Long, Set<StrategyType>> activeStrategies = new ConcurrentHashMap<>();
+    private final StrategyEngine strategyEngine;
+    private final StrategySettingsService settingsService;
+    private final StreamConnectionManager streamManager;
 
     @PostConstruct
     public void init() {
-        log.info("🧠 AiStrategyOrchestrator v4 initialized.");
+        log.info("🧠 AiStrategyOrchestrator v4.5 initialized (dynamic WS subscription, multi-exchange).");
     }
 
     // =====================================================================
-    // ▶️ START / STOP STRATEGY
+    // ▶️ START STRATEGY
     // =====================================================================
 
-    public void startStrategy(Long chatId, StrategyType type) {
-        activeStrategies
-                .computeIfAbsent(chatId, k -> new HashSet<>())
-                .add(type);
+    public StrategyRunInfo startStrategy(Long chatId, StrategyType type) {
+        StrategySettings s = settingsService.getOrCreate(chatId, type);
 
-        log.info("▶️ Strategy {} STARTED (chatId={})", type, chatId);
+        String symbol   = s.getSymbol();
+        String exchange = s.getExchangeName();
+        String timeframe = s.getTimeframe();
+        int tick = resolveTickIntervalSec(type);
+
+        if (symbol == null || symbol.isBlank()) {
+            log.error("❌ Нельзя запустить стратегию без символа! chatId={} type={}", chatId, type);
+            return buildRunInfo(s, false, "Ошибка: не выбран символ");
+        }
+
+        // 🔥 Подписываем только нужную биржу
+        streamManager.subscribeSymbol(symbol, exchange);
+
+        strategyEngine.start(chatId, type, symbol, tick);
+
+        s.setActive(true);
+        s.setUpdatedAt(LocalDateTime.now());
+        settingsService.save(s);
+
+        log.info("▶️ START {} | chatId={} exchange={} symbol={} tf={} tick={}s",
+                type, chatId, exchange, symbol, timeframe, tick);
+
+        return buildRunInfo(s, true, "Стратегия запущена");
     }
 
-    public void stopStrategy(Long chatId, StrategyType type) {
-        Optional.ofNullable(activeStrategies.get(chatId))
-                .ifPresent(set -> set.remove(type));
+    public StrategyRunInfo startStrategy(Long chatId,
+                                         StrategyType type,
+                                         String symbol,
+                                         int tick) {
 
-        log.info("⏹ Strategy {} STOPPED (chatId={})", type, chatId);
+        StrategySettings s = settingsService.getOrCreate(chatId, type);
+        String exchange = s.getExchangeName();
+
+        if (symbol == null || symbol.isBlank()) {
+            log.error("❌ Пустой символ при ручном запуске!");
+            return buildRunInfo(s, false, "Ошибка: символ пустой");
+        }
+
+        streamManager.subscribeSymbol(symbol, exchange);
+
+        strategyEngine.start(chatId, type, symbol, tick);
+
+        s.setSymbol(symbol);
+        s.setActive(true);
+        s.setUpdatedAt(LocalDateTime.now());
+        settingsService.save(s);
+
+        log.info("▶️ START {} (manual) | chatId={} exchange={} symbol={} tick={}",
+                type, chatId, exchange, symbol, tick);
+
+        return buildRunInfo(s, true, "Стратегия запущена");
     }
+
+    // =====================================================================
+    // ⏹ STOP STRATEGY
+    // =====================================================================
+
+    public StrategyRunInfo stopStrategy(Long chatId, StrategyType type) {
+        strategyEngine.stop(chatId, type);
+
+        StrategySettings s = settingsService.getOrCreate(chatId, type);
+        s.setActive(false);
+        s.setUpdatedAt(LocalDateTime.now());
+        settingsService.save(s);
+
+        log.info("⏹ STOP {} | chatId={}", type, chatId);
+
+        return buildRunInfo(s, false, "Стратегия остановлена");
+    }
+
+    // =====================================================================
+    // ❓ STATUS
+    // =====================================================================
 
     public boolean isActive(Long chatId, StrategyType type) {
-        return activeStrategies
-                .getOrDefault(chatId, Collections.emptySet())
-                .contains(type);
+        return strategyEngine.isRunning(chatId, type);
     }
 
     // =====================================================================
-    // 📋 LIST OF STRATEGIES FOR UI
+    // 📋 STRATEGY LIST (UI)
     // =====================================================================
 
-    public record StrategyInfo(
-            StrategyType type,
-            boolean active
-    ) {}
+    public record StrategyInfo(StrategyType type, boolean active) {}
 
     public List<StrategyInfo> getStrategies(Long chatId) {
-        Set<StrategyType> act = activeStrategies.getOrDefault(chatId, Set.of());
-        List<StrategyInfo> list = new ArrayList<>();
+        Set<StrategyType> running = strategyEngine.getRunningStrategies(chatId);
 
+        List<StrategyInfo> list = new ArrayList<>();
         for (StrategyType t : StrategyType.values()) {
-            list.add(new StrategyInfo(t, act.contains(t)));
+            list.add(new StrategyInfo(t, running.contains(t)));
         }
         return list;
     }
 
     // =====================================================================
-    // 💰 ORDER MANAGEMENT (FULLY COMPATIBLE WITH YOUR OrderService)
+    // 💰 ORDER MANAGEMENT
     // =====================================================================
 
-    public record OrderResult(
-            boolean success,
-            String message,
-            Long orderId
-    ) {}
+    public record OrderResult(boolean success, String message, Long orderId) {}
 
     public record OrderView(
             Long id,
@@ -101,67 +152,6 @@ public class AiStrategyOrchestrator {
             Boolean filled,
             Long timestamp
     ) {}
-
-    // ---- BUY -------------------------------------------------------------
-
-    public OrderResult marketBuy(Long chatId, String symbol, BigDecimal qty) {
-        try {
-            Order order = orderService.placeMarket(
-                    chatId,
-                    symbol,
-                    "BUY",
-                    qty,
-                    BigDecimal.ZERO,      // executionPrice
-                    "ORCHESTRATOR"        // strategyType
-            );
-
-            return new OrderResult(
-                    true,
-                    "BUY OK",
-                    order.getId()         // dto → id is correct
-            );
-        } catch (Exception e) {
-            log.error("❌ Error marketBuy: {}", e.getMessage());
-            return new OrderResult(false, e.getMessage(), null);
-        }
-    }
-
-    // ---- SELL ------------------------------------------------------------
-
-    public OrderResult marketSell(Long chatId, String symbol, BigDecimal qty) {
-        try {
-            Order order = orderService.placeMarket(
-                    chatId,
-                    symbol,
-                    "SELL",
-                    qty,
-                    BigDecimal.ZERO,
-                    "ORCHESTRATOR"
-            );
-
-            return new OrderResult(
-                    true,
-                    "SELL OK",
-                    order.getId()
-            );
-        } catch (Exception e) {
-            log.error("❌ Error marketSell: {}", e.getMessage());
-            return new OrderResult(false, e.getMessage(), null);
-        }
-    }
-
-    // ---- CANCEL ----------------------------------------------------------
-
-    public boolean cancelOrder(Long chatId, long orderId) {
-        try {
-            return orderService.cancelOrder(chatId, orderId);
-        } catch (Exception e) {
-            log.error("❌ Error cancelOrder: {}", e.getMessage());
-            return false;
-        }
-    }
-
-    // ---- LIST ORDERS (DTO) -----------------------------------------------
 
     public List<OrderView> listOrders(Long chatId, String symbol) {
         try {
@@ -181,48 +171,115 @@ public class AiStrategyOrchestrator {
                     .toList();
 
         } catch (Exception e) {
-            log.error("❌ Error listOrders: {}", e.getMessage());
+            log.error("❌ listOrders error: {}", e.getMessage(), e);
             return List.of();
         }
     }
 
+    public OrderResult marketBuy(Long chatId, String symbol, BigDecimal qty) {
+        try {
+            var order = orderService.placeMarket(chatId, symbol, "BUY", qty, BigDecimal.ZERO, "ORCHESTRATOR");
+            return new OrderResult(true, "BUY OK", order.getId());
+        } catch (Exception e) {
+            log.error("❌ marketBuy error: {}", e.getMessage(), e);
+            return new OrderResult(false, e.getMessage(), null);
+        }
+    }
+
+    public OrderResult marketSell(Long chatId, String symbol, BigDecimal qty) {
+        try {
+            var order = orderService.placeMarket(chatId, symbol, "SELL", qty, BigDecimal.ZERO, "ORCHESTRATOR");
+            return new OrderResult(true, "SELL OK", order.getId());
+        } catch (Exception e) {
+            log.error("❌ marketSell error: {}", e.getMessage(), e);
+            return new OrderResult(false, e.getMessage(), null);
+        }
+    }
+
+    public boolean cancelOrder(Long chatId, long orderId) {
+        try {
+            return orderService.cancelOrder(chatId, orderId);
+        } catch (Exception e) {
+            log.error("❌ cancelOrder error: {}", e.getMessage(), e);
+            return false;
+        }
+    }
+
     // =====================================================================
-    // 💵 BALANCE (ПОКА ЗАГЛУШКА)
+    // GLOBAL
     // =====================================================================
 
-    public record BalanceView(
-            BigDecimal total,
-            BigDecimal free,
-            BigDecimal locked
-    ) {}
+    public record GlobalState(BigDecimal totalBalance, BigDecimal totalProfitPct, int activeStrategies) {}
 
-    public record AssetBalanceView(
-            String asset,
-            BigDecimal free,
-            BigDecimal locked
-    ) {}
+    public GlobalState getGlobalState(Long chatId) {
+        int active = strategyEngine.getRunningStrategies(chatId).size();
+        return new GlobalState(BigDecimal.ZERO, BigDecimal.ZERO, active);
+    }
+
+    // =====================================================================
+    // BALANCE (заглушка пока)
+    // =====================================================================
+
+    public record BalanceView(BigDecimal total, BigDecimal free, BigDecimal locked) {}
 
     public BalanceView getBalance(Long chatId) {
-        // позже подключим ExchangeClient
         return new BalanceView(BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO);
     }
 
+    public record AssetBalanceView(String asset, BigDecimal free, BigDecimal locked) {}
+
     public List<AssetBalanceView> getAssets(Long chatId) {
-        return List.of(); // пока пусто
+        return List.of(
+                new AssetBalanceView("USDT", BigDecimal.ZERO, BigDecimal.ZERO),
+                new AssetBalanceView("BTC", BigDecimal.ZERO, BigDecimal.ZERO)
+        );
     }
 
     // =====================================================================
-    // 📊 GLOBAL STATE for Dashboard
+    // 🚀 BUILD StrategyRunInfo
     // =====================================================================
 
-    public record GlobalState(
-            BigDecimal totalBalance,
-            BigDecimal totalProfitPct,
-            int activeStrategies
-    ) {}
+    private StrategyRunInfo buildRunInfo(StrategySettings s, boolean active, String msg) {
 
-    public GlobalState getGlobalState(Long chatId) {
-        int active = activeStrategies.getOrDefault(chatId, Set.of()).size();
-        return new GlobalState(BigDecimal.ZERO, BigDecimal.ZERO, active);
+        return StrategyRunInfo.builder()
+                .chatId(s.getChatId())
+                .type(s.getType())
+                .symbol(s.getSymbol())
+                .active(active)
+
+                .timeframe(s.getTimeframe())
+                .exchangeName(s.getExchangeName())
+                .networkType(s.getNetworkType())
+
+                .capitalUsd(s.getCapitalUsd())
+                .equityUsd(s.getCapitalUsd())
+                .totalProfitPct(s.getTotalProfitPct())
+                .commissionPct(s.getCommissionPct())
+                .takeProfitPct(s.getTakeProfitPct())
+                .stopLossPct(s.getStopLossPct())
+                .riskPerTradePct(s.getRiskPerTradePct())
+                .mlConfidence(s.getMlConfidence())
+                .reinvestProfit(s.isReinvestProfit())
+
+                .totalTrades(0L)
+                .startedAt(active ? Instant.now() : null)
+                .stoppedAt(active ? null : Instant.now())
+                .message(msg)
+                .build();
+    }
+
+    // =====================================================================
+    // HELPERS
+    // =====================================================================
+
+    private int resolveTickIntervalSec(StrategyType type) {
+        return switch (type) {
+            case SMART_FUSION -> 10;
+            case SCALPING -> 3;
+            case FIBONACCI_GRID -> 15;
+            case RSI_EMA -> 5;
+            case ML_INVEST -> 30;
+            default -> 10;
+        };
     }
 }

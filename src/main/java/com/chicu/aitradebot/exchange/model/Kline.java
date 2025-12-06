@@ -6,7 +6,6 @@ import lombok.NoArgsConstructor;
 
 /**
  * Универсальная свеча (kline) для Binance / Bybit и т.п.
- *
  * Порядок полей соответствует тому, как мы создаём Kline:
  * new Kline(openTime, open, high, low, close, volume)
  */

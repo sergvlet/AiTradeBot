@@ -14,12 +14,48 @@ public class MarketStreamManager {
     // symbol → timeframe → List<Candle>
     private final Map<String, Map<String, List<Candle>>> cache = new ConcurrentHashMap<>();
 
+    // ============================
+    // NORMALIZATION HELPERS
+    // ============================
+
+    private String normSymbol(String s) {
+        if (s == null) return "";
+        s = s.trim().toUpperCase();
+
+        // Binance futures отправляет ETHFDUSD@kline_1m
+        int idx = s.indexOf("@");
+        if (idx > 0) {
+            s = s.substring(0, idx);
+        }
+
+        return s;
+    }
+
+    private String normTf(String tf) {
+        if (tf == null) return "";
+        tf = tf.trim().toLowerCase();
+
+        // иногда прилетает kline_1m → оставляем 1m
+        if (tf.startsWith("kline_")) {
+            return tf.substring(6);
+        }
+
+        return tf;
+    }
+
+    // ============================
+    // WRITE candles
+    // ============================
+
     public void addCandle(String symbol, String timeframe, Candle candle) {
 
-        cache.computeIfAbsent(symbol, k -> new ConcurrentHashMap<>())
-                .computeIfAbsent(timeframe, k -> new ArrayList<>());
+        String sym = normSymbol(symbol);
+        String tf  = normTf(timeframe);
 
-        List<Candle> list = cache.get(symbol).get(timeframe);
+        cache.computeIfAbsent(sym, k -> new ConcurrentHashMap<>())
+                .computeIfAbsent(tf, k -> new ArrayList<>());
+
+        List<Candle> list = cache.get(sym).get(tf);
 
         synchronized (list) {
 
@@ -30,38 +66,38 @@ public class MarketStreamManager {
 
             Candle last = list.get(list.size() - 1);
 
-            // обновляем формирующуюся свечу
+            // обновление текущей свечи
             if (last.getTime() == candle.getTime()) {
                 list.set(list.size() - 1, candle);
-
-                // если свеча закрылась → она теперь окончательная
-                if (candle.isClosed()) {
-                    // создаём новую свечу (формирующуюся)
-                    // Binance сам пришлёт её временем t следующей свечи
-                }
-
                 return;
             }
 
-            // свеча с НОВЫМ ts
+            // новая свеча
             list.add(candle);
 
-            // ограничение по хранению
+            // ограничитель
             if (list.size() > 1000) {
                 list.remove(0);
             }
         }
     }
 
+    // ============================
+    // READ candles
+    // ============================
 
     public List<Candle> getCandles(String symbol, String timeframe, int limit) {
-        var tfMap = cache.getOrDefault(symbol, Collections.emptyMap());
-        var list = tfMap.getOrDefault(timeframe, Collections.emptyList());
+
+        String sym = normSymbol(symbol);
+        String tf  = normTf(timeframe);
+
+        var tfMap = cache.getOrDefault(sym, Collections.emptyMap());
+        var list  = tfMap.getOrDefault(tf, Collections.emptyList());
 
         if (list.size() <= limit) {
             return new ArrayList<>(list);
         }
 
-        return new ArrayList<>(list.subList(list.size() - limit, list.size()));
+        return new ArrayList<>( list.subList(list.size() - limit, list.size()) );
     }
 }

@@ -234,7 +234,6 @@
                            class="form-control"
                            name="capitalUsd"
                            th:value="${strategy.capitalUsd}">
-
                 </div>
 
                 <div class="col-md-4">
@@ -248,7 +247,6 @@
                             class="btn btn-sm btn-outline-info mt-3">
                         🔄 Обновить комиссию
                     </button>
-
                 </div>
 
                 <div class="col-md-4 d-flex align-items-end">
@@ -328,7 +326,6 @@
 
             <div class="row g-4">
 
-                <!-- Symbol -->
                 <div class="col-md-4">
                     <label class="form-label">Пара</label>
                     <input type="text"
@@ -339,7 +336,6 @@
                            placeholder="BTCUSDT">
                 </div>
 
-                <!-- Timeframe -->
                 <div class="col-md-4">
                     <label class="form-label">Таймфрейм</label>
                     <select class="form-select" id="timeframeSelect" name="timeframe">
@@ -354,7 +350,6 @@
                     </div>
                 </div>
 
-                <!-- Candles -->
                 <div class="col-md-4">
                     <label class="form-label">Свечей в кэше</label>
                     <input type="number"
@@ -378,14 +373,12 @@
             <div id="marketResults"
                  class="table-responsive"
                  style="max-height: 420px; overflow-y: auto; border:1px solid #222; border-radius:8px;">
-                <!-- Таблица будет вставляться JS-кодом -->
                 <div class="text-center text-secondary p-3">
                     Введите поисковый запрос…
                 </div>
             </div>
 
         </div>
-
 
         <!-- ======================== TAB 5 — ADVANCED ======================== -->
         <div class="tab-pane" id="advanced">
@@ -411,7 +404,6 @@
         </div>
 
     </form>
-
     <!-- ======================== JS ======================== -->
     <script th:inline="javascript">
         document.addEventListener("DOMContentLoaded", () => {
@@ -468,7 +460,7 @@
             }
 
             // ----------------------------------------------------
-            // ПЕРЕГРУЗКА ПРИ СМЕНЕ БИРЖИ/СЕТИ
+            // СМЕНА БИРЖИ / СЕТИ
             // ----------------------------------------------------
             function reloadWithParams() {
                 showLoader("Перезагрузка…");
@@ -486,24 +478,38 @@
             if (ntSel) ntSel.addEventListener("change", reloadWithParams);
 
             // ----------------------------------------------------
-            // ВКЛАДКИ
+            // ВКЛАДКИ — сохраним последнюю активную вкладку
             // ----------------------------------------------------
             const tabs  = document.querySelectorAll(".tab-btn");
             const panes = document.querySelectorAll(".tab-pane");
 
-            tabs.forEach(btn => {
-                btn.addEventListener("click", () => {
-                    tabs.forEach(t => t.classList.remove("active"));
-                    panes.forEach(p => p.classList.remove("active"));
+            const TAB_KEY = "strategy_settings_active_tab";
 
-                    btn.classList.add("active");
-                    const pane = document.getElementById(btn.dataset.tab);
-                    if (pane) pane.classList.add("active");
-                });
+            function activateTab(tabId) {
+                tabs.forEach(t => t.classList.remove("active"));
+                panes.forEach(p => p.classList.remove("active"));
+
+                const btn = document.querySelector(`.tab-btn[data-tab='${tabId}']`);
+                const pane = document.getElementById(tabId);
+
+                if (btn) btn.classList.add("active");
+                if (pane) pane.classList.add("active");
+
+                localStorage.setItem(TAB_KEY, tabId);
+            }
+
+            // восстановление вкладки
+            const savedTab = localStorage.getItem(TAB_KEY);
+            if (savedTab && document.getElementById(savedTab)) {
+                activateTab(savedTab);
+            }
+
+            tabs.forEach(btn => {
+                btn.addEventListener("click", () => activateTab(btn.dataset.tab));
             });
 
             // ----------------------------------------------------
-            // РЕАЛЬНАЯ КОМИССИЯ (АВТОПОДГРУЗКА)
+            // РЕАЛЬНАЯ КОМИССИЯ (автоподгрузка)
             // ----------------------------------------------------
             async function loadRealFee() {
                 try {
@@ -532,7 +538,7 @@
             if (commissionInput) loadRealFee();
 
             // ----------------------------------------------------
-            // КНОПКА "ОБНОВИТЬ КОМИССИЮ"
+            // КНОПКА ОБНОВИТЬ КОМИССИЮ
             // ----------------------------------------------------
             if (refreshBtn) {
                 refreshBtn.addEventListener("click", async () => {
@@ -568,8 +574,8 @@
             }
 
             // ----------------------------------------------------
-// ВКЛАДКА ТОРГОВЛЯ — ПОИСК МОНЕТ  ⚡ Ускоренная версия
-// ----------------------------------------------------
+            // ПОИСК МОНЕТ
+            // ----------------------------------------------------
             let searchTimer = null;
 
             async function loadMarketSearch(query) {
@@ -578,9 +584,9 @@
 
                 if (!query || query.trim().length < 1) {
                     marketResults.innerHTML = `
-            <div class="text-center text-secondary p-3">
-                Введите поисковый запрос…
-            </div>`;
+                        <div class="text-center text-secondary p-3">
+                            Введите поисковый запрос…
+                        </div>`;
                     return;
                 }
 
@@ -590,54 +596,51 @@
                 const url = `/api/market/search?exchange=${ex}&network=${nt}&q=${encodeURIComponent(query)}`;
 
                 try {
-                    // loader внутри блока списка
                     marketResults.innerHTML = `
-            <div class="text-center text-info p-3">
-                Поиск…
-            </div>`;
+                        <div class="text-center text-info p-3">
+                            Поиск…
+                        </div>`;
 
                     const res = await fetch(url);
                     const list = await res.json();
 
-                    // Backend ТЕПЕРЬ отдаёт только подходящие пары → не фильтруем снова
-
                     if (!Array.isArray(list) || list.length === 0) {
                         marketResults.innerHTML = `
-                <div class="text-center text-secondary p-3">
-                    Ничего не найдено
-                </div>`;
+                            <div class="text-center text-secondary p-3">
+                                Ничего не найдено
+                            </div>`;
                         return;
                     }
 
                     let html = `
-        <table class="table table-dark table-sm table-striped mb-0">
-            <thead>
-                <tr>
-                    <th>Пара</th>
-                    <th>Цена</th>
-                    <th>24h %</th>
-                    <th>Объём</th>
-                    <th></th>
-                </tr>
-            </thead>
-            <tbody>`;
+                        <table class="table table-dark table-sm table-striped mb-0">
+                            <thead>
+                                <tr>
+                                    <th>Пара</th>
+                                    <th>Цена</th>
+                                    <th>24h %</th>
+                                    <th>Объём</th>
+                                    <th></th>
+                                </tr>
+                            </thead>
+                            <tbody>`;
 
                     list.forEach(s => {
                         const pct = Number(s.changePct || 0);
                         const pctColor = pct >= 0 ? "text-success" : "text-danger";
 
                         html += `
-                <tr>
-                    <td>${s.symbol}</td>
-                    <td>${Number(s.price).toFixed(6)}</td>
-                    <td class="${pctColor}">${pct.toFixed(2)}%</td>
-                    <td>${Number(s.volume).toFixed(2)}</td>
-                    <td>
-                        <button class="btn btn-sm btn-primary select-symbol" data-symbol="${s.symbol}">
-                            Выбрать
-                        </button>
-                    </td>
-                </tr>`;
+                            <tr>
+                                <td>${s.symbol}</td>
+                                <td>${Number(s.price).toFixed(6)}</td>
+                                <td class="${pctColor}">${pct.toFixed(2)}%</td>
+                                <td>${Number(s.volume).toFixed(2)}</td>
+                                <td>
+                                    <button class="btn btn-sm btn-primary select-symbol" data-symbol="${s.symbol}">
+                                        Выбрать
+                                    </button>
+                                </td>
+                            </tr>`;
                     });
 
                     html += "</tbody></table>";
@@ -657,15 +660,12 @@
                     console.error("Ошибка поиска:", e);
                     marketResults.innerHTML =
                         `<div class="text-danger text-center p-3">
-                Ошибка загрузки данных
-            </div>`;
+                            Ошибка загрузки данных
+                        </div>`;
                 }
             }
 
-
-// ----------------------------------------------------
-// Debounce 200ms
-// ----------------------------------------------------
+            // debounce
             if (marketSearch) {
                 marketSearch.addEventListener("input", () => {
                     const q = marketSearch.value.trim();
@@ -673,7 +673,6 @@
                     searchTimer = setTimeout(() => loadMarketSearch(q), 200);
                 });
             }
-
 
         }); // END DOMContentLoaded
     </script>

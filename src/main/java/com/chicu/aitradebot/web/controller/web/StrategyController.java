@@ -65,18 +65,27 @@ public class StrategyController {
 
         var ui = uiOpt.get();
 
+        String symbol = (ui.symbol() != null && !ui.symbol().isBlank())
+                ? ui.symbol()
+                : "BTCUSDT"; // fallback, но используется крайне редко
+
+        log.info("📊 Открытие дашборда стратегии {} chatId={} symbol={}", type, chatId, symbol);
+
         model.addAttribute("active", "strategies");
         model.addAttribute("pageTitle", "Стратегия: " + type);
         model.addAttribute("chatId", chatId);
         model.addAttribute("type", type);
-        model.addAttribute("symbol", ui.symbol());
 
-        // info / trades пока берём из других слоёв позже → шаблон защищён проверками (info != null)
+        // ⭐ самый важный атрибут → используется JS-графиком
+        model.addAttribute("symbol", symbol);
+        model.addAttribute("strategySymbol", symbol); // совместимость со старым шаблоном
+
         model.addAttribute("info", null);
         model.addAttribute("trades", null);
 
         return "dashboard";
     }
+
 
     // ================================================================
     // ⚙️ НАСТРОЙКИ СТРАТЕГИИ (форма конфигурации)

@@ -11,6 +11,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.springframework.http.*;
+import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestTemplate;
 
 import javax.crypto.Mac;
@@ -26,6 +27,7 @@ import java.util.stream.Collectors;
  * Полностью совместим с ExchangeClient V4
  */
 @Slf4j
+@Component // <<< главное изменение — теперь это Spring-бин
 public class BybitExchangeClient implements ExchangeClient {
 
     private static final String MAIN = "https://api.bybit.com";
@@ -307,8 +309,11 @@ public class BybitExchangeClient implements ExchangeClient {
     }
 
     private String encode(String s) {
-        try { return URLEncoder.encode(s, StandardCharsets.UTF_8); }
-        catch (Exception e) { return s; }
+        try {
+            return URLEncoder.encode(s, StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            return s;
+        }
     }
 
     private String sign(String data, String secret) {

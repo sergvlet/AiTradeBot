@@ -18,7 +18,6 @@ public class StrategyChartApiController {
      * FULL Стратегический график:
      *  — свечи
      *  — EMA, Bollinger
-     *  — SuperTrend / ATR
      *  — сделки
      *  — TP/SL уровни
      */
@@ -30,9 +29,10 @@ public class StrategyChartApiController {
             @RequestParam(defaultValue = "1m") String timeframe,
             @RequestParam(defaultValue = "500") int limit
     ) {
-        log.info("📈 StrategyChart → type={} chatId={} symbol={} tf={} limit={}",
-                type, chatId, symbol, timeframe, limit);
+        log.info("📈 StrategyChart → chatId={} type={} symbol={} tf={} limit={}",
+                chatId, type, symbol, timeframe, limit);
 
-        return chartFacade.buildChart(chatId, type, limit, timeframe);
+        // 🔥 ПЕРЕДАЁМ symbol в фасад (главный фикс!)
+        return chartFacade.buildChart(chatId, type, symbol, timeframe, limit);
     }
 }

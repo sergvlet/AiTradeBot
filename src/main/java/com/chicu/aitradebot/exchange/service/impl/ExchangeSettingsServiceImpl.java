@@ -61,37 +61,9 @@ public class ExchangeSettingsServiceImpl implements ExchangeSettingsService {
                 });
     }
 
-    // ========================================================================
-    // getOrThrow (старый — MAINNET)
-    // ========================================================================
-    @Override
-    public ExchangeSettings getOrThrow(Long chatId, String exchange) {
-        return repository.findByChatIdAndExchangeAndNetwork(chatId, exchange, NetworkType.MAINNET)
-                .orElseThrow(() ->
-                        new IllegalStateException(
-                                "Настройки не найдены: chatId=" + chatId + ", exchange=" + exchange
-                        )
-                );
-    }
 
-    // ========================================================================
-    // getOrThrow (НОВЫЙ — с NetworkType)
-    // ========================================================================
-    @Override
-    public ExchangeSettings getOrThrow(Long chatId, String exchange, NetworkType network) {
 
-        return repository.findByChatIdAndExchangeAndNetwork(
-                chatId,
-                exchange.toUpperCase(),
-                network
-        ).orElseThrow(() ->
-                new IllegalStateException(
-                        "Настройки не найдены: chatId=" + chatId +
-                                ", exchange=" + exchange +
-                                ", network=" + network
-                )
-        );
-    }
+
 
     // ========================================================================
     // save
@@ -139,17 +111,9 @@ public class ExchangeSettingsServiceImpl implements ExchangeSettingsService {
         return repository.findAllByChatId(chatId);
     }
 
-    @Override
-    public Optional<ExchangeSettings> findByChatIdAndExchangeAndNetwork(
-            Long chatId, String exchange, NetworkType network
-    ) {
-        return repository.findByChatIdAndExchangeAndNetwork(chatId, exchange, network);
-    }
 
-    @Override
-    public Optional<ExchangeSettings> findByChatIdAndExchange(Long chatId, String exchange) {
-        return repository.findByChatIdAndExchangeAndNetwork(chatId, exchange, NetworkType.MAINNET);
-    }
+
+
 
     @Override
     @Transactional
@@ -161,11 +125,7 @@ public class ExchangeSettingsServiceImpl implements ExchangeSettingsService {
                 exchange, network, chatId);
     }
 
-    @Override
-    @Transactional
-    public void deleteById(Long id) {
-        repository.deleteById(id);
-    }
+
 
     // ========================================================================
     // testConnection
@@ -182,7 +142,6 @@ public class ExchangeSettingsServiceImpl implements ExchangeSettingsService {
         return switch (s.getExchange().toUpperCase()) {
             case "BINANCE" -> testBinanceConnection(s);
             case "BYBIT"   -> testBybitConnection(s);
-            case "OKX"     -> false;
             default -> false;
         };
     }

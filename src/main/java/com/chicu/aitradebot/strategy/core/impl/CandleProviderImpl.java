@@ -1,19 +1,14 @@
 package com.chicu.aitradebot.strategy.core.impl;
 
 import com.chicu.aitradebot.market.MarketStreamManager;
-import com.chicu.aitradebot.market.model.Candle;
 import com.chicu.aitradebot.strategy.core.CandleProvider;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
+import java.util.ArrayList;
 import java.util.List;
-import java.util.stream.Collectors;
 
-/**
- * CandleProvider, который отдаёт свечи стратегиям,
- * конвертируя MarketStreamManager → CandleProvider.Candle.
- */
 @Slf4j
 @Component
 @RequiredArgsConstructor
@@ -29,22 +24,39 @@ public class CandleProviderImpl implements CandleProvider {
             int limit
     ) {
         try {
-            List<com.chicu.aitradebot.market.model.Candle> raw = manager.getCandles(symbol, timeframe, limit);
+            String sym = normalize(symbol);
+            String tf  = normalize(timeframe);
 
-            return raw.stream()
-                    .map(c -> new CandleProvider.Candle(
-                            c.getTime(),
-                            c.getOpen(),
-                            c.getHigh(),
-                            c.getLow(),
-                            c.getClose(),
-                            c.getVolume()
-                    ))
-                    .collect(Collectors.toList());
+            if (sym.isEmpty() || tf.isEmpty()) {
+                log.warn("⚠ Пустой symbol/timeframe");
+                return List.of();
+            }
+
+            List<com.chicu.aitradebot.market.model.Candle> raw =
+                    manager.getCandles(sym, tf, limit);
+
+            List<CandleProvider.Candle> list = new ArrayList<>();
+
+            for (com.chicu.aitradebot.market.model.Candle c : raw) {
+                list.add(new CandleProvider.Candle(
+                        c.getTime(),
+                        c.getOpen(),
+                        c.getHigh(),
+                        c.getLow(),
+                        c.getClose(),
+                        c.getVolume()
+                ));
+            }
+
+            return list;
 
         } catch (Exception e) {
             log.error("❌ Ошибка получения свечей {} {}: {}", symbol, timeframe, e.getMessage());
             return List.of();
         }
+    }
+
+    private String normalize(String s) {
+        return s == null ? "" : s.trim().toUpperCase();
     }
 }

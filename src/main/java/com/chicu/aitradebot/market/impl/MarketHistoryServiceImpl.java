@@ -26,7 +26,7 @@ public class MarketHistoryServiceImpl implements MarketHistoryService {
                                                    int limit) {
 
         try {
-            ExchangeClient client = exchangeClientFactory.getClientByChatId(chatId);
+            ExchangeClient client = exchangeClientFactory.getByChat(chatId);
 
             List<ExchangeClient.Kline> klines = client.getKlines(symbol, timeframe, limit);
 
@@ -55,7 +55,7 @@ public class MarketHistoryServiceImpl implements MarketHistoryService {
                                                 int limit) {
 
         try {
-            ExchangeClient client = exchangeClientFactory.getClientByChatId(chatId);
+            ExchangeClient client = exchangeClientFactory.getByChat(chatId);
 
             List<ExchangeClient.Kline> klines =
                     client.getKlines(symbol, timeframe, limit + 50);

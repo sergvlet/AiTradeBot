@@ -1,6 +1,6 @@
 "use strict";
 
-console.log("📈 strategy-chart.js loaded (dashboard modular)");
+console.log("📈 strategy-chart.js loaded (dashboard modular, FIXED v4.4)");
 
 // =============================================================
 // ГЛОБАЛЬНОЕ СОСТОЯНИЕ
@@ -15,7 +15,6 @@ let chart,
     bbLowerSeries,
     bbMiddleSeries;
 
-// История
 let candlesGlobal  = [];
 let ema20Global    = [];
 let ema50Global    = [];
@@ -24,95 +23,65 @@ let bbLowerGlobal  = [];
 let bbMiddleGlobal = [];
 let tradesGlobal   = [];
 
-// Флаги
 let autoScrollToRealTime = true;
 let initialDataLoaded    = false;
 
-let lastPriceLine   = null;
+let lastAnimatedCandle = null;
+let animFrame = null;
+
+let lastPriceLine = null;
 let strategyRunning = false;
 
-// ограничения
 const MAX_CANDLES_HISTORY = 600;
 const MAX_TRADES_HISTORY  = 400;
 
-// отступ справа ~3 см (в пикселях)
 const RIGHT_OFFSET_PX   = 110;
 const BASE_BAR_SPACING  = 8;
 let   lastBarSpacing    = BASE_BAR_SPACING;
 
-// внешний хук — оставить
 window.setStrategyRunning = f => (strategyRunning = !!f);
 
 // =============================================================
 // ХЕЛПЕРЫ
 // =============================================================
-function getCurrentTf() {
-    const s = document.getElementById("timeframe-select");
-    return s ? s.value || "1m" : "1m";
-}
-
 function normalizeTimeMs(t) {
     if (t == null) return null;
-    // если пришло в секундах — переводим в миллисекунды
     return t < 1e12 ? t * 1000 : t;
 }
 
-function formatPrice(p, digits = 2) {
-    return typeof p === "number" ? p.toFixed(digits) : String(p);
+function f2(v) {
+    return typeof v === "number" ? v.toFixed(2) : "-";
 }
 
-// кастомный форматтер оси Y
 function customPriceFormatter(price) {
-    const lastCandle = candlesGlobal.length ? candlesGlobal[candlesGlobal.length - 1] : null;
-    const lastEma20  = ema20Global.length   ? ema20Global[ema20Global.length - 1]   : null;
-    const lastEma50  = ema50Global.length   ? ema50Global[ema50Global.length - 1]   : null;
-    const lastBBU    = bbUpperGlobal.length ? bbUpperGlobal[bbUpperGlobal.length - 1] : null;
-    const lastBBL    = bbLowerGlobal.length ? bbLowerGlobal[bbLowerGlobal.length - 1] : null;
-    const lastBBM    = bbMiddleGlobal.length? bbMiddleGlobal[bbMiddleGlobal.length - 1]: null;
-
-    const basePrice = lastCandle && typeof lastCandle.close === "number"
-        ? lastCandle.close
-        : (typeof price === "number" ? price : Number(price) || 0);
-
-    const pStr   = formatPrice(basePrice, 2);
-    const ema20  = lastEma20 ? formatPrice(lastEma20.value, 2) : "-";
-    const ema50  = lastEma50 ? formatPrice(lastEma50.value, 2) : "-";
-    const bbu    = lastBBU   ? formatPrice(lastBBU.value, 2)   : "-";
-    const bbl    = lastBBL   ? formatPrice(lastBBL.value, 2)   : "-";
-    const bbm    = lastBBM   ? formatPrice(lastBBM.value, 2)   : "-";
+    const last = candlesGlobal.at(-1);
+    const base = last?.close ?? price ?? 0;
 
     return (
-        `PRICE ${pStr}\n` +
-        `EMA20 ${ema20}\n` +
-        `EMA50 ${ema50}\n` +
-        `BB↑ ${bbu}\n` +
-        `BB↓ ${bbl}\n` +
-        `BB mid ${bbm}`
+        `PRICE ${f2(base)}\n` +
+        `EMA20 ${f2(ema20Global.at(-1)?.value)}\n` +
+        `EMA50 ${f2(ema50Global.at(-1)?.value)}\n` +
+        `BB↑ ${f2(bbUpperGlobal.at(-1)?.value)}\n` +
+        `BB↓ ${f2(bbLowerGlobal.at(-1)?.value)}\n` +
+        `BB mid ${f2(bbMiddleGlobal.at(-1)?.value)}`
     );
 }
 
 // =============================================================
-// АДАПТИВНЫЙ ОТСТУП СПРАВА
+// ОТСТУП СПРАВА
 // =============================================================
 function applyRightOffset() {
     if (!chart) return;
-
-    const ts = chart.timeScale();
-    const bs = lastBarSpacing || BASE_BAR_SPACING;
-    const rightOffsetBars = RIGHT_OFFSET_PX / bs;
-
-    ts.applyOptions({ rightOffset: rightOffsetBars });
+    const offsetBars = RIGHT_OFFSET_PX / (lastBarSpacing || BASE_BAR_SPACING);
+    chart.timeScale().applyOptions({ rightOffset: offsetBars });
 }
 
 // =============================================================
-// INIT CHART
+// ИНИЦИАЛИЗАЦИЯ ГРАФИКА
 // =============================================================
 function initChart() {
     const el = document.getElementById("candles-chart");
-    if (!el) {
-        console.error("❗ candles-chart element missing");
-        return;
-    }
+    if (!el) return;
 
     chart = LightweightCharts.createChart(el, {
         width:  el.clientWidth,
@@ -127,11 +96,11 @@ function initChart() {
         },
         crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
         timeScale: {
-            timeVisible:    true,
+            timeVisible: true,
             secondsVisible: true,
-            borderColor:    "rgba(255,255,255,0.2)",
-            barSpacing:     BASE_BAR_SPACING,
-            minBarSpacing:  0.5
+            borderColor: "rgba(255,255,255,0.2)",
+            barSpacing: BASE_BAR_SPACING,
+            minBarSpacing: 0.5
         },
         rightPriceScale: {
             borderColor: "rgba(255,255,255,0.2)",
@@ -142,49 +111,28 @@ function initChart() {
     lastBarSpacing = BASE_BAR_SPACING;
 
     candleSeries = chart.addCandlestickSeries({
-        upColor:         "#2ecc71",
-        downColor:       "#e74c3c",
-        borderUpColor:   "#2ecc71",
+        upColor: "#2ecc71",
+        downColor: "#e74c3c",
+        borderUpColor: "#2ecc71",
         borderDownColor: "#e74c3c",
-        wickUpColor:     "#2ecc71",
-        wickDownColor:   "#e74c3c",
+        wickUpColor: "#2ecc71",
+        wickDownColor: "#e74c3c",
         priceLineVisible: false
     });
 
-    ema20Series = chart.addLineSeries({
-        color: "#42a5f5",
-        lineWidth: 2,
-        priceLineVisible: false
-    });
+    ema20Series = chart.addLineSeries({ color: "#42a5f5", lineWidth: 2 });
+    ema50Series = chart.addLineSeries({ color: "#ab47bc", lineWidth: 2 });
 
-    ema50Series = chart.addLineSeries({
-        color: "#ab47bc",
-        lineWidth: 2,
-        priceLineVisible: false
-    });
-
-    bbUpperSeries  = chart.addLineSeries({
-        color: "rgba(255,215,0,0.8)",
-        lineWidth: 1,
-        priceLineVisible: false
-    });
-
-    bbLowerSeries  = chart.addLineSeries({
-        color: "rgba(255,215,0,0.8)",
-        lineWidth: 1,
-        priceLineVisible: false
-    });
-
+    bbUpperSeries  = chart.addLineSeries({ color: "rgba(255,215,0,0.8)", lineWidth: 1 });
+    bbLowerSeries  = chart.addLineSeries({ color: "rgba(255,215,0,0.8)", lineWidth: 1 });
     bbMiddleSeries = chart.addLineSeries({
-        color:     "rgba(255,255,255,0.4)",
+        color: "rgba(255,255,255,0.4)",
         lineWidth: 1,
-        lineStyle: LightweightCharts.LineStyle.Dotted,
-        priceLineVisible: false
+        lineStyle: LightweightCharts.LineStyle.Dotted
     });
 
     chart.timeScale().subscribeVisibleTimeRangeChange(() => {
-        const sc = chart.timeScale().scrollPosition();
-        autoScrollToRealTime = sc < 0.5;
+        autoScrollToRealTime = chart.timeScale().scrollPosition() < 0.5;
     });
 
     setupSmoothZoomAndScroll(el);
@@ -192,72 +140,40 @@ function initChart() {
     applyRightOffset();
 
     window.addEventListener("resize", () => {
-        if (!chart) return;
         chart.applyOptions({ width: el.clientWidth });
         applyRightOffset();
     });
 }
 
-// плавный zoom/scroll
+// =============================================================
+// ZOOM / SCROLL
+// =============================================================
 function setupSmoothZoomAndScroll(container) {
-    if (!chart) return;
-    const timeScale = chart.timeScale();
+    const ts = chart.timeScale();
+    ts.applyOptions({ barSpacing: lastBarSpacing });
 
-    timeScale.applyOptions({
-        barSpacing:    lastBarSpacing,
-        minBarSpacing: 0.5
-    });
-
-    let zoomTimeout = null;
-
-    container.addEventListener("wheel", (event) => {
-        event.preventDefault();
-
-        const delta  = event.deltaY || 0;
-        const current = lastBarSpacing || BASE_BAR_SPACING;
-
-        const zoomFactor = Math.exp(-delta * 0.0015);
-        let next = current * zoomFactor;
-
-        next = Math.max(0.5, Math.min(40, next));
-
-        lastBarSpacing = next;
-        timeScale.applyOptions({ barSpacing: next });
+    container.addEventListener("wheel", e => {
+        e.preventDefault();
+        const zoomFactor = Math.exp(-e.deltaY * 0.0015);
+        lastBarSpacing = Math.min(40, Math.max(0.5, lastBarSpacing * zoomFactor));
+        ts.applyOptions({ barSpacing: lastBarSpacing });
         applyRightOffset();
-
-        if (zoomTimeout) clearTimeout(zoomTimeout);
-        zoomTimeout = setTimeout(() => {
-            if (autoScrollToRealTime) {
-                timeScale.scrollToRealTime();
-            }
-        }, 350);
     }, { passive: false });
 
-    let isDragging = false;
-    let lastX = 0;
+    let dragging = false, lastX = 0;
 
-    container.addEventListener("mousedown", (e) => {
-        isDragging = true;
+    container.addEventListener("mousedown", e => {
+        dragging = true; lastX = e.clientX;
+    });
+
+    container.addEventListener("mousemove", e => {
+        if (!dragging) return;
+        ts.scrollToPosition(ts.scrollPosition() - (e.clientX - lastX) / 5, false);
         lastX = e.clientX;
     });
 
-    container.addEventListener("mousemove", (e) => {
-        if (!isDragging) return;
-
-        const dx = e.clientX - lastX;
-        lastX = e.clientX;
-
-        const pos = timeScale.scrollPosition();
-        timeScale.scrollToPosition(pos - dx / 5, false);
-    });
-
-    container.addEventListener("mouseleave", () => {
-        isDragging = false;
-    });
-
-    document.addEventListener("mouseup", () => {
-        isDragging = false;
-    });
+    document.addEventListener("mouseup", () => dragging = false);
+    container.addEventListener("mouseleave", () => dragging = false);
 }
 
 // =============================================================
@@ -265,81 +181,30 @@ function setupSmoothZoomAndScroll(container) {
 // =============================================================
 function initTooltip() {
     const container = document.getElementById("candles-chart");
-    if (!container || !chart) return;
-
-    container.style.position = "relative";
+    if (!container) return;
 
     const tt = document.createElement("div");
     tt.id = "chart-tooltip";
-    tt.style.position      = "absolute";
-    tt.style.pointerEvents = "none";
-    tt.style.display       = "none";
-    tt.style.background    = "rgba(0,0,0,0.90)";
-    tt.style.border        = "1px solid rgba(255,255,255,0.15)";
-    tt.style.borderRadius  = "6px";
-    tt.style.padding       = "8px 12px";
-    tt.style.color         = "#fff";
-    tt.style.fontSize      = "12px";
-    tt.style.zIndex        = "99999";
-
+    tt.style.cssText = `
+        position:absolute;pointer-events:none;display:none;
+        background:rgba(0,0,0,0.9);border:1px solid rgba(255,255,255,.15);
+        border-radius:6px;padding:8px 12px;color:#fff;font-size:12px;z-index:99`;
     container.appendChild(tt);
 
     chart.subscribeCrosshairMove(param => {
-        if (!param.point || param.time === undefined || param.time === null) {
-            tt.style.display = "none";
-            return;
-        }
+        if (!param.point || param.time == null) { tt.style.display = "none"; return; }
 
-        const timeSec = typeof param.time === "object" && "timestamp" in param.time
-            ? param.time.timestamp
-            : param.time;
-
-        const tMs = Math.round(timeSec * 1000);
-
+        const sec = typeof param.time === "object" ? param.time.timestamp : param.time;
+        const tMs = sec * 1000;
         const c = candlesGlobal.find(x => x.time === tMs);
-        if (!c) {
-            tt.style.display = "none";
-            return;
-        }
+        if (!c) { tt.style.display = "none"; return; }
 
-        const e20 = ema20Global.find(e => e.time === tMs);
-        const e50 = ema50Global.find(e => e.time === tMs);
+        tt.innerHTML =
+            `<b>${new Date(tMs).toLocaleString()}</b><br>
+             O:${c.open} H:${c.high} L:${c.low} C:${c.close}`;
 
-        let tr = null;
-        for (const t of tradesGlobal) {
-            if (Math.abs(t.time - tMs) <= 1500) {
-                tr = t;
-                break;
-            }
-        }
-
-        tt.innerHTML = `
-            <b>${new Date(tMs).toLocaleString()}</b><br>
-            O: ${c.open}<br>
-            H: ${c.high}<br>
-            L: ${c.low}<br>
-            C: ${c.close}<br>
-            <span style="color:#42a5f5">EMA20:</span> ${e20?.value ?? "-"}<br>
-            <span style="color:#ab47bc">EMA50:</span> ${e50?.value ?? "-"}<br>
-            ${tr ? `<hr>${tr.side} @ ${tr.price}` : ""}
-        `;
-
-        let left = param.point.x + 30;
-        let top  = param.point.y + 20;
-
-        const rect = container.getBoundingClientRect();
-        const w = tt.offsetWidth;
-        const h = tt.offsetHeight;
-
-        if (left + w > rect.width) {
-            left = param.point.x - w - 30;
-        }
-        if (top + h > rect.height) {
-            top = param.point.y - h - 20;
-        }
-
-        tt.style.left   = left + "px";
-        tt.style.top    = top  + "px";
+        tt.style.left = param.point.x + 20 + "px";
+        tt.style.top  = param.point.y + 20 + "px";
         tt.style.display = "block";
     });
 }
@@ -349,16 +214,10 @@ function initTooltip() {
 // =============================================================
 async function loadTimeframes(exchange, network, currentTf, chatId, symbol) {
     try {
-        const r = await fetch(
-            `/api/exchange/timeframes?exchange=${encodeURIComponent(exchange)}&networkType=${encodeURIComponent(network)}`
-        );
-        if (!r.ok) {
-            console.error("❌ loadTimeframes HTTP error", r.status);
-            return;
-        }
+        const r = await fetch(`/api/exchange/timeframes?exchange=${exchange}&networkType=${network}`);
+        if (!r.ok) return;
 
         const arr = await r.json();
-
         const sel = document.getElementById("timeframe-select");
         if (!sel) return;
 
@@ -371,116 +230,97 @@ async function loadTimeframes(exchange, network, currentTf, chatId, symbol) {
             sel.appendChild(o);
         });
 
-        // не плодим миллионы обработчиков
         sel.onchange = () => {
-            const tf = sel.value;
-
-            initialDataLoaded    = false;
+            initialDataLoaded = false;
             autoScrollToRealTime = true;
-            lastBarSpacing       = BASE_BAR_SPACING;
+            lastBarSpacing = BASE_BAR_SPACING;
 
-            window.AiStrategyChart.loadFullChart(chatId, symbol, tf, { initial: true });
+            const tf = sel.value;
+            window.AiStrategyChart.loadFullChart(chatId, symbol, tf);
             window.AiStrategyChart.subscribeLive(symbol, tf);
         };
+
     } catch (e) {
-        console.error("❌ loadTimeframes error:", e);
+        console.error("loadTimeframes error:", e);
     }
 }
 
 // =============================================================
 // LOAD FULL CHART
 // =============================================================
-async function loadFullChart(chatId, symbol, timeframe, opts = {}) {
-    const initial = !!opts.initial;
+async function loadFullChart(chatId, symbol, timeframe) {
+    if (!chart) initChart();
 
-    if (!chart) {
-        initChart();
-        if (!chart) {
-            console.error("❌ Chart not initialized");
-            return;
-        }
-    }
-
-    // Берём тип стратегии из data-атрибута корневого блока
-    const root = document.getElementById("strategy-dashboard");
-    const type = root?.dataset?.type || "SMART_FUSION";
+    const type = document.getElementById("strategy-dashboard")?.dataset?.type;
 
     try {
-        const url =
-            `/api/chart/strategy` +
-            `?chatId=${encodeURIComponent(chatId)}` +
-            `&type=${encodeURIComponent(type)}` +
-            `&symbol=${encodeURIComponent(symbol)}` +
-            `&timeframe=${encodeURIComponent(timeframe)}` +
-            `&limit=300`;
-
-        const r = await fetch(url);
-        if (!r.ok) {
-            console.error("❌ loadFullChart HTTP error:", r.status);
-            return;
-        }
+        const r = await fetch(
+            `/api/chart/strategy?chatId=${chatId}&type=${type}&symbol=${symbol}&timeframe=${timeframe}&limit=300`
+        );
+        if (!r.ok) return;
 
         const d = await r.json();
 
+        // ------------------------------------
         // Candles
-        candlesGlobal = (d.candles || []).map(c => {
-            const tMs = normalizeTimeMs(c.time);
-            return {
-                time:  tMs,
-                open:  c.open,
-                high:  c.high,
-                low:   c.low,
-                close: c.close
-            };
-        });
+        // ------------------------------------
+        candlesGlobal = (d.candles || []).map(c => ({
+            time:  normalizeTimeMs(c.time),
+            open:  c.open,
+            high:  c.high,
+            low:   c.low,
+            close: c.close
+        }));
 
-        if (candlesGlobal.length > MAX_CANDLES_HISTORY) {
+        if (candlesGlobal.length > MAX_CANDLES_HISTORY)
             candlesGlobal = candlesGlobal.slice(-MAX_CANDLES_HISTORY);
-        }
 
         candleSeries.setData(
             candlesGlobal.map(c => ({
-                time:  c.time / 1000,
-                open:  c.open,
-                high:  c.high,
-                low:   c.low,
+                time: c.time / 1000,
+                open: c.open,
+                high: c.high,
+                low:  c.low,
                 close: c.close
             }))
         );
 
+        // ------------------------------------
         // EMA
+        // ------------------------------------
         ema20Global = (d.ema20 || []).map(p => ({
-            time:  normalizeTimeMs(p.time),
-            value: p.value
+            time: normalizeTimeMs(p.time), value: p.value
         }));
         ema50Global = (d.ema50 || []).map(p => ({
-            time:  normalizeTimeMs(p.time),
-            value: p.value
+            time: normalizeTimeMs(p.time), value: p.value
         }));
 
-        ema20Series.setData(ema20Global.map(p => ({ time: p.time / 1000, value: p.value })));
-        ema50Series.setData(ema50Global.map(p => ({ time: p.time / 1000, value: p.value })));
+        ema20Series.setData(ema20Global.map(p => ({ time:p.time/1000, value:p.value })));
+        ema50Series.setData(ema50Global.map(p => ({ time:p.time/1000, value:p.value })));
 
+        // ------------------------------------
         // Bollinger
+        // ------------------------------------
         const bb = d.bollinger || {};
-        bbUpperGlobal  = (bb.upper  || []).map(p => ({ time: normalizeTimeMs(p.time), value: p.value }));
-        bbLowerGlobal  = (bb.lower  || []).map(p => ({ time: normalizeTimeMs(p.time), value: p.value }));
-        bbMiddleGlobal = (bb.middle || []).map(p => ({ time: normalizeTimeMs(p.time), value: p.value }));
+        bbUpperGlobal  = (bb.upper  || []).map(p => ({ time: normalizeTimeMs(p.time), value:p.value }));
+        bbLowerGlobal  = (bb.lower  || []).map(p => ({ time: normalizeTimeMs(p.time), value:p.value }));
+        bbMiddleGlobal = (bb.middle || []).map(p => ({ time: normalizeTimeMs(p.time), value:p.value }));
 
-        bbUpperSeries .setData(bbUpperGlobal .map(p => ({ time: p.time / 1000, value: p.value })));
-        bbLowerSeries .setData(bbLowerGlobal .map(p => ({ time: p.time / 1000, value: p.value })));
-        bbMiddleSeries.setData(bbMiddleGlobal.map(p => ({ time: p.time / 1000, value: p.value })));
+        bbUpperSeries .setData(bbUpperGlobal .map(p => ({ time:p.time/1000, value:p.value })));
+        bbLowerSeries .setData(bbLowerGlobal .map(p => ({ time:p.time/1000, value:p.value })));
+        bbMiddleSeries.setData(bbMiddleGlobal.map(p => ({ time:p.time/1000, value:p.value })));
 
-        // Trades
+        // ------------------------------------
+        // TRADES
+        // ------------------------------------
         tradesGlobal = (d.trades || []).map(t => ({
-            time:  normalizeTimeMs(t.time),
+            time: normalizeTimeMs(t.time),
             price: t.price,
-            side:  t.side
+            side: t.side
         }));
 
-        if (tradesGlobal.length > MAX_TRADES_HISTORY) {
+        if (tradesGlobal.length > MAX_TRADES_HISTORY)
             tradesGlobal = tradesGlobal.slice(-MAX_TRADES_HISTORY);
-        }
 
         updateTradeMarkers();
         updatePriceLine();
@@ -488,17 +328,7 @@ async function loadFullChart(chatId, symbol, timeframe, opts = {}) {
 
         applyRightOffset();
 
-        if (candlesGlobal.length) {
-            const lastIdx    = candlesGlobal.length - 1;
-            const windowSize = Math.min(120, Math.max(80, candlesGlobal.length));
-            const fromIdx    = Math.max(0, lastIdx - windowSize + 1);
-
-            const from = candlesGlobal[fromIdx].time / 1000;
-            const to   = candlesGlobal[lastIdx].time / 1000;
-
-            chart.timeScale().setVisibleRange({ from, to });
-        }
-
+        // авто-скролл
         if (!initialDataLoaded) {
             chart.timeScale().scrollToRealTime();
             initialDataLoaded = true;
@@ -507,79 +337,69 @@ async function loadFullChart(chatId, symbol, timeframe, opts = {}) {
         }
 
     } catch (e) {
-        console.error("❌ loadFullChart error:", e);
+        console.error("loadFullChart error:", e);
     }
 }
 
 // =============================================================
-// STATS
+// ФРОНТ СТАТИСТИКА
 // =============================================================
 function updateFrontStats() {
     if (!candlesGlobal.length) return;
 
     const first = candlesGlobal[0];
-    const last  = candlesGlobal[candlesGlobal.length - 1];
+    const last  = candlesGlobal.at(-1);
 
     const elLast = document.getElementById("stat-last-price");
-    if (elLast) {
-        elLast.textContent =
-            typeof last.close === "number" ? last.close.toFixed(2) : String(last.close);
-    }
+    if (elLast) elLast.textContent = f2(last.close);
 
+    const deltaPct = ((last.close - first.close) / first.close) * 100;
     const elChange = document.getElementById("stat-change-pct");
     const elTrend  = document.getElementById("stat-trend");
 
-    if (elChange && typeof first.close === "number" && first.close !== 0) {
-        const pct = ((last.close - first.close) / first.close) * 100;
-        elChange.textContent = pct.toFixed(2) + "%";
-        elChange.style.color = pct >= 0 ? "#2ecc71" : "#e74c3c";
+    if (elChange) {
+        elChange.textContent = deltaPct.toFixed(2) + "%";
+        elChange.style.color = deltaPct >= 0 ? "#2ecc71" : "#e74c3c";
+    }
 
-        if (elTrend) {
-            if (pct > 0.4) {
-                elTrend.textContent = "Восходящий";
-                elTrend.style.color = "#2ecc71";
-            } else if (pct < -0.4) {
-                elTrend.textContent = "Нисходящий";
-                elTrend.style.color = "#e74c3c";
-            } else {
-                elTrend.textContent = "Боковой";
-                elTrend.style.color = "#f1c40f";
-            }
+    if (elTrend) {
+        if (deltaPct > 0.4) {
+            elTrend.textContent = "Восходящий";
+            elTrend.style.color = "#2ecc71";
+        } else if (deltaPct < -0.4) {
+            elTrend.textContent = "Нисходящий";
+            elTrend.style.color = "#e74c3c";
+        } else {
+            elTrend.textContent = "Боковой";
+            elTrend.style.color = "#f1c40f";
         }
     }
 
+    const lows  = candlesGlobal.map(c => c.low);
+    const highs = candlesGlobal.map(c => c.high);
     const elRange = document.getElementById("stat-range");
-    if (elRange) {
-        const lows  = candlesGlobal.map(c => c.low);
-        const highs = candlesGlobal.map(c => c.high);
-        elRange.textContent =
-            `${Math.min(...lows).toFixed(2)} – ${Math.max(...highs).toFixed(2)}`;
-    }
+    if (elRange) elRange.textContent = `${Math.min(...lows).toFixed(2)} – ${Math.max(...highs).toFixed(2)}`;
 }
 
 // =============================================================
 // TRADE MARKERS
 // =============================================================
 function updateTradeMarkers() {
-    if (!candleSeries) return;
     candleSeries.setMarkers(
         tradesGlobal.map(t => ({
-            time:     t.time / 1000,
+            time: t.time / 1000,
             position: t.side === "BUY" ? "belowBar" : "aboveBar",
-            color:    t.side === "BUY" ? "#26a69a" : "#ef5350",
-            shape:    t.side === "BUY" ? "arrowUp"  : "arrowDown",
-            text:     `${t.side} @ ${t.price}`
+            color: t.side === "BUY" ? "#26a69a" : "#ef5350",
+            shape: t.side === "BUY" ? "arrowUp" : "arrowDown",
+            text: `${t.side} ${t.price}`
         }))
     );
 }
-// =============================================================
-// 🔥 ПЛАВНАЯ АНИМАЦИЯ ОБНОВЛЕНИЯ СВЕЧИ (ИСПРАВЛЕННАЯ)
-// =============================================================
-let animFrame = null;
-let lastAnimatedCandle = null;
 
+// =============================================================
+// ПЛАВНОЕ ОБНОВЛЕНИЕ СВЕЧИ
+// =============================================================
 function smoothCandleUpdate(newCandle) {
-    // newCandle.time всегда в секундах → так и должно быть
     if (!lastAnimatedCandle) {
         lastAnimatedCandle = { ...newCandle };
         candleSeries.update(newCandle);
@@ -598,15 +418,15 @@ function smoothCandleUpdate(newCandle) {
         const progress = Math.min((now - startTime) / duration, 1);
         const lerp = (a, b) => a + (b - a) * progress;
 
-        const frameCandle = {
-            time: end.time,              // ← главное исправление
+        const c = {
+            time: end.time,
             open:  lerp(start.open,  end.open),
             high:  lerp(start.high,  end.high),
             low:   lerp(start.low,   end.low),
             close: lerp(start.close, end.close)
         };
 
-        candleSeries.update(frameCandle);
+        candleSeries.update(c);
 
         if (progress < 1) {
             animFrame = requestAnimationFrame(animate);
@@ -618,30 +438,20 @@ function smoothCandleUpdate(newCandle) {
     animFrame = requestAnimationFrame(animate);
 }
 
-
-
 // =============================================================
 // PRICE LINE
 // =============================================================
 function updatePriceLine() {
-    const last = candlesGlobal[candlesGlobal.length - 1];
-    if (!last || typeof last.close !== "number") return;
+    const last = candlesGlobal.at(-1);
+    if (!last) return;
 
-    if (lastPriceLine) {
-        try {
-            candleSeries.removePriceLine(lastPriceLine);
-        } catch (e) {
-            // ignore
-        }
-    }
+    if (lastPriceLine) candleSeries.removePriceLine(lastPriceLine);
 
     lastPriceLine = candleSeries.createPriceLine({
-        price:     last.close,
+        price: last.close,
+        color: "rgba(0,255,150,.8)",
         lineWidth: 1,
-        color:     "rgba(0,255,150,0.7)",
-        lineStyle: LightweightCharts.LineStyle.Dashed,
-        axisLabelVisible: false,
-        title: ""
+        lineStyle: LightweightCharts.LineStyle.Dashed
     });
 }
 
@@ -649,160 +459,64 @@ function updatePriceLine() {
 // LIVE WEBSOCKET
 // =============================================================
 function subscribeLive(symbol, timeframe) {
-    console.log("[WS] subscribeLive init", { symbol, timeframe });
-
     if (currentWs) {
-        try { currentWs.close(1000, "switch"); } catch {}
+        try { currentWs.close(1000); } catch {}
         currentWs = null;
     }
 
-    const loc      = window.location;
-    const protocol = loc.protocol === "https:" ? "wss" : "ws";
-    const wsUrl    = `${protocol}://${loc.host}/ws/candles?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}`;
+    const loc = window.location;
+    const proto = loc.protocol === "https:" ? "wss" : "ws";
+    const wsUrl = `${proto}://${loc.host}/ws/candles?symbol=${symbol}&timeframe=${timeframe}`;
 
     const ws = new WebSocket(wsUrl);
     currentWs = ws;
 
-    ws.onopen = () => {
-        console.log("[WS] OPEN", wsUrl);
-        setLiveStatus(true);
-    };
+    ws.onopen = () => setLiveStatus(true);
+    ws.onerror = () => setLiveStatusError("Ошибка WebSocket");
+    ws.onclose = () => setLiveStatus(false);
 
-    ws.onerror = (err) => {
-        console.error("[WS] ERROR", err);
-        setLiveStatusError("Ошибка WebSocket");
-    };
-
-    ws.onclose = (evt) => {
-        console.log("[WS] CLOSE", evt.code, evt.reason);
-        setLiveStatus(false);
-    };
-
-    // ============================================================
-    // 🔥 УНИВЕРСАЛЬНЫЙ WS-ПАРСЕР
-    // Поддерживает ВСЕ форматы Binance + твой "tick"
-    // ============================================================
-    ws.onmessage = (event) => {
+    ws.onmessage = e => {
         let payload;
-        try { payload = JSON.parse(event.data); }
+        try { payload = JSON.parse(e.data); }
         catch { return; }
 
-        let k = null;
-
-        // формат "tick"
-        if (payload.type === "tick" && payload.candle) {
-            k = {
-                t: payload.candle.time,
-                o: payload.candle.open,
-                h: payload.candle.high,
-                l: payload.candle.low,
-                c: payload.candle.close,
-                v: payload.candle.volume || 0,
-                x: payload.candle.closed || false
-            };
-        }
-
-        // формат Binance WS: {stream:"", data:{k:{...}}}
-        else if (payload.data && payload.data.k) {
-            k = payload.data.k;
-        }
-
-        // формат Binance одиночной свечи: {"e":"kline", "k":{...}}
-        else if (payload.k) {
-            k = payload.k;
-        }
-
+        let k = payload?.k || payload?.data?.k || payload?.candle;
         if (!k) return;
 
-        // нормализация
-        const timeMs = normalizeTimeMs(k.t);
-        const open   = parseFloat(k.o);
-        const high   = parseFloat(k.h);
-        const low    = parseFloat(k.l);
-        const close  = parseFloat(k.c);
-        const vol    = parseFloat(k.v);
-        const closed = k.x === true;
+        const time = normalizeTimeMs(k.t);
+        const open = +k.o, high = +k.h, low = +k.l, close = +k.c;
 
-        const stateCandle = { time: timeMs, open, high, low, close, volume: vol, closed };
-        const chartCandle = { time: timeMs / 1000, open, high, low, close };
+        const stateC = { time, open, high, low, close };
+        const chartC = { time: time / 1000, open, high, low, close };
 
-        // === обновление свечи на графике ===
-        smoothCandleUpdate(chartCandle);
+        smoothCandleUpdate(chartC);
 
+        const last = candlesGlobal.at(-1);
+        if (!last || last.time < time) candlesGlobal.push(stateC);
+        else candlesGlobal[candlesGlobal.length - 1] = stateC;
 
-        // ============================================================
-        // 🔥 Правильная логика закрытия + открытия новой свечи
-        // ============================================================
-        if (candlesGlobal.length === 0) {
-            candlesGlobal.push(stateCandle);
-        } else {
-            const last = candlesGlobal[candlesGlobal.length - 1];
-
-            if (last.time === stateCandle.time) {
-                // обновляем текущую
-                candlesGlobal[candlesGlobal.length - 1] = stateCandle;
-
-                if (closed) {
-                    console.log("🟩 Свеча закрыта:", new Date(timeMs).toLocaleString());
-                }
-            }
-            else if (stateCandle.time > last.time) {
-                console.log("🆕 Новая свеча:", new Date(timeMs).toLocaleString());
-                candlesGlobal.push(stateCandle);
-            }
-        }
-
-        // ограничение
-        if (candlesGlobal.length > MAX_CANDLES_HISTORY) {
+        if (candlesGlobal.length > MAX_CANDLES_HISTORY)
             candlesGlobal = candlesGlobal.slice(-MAX_CANDLES_HISTORY);
-        }
 
-        updatePriceLabel(close);
         updatePriceLine();
         updateFrontStats();
 
-        if (autoScrollToRealTime) {
-            chart.timeScale().scrollToRealTime();
-        }
+        if (autoScrollToRealTime) chart.timeScale().scrollToRealTime();
     };
 }
 
-
-// =============================================================
-// WS STATUS
-// =============================================================
-function setLiveStatus(isOk) {
+function setLiveStatus(ok) {
     const el = document.getElementById("live-status");
     if (!el) return;
-
-    if (isOk) {
-        el.textContent = "LIVE";
-        el.style.color = "#2ecc71";
-    } else {
-        el.textContent = "OFFLINE";
-        el.style.color = "#e74c3c";
-    }
+    el.textContent = ok ? "LIVE" : "OFFLINE";
+    el.style.color = ok ? "#2ecc71" : "#e74c3c";
 }
 
 function setLiveStatusError(msg) {
     const el = document.getElementById("live-status");
     if (!el) return;
-    el.textContent = msg || "ERROR";
+    el.textContent = msg;
     el.style.color = "#f1c40f";
-}
-
-// =============================================================
-// LABEL В КАРТОЧКЕ
-// =============================================================
-function updatePriceLabel(price) {
-    const el = document.getElementById("stat-last-price");
-    if (!el) return;
-
-    if (typeof price === "number") {
-        el.textContent = price.toFixed(2);
-    } else {
-        el.textContent = String(price);
-    }
 }
 
 // =============================================================
@@ -812,24 +526,15 @@ function initExportPng() {
     const btn = document.getElementById("btn-export-png");
     if (!btn) return;
 
-    btn.addEventListener("click", async () => {
-        if (!window.html2canvas) {
-            console.warn("html2canvas not loaded");
-            return;
-        }
+    btn.onclick = async () => {
+        if (!window.html2canvas) return;
         const el = document.querySelector(".chart-wrapper-main");
-        if (!el) return;
-
-        try {
-            const canvas = await window.html2canvas(el);
-            const link = document.createElement("a");
-            link.href = canvas.toDataURL("image/png");
-            link.download = "strategy-chart.png";
-            link.click();
-        } catch (e) {
-            console.error("Export PNG error", e);
-        }
-    });
+        const canvas = await window.html2canvas(el);
+        const a = document.createElement("a");
+        a.href = canvas.toDataURL("image/png");
+        a.download = "chart.png";
+        a.click();
+    };
 }
 
 // =============================================================
@@ -839,46 +544,27 @@ function initStartStopButtons() {
     const root = document.getElementById("strategy-dashboard");
     if (!root) return;
 
-    const chatId = Number(root.dataset.chatId || "0");
-    const type   = root.dataset.type;
+    const chatId = root.dataset.chatId;
+    const type = root.dataset.type;
 
-    const btnStart = document.getElementById("btn-start");
-    const btnStop  = document.getElementById("btn-stop");
+    const start = document.getElementById("btn-start");
+    const stop  = document.getElementById("btn-stop");
 
-    if (btnStart) {
-        btnStart.addEventListener("click", async () => {
-            try {
-                await fetch(`/api/strategy/start?chatId=${chatId}&type=${encodeURIComponent(type)}`, {
-                    method: "POST"
-                });
-            } catch (e) {
-                console.error("start strategy error", e);
-            }
-        });
-    }
+    if (start) start.onclick = () =>
+        fetch(`/api/strategy/start?chatId=${chatId}&type=${type}`, { method:"POST" });
 
-    if (btnStop) {
-        btnStop.addEventListener("click", async () => {
-            try {
-                await fetch(`/api/strategy/stop?chatId=${chatId}&type=${encodeURIComponent(type)}`, {
-                    method: "POST"
-                });
-            } catch (e) {
-                console.error("stop strategy error", e);
-            }
-        });
-    }
+    if (stop) stop.onclick = () =>
+        fetch(`/api/strategy/stop?chatId=${chatId}&type=${type}`, { method:"POST" });
 }
 
 // =============================================================
-// ПУБЛИЧНЫЙ API ДЛЯ ДРУГИХ ФАЙЛОВ
+// ПУБЛИЧНЫЙ API
 // =============================================================
 window.AiStrategyChart = {
     initChart,
     loadFullChart,
     subscribeLive,
     loadTimeframes,
-    getCurrentTf,
     initExportPng,
     initStartStopButtons
 };
