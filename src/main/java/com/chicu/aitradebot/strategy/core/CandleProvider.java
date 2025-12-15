@@ -26,11 +26,11 @@ public interface CandleProvider {
             double volume
     ) {
 
-        public long getTime()   { return time; }
-        public double getOpen() { return open; }
-        public double getHigh() { return high; }
-        public double getLow()  { return low; }
-        public double getClose(){ return close; }
+        public long getTime()    { return time; }
+        public double getOpen()  { return open; }
+        public double getHigh()  { return high; }
+        public double getLow()   { return low; }
+        public double getClose() { return close; }
         public double getVolume(){ return volume; }
 
         /** Удобный конструктор для Instant → long */
@@ -54,7 +54,29 @@ public interface CandleProvider {
     }
 
     /**
+     * 🔥 ДОБАВЛЕНО
+     * Сохранение (или обновление) свечи.
+     * Используется LiveCandleAggregator.
+     */
+    void addCandle(
+            long chatId,
+            String symbol,
+            String timeframe,
+            Instant time,
+            double open,
+            double high,
+            double low,
+            double close,
+            double volume
+    );
+
+    /**
      * Стандартный метод получения последних свечей.
      */
-    List<Candle> getRecentCandles(long chatId, String symbol, String timeframe, int limit);
+    List<Candle> getRecentCandles(
+            long chatId,
+            String symbol,
+            String timeframe,
+            int limit
+    );
 }

@@ -4,6 +4,8 @@ import com.chicu.aitradebot.common.enums.NetworkType;
 import jakarta.persistence.*;
 import lombok.*;
 
+import java.time.Instant;
+
 @Entity
 @Table(name = "scalping_strategy_settings")
 @Getter
@@ -15,34 +17,84 @@ public class ScalpingStrategySettings {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
-    private Long id;                 // ← обязательно нужно!
+    private Long id;
 
     @Column(nullable = false)
     private Long chatId;
 
-    private String symbol;
-    private String timeframe;
+    // ============================================================
+    // 🔹 УНИВЕРСАЛЬНЫЕ ПОЛЯ (единая структура)
+    // ============================================================
 
-    @Column(name = "candle_limit")
-    private int candleLimit;
+    @Builder.Default
+    private String symbol = "BTCUSDT";
 
-    private double priceChangeThreshold;
-    private double spreadThreshold;
-    private double orderVolume;
+    @Builder.Default
+    private String timeframe = "1m";
 
-    private int leverage;
+    @Builder.Default
+    @Column(name = "candle_limit", nullable = false)
+    private int cachedCandlesLimit = 300;
 
-    private int windowSize;
+    @Builder.Default
+    @Column(nullable = false)
+    private double capitalUsd = 50.0;
 
-    private int cachedCandlesLimit;
+    @Builder.Default
+    private double commissionPct = 0.04;
 
-    private double takeProfitPct;
-    private double stopLossPct;
+    @Builder.Default
+    private double riskPerTradePct = 1.0;
+
+    @Builder.Default
+    private double dailyLossLimitPct = 5.0;
+
+    @Builder.Default
+    private int leverage = 1;
+
+    @Builder.Default
+    private boolean reinvestProfit = false;
+
+    @Builder.Default
+    private double takeProfitPct = 0.5;
+
+    @Builder.Default
+    private double stopLossPct = 0.5;
+
+    // ============================================================
+    // 🔸 УНИКАЛЬНЫЕ ПАРАМЕТРЫ SCALPING
+    // ============================================================
+
+    @Builder.Default
+    private int windowSize = 20;
+
+    @Builder.Default
+    private double priceChangeThreshold = 0.3; // %
+
+    @Builder.Default
+    private double spreadThreshold = 0.1; // %
+
+    @Builder.Default
+    private double orderVolume = 20.0;
+
+    // ============================================================
+    // SYSTEM
+    // ============================================================
 
     @Enumerated(EnumType.STRING)
+    @Builder.Default
     private NetworkType networkType = NetworkType.TESTNET;
 
+    @Builder.Default
     private boolean active = false;
 
-    private java.time.Instant createdAt;
+    @Builder.Default
+    @Column(nullable = false, updatable = false)
+    private Instant createdAt = Instant.now();
+
+    @PrePersist
+    public void prePersist() {
+        if (createdAt == null)
+            createdAt = Instant.now();
+    }
 }

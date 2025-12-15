@@ -2,6 +2,7 @@ package com.chicu.aitradebot.web.service;
 
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.web.facade.WebStrategyFacade;
+import com.chicu.aitradebot.web.facade.StrategyUi;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
@@ -23,7 +24,7 @@ public class StrategyService {
     /**
      * Список стратегий для UI.
      */
-    public List<WebStrategyFacade.StrategyUi> getStrategies(Long chatId) {
+    public List<StrategyUi> getStrategies(Long chatId) {
         return webStrategyFacade.getStrategies(chatId);
     }
 

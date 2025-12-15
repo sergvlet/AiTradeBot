@@ -1,57 +1,26 @@
 package com.chicu.aitradebot.config;
 
-import com.chicu.aitradebot.exchange.binance.ws.BinanceSpotWebSocketClient;
-import com.chicu.aitradebot.market.ws.CandleWebSocketHandler;
-import com.chicu.aitradebot.market.ws.MarketStreamWebSocketHandler;
-import com.chicu.aitradebot.market.ws.TradeWebSocketHandler;
-import lombok.RequiredArgsConstructor;
-import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.web.socket.config.annotation.EnableWebSocket;
-import org.springframework.web.socket.config.annotation.WebSocketConfigurer;
-import org.springframework.web.socket.config.annotation.WebSocketHandlerRegistry;
+import org.springframework.messaging.simp.config.MessageBrokerRegistry;
+import org.springframework.web.socket.config.annotation.*;
 
 @Configuration
-@EnableWebSocket
-@RequiredArgsConstructor
-public class WebSocketConfig implements WebSocketConfigurer {
-
-    /** ✔ теперь только SPOT WS */
-    private final BinanceSpotWebSocketClient binanceSpotWsClient;
-
-    // ==============================
-    //  REGISTER BEANS
-    // ==============================
-
-    @Bean
-    public CandleWebSocketHandler candleWebSocketHandler() {
-        return new CandleWebSocketHandler(binanceSpotWsClient);
-    }
-
-    @Bean
-    public MarketStreamWebSocketHandler marketStreamWebSocketHandler() {
-        return new MarketStreamWebSocketHandler();
-    }
-
-    @Bean
-    public TradeWebSocketHandler tradeWebSocketHandler() {
-        return new TradeWebSocketHandler();
-    }
-
-    // ==============================
-    //  MAP URL → HANDLERS
-    // ==============================
+@EnableWebSocketMessageBroker
+public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
 
     @Override
-    public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
+    public void configureMessageBroker(MessageBrokerRegistry registry) {
+        // брокер для топиков
+        registry.enableSimpleBroker("/topic", "/queue");
+        // префикс для @MessageMapping (если используешь)
+        registry.setApplicationDestinationPrefixes("/app");
+    }
 
-        registry.addHandler(candleWebSocketHandler(), "/ws/candles")
-                .setAllowedOrigins("*");
-
-        registry.addHandler(marketStreamWebSocketHandler(), "/ws/market")
-                .setAllowedOrigins("*");
-
-        registry.addHandler(tradeWebSocketHandler(), "/ws/trades")
-                .setAllowedOrigins("*");
+    @Override
+    public void registerStompEndpoints(StompEndpointRegistry registry) {
+        // ВАЖНО: endpoint ДОЛЖЕН совпадать с тем, что в JS
+        registry.addEndpoint("/ws/strategy")
+                .setAllowedOriginPatterns("*")
+                .withSockJS();
     }
 }

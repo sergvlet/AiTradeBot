@@ -11,52 +11,78 @@ public class ScalpingStrategySettingsServiceImpl implements ScalpingStrategySett
 
     private final ScalpingStrategySettingsRepository repo;
 
+    // =====================================================================
+    // 1) Получение или создание настроек
+    // =====================================================================
     @Override
     public ScalpingStrategySettings getOrCreate(Long chatId) {
+
         return repo.findTopByChatIdOrderByIdDesc(chatId)
                 .orElseGet(() -> {
 
-                    // ⚠️ ВАЖНО: значения передаются ТОЛЬКО в реальные поля
                     ScalpingStrategySettings def = ScalpingStrategySettings.builder()
                             .chatId(chatId)
-                            .symbol("BTCUSDT")
-                            .timeframe("1m")
-                            .windowSize(20)
-                            .priceChangeThreshold(0.1)
-                            .spreadThreshold(0.05)
-                            .orderVolume(10.0)
-                            .takeProfitPct(0.5)
-                            .stopLossPct(0.3)
-                            .cachedCandlesLimit(150)
-                            .leverage(1)
-                            .build();
+                            .build();  // все defaults подтянутся из @Builder.Default / @PrePersist
 
-                    log.info("🆕 Созданы настройки Scalping (chatId={})", chatId);
+                    log.info("🆕 Созданы настройки SCALPING (chatId={})", chatId);
                     return repo.save(def);
                 });
     }
 
+    // =====================================================================
+    // 2) Сохранение
+    // =====================================================================
     @Override
     public ScalpingStrategySettings save(ScalpingStrategySettings settings) {
         return repo.save(settings);
     }
 
+    // =====================================================================
+    // 3) Частичное обновление
+    // =====================================================================
     @Override
     public ScalpingStrategySettings update(Long chatId, ScalpingStrategySettings dto) {
 
         ScalpingStrategySettings s = getOrCreate(chatId);
 
-        if (dto.getSymbol() != null)
+        // === УНИВЕРСАЛЬНЫЕ ПАРАМЕТРЫ ===
+
+        if (dto.getSymbol() != null && !dto.getSymbol().isBlank())
             s.setSymbol(dto.getSymbol());
 
-        if (dto.getTimeframe() != null)
+        if (dto.getTimeframe() != null && !dto.getTimeframe().isBlank())
             s.setTimeframe(dto.getTimeframe());
-
-        if (dto.getWindowSize() > 0)
-            s.setWindowSize(dto.getWindowSize());
 
         if (dto.getCachedCandlesLimit() > 0)
             s.setCachedCandlesLimit(dto.getCachedCandlesLimit());
+
+        if (dto.getCapitalUsd() > 0)
+            s.setCapitalUsd(dto.getCapitalUsd());
+
+        if (dto.getCommissionPct() > 0)
+            s.setCommissionPct(dto.getCommissionPct());
+
+        if (dto.getRiskPerTradePct() > 0)
+            s.setRiskPerTradePct(dto.getRiskPerTradePct());
+
+        if (dto.getDailyLossLimitPct() > 0)
+            s.setDailyLossLimitPct(dto.getDailyLossLimitPct());
+
+        if (dto.getLeverage() > 0)
+            s.setLeverage(dto.getLeverage());
+
+        s.setReinvestProfit(dto.isReinvestProfit());
+
+        if (dto.getTakeProfitPct() > 0)
+            s.setTakeProfitPct(dto.getTakeProfitPct());
+
+        if (dto.getStopLossPct() > 0)
+            s.setStopLossPct(dto.getStopLossPct());
+
+        // === УНИКАЛЬНЫЕ ДЛЯ SCALPING ===
+
+        if (dto.getWindowSize() > 0)
+            s.setWindowSize(dto.getWindowSize());
 
         if (dto.getPriceChangeThreshold() > 0)
             s.setPriceChangeThreshold(dto.getPriceChangeThreshold());
@@ -66,15 +92,6 @@ public class ScalpingStrategySettingsServiceImpl implements ScalpingStrategySett
 
         if (dto.getOrderVolume() > 0)
             s.setOrderVolume(dto.getOrderVolume());
-
-        if (dto.getTakeProfitPct() > 0)
-            s.setTakeProfitPct(dto.getTakeProfitPct());
-
-        if (dto.getStopLossPct() > 0)
-            s.setStopLossPct(dto.getStopLossPct());
-
-        if (dto.getLeverage() > 0)
-            s.setLeverage(dto.getLeverage());
 
         return repo.save(s);
     }

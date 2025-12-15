@@ -2,11 +2,13 @@ package com.chicu.aitradebot.strategy.smartfusion;
 
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
+import com.chicu.aitradebot.common.util.TimeframeUtils;
 import com.chicu.aitradebot.exchange.enums.OrderSide;
 import com.chicu.aitradebot.strategy.core.CandleProvider;
 import com.chicu.aitradebot.strategy.core.ContextAwareStrategy;
-import com.chicu.aitradebot.strategy.core.RuntimeIntrospectable;
 import com.chicu.aitradebot.strategy.core.TradingStrategy;
+import com.chicu.aitradebot.strategy.live.LiveCandleAggregator;
+import com.chicu.aitradebot.strategy.live.StrategyLivePublisher;
 import com.chicu.aitradebot.strategy.registry.StrategyBinding;
 import com.chicu.aitradebot.strategy.smartfusion.components.SmartFusionOrderExecutor;
 import com.chicu.aitradebot.strategy.smartfusion.components.SmartFusionPnLTracker;
@@ -17,223 +19,427 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Instant;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-@Component
-@StrategyBinding(StrategyType.SMART_FUSION)
-@RequiredArgsConstructor
 @Slf4j
-public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectable, ContextAwareStrategy {
+@Component
+@RequiredArgsConstructor
+@StrategyBinding(StrategyType.SMART_FUSION)
+public class SmartFusionStrategy implements TradingStrategy, ContextAwareStrategy {
 
     private final CandleProvider candleProvider;
     private final SmartFusionOrderExecutor orderExecutor;
     private final SmartFusionPnLTracker pnlTracker;
     private final SmartFusionStrategySettingsService settingsService;
+    private final StrategyLivePublisher live;
+    private final LiveCandleAggregator candleAggregator;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
 
-    private long chatId;
-    private String symbol;
-    private String exchange;
-    private NetworkType network;
-
-    private SmartFusionStrategySettings cfg;
+    private volatile long chatId;
+    private volatile String symbol;
+    private volatile String exchange;
+    private volatile NetworkType network;
+    private volatile SmartFusionStrategySettings cfg;
 
     @Getter
-    private String lastEvent = "INIT";
-    private Instant startedAt;
+    private volatile String lastEvent = "INIT";
 
-    // =====================================================================
-    // INIT
-    // =====================================================================
+    private volatile Instant startedAt;
+
+    private volatile BigDecimal lastEmaFast;
+    private volatile BigDecimal lastEmaSlow;
+    private volatile BigDecimal lastSupport;
+    private volatile BigDecimal lastResistance;
 
     @PostConstruct
     public void onInit() {
         log.info("🚀 SmartFusionStrategy bean loaded");
     }
 
-    // =====================================================================
+    // =========================================================
     // CONTEXT
-    // =====================================================================
-
+    // =========================================================
     @Override
     public void setContext(long chatId, String symbol) {
         this.chatId = chatId;
-        this.symbol = symbol.toUpperCase(Locale.ROOT);
-
+        if (symbol != null && !symbol.isBlank()) {
+            this.symbol = symbol.toUpperCase(Locale.ROOT);
+        }
         loadSettings();
-
-        log.info("⚙️ SmartFusion context applied → chatId={}, symbol={}, exchange={}, network={}",
-                chatId, symbol, exchange, network);
     }
 
     private void loadSettings() {
-        this.cfg = settingsService.getOrCreate(chatId);
+        SmartFusionStrategySettings s = settingsService.getOrCreate(chatId);
+        this.cfg = s;
+        this.exchange = s.getExchange();
+        this.network = s.getNetworkType();
 
-        this.exchange = cfg.getExchange();
-        this.network = cfg.getNetworkType();
-    }
-
-    // =====================================================================
-    // TRAINING
-    // =====================================================================
-
-    private void train() {
-
-        log.info("📚 SmartFusion TRAIN started (chatId={}, symbol={})", chatId, symbol);
-
-        List<CandleProvider.Candle> candles =
-                candleProvider.getRecentCandles(chatId, symbol, cfg.getTimeframe(), cfg.getCandleLimit());
-
-        if (candles.size() < 50) {
-            log.warn("⚠️ Training skipped — недостаточно свечей");
-            return;
+        if (this.symbol == null || this.symbol.isBlank()) {
+            this.symbol = (s.getSymbol() != null && !s.getSymbol().isBlank())
+                    ? s.getSymbol().toUpperCase(Locale.ROOT)
+                    : "BTCUSDT";
         }
-
-        // Здесь может быть:
-        // AI warm-up, ATR calibration, volatility threshold calibration
-
-        log.info("📘 SmartFusion TRAIN complete");
     }
 
-    // =====================================================================
+    // =========================================================
     // START / STOP
-    // =====================================================================
-
+    // =========================================================
     @Override
-    public synchronized void start() {
+    public synchronized void start(Long chatId, String symbol) {
 
         if (running.get()) {
-            log.warn("⚠️ SmartFusion already running");
+            log.warn("⚠️ SMART_FUSION already running chatId={} symbol={}", this.chatId, this.symbol);
             return;
         }
 
+        this.chatId = chatId;
+
+        if (symbol != null && !symbol.isBlank()) {
+            this.symbol = symbol.toUpperCase(Locale.ROOT);
+        }
+
+        // ✅ ЕДИНСТВЕННО КОРРЕКТНЫЙ СПОСОБ ПОЛУЧИТЬ НАСТРОЙКИ
         loadSettings();
-        train();
 
         running.set(true);
         startedAt = Instant.now();
 
-        log.info("▶️ SmartFusion STARTED (symbol={}, tf={}, limit={})",
-                symbol, cfg.getTimeframe(), cfg.getCandleLimit());
+        // сброс дедупов для UI
+        lastEmaFast = null;
+        lastEmaSlow = null;
+        lastSupport = null;
+        lastResistance = null;
+
+        // уведомляем UI
+        live.pushState(
+                this.chatId,
+                StrategyType.SMART_FUSION,
+                this.symbol,
+                true
+        );
+
+        log.info("▶️ SMART_FUSION START chatId={} symbol={}", this.chatId, this.symbol);
     }
 
     @Override
-    public synchronized void stop() {
+    public synchronized void stop(Long chatId, String ignored) {
+        if (!running.get()) return;
+        running.set(false);
+
+        long tfMillis = TimeframeUtils.toMillis(cfg.getTimeframe());
+        candleAggregator.flush(chatId, StrategyType.SMART_FUSION, symbol, cfg.getTimeframe(), tfMillis);
+
+        live.pushState(chatId, StrategyType.SMART_FUSION, symbol, false);
+        log.info("⏹ SMART_FUSION STOP chatId={} symbol={}", chatId, symbol);
+    }
+
+    // =========================================================
+    // INFO
+    // =========================================================
+    @Override public boolean isActive(Long chatId) { return running.get(); }
+    @Override public Instant getStartedAt(Long chatId) { return startedAt; }
+    @Override public String getThreadName(Long chatId) { return "SMARTFUSION-" + symbol; }
+
+    // =========================================================
+    // PRICE UPDATE
+    // =========================================================
+    @Override
+    public void onPriceUpdate(Long chatId, String symbol, BigDecimal price, Instant ts) {
+
+        log.debug(
+                "🧠 SMART_FUSION onPriceUpdate running={} chatId={} symbol={}",
+                running.get(),
+                this.chatId,
+                this.symbol
+        );
+
+        if (price == null) return;
+
+        Instant time = ts != null ? ts : Instant.now();
+
+        // =====================================================
+        // 🔥 ВСЕГДА пушим цену (визуализация)
+        // =====================================================
+        live.pushPriceTick(
+                this.chatId,
+                StrategyType.SMART_FUSION,
+                this.symbol,
+                price,
+                time
+        );
+
+        // =====================================================
+        // 🟣 ЕСЛИ СТРАТЕГИЯ НЕ ЗАПУЩЕНА — ТОЛЬКО ВИЗУАЛ
+        // =====================================================
         if (!running.get()) {
-            log.warn("⚠️ SmartFusion already stopped");
+
+            // fallback уровни ±0.2%
+            BigDecimal priceBd = price;
+            BigDecimal delta =
+                    priceBd.multiply(BigDecimal.valueOf(0.002))
+                            .setScale(8, RoundingMode.HALF_UP);
+
+            live.pushLevels(
+                    this.chatId,
+                    StrategyType.SMART_FUSION,
+                    this.symbol,
+                    List.of(
+                            scale(priceBd.subtract(delta)),
+                            scale(priceBd.add(delta))
+                    )
+            );
+
             return;
         }
 
-        running.set(false);
-        log.info("⏹ SmartFusion STOPPED {}", symbol);
+        // =====================================================
+        // ✅ СТРАТЕГИЯ АКТИВНА — ПОЛНЫЙ ЦИКЛ
+        // =====================================================
+        long tfMillis = TimeframeUtils.toMillis(cfg.getTimeframe());
+
+        candleAggregator.onPriceTick(
+                this.chatId,
+                StrategyType.SMART_FUSION,
+                this.symbol,
+                cfg.getTimeframe(),
+                tfMillis,
+                price,
+                time
+        );
+
+        executeCycle(price.doubleValue(), cfg);
     }
 
-    @Override
-    public boolean isActive() {
-        return running.get();
-    }
-
-    // =====================================================================
-    // EVENT-DRIVEN
-    // =====================================================================
-
-    @Override
-    public void onPriceUpdate(String s, BigDecimal price) {
-        if (!running.get()) return;
-
-        try {
-            executeCycle();
-        } catch (Exception e) {
-            log.error("❌ SmartFusion cycle error: {}", e.getMessage(), e);
-        }
-    }
-
-    // =====================================================================
+    // =========================================================
     // MAIN CYCLE
-    // =====================================================================
+    // =========================================================
+    private void executeCycle(double lastPrice, SmartFusionStrategySettings cfg) {
 
-    private void executeCycle() {
+        List<CandleProvider.Candle> candles =
+                candleProvider.getRecentCandles(
+                        chatId,
+                        symbol,
+                        cfg.getTimeframe(),
+                        cfg.getCandleLimit()
+                );
 
-        loadSettings(); // настройки могли измениться из UI
+        BigDecimal priceBd = BigDecimal.valueOf(lastPrice);
+
+        // =====================================================
+        // ⏳ FALLBACK — пока не хватает свечей
+        // =====================================================
+        int need = Math.max(
+                Math.max(cfg.getEmaSlowPeriod(), cfg.getAtrPeriod()),
+                cfg.getRsiPeriod()
+        ) + 5;
+
+        if (candles == null || candles.size() < need) {
+
+            // минимальный псевдо-ATR (0.2%)
+            BigDecimal fallbackAtr =
+                    priceBd.multiply(BigDecimal.valueOf(0.002))
+                            .setScale(8, RoundingMode.HALF_UP);
+
+            BigDecimal support    = priceBd.subtract(fallbackAtr);
+            BigDecimal resistance = priceBd.add(fallbackAtr);
+
+            // уровни сразу в UI
+            live.pushLevels(
+                    chatId,
+                    StrategyType.SMART_FUSION,
+                    symbol,
+                    List.of(support, resistance)
+            );
+
+            // базовая зона
+            live.pushZone(
+                    chatId,
+                    StrategyType.SMART_FUSION,
+                    symbol,
+                    resistance,
+                    support
+            );
+
+            log.debug(
+                    "⏳ SMART_FUSION waiting candles: have={} need={}",
+                    candles == null ? 0 : candles.size(),
+                    need
+            );
+
+            return;
+        }
+
+        // =====================================================
+        // ✅ НОРМАЛЬНЫЙ РАСЧЁТ (когда свечей достаточно)
+        // =====================================================
+        double[] closes = candles.stream()
+                .mapToDouble(CandleProvider.Candle::close)
+                .toArray();
+
+        double emaFast = ema(closes, cfg.getEmaFastPeriod());
+        double emaSlow = ema(closes, cfg.getEmaSlowPeriod());
+        double rsi     = rsi(closes, cfg.getRsiPeriod());
+        double atr     = calcAtr(closes, cfg.getAtrPeriod());
+
+        BigDecimal atrBd = BigDecimal.valueOf(atr).setScale(8, RoundingMode.HALF_UP);
+
+        // =====================================================
+        // 📈 EMA
+        // =====================================================
+        pushPriceLineDedup("EMA_FAST", emaFast, true);
+        pushPriceLineDedup("EMA_SLOW", emaSlow, false);
+
+        // =====================================================
+        // 🟣 SMART LEVELS (ATR-based)
+        // =====================================================
+        BigDecimal support    = priceBd.subtract(atrBd.multiply(BigDecimal.valueOf(1.5)));
+        BigDecimal resistance = priceBd.add(atrBd.multiply(BigDecimal.valueOf(1.5)));
+
+        if (!support.equals(lastSupport) || !resistance.equals(lastResistance)) {
+
+            live.pushLevels(
+                    chatId,
+                    StrategyType.SMART_FUSION,
+                    symbol,
+                    List.of(scale(support), scale(resistance))
+            );
+
+            lastSupport = support;
+            lastResistance = resistance;
+        }
+
+        // =====================================================
+        // 🟠 ZONE
+        // =====================================================
+        live.pushZone(
+                chatId,
+                StrategyType.SMART_FUSION,
+                symbol,
+                resistance,
+                support
+        );
+
+        // =====================================================
+        // 📊 ATR
+        // =====================================================
+        live.pushAtr(
+                chatId,
+                StrategyType.SMART_FUSION,
+                symbol,
+                atr,
+                atr / lastPrice * 100
+        );
+
+        // =====================================================
+        // 🔴🟢 SIGNALS / TRADES
+        // =====================================================
+        if (rsi < cfg.getRsiBuyThreshold() && emaFast > emaSlow) {
+
+            live.pushSignal(
+                    chatId,
+                    StrategyType.SMART_FUSION,
+                    symbol,
+                    "BUY",
+                    1.0
+            );
+
+            live.pushTradeZone(
+                    chatId,
+                    StrategyType.SMART_FUSION,
+                    symbol,
+                    "BUY",
+                    priceBd.add(atrBd),
+                    priceBd.subtract(atrBd)
+            );
+
+            processTrade(OrderSide.BUY, lastPrice, cfg);
+        }
+
+        if (rsi > cfg.getRsiSellThreshold() && emaFast < emaSlow) {
+
+            live.pushSignal(
+                    chatId,
+                    StrategyType.SMART_FUSION,
+                    symbol,
+                    "SELL",
+                    1.0
+            );
+
+            live.pushTradeZone(
+                    chatId,
+                    StrategyType.SMART_FUSION,
+                    symbol,
+                    "SELL",
+                    priceBd.add(atrBd),
+                    priceBd.subtract(atrBd)
+            );
+
+            processTrade(OrderSide.SELL, lastPrice, cfg);
+        }
+
+        // =====================================================
+        // 🎯 TP / SL
+        // =====================================================
+        live.pushTpSl(
+                chatId,
+                StrategyType.SMART_FUSION,
+                symbol,
+                priceBd.add(atrBd.multiply(BigDecimal.valueOf(2))),
+                priceBd.subtract(atrBd.multiply(BigDecimal.valueOf(2)))
+        );
+
+        lastEvent = String.format(Locale.ROOT, "RSI=%.2f ATR=%.2f", rsi, atr);
+    }
+
+    // =========================================================
+    // REPLAY
+    // =========================================================
+    @Override
+    public void replayLayers(Long chatId) {
+        if (!running.get()) return;
 
         List<CandleProvider.Candle> candles =
                 candleProvider.getRecentCandles(chatId, symbol, cfg.getTimeframe(), cfg.getCandleLimit());
 
-        if (candles.size() < 30) return;
+        if (candles == null || candles.isEmpty()) return;
 
-        double[] closes = candles.stream().mapToDouble(CandleProvider.Candle::close).toArray();
-        double last = closes[closes.length - 1];
+        double last = candles.get(candles.size() - 1).close();
+        executeCycle(last, cfg);
 
-        double emaFast = ema(closes, cfg.getEmaFastPeriod());
-        double emaSlow = ema(closes, cfg.getEmaSlowPeriod());
-        double rsi = rsi(closes, cfg.getRsiPeriod());
-        double[] bb = bollinger(closes, cfg.getBollingerPeriod(), cfg.getBollingerK());
+        log.debug("🔁 SMART_FUSION replayLayers complete chatId={} symbol={}", chatId, symbol);
+    }
 
-        boolean buySignal = rsi < cfg.getRsiBuyThreshold() && emaFast > emaSlow;
-        boolean sellSignal = rsi > cfg.getRsiSellThreshold() && emaFast < emaSlow;
-
-        pnlTracker.updateIndicators(chatId, symbol, Map.of(
-                "emaFast", emaFast,
-                "emaSlow", emaSlow,
-                "rsi", rsi,
-                "bbUpper", bb[1],
-                "bbLower", bb[2]
-        ));
-
-        if (buySignal) {
-            processTrade(OrderSide.BUY, last);
-        } else if (sellSignal) {
-            processTrade(OrderSide.SELL, last);
+    // =========================================================
+    // HELPERS
+    // =========================================================
+    private void pushPriceLineDedup(String name, double value, boolean fast) {
+        BigDecimal bd = scale(BigDecimal.valueOf(value));
+        if (fast) {
+            if (lastEmaFast == null || bd.compareTo(lastEmaFast) != 0) {
+                live.pushPriceLine(chatId, StrategyType.SMART_FUSION, symbol, name, bd);
+                lastEmaFast = bd;
+            }
         } else {
-            lastEvent = "HOLD";
+            if (lastEmaSlow == null || bd.compareTo(lastEmaSlow) != 0) {
+                live.pushPriceLine(chatId, StrategyType.SMART_FUSION, symbol, name, bd);
+                lastEmaSlow = bd;
+            }
         }
     }
 
-    // =====================================================================
-    // TRADE EXECUTION
-    // =====================================================================
-
-    private void processTrade(OrderSide side, double price) {
-        try {
-
-            double qty = cfg.getCapitalUsd() / price;
-
-            orderExecutor.placeMarketOrder(
-                    chatId,
-                    symbol,
-                    cfg.getNetworkType(),
-                    cfg.getExchange(),
-                    side,
-                    BigDecimal.valueOf(qty)
-            );
-
-            pnlTracker.recordTrade(chatId, symbol, price, qty, true, 1.0);
-
-            lastEvent = side.name();
-
-            log.info("💱 SmartFusion {} executed @ {}", side, price);
-
-        } catch (Exception e) {
-            log.error("❌ Trade error: {}", e.getMessage(), e);
-        }
+    private BigDecimal scale(BigDecimal v) {
+        return v.setScale(8, RoundingMode.HALF_UP);
     }
-
-    // =====================================================================
-    // INDICATORS
-    // =====================================================================
 
     private double ema(double[] arr, int p) {
         double k = 2.0 / (p + 1);
         double v = arr[0];
-        for (int i = 1; i < arr.length; i++) {
-            v = arr[i] * k + v * (1 - k);
-        }
+        for (int i = 1; i < arr.length; i++) v = arr[i] * k + v * (1 - k);
         return v;
     }
 
@@ -247,35 +453,50 @@ public class SmartFusionStrategy implements TradingStrategy, RuntimeIntrospectab
         return 100 - 100 / (1 + rs);
     }
 
-    private double[] bollinger(double[] arr, int period, double k) {
-        if (arr.length < period) return new double[]{0, 0, 0};
-
-        double mean = Arrays.stream(arr, arr.length - period, arr.length).average().orElse(0.0);
-        double variance = Arrays.stream(arr, arr.length - period, arr.length)
-                                  .map(v -> (v - mean) * (v - mean))
-                                  .sum() / period;
-
-        double std = Math.sqrt(variance);
-
-        return new double[]{mean, mean + k * std, mean - k * std};
+    private double calcAtr(double[] closes, int period) {
+        double sum = 0;
+        for (int i = closes.length - period; i < closes.length; i++) {
+            sum += Math.abs(closes[i] - closes[i - 1]);
+        }
+        return sum / period;
     }
 
-    // =====================================================================
-    // RUNTIME
-    // =====================================================================
+    // =========================================================
+// TRADE
+// =========================================================
+    private void processTrade(OrderSide side, double price, SmartFusionStrategySettings cfg) {
 
-    @Override
-    public String getSymbol() {
-        return symbol;
+        double qty = cfg.getCapitalUsd() / price;
+
+        try {
+            orderExecutor.placeMarketOrder(
+                    this.chatId,
+                    this.symbol,
+                    this.network,
+                    this.exchange,
+                    side,
+                    BigDecimal.valueOf(qty)
+            );
+
+            live.pushTrade(
+                    this.chatId,
+                    StrategyType.SMART_FUSION,
+                    this.symbol,
+                    side.name(),
+                    BigDecimal.valueOf(price),
+                    BigDecimal.valueOf(qty),
+                    Instant.now()
+            );
+
+        } catch (Exception e) {
+            log.error(
+                    "❌ SMART_FUSION trade failed chatId={} side={} price={}",
+                    this.chatId,
+                    side,
+                    price,
+                    e
+            );
+        }
     }
 
-    @Override
-    public Instant getStartedAt() {
-        return startedAt;
-    }
-
-    @Override
-    public String getThreadName() {
-        return "SMARTFUSION-" + symbol;
-    }
 }

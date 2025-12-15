@@ -4,23 +4,35 @@ import java.time.Instant;
 import java.util.Optional;
 import java.util.concurrent.ScheduledFuture;
 
+/**
+ * Чистый планировщик задач по строковому ключу.
+ *
+ * Задача этого сервиса — только крутить Runnable по таймеру.
+ * Он НЕ знает ни про стратегии, ни про chatId, ни про символы.
+ */
 public interface SchedulerService {
 
     /**
      * Запускает периодическую задачу.
      *
-     * @param key         уникальный ключ (например, "chatId|SCALPING")
-     * @param task        логика стратегии (onPriceUpdate и т.п.)
-     * @param intervalSec интервал между тиками
+     * @param key         уникальный ключ задачи (например: "12345|SCALPING")
+     * @param task        логика, которую надо регулярно выполнять
+     * @param intervalSec интервал между тиками, в секундах
      */
     ScheduledFuture<?> scheduleAtFixedRate(String key, Runnable task, long intervalSec);
 
-    /** Остановка задачи по ключу. */
+    /**
+     * Остановка задачи по ключу.
+     */
     void cancel(String key);
 
-    /** Есть ли активная задача по ключу. */
+    /**
+     * Активна ли задача по ключу.
+     */
     boolean isActive(String key);
 
-    /** Время старта задачи. */
+    /**
+     * Время старта задачи по ключу.
+     */
     Optional<Instant> getStartedAt(String key);
 }

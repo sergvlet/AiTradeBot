@@ -26,6 +26,7 @@
     </properties>
 
     <dependencies>
+
         <!-- Web / REST API -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -36,6 +37,12 @@
             <groupId>com.squareup.okhttp3</groupId>
             <artifactId>okhttp</artifactId>
             <version>4.11.0</version>
+        </dependency>
+
+        <dependency>
+            <groupId>nz.net.ultraq.thymeleaf</groupId>
+            <artifactId>thymeleaf-layout-dialect</artifactId>
+            <version>3.3.0</version>
         </dependency>
 
         <dependency>
@@ -85,6 +92,7 @@
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
+            <version>1.18.42</version>
             <optional>true</optional>
         </dependency>
 
@@ -116,14 +124,25 @@
                 <artifactId>maven-compiler-plugin</artifactId>
                 <version>3.11.0</version>
                 <configuration>
-                    <!-- Используем release 21, без preview -->
                     <release>${maven.compiler.release}</release>
                     <encoding>UTF-8</encoding>
+
                     <annotationProcessorPaths>
+
+                        <!-- Lombok -->
                         <path>
                             <groupId>org.projectlombok</groupId>
                             <artifactId>lombok</artifactId>
+                            <version>1.18.42</version>
                         </path>
+
+                        <!-- Thymeleaf Layout Dialect -->
+                        <path>
+                            <groupId>nz.net.ultraq.thymeleaf</groupId>
+                            <artifactId>thymeleaf-layout-dialect</artifactId>
+                            <version>3.3.0</version>
+                        </path>
+
                     </annotationProcessorPaths>
                 </configuration>
             </plugin>

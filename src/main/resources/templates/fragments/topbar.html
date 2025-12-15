@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="ru" xmlns:th="http://www.thymeleaf.org">
+<body>
+
+<div th:fragment="topbar">
+
+    <div class="topbar-inner d-flex align-items-center justify-content-between px-3">
+
+        <!-- Левая часть -->
+        <div class="d-flex align-items-center gap-2">
+            <!-- Гамбургер (мобилка) -->
+            <button class="btn btn-sm btn-outline-light d-md-inline-flex d-lg-none btn-sidebar-toggle"
+                    id="sidebarToggle"
+                    type="button"
+                    aria-label="Меню">
+                <i class="bi bi-list"></i>
+            </button>
+
+            <h1 class="page-title h5 mb-0"
+                th:text="${pageTitle} ?: 'Дашборд'">
+                Дашборд
+            </h1>
+        </div>
+
+        <!-- Правая часть -->
+        <div class="d-flex align-items-center gap-3">
+
+            <div class="text-end d-none d-sm-block">
+                <div class="small text-muted">Chat ID</div>
+                <div class="fw-semibold"
+                     th:text="${chatId} ?: '—'">—</div>
+            </div>
+
+            <!-- Тема -->
+            <button class="theme-btn" id="themeToggle" type="button" title="Переключить тему">
+                <i class="bi bi-moon-stars" id="themeToggleIcon"></i>
+            </button>
+        </div>
+
+    </div>
+
+</div>
+
+</body>
+</html>

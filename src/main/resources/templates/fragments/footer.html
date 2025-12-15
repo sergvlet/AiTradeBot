@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="ru" xmlns:th="http://www.thymeleaf.org">
+<body>
+
+<div th:fragment="footer">
+    <div class="footer-inner text-center py-2 small text-muted">
+        © <span th:text="${#dates.format(#dates.createNow(), 'yyyy')}">2025</span>
+        AiTradeBot — AI Trading Platform
+    </div>
+</div>
+
+</body>
+</html>

@@ -1,168 +1,434 @@
 package com.chicu.aitradebot.strategy.fibonacci;
 
 import com.chicu.aitradebot.common.enums.StrategyType;
+import com.chicu.aitradebot.common.util.TimeframeUtils;
+import com.chicu.aitradebot.exchange.model.Order;
+import com.chicu.aitradebot.service.OrderService;
 import com.chicu.aitradebot.strategy.core.CandleProvider;
-import com.chicu.aitradebot.strategy.core.ContextAwareStrategy;
 import com.chicu.aitradebot.strategy.core.TradingStrategy;
+import com.chicu.aitradebot.strategy.live.LiveCandleAggregator;
+import com.chicu.aitradebot.strategy.live.StrategyLivePublisher;
 import com.chicu.aitradebot.strategy.registry.StrategyBinding;
+import com.chicu.aitradebot.web.ui.UiStrategyLayerService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
-import java.util.List;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.math.RoundingMode;
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
-/**
- * Fibonacci Grid Strategy (v4, готова для StrategyEngine)
- *
- * Особенности:
- *  ✔ поддерживает setContext(chatId, symbol)
- *  ✔ загружает параметры из таблицы fibonacci_grid_strategy_settings
- *  ✔ имеет этап train() перед start()
- *  ✔ работает через StrategyEngine (tick)
- *  ✔ использует CandleProvider
- */
 @Slf4j
 @Component
 @RequiredArgsConstructor
 @StrategyBinding(StrategyType.FIBONACCI_GRID)
-public class FibonacciGridStrategy implements TradingStrategy, ContextAwareStrategy {
+public class FibonacciGridStrategy implements TradingStrategy {
 
-    private final CandleProvider candleProvider;
+    /** Цена считается «на уровне», если расстояние < 0.05% */
+    private static final BigDecimal ACTIVE_DELTA_PCT = new BigDecimal("0.0005");
+
     private final FibonacciGridStrategySettingsService settingsService;
+    private final CandleProvider candleProvider;
+    private final OrderService orderService;
 
-    private long chatId;
-    private String symbol;
+    private final StrategyLivePublisher live;
+    private final LiveCandleAggregator candleAggregator;
+    private final UiStrategyLayerService uiLayerService;
 
-    private final AtomicBoolean active = new AtomicBoolean(false);
+    // =====================================================
+    // STATE
+    // =====================================================
+    private static class State {
+        Instant startedAt;
+        String symbol;
+        boolean active;
 
-    // Загружаемые параметры
-    private int gridLevels;
-    private double distancePct;
-    private double takeProfitPct;
-    private double stopLossPct;
-    private int cachedCandlesLimit;
-    private String timeframe;
+        BigDecimal base;
+        Instant lastSavedCandleTime;
 
-    // =====================================================================
-    // ✔ КОНТЕКСТ
-    // =====================================================================
+        List<BigDecimal> levels = new ArrayList<>();
 
-    @Override
-    public void setContext(long chatId, String symbol) {
-        this.chatId = chatId;
-        this.symbol = symbol.toUpperCase();
-
-        loadSettings();
-
-        log.info("⚙️ FIBO context set: chatId={}, symbol={}, levels={}, distPct={}%",
-                chatId, symbol, gridLevels, distancePct);
+        /** 🔑 УРОВЕНЬ → ОРДЕР */
+        Map<BigDecimal, Order> activeOrders = new ConcurrentHashMap<>();
     }
 
-    // =====================================================================
-    // ✔ ОБУЧЕНИЕ (train)
-    // =====================================================================
+    private final Map<Long, State> states = new ConcurrentHashMap<>();
 
-    /**
-     * Обучение стратегии (перед запуском).
-     * Сейчас базовая заглушка – можно подключить ML/ATR-кластеризацию.
-     */
-    private void train() {
-        log.info("📚 FIBO TRAINING started (chatId={}, symbol={})", chatId, symbol);
+    // =====================================================
+    // GRID LEVELS
+    // =====================================================
+    private List<BigDecimal> computeLevels(BigDecimal base, FibonacciGridStrategySettings s) {
+        if (base == null || base.signum() <= 0) return List.of();
 
-        // Пример: анализ последних свечей
-        List<CandleProvider.Candle> candles =
-                candleProvider.getRecentCandles(chatId, symbol, timeframe, 300);
+        BigDecimal step = BigDecimal.valueOf(s.getDistancePct())
+                .divide(BigDecimal.valueOf(100), 8, RoundingMode.HALF_UP);
 
-        if (candles.size() < 50) {
-            log.warn("⚠️ FIBO TRAINING skipped – мало данных");
-            return;
+        int half = Math.max(1, s.getGridLevels() / 2);
+
+        List<BigDecimal> levels = new ArrayList<>();
+        levels.add(base);
+
+        for (int i = 1; i <= half; i++) {
+            BigDecimal mul = step.multiply(BigDecimal.valueOf(i));
+            levels.add(base.multiply(BigDecimal.ONE.subtract(mul)));
+            levels.add(base.multiply(BigDecimal.ONE.add(mul)));
         }
 
-        // Можно вычислять среднюю волатильность → подстраивать distancePct
-        log.info("📘 FIBO TRAINING completed.");
+        levels.sort(Comparator.naturalOrder());
+
+        return levels.stream()
+                .map(v -> v.setScale(8, RoundingMode.HALF_UP))
+                .limit(s.getGridLevels())
+                .toList();
     }
 
-    // =====================================================================
-    // ✔ START / STOP
-    // =====================================================================
+    // =====================================================
+    // UTILS
+    // =====================================================
+    private String resolveSymbol(String arg, FibonacciGridStrategySettings s, State st) {
+        if (arg != null && !arg.isBlank()) return arg;
+        if (st != null && st.symbol != null) return st.symbol;
+        return s.getSymbol();
+    }
 
+    private Instant resolveCandleTime(Instant time, long tfMillis) {
+        long ms = (time != null ? time : Instant.now()).toEpochMilli();
+        return Instant.ofEpochMilli((ms / tfMillis) * tfMillis);
+    }
+
+    private BigDecimal resolveBaseFromCandleClose(
+            Long chatId,
+            String symbol,
+            FibonacciGridStrategySettings s,
+            BigDecimal fallback
+    ) {
+        return candleProvider
+                .getRecentCandles(chatId, symbol, s.getTimeframe(), 1)
+                .stream()
+                .reduce((a, b) -> b)
+                .map(c -> BigDecimal.valueOf(c.getClose()))
+                .orElse(fallback);
+    }
+
+    // =====================================================
+    // START
+    // =====================================================
     @Override
-    public synchronized void start() {
-        loadSettings();   // всегда загружаем актуальные параметры
-        train();          // обязательно обучаемся
+    public synchronized void start(Long chatId, String symbol) {
 
-        active.set(true);
-        log.info("▶️ FIBO STARTED (chatId={}, symbol={})", chatId, symbol);
-    }
+        FibonacciGridStrategySettings s = settingsService.getOrCreate(chatId);
+        String sym = resolveSymbol(symbol, s, null).toUpperCase(Locale.ROOT);
 
-    @Override
-    public synchronized void stop() {
-        active.set(false);
-        log.info("⏹ FIBO STOPPED (chatId={}, symbol={})", chatId, symbol);
-    }
+        State st = new State();
+        st.active = true;
+        st.symbol = sym;
+        st.startedAt = Instant.now();
+        states.put(chatId, st);
 
-    @Override
-    public boolean isActive() {
-        return active.get();
-    }
+        // сохраняем настройки
+        s.setSymbol(sym);
+        s.setActive(true);
+        settingsService.save(s);
 
-    // =====================================================================
-    // ✔ Основной цикл стратегии
-    // =====================================================================
+        // =====================================================
+        // 🔑 BASE PRICE (CANDLE → LIVE → LAZY INIT)
+        // =====================================================
+        BigDecimal base = resolveBaseFromCandleClose(chatId, sym, s, null);
 
-    @Override
-    public void onPriceUpdate(String ignoredSymbol, BigDecimal price) {
-        if (!active.get()) return;
-        executeCycle();
-    }
-
-    private void executeCycle() {
-
-        List<CandleProvider.Candle> candles =
-                candleProvider.getRecentCandles(chatId, symbol, timeframe, cachedCandlesLimit);
-
-        if (candles == null || candles.size() < 50) {
-            return;
+        if (base != null && base.signum() > 0) {
+            // ✅ есть база — сразу строим сетку
+            initGrid(chatId, st, s, base);
+            log.info("🟣 FIB base from candle: {}", base);
+        } else {
+            // ⚠️ базы нет — инициализация будет при первом price tick
+            log.warn("⚠️ FIB start without base price, waiting for live tick");
         }
 
-        CandleProvider.Candle lastCandle = candles.get(candles.size() - 1);
-        double lastPrice = lastCandle.close();
+        live.pushState(chatId, StrategyType.FIBONACCI_GRID, sym, true);
 
-        double step = lastPrice * distancePct / 100.0;
+        log.info("▶️ FIB START chatId={} symbol={}", chatId, sym);
+    }
 
-        // Генерируем уровни
-        for (int i = 1; i <= gridLevels; i++) {
+    // =====================================================
+    // STOP
+    // =====================================================
+    @Override
+    public synchronized void stop(Long chatId, String ignored) {
 
-            double buyLvl = lastPrice - i * step;
-            double sellLvl = lastPrice + i * step;
+        State st = states.remove(chatId);
+        if (st == null) return;
 
-            log.debug("📐 FIBO GRID {} → BUY={} SELL={} (step={}, last={})",
-                    i, buyLvl, sellLvl, step, lastPrice);
+        FibonacciGridStrategySettings s = settingsService.getOrCreate(chatId);
+        s.setActive(false);
+        settingsService.save(s);
 
-            // ❗ пока не ставим реальные ордера
-            // здесь можно дергать OrderService позже
+        live.pushState(chatId, StrategyType.FIBONACCI_GRID, st.symbol, false);
+
+        uiLayerService.clearStrategy(chatId, StrategyType.FIBONACCI_GRID, st.symbol);
+
+        log.info("⏹ FIB STOP chatId={} symbol={}", chatId, st.symbol);
+    }
+
+    // =====================================================
+    // INFO
+    // =====================================================
+    @Override
+    public boolean isActive(Long chatId) {
+        return states.containsKey(chatId) && states.get(chatId).active;
+    }
+
+    @Override
+    public Instant getStartedAt(Long chatId) {
+        State st = states.get(chatId);
+        return st != null ? st.startedAt : null;
+    }
+
+    @Override
+    public String getThreadName(Long chatId) {
+        return "fib-" + chatId;
+    }
+
+    // =====================================================
+    // PRICE UPDATE — 🔥 ОСНОВНАЯ ЛОГИКА
+    // =====================================================
+    @Override
+    public void onPriceUpdate(Long chatId,
+                              String symbol,
+                              BigDecimal price,
+                              Instant ts) {
+
+        State st = states.get(chatId);
+        if (st == null || !st.active || price == null) return;
+
+        FibonacciGridStrategySettings s = settingsService.getOrCreate(chatId);
+
+        String sym = resolveSymbol(symbol, s, st).toUpperCase(Locale.ROOT);
+        st.symbol = sym;
+
+        Instant tickTime = ts != null ? ts : Instant.now();
+
+        // =====================================================
+        // 📈 PRICE TICK → UI
+        // =====================================================
+        live.pushPriceTick(
+                chatId,
+                StrategyType.FIBONACCI_GRID,
+                sym,
+                price,
+                tickTime
+        );
+
+        // =====================================================
+        // 🟣 LAZY INIT GRID (если старт был без базы)
+        // =====================================================
+        if (st.base == null || st.levels == null || st.levels.isEmpty()) {
+
+            st.base = price;
+            st.levels = computeLevels(price, s);
+
+            long tfMillis = TimeframeUtils.toMillis(s.getTimeframe());
+            Instant candleTime = resolveCandleTime(tickTime, tfMillis);
+
+            st.lastSavedCandleTime = candleTime;
+
+            saveLayers(chatId, sym, candleTime, st.levels);
+
+            log.info("🟣 FIB grid initialized from live price {}", price);
+        }
+
+        // =====================================================
+        // 🔍 ПОИСК БЛИЖАЙШЕГО УРОВНЯ
+        // =====================================================
+        BigDecimal nearest = null;
+        BigDecimal minDelta = null;
+
+        for (BigDecimal lvl : st.levels) {
+            if (lvl == null || lvl.signum() <= 0) continue;
+
+            BigDecimal delta = price.subtract(lvl).abs()
+                    .divide(lvl, 8, RoundingMode.HALF_UP);
+
+            if (minDelta == null || delta.compareTo(minDelta) < 0) {
+                minDelta = delta;
+                nearest = lvl;
+            }
+        }
+
+        if (nearest == null || minDelta == null) return;
+
+        String role = price.compareTo(nearest) >= 0
+                ? "SUPPORT"
+                : "RESISTANCE";
+
+        // =====================================================
+        // 🎯 ACTIVE LEVEL + MAGNET
+        // =====================================================
+        live.pushActiveLevel(
+                chatId,
+                StrategyType.FIBONACCI_GRID,
+                sym,
+                nearest,
+                role
+        );
+
+        double magnetStrength =
+                Math.max(0.0, 1.0 - minDelta.doubleValue());
+
+        live.pushMagnet(
+                chatId,
+                StrategyType.FIBONACCI_GRID,
+                sym,
+                nearest,
+                magnetStrength
+        );
+
+        // =====================================================
+        // 🚀 ВХОД В СДЕЛКУ (ОДИН РАЗ НА УРОВЕНЬ)
+        // =====================================================
+        if (minDelta.compareTo(ACTIVE_DELTA_PCT) < 0
+            && !st.activeOrders.containsKey(nearest)) {
+
+            String side = role.equals("SUPPORT") ? "BUY" : "SELL";
+
+            Order order = orderService.placeLimit(
+                    chatId,
+                    sym,
+                    side,
+                    BigDecimal.valueOf(s.getBaseOrderVolume()),
+                    nearest,
+                    "GTC",
+                    StrategyType.FIBONACCI_GRID.name()
+            );
+
+            if (order == null) return;
+
+            st.activeOrders.put(nearest, order);
+
+            // =================================================
+            // 📦 ORDER → UI
+            // =================================================
+            live.pushOrder(
+                    chatId,
+                    StrategyType.FIBONACCI_GRID,
+                    sym,
+                    String.valueOf(order.getId()),
+                    side,
+                    nearest,
+                    order.getQuantity(),
+                    order.getStatus()
+            );
+
+            // =================================================
+            // 🟢 TP / SL
+            // =================================================
+            BigDecimal tp = side.equals("BUY")
+                    ? nearest.multiply(
+                    BigDecimal.ONE.add(
+                            BigDecimal.valueOf(s.getTakeProfitPct() / 100.0)))
+                    : nearest.multiply(
+                    BigDecimal.ONE.subtract(
+                            BigDecimal.valueOf(s.getTakeProfitPct() / 100.0)));
+
+            BigDecimal sl = side.equals("BUY")
+                    ? nearest.multiply(
+                    BigDecimal.ONE.subtract(
+                            BigDecimal.valueOf(s.getStopLossPct() / 100.0)))
+                    : nearest.multiply(
+                    BigDecimal.ONE.add(
+                            BigDecimal.valueOf(s.getStopLossPct() / 100.0)));
+
+            live.pushTpSl(chatId, StrategyType.FIBONACCI_GRID, sym, tp, sl);
+
+            live.pushTradeZone(
+                    chatId,
+                    StrategyType.FIBONACCI_GRID,
+                    sym,
+                    side,
+                    tp.max(sl),
+                    tp.min(sl)
+            );
+
+            log.info("🚀 FIB ENTRY chatId={} {} @ {}", chatId, side, nearest);
         }
     }
 
-    // =====================================================================
-    // ✔ загрузка параметров из БД
-    // =====================================================================
 
-    private void loadSettings() {
-        FibonacciGridStrategySettings set =
-                settingsService.getOrCreate(chatId);
+    // =====================================================
+    // 🔁 REPLAY
+    // =====================================================
+    @Override
+    public void replayLayers(Long chatId) {
 
-        this.gridLevels = set.getGridLevels();
-        this.distancePct = set.getDistancePct();
-        this.takeProfitPct = set.getTakeProfitPct();
-        this.stopLossPct = set.getStopLossPct();
-        this.cachedCandlesLimit = set.getCandleLimit();   // ← ИСПРАВЛЕНО
-        this.timeframe = set.getTimeframe();
+        FibonacciGridStrategySettings s = settingsService.getOrCreate(chatId);
+        State st = states.computeIfAbsent(chatId, k -> new State());
 
-        log.info("🔧 FIBO settings loaded: levels={}, dist={}, TP={}, SL={}, tf={}, cache={}",
-                gridLevels, distancePct, takeProfitPct, stopLossPct, timeframe, cachedCandlesLimit);
+        String sym = resolveSymbol(null, s, st).toUpperCase(Locale.ROOT);
+        st.symbol = sym;
+
+        BigDecimal base = resolveBaseFromCandleClose(chatId, sym, s, BigDecimal.ZERO);
+        if (base.signum() <= 0) return;
+
+        st.base = base;
+        st.levels = computeLevels(base, s);
+
+        long tfMillis = TimeframeUtils.toMillis(s.getTimeframe());
+        Instant candleTime = resolveCandleTime(Instant.now(), tfMillis);
+
+        st.lastSavedCandleTime = candleTime;
+
+        saveLayers(chatId, sym, candleTime, st.levels);
+
+        log.info("🔁 FIB REPLAY chatId={} symbol={} levels={}", chatId, sym, st.levels.size());
+    }
+
+    // =====================================================
+    // SAVE UI LAYERS + WS
+    // =====================================================
+    private void saveLayers(Long chatId,
+                            String symbol,
+                            Instant candleTime,
+                            List<BigDecimal> levels) {
+
+        uiLayerService.saveLevels(
+                chatId,
+                StrategyType.FIBONACCI_GRID,
+                symbol,
+                candleTime,
+                levels
+        );
+
+        BigDecimal min = levels.get(0);
+        BigDecimal max = levels.get(levels.size() - 1);
+
+        uiLayerService.saveZone(
+                chatId,
+                StrategyType.FIBONACCI_GRID,
+                symbol,
+                candleTime,
+                max.doubleValue(),
+                min.doubleValue(),
+                "rgba(59,130,246,0.12)"
+        );
+
+        live.pushLevels(chatId, StrategyType.FIBONACCI_GRID, symbol, levels);
+        live.pushZone(chatId, StrategyType.FIBONACCI_GRID, symbol, max, min);
+    }
+    private void initGrid(Long chatId,
+                          State st,
+                          FibonacciGridStrategySettings s,
+                          BigDecimal base) {
+
+        st.base = base;
+        st.levels = computeLevels(base, s);
+
+        long tfMillis = TimeframeUtils.toMillis(s.getTimeframe());
+        Instant candleTime = resolveCandleTime(Instant.now(), tfMillis);
+
+        st.lastSavedCandleTime = candleTime;
+
+        saveLayers(chatId, st.symbol, candleTime, st.levels);
     }
 
 }

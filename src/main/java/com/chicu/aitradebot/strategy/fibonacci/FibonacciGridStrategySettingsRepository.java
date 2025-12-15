@@ -10,4 +10,6 @@ public interface FibonacciGridStrategySettingsRepository
         extends JpaRepository<FibonacciGridStrategySettings, Long> {
 
     Optional<FibonacciGridStrategySettings> findTopByChatIdOrderByIdDesc(Long chatId);
+
+
 }

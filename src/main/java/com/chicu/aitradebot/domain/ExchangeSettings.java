@@ -85,7 +85,12 @@ public class ExchangeSettings {
         return this.network == NetworkType.TESTNET;
     }
 
-
+    /** Проверка: есть ли валидные ключи (используется в контроллерах/сервисах) */
+    @Transient
+    public boolean hasKeys() {
+        return apiKey != null && !apiKey.isBlank()
+               && apiSecret != null && !apiSecret.isBlank();
+    }
 
     // ===================== Методы совместимости =====================
 
@@ -94,6 +99,4 @@ public class ExchangeSettings {
     public boolean getTestnet() {
         return isTestnet();
     }
-
-
 }

@@ -2,6 +2,7 @@ package com.chicu.aitradebot.web.service;
 
 import com.chicu.aitradebot.web.facade.WebDashboardFacade;
 import com.chicu.aitradebot.web.facade.WebStrategyFacade;
+import com.chicu.aitradebot.web.facade.StrategyUi;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
@@ -28,9 +29,9 @@ public class StrategyDashboardService {
     }
 
     /**
-     * Список стратегий для UI (v4-фасад возвращает DTO).
+     * Список стратегий для UI.
      */
-    public List<WebStrategyFacade.StrategyUi> getStrategies(Long chatId) {
+    public List<StrategyUi> getStrategies(Long chatId) {
         return strategyFacade.getStrategies(chatId);
     }
 }

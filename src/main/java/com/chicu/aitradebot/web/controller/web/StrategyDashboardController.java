@@ -1,8 +1,7 @@
 package com.chicu.aitradebot.web.controller.web;
 
 import com.chicu.aitradebot.common.enums.StrategyType;
-import com.chicu.aitradebot.service.StrategySettingsService;
-import com.chicu.aitradebot.web.facade.WebStrategyFacade;
+import com.chicu.aitradebot.orchestrator.AiStrategyOrchestrator;
 import com.chicu.aitradebot.orchestrator.dto.StrategyRunInfo;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -16,33 +15,26 @@ import org.springframework.web.bind.annotation.*;
 @RequestMapping("/strategies")
 public class StrategyDashboardController {
 
-    private final WebStrategyFacade webStrategyFacade;
-    private final StrategySettingsService settingsService;
+    private final AiStrategyOrchestrator orchestrator;
 
-    @GetMapping("/{type}/dashboard")
-    public String dashboard(
-            @PathVariable StrategyType type,
-            @RequestParam Long chatId,
-            @RequestParam String symbol,
-            Model model
-    ) {
-        log.info("📊 Открытие дашборда {} chatId={} symbol={}", type, chatId, symbol);
+    @GetMapping("/{type}/strategy_dashboard")
+    public String strategyDashboardPage(@PathVariable("type") String type,
+                                        @RequestParam("chatId") Long chatId,
+                                        @RequestParam(value = "symbol", required = false) String symbol,
+                                        Model model) {
 
-        // 1. Настройки стратегии
-        var settings = settingsService.getOrCreate(chatId, type);
+        StrategyRunInfo info = orchestrator.getStatus(chatId, StrategyType.valueOf(type));
 
-        // 2. Текущее состояние стратегии
-        StrategyRunInfo info = webStrategyFacade.getRunInfo(chatId, type);
+        if (info == null) {
+            log.warn("StrategyRunInfo is null for chatId={} type={}", chatId, type);
+        }
 
-        // 3. На данном этапе trades временно ставим null — UI это поддерживает
-        model.addAttribute("trades", null);
-
-        // 4. Передаём параметры в UI
-        model.addAttribute("chatId", chatId);
-        model.addAttribute("symbol", settings.getSymbol());
+        model.addAttribute("page", "strategy_dashboard");
         model.addAttribute("type", type);
+        model.addAttribute("chatId", chatId);
+        model.addAttribute("symbol",
+                symbol != null ? symbol : (info != null ? info.getSymbol() : "BTCUSDT"));
         model.addAttribute("info", info);
-
-        return "strategies/dashboard";
+        return "layout/app";
     }
 }

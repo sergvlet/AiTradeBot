@@ -40,6 +40,8 @@ public class OrderServiceImpl implements OrderService {
 
         OrderEntity entity = new OrderEntity();
         entity.setChatId(chatId);
+        entity.setUserId(chatId); // ✅ ИСПРАВЛЕНИЕ
+
         entity.setSymbol(symbol);
         entity.setSide(side);
         entity.setPrice(executionPrice);
@@ -50,8 +52,11 @@ public class OrderServiceImpl implements OrderService {
         entity.setTimestamp(System.currentTimeMillis());
         entity.setCreatedAt(LocalDateTime.now());
 
-        orderRepository.save(entity);
+        if (executionPrice != null && quantity != null) {
+            entity.setTotal(executionPrice.multiply(quantity));
+        }
 
+        orderRepository.save(entity);
         return mapToDto(entity);
     }
 
@@ -73,18 +78,23 @@ public class OrderServiceImpl implements OrderService {
 
         OrderEntity entity = new OrderEntity();
         entity.setChatId(chatId);
+        entity.setUserId(chatId); // ✅
+
         entity.setSymbol(symbol);
         entity.setSide(side);
         entity.setPrice(limitPrice);
         entity.setQuantity(quantity);
         entity.setStrategyType(strategyType);
-        entity.setStatus("NEW");       // лимитник выставлен, ждём исполнения
+        entity.setStatus("NEW");
         entity.setFilled(false);
         entity.setTimestamp(System.currentTimeMillis());
         entity.setCreatedAt(LocalDateTime.now());
 
-        orderRepository.save(entity);
+        if (limitPrice != null && quantity != null) {
+            entity.setTotal(limitPrice.multiply(quantity));
+        }
 
+        orderRepository.save(entity);
         return mapToDto(entity);
     }
 
@@ -104,12 +114,12 @@ public class OrderServiceImpl implements OrderService {
         log.info("📥 [OCO] chatId={}, symbol={}, qty={}, tp={}, stop={}, stopLimit={}, strategy={}",
                 chatId, symbol, quantity, takeProfitPrice, stopPrice, stopLimitPrice, strategyType);
 
-        // В упрощённом варианте — создаём одну запись,
-        // но сохраняем TP/SL в ULTRA-поля
         OrderEntity entity = new OrderEntity();
         entity.setChatId(chatId);
+        entity.setUserId(chatId); // ✅
+
         entity.setSymbol(symbol);
-        entity.setSide("SELL"); // типично для фиксации позиции
+        entity.setSide("SELL");
         entity.setPrice(takeProfitPrice != null ? takeProfitPrice : stopLimitPrice);
         entity.setQuantity(quantity);
         entity.setStrategyType(strategyType);
@@ -121,8 +131,11 @@ public class OrderServiceImpl implements OrderService {
         entity.setTakeProfitPrice(takeProfitPrice);
         entity.setStopLossPrice(stopLimitPrice != null ? stopLimitPrice : stopPrice);
 
-        orderRepository.save(entity);
+        if (entity.getPrice() != null && quantity != null) {
+            entity.setTotal(entity.getPrice().multiply(quantity));
+        }
 
+        orderRepository.save(entity);
         return mapToDto(entity);
     }
 
@@ -133,7 +146,7 @@ public class OrderServiceImpl implements OrderService {
     @Transactional
     public boolean cancelOrder(Long chatId, Long orderId) {
         return orderRepository.findById(orderId)
-                .filter(o -> chatId.equals(o.getChatId()))
+                .filter(o -> chatId != null && chatId.equals(o.getChatId()))
                 .map(o -> {
                     log.info("❌ [CANCEL] chatId={}, orderId={}", chatId, orderId);
                     o.setStatus("CANCELED");
@@ -187,27 +200,41 @@ public class OrderServiceImpl implements OrderService {
     @Override
     @Transactional
     public Order createOrder(Order order) {
+        if (order == null) return null;
+
         log.info("📥 [CREATE] order DTO = {}", order);
 
         OrderEntity entity = new OrderEntity();
         entity.setChatId(order.getChatId());
+        entity.setUserId(order.getChatId()); // ✅
+
         entity.setSymbol(order.getSymbol());
         entity.setSide(order.getSide());
         entity.setPrice(order.getPrice());
         entity.setQuantity(order.getQuantity());
-        entity.setStrategyType(String.valueOf(order.getStrategyType()));
         entity.setStatus(order.getStatus() != null ? order.getStatus() : "NEW");
         entity.setFilled(Boolean.TRUE.equals(order.isFilled()));
-        entity.setTimestamp(order.getTimestamp() != null ? order.getTimestamp() : System.currentTimeMillis());
+        entity.setTimestamp(order.getTimestamp() != null
+                ? order.getTimestamp()
+                : System.currentTimeMillis());
         entity.setCreatedAt(LocalDateTime.now());
 
-        orderRepository.save(entity);
+        if (order.getStrategyType() != null) {
+            entity.setStrategyType(String.valueOf(order.getStrategyType()));
+        } else {
+            entity.setStrategyType("UNKNOWN");
+        }
 
+        if (entity.getPrice() != null && entity.getQuantity() != null) {
+            entity.setTotal(entity.getPrice().multiply(entity.getQuantity()));
+        }
+
+        orderRepository.save(entity);
         return mapToDto(entity);
     }
 
     // ==========================
-    // ИСТОРИЯ (DTO)
+    // HISTORY (DTO)
     // ==========================
     @Override
     @Transactional(readOnly = true)
@@ -221,7 +248,7 @@ public class OrderServiceImpl implements OrderService {
     }
 
     // ==========================
-    // ИСТОРИЯ (ENTITY)
+    // HISTORY (ENTITY)
     // ==========================
     @Override
     @Transactional(readOnly = true)
@@ -230,29 +257,28 @@ public class OrderServiceImpl implements OrderService {
     }
 
     // ==========================
-    // МАППЕР Entity → DTO
+    // МАППЕР
     // ==========================
-    /**
-     * Здесь я предполагаю, что у Order есть геттеры/сеттеры или @Builder.
-     * Если у тебя другой формат Order — просто поправим маппинг.
-     */
     private Order mapToDto(OrderEntity e) {
-        if (e == null) {
-            return null;
-        }
+        if (e == null) return null;
 
-        // ⚠️ ВАЖНО: подстрой под фактическую структуру com.chicu.aitradebot.exchange.model.Order
-        Order order = new Order();
-        order.setId(e.getId());
-        order.setChatId(e.getChatId());
-        order.setSymbol(e.getSymbol());
-        order.setSide(e.getSide());
-        order.setPrice(e.getPrice());
-        order.setQuantity(e.getQuantity());
-        order.setStatus(e.getStatus());
-        order.setFilled(e.getFilled());
-        order.setTimestamp(e.getTimestamp());
-        order.setStrategyType(StrategyType.valueOf(e.getStrategyType()));
-        return order;
+        Order o = new Order();
+        o.setId(e.getId());
+        o.setChatId(e.getChatId());
+        o.setSymbol(e.getSymbol());
+        o.setSide(e.getSide());
+        o.setPrice(e.getPrice());
+        o.setQuantity(e.getQuantity());
+        o.setStatus(e.getStatus());
+        o.setFilled(e.getFilled());
+        o.setTimestamp(e.getTimestamp());
+
+        try {
+            if (e.getStrategyType() != null) {
+                o.setStrategyType(StrategyType.valueOf(e.getStrategyType()));
+            }
+        } catch (Exception ignore) {}
+
+        return o;
     }
 }

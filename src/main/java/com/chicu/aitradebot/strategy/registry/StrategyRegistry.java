@@ -9,23 +9,33 @@ import org.springframework.stereotype.Component;
 
 import java.util.*;
 
+/**
+ * Универсальный реестр стратегий (v4):
+ *  1) UI-метаданные (FieldMeta) — старый модуль, оставлен полностью.
+ *  2) Реестр Java-бинов стратегий (register/getStrategy) — ядро v4.
+ *
+ * StrategyBindingProcessor вызывает register() автоматически.
+ */
 @Slf4j
 @Component
 public class StrategyRegistry {
 
-    // ========= СТАРЫЙ UI-ФУНКЦИОНАЛ (оставляем полностью) =========
+    // =====================================================================
+    // 1) МЕТАДАННЫЕ ДЛЯ UI (СТАРЫЙ МЕХАНИЗМ — НЕ УБИРАЕМ)
+    // =====================================================================
 
     @Data
     @AllArgsConstructor
     public static class FieldMeta {
-        private String name;   // имя свойства в StrategySettings
-        private String label;  // название для UI
-        private String type;   // text | number | checkbox
+        private String name;     // имя поля в StrategySettings
+        private String label;    // label в UI
+        private String type;     // text | number | checkbox
     }
 
-    private final Map<StrategyType, List<FieldMeta>> fields = new HashMap<>();
+    private final Map<StrategyType, List<FieldMeta>> fields = new EnumMap<>(StrategyType.class);
 
     public StrategyRegistry() {
+
         fields.put(StrategyType.SMART_FUSION, List.of(
                 new FieldMeta("emaPeriod", "EMA период", "number"),
                 new FieldMeta("atrPeriod", "ATR период", "number"),
@@ -58,19 +68,33 @@ public class StrategyRegistry {
         return fields.getOrDefault(type, List.of());
     }
 
-    // ========= НОВАЯ ЧАСТЬ — РЕЕСТР СТРАТЕГИЙ ДЛЯ ENGINE =========
+    // =====================================================================
+    // 2) РЕЕСТР JAVA-СТРАТЕГИЙ (ДЛЯ ENGINE)
+    // =====================================================================
 
-    /** Реестр настоящих Java-объектов стратегий */
-    private final Map<StrategyType, TradingStrategy> strategies = new EnumMap<>(StrategyType.class);
+    private final Map<StrategyType, TradingStrategy> strategies =
+            new EnumMap<>(StrategyType.class);
 
-    /** StrategyBindingProcessor вызывает это автоматически */
+    /**
+     * Вызывается автопроцессором StrategyBindingProcessor.
+     */
     public void register(StrategyType type, TradingStrategy strategy) {
         strategies.put(type, strategy);
         log.info("📌 Strategy registered: {} → {}", type, strategy.getClass().getSimpleName());
     }
 
-    /** Получить стратегию по типу (для StrategyEngine) */
+    /**
+     * Получить стратегию (основной метод).
+     */
     public TradingStrategy getStrategy(StrategyType type) {
+        return strategies.get(type);
+    }
+
+    /**
+     * Алиас для обратной совместимости.
+     * Некоторые сервисы вызывали registry.get(type).
+     */
+    public TradingStrategy get(StrategyType type) {
         return strategies.get(type);
     }
 }

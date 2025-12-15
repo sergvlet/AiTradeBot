@@ -14,26 +14,26 @@ import org.springframework.web.bind.annotation.*;
 @Slf4j
 @RestController
 @RequiredArgsConstructor
-@RequestMapping("/api/strategy")
+@RequestMapping("/api/strategy") // ← ОСТАВЛЯЕМ ЭТОТ ПУТЬ
 public class StrategyToggleApiController {
 
     private final WebStrategyFacade webStrategyFacade;
 
     /**
-     * POST /api/strategy/toggle?chatId=1&type=SMART_FUSION&symbol=BTCUSDT
+     * POST /api/strategy/toggle
+     * chatId=1&type=SMART_FUSION&symbol=BTCUSDT&timeframe=1m
      */
     @PostMapping("/toggle")
     public ResponseEntity<ToggleResponse> toggle(
             @RequestParam Long chatId,
             @RequestParam StrategyType type,
-            @RequestParam(required = false) String symbol,
-            @RequestParam(required = false) String timeframe
+            @RequestParam String symbol,
+            @RequestParam(required = false, defaultValue = "1m") String timeframe
     ) {
-
-        log.info("🌐 [WEB] toggle: chatId={}, type={}, symbol={}, timeframe={}",
+        log.info("🌐 [WEB] toggle strategy: chatId={}, type={}, symbol={}, timeframe={}",
                 chatId, type, symbol, timeframe);
 
-        // === ВАЛИДАЦИЯ ===
+        // === Валидация ===
         if (chatId == null || chatId <= 0) {
             return ResponseEntity.badRequest()
                     .body(ToggleResponse.error("Некорректный chatId"));
@@ -41,19 +41,19 @@ public class StrategyToggleApiController {
 
         if (symbol == null || symbol.isBlank()) {
             return ResponseEntity.badRequest()
-                    .body(ToggleResponse.error("Не указан торговый символ"));
+                    .body(ToggleResponse.error("Не указан символ"));
         }
 
         try {
-            StrategyRunInfo info =
-                    webStrategyFacade.toggleStrategy(chatId, type, symbol, timeframe);
+            // ⚡ ВАЖНО — вызываем единый фасад
+            StrategyRunInfo info = webStrategyFacade.toggleStrategy(chatId, type, symbol, timeframe);
 
             return ResponseEntity.ok(
                     ToggleResponse.success(info.isActive(), info.getMessage(), info)
             );
 
         } catch (Exception ex) {
-            log.error("❌ Ошибка при toggle стратегии", ex);
+            log.error("❌ Ошибка переключения стратегии", ex);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                     .body(ToggleResponse.error("Ошибка переключения стратегии"));
         }
@@ -62,7 +62,6 @@ public class StrategyToggleApiController {
     // =============================================================
     // DTO ответа
     // =============================================================
-
     @Data
     @AllArgsConstructor
     public static class ToggleResponse {

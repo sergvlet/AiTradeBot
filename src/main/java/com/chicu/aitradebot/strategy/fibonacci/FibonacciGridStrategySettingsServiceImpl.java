@@ -12,42 +12,81 @@ public class FibonacciGridStrategySettingsServiceImpl
 
     private final FibonacciGridStrategySettingsRepository repo;
 
+    // =====================================================================
+    // GET OR CREATE
+    // =====================================================================
     @Override
     public FibonacciGridStrategySettings getOrCreate(Long chatId) {
         return repo.findTopByChatIdOrderByIdDesc(chatId)
                 .orElseGet(() -> {
-                    FibonacciGridStrategySettings def = FibonacciGridStrategySettings.builder()
-                            .chatId(chatId)
-                            .symbol("BTCUSDT")
-                            .gridLevels(6)
-                            .distancePct(0.5)
-                            .baseOrderVolume(20.0)
-                            .timeframe("1m")
-                            .candleLimit(200)
-                            .build();
+
+                    FibonacciGridStrategySettings def =
+                            FibonacciGridStrategySettings.builder()
+                                    .chatId(chatId)
+                                    .build(); // все дефолты через @Builder.Default
 
                     log.info("🆕 Созданы настройки Fibonacci Grid (chatId={})", chatId);
                     return repo.save(def);
                 });
     }
 
+    // =====================================================================
+    // SAVE (прямое сохранение)
+    // =====================================================================
     @Override
     public FibonacciGridStrategySettings save(FibonacciGridStrategySettings settings) {
         return repo.save(settings);
     }
 
+    // =====================================================================
+    // UPDATE (частичное обновление DTO)
+    // =====================================================================
     @Override
-    public FibonacciGridStrategySettings update(Long chatId, FibonacciGridStrategySettings dto) {
+    public FibonacciGridStrategySettings update(Long chatId,
+                                                FibonacciGridStrategySettings dto) {
+
         FibonacciGridStrategySettings s = getOrCreate(chatId);
 
-        if (dto.getSymbol() != null) s.setSymbol(dto.getSymbol());
-        if (dto.getGridLevels() > 0) s.setGridLevels(dto.getGridLevels());
-        if (dto.getDistancePct() > 0) s.setDistancePct(dto.getDistancePct());
-        if (dto.getBaseOrderVolume() > 0) s.setBaseOrderVolume(dto.getBaseOrderVolume());
+        // ===== UNIVERSAL (пока ограничены тем, что есть в сущности) =====
 
-        if (dto.getTimeframe() != null) s.setTimeframe(dto.getTimeframe());
-        if (dto.getCandleLimit() > 0) s.setCandleLimit(dto.getCandleLimit());
+        if (dto.getSymbol() != null && !dto.getSymbol().isBlank())
+            s.setSymbol(dto.getSymbol().toUpperCase());
+
+        if (dto.getTimeframe() != null && !dto.getTimeframe().isBlank())
+            s.setTimeframe(dto.getTimeframe());
+
+        if (dto.getCandleLimit() > 0)
+            s.setCandleLimit(dto.getCandleLimit());
+
+        if (dto.getNetworkType() != null)
+            s.setNetworkType(dto.getNetworkType());
+
+        s.setActive(dto.isActive());
+
+        // ===== UNIQUE FIB GRID FIELDS =====
+
+        if (dto.getGridLevels() > 0)
+            s.setGridLevels(dto.getGridLevels());
+
+        if (dto.getDistancePct() > 0)
+            s.setDistancePct(dto.getDistancePct());
+
+        if (dto.getBaseOrderVolume() > 0)
+            s.setBaseOrderVolume(dto.getBaseOrderVolume());
+
+        if (dto.getTakeProfitPct() > 0)
+            s.setTakeProfitPct(dto.getTakeProfitPct());
+
+        if (dto.getStopLossPct() > 0)
+            s.setStopLossPct(dto.getStopLossPct());
 
         return repo.save(s);
     }
+    @Override
+    public FibonacciGridStrategySettings getLatest(Long chatId) {
+        return repo.findTopByChatIdOrderByIdDesc(chatId)
+                .orElseThrow(() -> new IllegalStateException(
+                        "Нет настроек FibonacciGrid для chatId=" + chatId));
+    }
+
 }

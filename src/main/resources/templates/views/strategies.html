@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="ru" xmlns:th="http://www.thymeleaf.org">
+<body>
+
+<div th:fragment="content">
+
+    <h2 class="fw-bold mb-4 d-flex align-items-center gap-2">
+        <i class="bi bi-diagram-3"></i>
+        <span>Стратегии</span>
+    </h2>
+
+    <div class="row g-4">
+
+        <!-- ОДНА КАРТОЧКА НА СТРАТЕГИЮ -->
+        <div class="col-md-4 col-sm-6" th:each="s : ${strategies}">
+
+            <div class="card card-theme strategy-card h-100 shadow-sm"
+                 th:classappend="${s.active} ? ' border-success border-2' : ''">
+
+                <div class="card-body text-center">
+
+                    <!-- Название стратегии -->
+                    <h5 class="strategy-title mb-2" th:text="${s.title}">Strategy</h5>
+
+                    <!-- Статус -->
+                    <span class="badge px-3 py-2 mb-2"
+                          th:classappend="${s.active} ? ' bg-success' : ' bg-secondary'">
+                        <span th:text="${s.active} ? '🟢 Активна' : '⚫ Остановлена'">⚫ Остановлена</span>
+                    </span>
+
+                    <!-- Основная инфа -->
+                    <div class="small">
+                        <div>
+                            PnL:
+                            <span th:text="${s.totalProfitPct}"
+                                  th:classappend="${s.totalProfitPct >= 0} ? ' pnl-green' : ' pnl-red'">0</span>%
+                        </div>
+                        <div>ML доверие: <strong th:text="${s.mlConfidence}">0</strong></div>
+                        <div>Пара: <strong th:text="${s.symbol}">BTCUSDT</strong></div>
+                        <div>Сеть: <strong th:text="${s.networkType}">MAINNET</strong></div>
+                    </div>
+
+                    <!-- КНОПКИ -->
+                    <div class="mt-4 d-grid gap-2">
+
+                        <!-- 🚀 Запустить / Остановить -->
+                        <button type="button"
+                                class="btn toggle-btn"
+                                th:classappend="${s.active} ? ' btn-outline-danger' : ' btn-outline-success'"
+                                th:data-type="${s.type}"
+                                th:data-chat-id="${s.chatId}"
+                                th:data-symbol="${s.symbol}"
+                                th:data-active="${s.active}">
+                            <i th:class="${s.active} ? 'bi bi-stop-fill' : 'bi bi-play-fill'"></i>
+                            <span th:text="${s.active} ? 'Остановить' : 'Запустить'">Запустить</span>
+                        </button>
+
+                        <!-- 📊 Дашборд -->
+                        <a class="btn btn-outline-primary"
+                           th:href="@{'/strategies/' + ${s.type} + '/strategy_dashboard'(chatId=${s.chatId}, symbol=${s.symbol})}">
+                            <i class="bi bi-graph-up"></i> Дашборт
+                        </a>
+
+
+                        <!-- ⚙️ Настройки (ИСПРАВЛЕНО) -->
+                        <a class="btn btn-outline-primary"
+                           th:href="@{'/strategies/' + ${s.type} + '/config'(chatId=${s.chatId})}">
+                            <i class="bi bi-gear"></i> Настройки
+                        </a>
+
+                    </div>
+
+                </div>
+            </div>
+
+        </div>
+
+    </div>
+
+</div>
+
+</body>
+</html>

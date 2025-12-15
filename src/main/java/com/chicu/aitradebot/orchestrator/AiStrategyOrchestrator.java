@@ -8,6 +8,8 @@ import com.chicu.aitradebot.market.stream.StreamConnectionManager;
 import com.chicu.aitradebot.orchestrator.dto.StrategyRunInfo;
 import com.chicu.aitradebot.service.OrderService;
 import com.chicu.aitradebot.service.StrategySettingsService;
+import com.chicu.aitradebot.strategy.core.TradingStrategy;
+import com.chicu.aitradebot.strategy.registry.StrategyRegistry;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -30,9 +32,12 @@ public class AiStrategyOrchestrator {
     private final StrategySettingsService settingsService;
     private final StreamConnectionManager streamManager;
 
+    // ✅ ОБЯЗАТЕЛЬНО: нужен для replayLayers
+    private final StrategyRegistry strategyRegistry;
+
     @PostConstruct
     public void init() {
-        log.info("🧠 AiStrategyOrchestrator v4.5 initialized (dynamic WS subscription, multi-exchange).");
+        log.info("🧠 AiStrategyOrchestrator v4.5 initialized");
     }
 
     // =====================================================================
@@ -42,55 +47,34 @@ public class AiStrategyOrchestrator {
     public StrategyRunInfo startStrategy(Long chatId, StrategyType type) {
         StrategySettings s = settingsService.getOrCreate(chatId, type);
 
-        String symbol   = s.getSymbol();
-        String exchange = s.getExchangeName();
+        String symbol    = s.getSymbol();
+        String exchange  = s.getExchangeName();
         String timeframe = s.getTimeframe();
-        int tick = resolveTickIntervalSec(type);
+        int tick         = resolveTickIntervalSec(type);
 
         if (symbol == null || symbol.isBlank()) {
-            log.error("❌ Нельзя запустить стратегию без символа! chatId={} type={}", chatId, type);
+            log.error("❌ No symbol chatId={} type={}", chatId, type);
             return buildRunInfo(s, false, "Ошибка: не выбран символ");
         }
 
-        // 🔥 Подписываем только нужную биржу
-        streamManager.subscribeSymbol(symbol, exchange);
-
-        strategyEngine.start(chatId, type, symbol, tick);
-
-        s.setActive(true);
-        s.setUpdatedAt(LocalDateTime.now());
-        settingsService.save(s);
-
-        log.info("▶️ START {} | chatId={} exchange={} symbol={} tf={} tick={}s",
-                type, chatId, exchange, symbol, timeframe, tick);
-
-        return buildRunInfo(s, true, "Стратегия запущена");
-    }
-
-    public StrategyRunInfo startStrategy(Long chatId,
-                                         StrategyType type,
-                                         String symbol,
-                                         int tick) {
-
-        StrategySettings s = settingsService.getOrCreate(chatId, type);
-        String exchange = s.getExchangeName();
-
-        if (symbol == null || symbol.isBlank()) {
-            log.error("❌ Пустой символ при ручном запуске!");
-            return buildRunInfo(s, false, "Ошибка: символ пустой");
+        if (exchange == null || exchange.isBlank()) {
+            log.error("❌ No exchange chatId={} type={}", chatId, type);
+            return buildRunInfo(s, false, "Ошибка: не выбрана биржа");
         }
 
-        streamManager.subscribeSymbol(symbol, exchange);
-
+        streamManager.subscribeSymbol(exchange, symbol);
         strategyEngine.start(chatId, type, symbol, tick);
 
-        s.setSymbol(symbol);
+        if (!strategyEngine.isRunning(chatId, type)) {
+            log.error("❌ Strategy {} not started chatId={}", type, chatId);
+            return buildRunInfo(s, false, "Ошибка запуска стратегии");
+        }
+
         s.setActive(true);
         s.setUpdatedAt(LocalDateTime.now());
         settingsService.save(s);
 
-        log.info("▶️ START {} (manual) | chatId={} exchange={} symbol={} tick={}",
-                type, chatId, exchange, symbol, tick);
+        log.info("▶️ START {} chatId={} {} {}", type, chatId, exchange, symbol);
 
         return buildRunInfo(s, true, "Стратегия запущена");
     }
@@ -107,21 +91,13 @@ public class AiStrategyOrchestrator {
         s.setUpdatedAt(LocalDateTime.now());
         settingsService.save(s);
 
-        log.info("⏹ STOP {} | chatId={}", type, chatId);
+        log.info("⏹ STOP {} chatId={}", type, chatId);
 
         return buildRunInfo(s, false, "Стратегия остановлена");
     }
 
     // =====================================================================
-    // ❓ STATUS
-    // =====================================================================
-
-    public boolean isActive(Long chatId, StrategyType type) {
-        return strategyEngine.isRunning(chatId, type);
-    }
-
-    // =====================================================================
-    // 📋 STRATEGY LIST (UI)
+    // 📋 STRATEGY LIST
     // =====================================================================
 
     public record StrategyInfo(StrategyType type, boolean active) {}
@@ -137,10 +113,8 @@ public class AiStrategyOrchestrator {
     }
 
     // =====================================================================
-    // 💰 ORDER MANAGEMENT
+    // 💰 ORDERS
     // =====================================================================
-
-    public record OrderResult(boolean success, String message, Long orderId) {}
 
     public record OrderView(
             Long id,
@@ -171,101 +145,40 @@ public class AiStrategyOrchestrator {
                     .toList();
 
         } catch (Exception e) {
-            log.error("❌ listOrders error: {}", e.getMessage(), e);
+            log.error("❌ listOrders error", e);
             return List.of();
         }
     }
 
-    public OrderResult marketBuy(Long chatId, String symbol, BigDecimal qty) {
+    // =====================================================================
+    // 🔁 REPLAY STRATEGY LAYERS (🔥 ДЛЯ ГРАФИКА)
+    // =====================================================================
+
+    public void replayStrategyLayers(Long chatId, StrategyType type) {
+        TradingStrategy strategy;
         try {
-            var order = orderService.placeMarket(chatId, symbol, "BUY", qty, BigDecimal.ZERO, "ORCHESTRATOR");
-            return new OrderResult(true, "BUY OK", order.getId());
+            strategy = strategyRegistry.get(type);
         } catch (Exception e) {
-            log.error("❌ marketBuy error: {}", e.getMessage(), e);
-            return new OrderResult(false, e.getMessage(), null);
+            // если StrategyRegistry внутри кидает исключение — не даём 500
+            log.error("❌ replayLayers: StrategyRegistry.get failed type={} chatId={}", type, chatId, e);
+            return;
         }
-    }
 
-    public OrderResult marketSell(Long chatId, String symbol, BigDecimal qty) {
+        if (strategy == null) {
+            log.warn("⚠ replayLayers: strategy not found type={} chatId={}", type, chatId);
+            return;
+        }
+
+        log.info("🔁 replayLayers START type={} chatId={} strategyClass={}", type, chatId, strategy.getClass().getName());
+
         try {
-            var order = orderService.placeMarket(chatId, symbol, "SELL", qty, BigDecimal.ZERO, "ORCHESTRATOR");
-            return new OrderResult(true, "SELL OK", order.getId());
+            strategy.replayLayers(chatId);
+            log.info("✅ replayLayers OK type={} chatId={}", type, chatId);
         } catch (Exception e) {
-            log.error("❌ marketSell error: {}", e.getMessage(), e);
-            return new OrderResult(false, e.getMessage(), null);
+            // ВОТ ЭТО и было причиной 500: исключение улетало в контроллер
+            log.error("❌ replayLayers FAILED type={} chatId={} strategyClass={}",
+                    type, chatId, strategy.getClass().getName(), e);
         }
-    }
-
-    public boolean cancelOrder(Long chatId, long orderId) {
-        try {
-            return orderService.cancelOrder(chatId, orderId);
-        } catch (Exception e) {
-            log.error("❌ cancelOrder error: {}", e.getMessage(), e);
-            return false;
-        }
-    }
-
-    // =====================================================================
-    // GLOBAL
-    // =====================================================================
-
-    public record GlobalState(BigDecimal totalBalance, BigDecimal totalProfitPct, int activeStrategies) {}
-
-    public GlobalState getGlobalState(Long chatId) {
-        int active = strategyEngine.getRunningStrategies(chatId).size();
-        return new GlobalState(BigDecimal.ZERO, BigDecimal.ZERO, active);
-    }
-
-    // =====================================================================
-    // BALANCE (заглушка пока)
-    // =====================================================================
-
-    public record BalanceView(BigDecimal total, BigDecimal free, BigDecimal locked) {}
-
-    public BalanceView getBalance(Long chatId) {
-        return new BalanceView(BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO);
-    }
-
-    public record AssetBalanceView(String asset, BigDecimal free, BigDecimal locked) {}
-
-    public List<AssetBalanceView> getAssets(Long chatId) {
-        return List.of(
-                new AssetBalanceView("USDT", BigDecimal.ZERO, BigDecimal.ZERO),
-                new AssetBalanceView("BTC", BigDecimal.ZERO, BigDecimal.ZERO)
-        );
-    }
-
-    // =====================================================================
-    // 🚀 BUILD StrategyRunInfo
-    // =====================================================================
-
-    private StrategyRunInfo buildRunInfo(StrategySettings s, boolean active, String msg) {
-
-        return StrategyRunInfo.builder()
-                .chatId(s.getChatId())
-                .type(s.getType())
-                .symbol(s.getSymbol())
-                .active(active)
-
-                .timeframe(s.getTimeframe())
-                .exchangeName(s.getExchangeName())
-                .networkType(s.getNetworkType())
-
-                .capitalUsd(s.getCapitalUsd())
-                .equityUsd(s.getCapitalUsd())
-                .totalProfitPct(s.getTotalProfitPct())
-                .commissionPct(s.getCommissionPct())
-                .takeProfitPct(s.getTakeProfitPct())
-                .stopLossPct(s.getStopLossPct())
-                .riskPerTradePct(s.getRiskPerTradePct())
-                .mlConfidence(s.getMlConfidence())
-                .reinvestProfit(s.isReinvestProfit())
-
-                .totalTrades(0L)
-                .startedAt(active ? Instant.now() : null)
-                .stoppedAt(active ? null : Instant.now())
-                .message(msg)
-                .build();
     }
 
     // =====================================================================
@@ -281,5 +194,105 @@ public class AiStrategyOrchestrator {
             case ML_INVEST -> 30;
             default -> 10;
         };
+    }
+
+    private StrategyRunInfo buildRunInfo(StrategySettings s, boolean active, String msg) {
+        return StrategyRunInfo.builder()
+                .chatId(s.getChatId())
+                .type(s.getType())
+                .symbol(s.getSymbol())
+                .active(active)
+                .timeframe(s.getTimeframe())
+                .exchangeName(s.getExchangeName())
+                .networkType(s.getNetworkType())
+                .capitalUsd(s.getCapitalUsd())
+                .equityUsd(s.getCapitalUsd())
+                .totalProfitPct(s.getTotalProfitPct())
+                .commissionPct(s.getCommissionPct())
+                .takeProfitPct(s.getTakeProfitPct())
+                .stopLossPct(s.getStopLossPct())
+                .riskPerTradePct(s.getRiskPerTradePct())
+                .mlConfidence(s.getMlConfidence())
+                .reinvestProfit(s.isReinvestProfit())
+                .totalTrades(0L)
+                .startedAt(active ? Instant.now() : null)
+                .stoppedAt(active ? null : Instant.now())
+                .message(msg)
+                .build();
+    }
+
+    // =====================================================================
+    // ❓ STATUS (для Dashboard)
+    // =====================================================================
+
+    public StrategyRunInfo getStatus(Long chatId, StrategyType type) {
+        StrategySettings s = settingsService.getOrCreate(chatId, type);
+        boolean active = strategyEngine.isRunning(chatId, type);
+
+        return buildRunInfo(
+                s,
+                active,
+                active ? "Стратегия запущена" : "Стратегия остановлена"
+        );
+    }
+
+    // =====================================================================
+    // GLOBAL
+    // =====================================================================
+
+    public record GlobalState(BigDecimal totalBalance, BigDecimal totalProfitPct, int activeStrategies) {}
+
+    public GlobalState getGlobalState(Long chatId) {
+        int active = strategyEngine.getRunningStrategies(chatId).size();
+        return new GlobalState(BigDecimal.ZERO, BigDecimal.ZERO, active);
+    }
+
+    // =====================================================================
+    // 💰 ORDER MANAGEMENT (for Web UI)
+    // =====================================================================
+
+    public record OrderResult(boolean success, String message, Long orderId) {}
+
+    public OrderResult marketBuy(Long chatId, String symbol, BigDecimal qty) {
+        try {
+            Order order = orderService.placeMarket(
+                    chatId,
+                    symbol,
+                    "BUY",
+                    qty,
+                    BigDecimal.ZERO,
+                    "WEB_UI"
+            );
+            return new OrderResult(true, "BUY OK", order.getId());
+        } catch (Exception e) {
+            log.error("❌ marketBuy error: {}", e.getMessage(), e);
+            return new OrderResult(false, e.getMessage(), null);
+        }
+    }
+
+    public OrderResult marketSell(Long chatId, String symbol, BigDecimal qty) {
+        try {
+            Order order = orderService.placeMarket(
+                    chatId,
+                    symbol,
+                    "SELL",
+                    qty,
+                    BigDecimal.ZERO,
+                    "WEB_UI"
+            );
+            return new OrderResult(true, "SELL OK", order.getId());
+        } catch (Exception e) {
+            log.error("❌ marketSell error: {}", e.getMessage(), e);
+            return new OrderResult(false, e.getMessage(), null);
+        }
+    }
+
+    public boolean cancelOrder(Long chatId, long orderId) {
+        try {
+            return orderService.cancelOrder(chatId, orderId);
+        } catch (Exception e) {
+            log.error("❌ cancelOrder error: {}", e.getMessage(), e);
+            return false;
+        }
     }
 }

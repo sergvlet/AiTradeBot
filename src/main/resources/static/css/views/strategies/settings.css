@@ -1,0 +1,131 @@
+/* =========================================================
+   SETTINGS PAGE — FULL STYLESHEET
+   static/css/views/strategies/settings.css
+   ========================================================= */
+
+.strategy-settings-page {
+    color: #e5e7eb;
+}
+
+/* ---------------------- CARD ---------------------- */
+.strategy-settings-page .card-theme {
+    background: #15171a;
+    border: 1px solid #2a2d31;
+    border-radius: 16px;
+    padding: 20px;
+}
+
+/* ---------------------- TABS ----------------------- */
+.strategy-settings-page .nav-tabs {
+    border-bottom: 1px solid rgba(148, 163, 184, 0.3);
+}
+
+.strategy-settings-page .nav-tabs .nav-link {
+    padding: 12px 20px;
+    color: #c7cbd1;
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    font-weight: 500;
+    transition: all .15s ease-in-out;
+}
+
+.strategy-settings-page .nav-tabs .nav-link:hover {
+    color: #fff;
+}
+
+.strategy-settings-page .nav-tabs .nav-link.active {
+    color: #fff;
+    border-bottom: 2px solid #0d6efd;
+    background: rgba(13, 110, 253, 0.05);
+}
+
+/* ---------------------- TAB CONTENT ---------------------- */
+.strategy-settings-page .tab-pane {
+    display: none;
+    padding-top: 20px;
+}
+
+.strategy-settings-page .tab-pane.active {
+    display: block;
+}
+
+/* ---------------------- SECTION TITLES ---------------------- */
+.strategy-settings-page .section-title {
+    font-size: 1.1rem;
+    margin: 20px 0 10px;
+    font-weight: 600;
+    color: #f0f0f0;
+}
+
+/* ---------------------- TABLE DIAGNOSTICS -------------------- */
+.strategy-settings-page table {
+    border-radius: 10px;
+    overflow: hidden;
+}
+
+.strategy-settings-page table td {
+    padding: 12px;
+    font-size: 0.95rem;
+}
+
+/* ---------------------- MARKET SEARCH BOX ---------------------- */
+.market-results-box {
+    border: 1px solid #2b2d31;
+    background: #16181d;
+    border-radius: 10px;
+    padding: 0;
+    max-height: 420px;
+    overflow-y: auto;
+}
+
+.market-results-box table {
+    margin-bottom: 0;
+}
+
+/* placeholder text */
+.market-results-box .placeholder {
+    padding: 20px;
+    text-align: center;
+    color: #9ca3af;
+}
+
+.select-symbol {
+    padding: 4px 10px !important;
+}
+
+/* ---------------------- LOADER ---------------------- */
+#loader-overlay {
+    backdrop-filter: blur(3px);
+}
+
+
+/* ---------------------- FORM ---------------------- */
+.strategy-settings-page input,
+.strategy-settings-page select {
+    background: #0e0f11 !important;
+    border: 1px solid #32363c !important;
+    color: #e5e7eb !important;
+}
+
+.strategy-settings-page input:focus,
+.strategy-settings-page select:focus {
+    border-color: #0d6efd !important;
+    box-shadow: 0 0 0 0.15rem rgba(13,110,253,0.25) !important;
+}
+
+/* ---------------------- BUTTONS ---------------------- */
+.strategy-settings-page .btn-outline-info {
+    border-color: #3aa1ff;
+    color: #3aa1ff;
+}
+
+.strategy-settings-page .btn-outline-info:hover {
+    background: #3aa1ff;
+    color: #000;
+}
+
+.strategy-settings-page .btn-primary {
+    background: #0d6efd;
+    border: none;
+}

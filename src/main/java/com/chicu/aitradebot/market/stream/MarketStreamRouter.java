@@ -7,7 +7,6 @@ import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
@@ -18,13 +17,14 @@ public class MarketStreamRouter {
     private final MarketPriceService priceService;
 
     /**
-     * Кэш допустимых источников:
      * symbol → BINANCE / BYBIT
+     * Если карта пустая — пропускаются ВСЕ источники (режим по умолчанию).
      */
     private final Map<String, String> allowedExchange = new ConcurrentHashMap<>();
 
+
     /**
-     * Разрешить символу получать данные только с выбранной биржи
+     * Включает фильтрацию и привязывает символ к бирже
      */
     public void allowSymbol(String symbol, String exchangeName) {
         if (symbol == null || exchangeName == null) return;
@@ -32,8 +32,9 @@ public class MarketStreamRouter {
         log.info("✅ Разрешён стрим: {} @ {}", symbol, exchangeName);
     }
 
+
     /**
-     * Универсальная точка входа для любого тика
+     * Основной роутер
      */
     public void route(Tick tick) {
         if (tick == null) return;
@@ -41,29 +42,45 @@ public class MarketStreamRouter {
         String symbol = normalize(tick.symbol());
         if (symbol.isEmpty()) return;
 
-        // фильтрация по источнику
+        // ФИЛЬТРАЦИЯ ТИКОВ
         if (!isAllowed(symbol, tick.exchange())) {
-            //log.debug("⛔ Отфильтрован тик {} от {}", symbol, tick.exchange());
             return;
         }
 
         BigDecimal price = tick.price();
         if (price == null || price.signum() <= 0) return;
 
-        // сохраняем цену
         priceService.updatePrice(symbol, price);
 
-        log.debug("💹 [{}] {} = {}", tick.exchange(), symbol, price);
+        //log.debug("💹 [{}] {} = {}", tick.exchange(), symbol, price);
     }
 
+
+    /**
+     * Логика допуска источников
+     * 1) Если allowedExchange пустой → пропускаем всё
+     * 2) Если символ есть в карте → пропускаем только подходящую биржу
+     * 3) Если символа нет в карте → пропускаем (символ не отфильтрован)
+     */
     private boolean isAllowed(String symbol, String exchangeFromTick) {
-        String allowed = allowedExchange.get(symbol);
-        if (allowed == null) {
-            // если не настроено — блокируем ВСЁ, чтобы не было диких данных
-            return false;
+
+        // 1) Если пользователь НЕ настроил фильтрацию — разрешаем ВСЁ
+        if (allowedExchange.isEmpty()) {
+            return true;
         }
+
+        // 2) Пользователь ограничил именно этот символ?
+        String allowed = allowedExchange.get(symbol);
+
+        if (allowed == null) {
+            // Фильтрация включена, но символ не указан → В ЭТОМ случае допускаем цену
+            return true;
+        }
+
+        // 3) Символ найден → пропускаем только правильную биржу
         return allowed.equalsIgnoreCase(exchangeFromTick);
     }
+
 
     private String normalize(String s) {
         return s == null ? "" : s.trim().toUpperCase();

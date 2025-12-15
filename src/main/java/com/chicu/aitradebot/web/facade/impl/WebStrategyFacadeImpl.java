@@ -7,13 +7,13 @@ import com.chicu.aitradebot.orchestrator.AiStrategyOrchestrator;
 import com.chicu.aitradebot.orchestrator.dto.StrategyRunInfo;
 import com.chicu.aitradebot.repository.StrategySettingsRepository;
 import com.chicu.aitradebot.service.StrategySettingsService;
+import com.chicu.aitradebot.web.facade.StrategyUi;
 import com.chicu.aitradebot.web.facade.WebStrategyFacade;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
-import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -27,9 +27,9 @@ public class WebStrategyFacadeImpl implements WebStrategyFacade {
     private final StrategySettingsService settingsService;
     private final AiStrategyOrchestrator orchestrator;
 
-    // =============================================================
-    // 📋 Список стратегий для UI (/strategies)
-    // =============================================================
+    // =====================================================================
+    // 📋 UI список стратегий
+    // =====================================================================
     @Override
     public List<StrategyUi> getStrategies(Long chatId) {
 
@@ -71,45 +71,39 @@ public class WebStrategyFacadeImpl implements WebStrategyFacade {
         return result;
     }
 
-    // =============================================================
-    // ▶️ Старт / ⏹ Стоп / 🔁 toggle (СТАРЫЙ API — ОБЯЗАТЕЛЕН)
-    // =============================================================
+    // =====================================================================
+    // 🔁 toggle (старый API)
+    // =====================================================================
     @Override
     public void toggle(Long chatId, StrategyType strategyType) {
         StrategySettings s = settingsService.getOrCreate(chatId, strategyType);
 
         if (s.isActive()) {
-            stop(chatId, strategyType);
+            orchestrator.stopStrategy(chatId, strategyType);
         } else {
-            start(chatId, strategyType);
+            orchestrator.startStrategy(chatId, strategyType);
         }
     }
 
+    // =====================================================================
+    // ▶ start
+    // =====================================================================
     @Override
     public void start(Long chatId, StrategyType strategyType) {
         orchestrator.startStrategy(chatId, strategyType);
-
-        StrategySettings s = settingsService.getOrCreate(chatId, strategyType);
-        s.setActive(true);
-        settingsService.save(s);
-
-        log.info("▶️ Стратегия {} активирована для chatId={}", strategyType, chatId);
     }
 
+    // =====================================================================
+    // ⏹ stop
+    // =====================================================================
     @Override
     public void stop(Long chatId, StrategyType strategyType) {
         orchestrator.stopStrategy(chatId, strategyType);
-
-        StrategySettings s = settingsService.getOrCreate(chatId, strategyType);
-        s.setActive(false);
-        settingsService.save(s);
-
-        log.info("⏹ Стратегия {} остановлена для chatId={}", strategyType, chatId);
     }
 
-    // =============================================================
-    // Новый toggleStrategy() — используется API
-    // =============================================================
+    // =====================================================================
+    // ⭐ Новый API: toggleStrategy (WEB UI)
+    // =====================================================================
     @Override
     public StrategyRunInfo toggleStrategy(Long chatId,
                                           StrategyType strategyType,
@@ -118,85 +112,30 @@ public class WebStrategyFacadeImpl implements WebStrategyFacade {
 
         StrategySettings s = settingsService.getOrCreate(chatId, strategyType);
 
-        if (symbol != null && !symbol.isBlank()) s.setSymbol(symbol);
-        if (timeframe != null && !timeframe.isBlank()) s.setTimeframe(timeframe);
+        if (symbol != null && !symbol.isBlank())
+            s.setSymbol(symbol);
 
-        boolean active = s.isActive();
+        if (timeframe != null && !timeframe.isBlank())
+            s.setTimeframe(timeframe);
 
-        if (active) {
-            stop(chatId, strategyType);
-        } else {
-            start(chatId, strategyType);
-        }
+        settingsService.save(s);
 
-        // reload after start/stop
-        StrategySettings updated = settingsService.getOrCreate(chatId, strategyType);
-
-        return StrategyRunInfo.builder()
-                .chatId(chatId)
-                .type(strategyType)
-                .symbol(updated.getSymbol())
-                .timeframe(updated.getTimeframe())
-                .networkType(updated.getNetworkType())
-                .active(updated.isActive())
-                .capitalUsd(updated.getCapitalUsd())
-                .totalProfitPct(updated.getTotalProfitPct())
-                .riskPerTradePct(updated.getRiskPerTradePct())
-                .mlConfidence(updated.getMlConfidence())
-                .message(active ? "Стратегия остановлена" : "Стратегия запущена")
-                .build();
+        return (s.isActive())
+                ? orchestrator.stopStrategy(chatId, strategyType)
+                : orchestrator.startStrategy(chatId, strategyType);
     }
 
-
-    // =============================================================
-    // ⭐ Построение полного StrategyRunInfo для Дашборда
-    // =============================================================
-    private StrategyRunInfo buildRunInfo(StrategySettings s) {
-
-        return StrategyRunInfo.builder()
-                .chatId(s.getChatId())
-                .type(s.getType())
-                .symbol(s.getSymbol())
-                .timeframe(s.getTimeframe())
-                .active(s.isActive())
-
-                .exchangeName(s.getExchangeName())
-                .networkType(s.getNetworkType())
-
-                .capitalUsd(s.getCapitalUsd())
-                .equityUsd(s.getCapitalUsd()) // позже заменим
-                .commissionPct(s.getCommissionPct())
-                .takeProfitPct(s.getTakeProfitPct())
-                .stopLossPct(s.getStopLossPct())
-                .riskPerTradePct(s.getRiskPerTradePct())
-                .reinvestProfit(s.isReinvestProfit())
-
-                .totalProfitPct(s.getTotalProfitPct())
-                .mlConfidence(s.getMlConfidence())
-
-                // нет поля — ставим 0
-                .totalTrades(0L)
-
-                // LocalDateTime → Instant
-                .startedAt(s.getCreatedAt() != null ? s.getCreatedAt().toInstant(ZoneOffset.UTC) : null)
-                .stoppedAt(s.getUpdatedAt() != null ? s.getUpdatedAt().toInstant(ZoneOffset.UTC) : null)
-
-                .version(s.getVersion())
-                .message("OK")
-                .build();
-    }
-
-    // =============================================================
-    // getRunInfo() для UI
-    // =============================================================
+    // =====================================================================
+    // 📌 RunInfo
+    // =====================================================================
     @Override
     public StrategyRunInfo getRunInfo(Long chatId, StrategyType type) {
-        return buildRunInfo(settingsService.getOrCreate(chatId, type));
+        return orchestrator.getStatus(chatId, type);
     }
 
-    // =============================================================
-    // Дефолтные стратегии
-    // =============================================================
+    // =====================================================================
+    // ⭐ Создание дефолтных записей
+    // =====================================================================
     private void createDefaultStrategies(Long chatId) {
 
         for (StrategyType type : StrategyType.values()) {
@@ -204,11 +143,9 @@ public class WebStrategyFacadeImpl implements WebStrategyFacade {
             StrategySettings s = StrategySettings.builder()
                     .chatId(chatId)
                     .type(type)
-
                     .symbol("BTCUSDT")
                     .timeframe("1m")
                     .cachedCandlesLimit(500)
-
                     .capitalUsd(BigDecimal.valueOf(100))
                     .commissionPct(BigDecimal.valueOf(0.05))
                     .takeProfitPct(BigDecimal.valueOf(1))
@@ -217,13 +154,10 @@ public class WebStrategyFacadeImpl implements WebStrategyFacade {
                     .dailyLossLimitPct(BigDecimal.valueOf(20))
                     .reinvestProfit(false)
                     .leverage(1)
-
                     .totalProfitPct(BigDecimal.ZERO)
                     .mlConfidence(BigDecimal.ZERO)
-
                     .exchangeName("BINANCE")
                     .networkType(NetworkType.TESTNET)
-
                     .active(false)
                     .build();
 

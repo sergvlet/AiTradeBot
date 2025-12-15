@@ -10,10 +10,9 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 import org.springframework.stereotype.Component;
 
-import java.io.IOException;
 import java.math.BigDecimal;
-import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
 @Component
@@ -23,16 +22,16 @@ public class BybitMarketStreamAdapter {
     private static final String WS_URL = "wss://stream.bybit.com/v5/public/spot";
 
     private final MarketStreamRouter router;
-
-    private final OkHttpClient client = new OkHttpClient();
+    private final OkHttpClient client; // ✅ DI, БЕЗ new
 
     private WebSocket webSocket;
 
-    /** ⭐ Трек текущих подписок */
-    private final Set<String> subscribedSymbols = new HashSet<>();
+    /** ✔ thread-safe set */
+    private final Set<String> subscribedTopics =
+            ConcurrentHashMap.newKeySet();
 
     // ============================================================
-    // 🔌 CONNECT / DISCONNECT / STATE
+    // 🔌 CONNECT / DISCONNECT
     // ============================================================
 
     public synchronized void connect() {
@@ -41,99 +40,69 @@ public class BybitMarketStreamAdapter {
             return;
         }
 
-        Request req = new Request.Builder().url(WS_URL).build();
+        Request req = new Request.Builder()
+                .url(WS_URL)
+                .build();
 
         webSocket = client.newWebSocket(req, new BybitListener());
-        log.info("🔌 Bybit WS connected");
+        log.info("🔌 Bybit WS подключен (TICKER ONLY)");
     }
 
     public synchronized void disconnect() {
         if (webSocket != null) {
             webSocket.close(1000, "shutdown");
             webSocket = null;
-            log.info("🔌 Bybit WS disconnected");
+            subscribedTopics.clear();
+            log.info("🔌 Bybit WS отключен");
         }
     }
 
-    /** ⭐ Нужно для StreamConnectionManager */
     public boolean isConnected() {
         return webSocket != null;
     }
 
     // ============================================================
-    // 📡 SUBSCRIBE
+    // 📡 SUBSCRIBE / UNSUBSCRIBE (TICKER ONLY)
     // ============================================================
 
     public synchronized void subscribeTicker(String symbol) {
-        symbol = normalize(symbol);
+        String sym = normalize(symbol);
+        if (sym.isEmpty()) return;
 
-        if (webSocket == null) {
-            connect();
-        }
+        if (webSocket == null) connect();
 
-        if (!subscribedSymbols.add(symbol)) {
-            return; // уже есть подписка
-        }
+        String topic = "tickers." + sym;
+        if (!subscribedTopics.add(topic)) return;
 
-        sendSubscribe(symbol);
+        send("subscribe", topic);
     }
-
-    // ============================================================
-    // 🔕 UNSUBSCRIBE
-    // ============================================================
 
     public synchronized void unsubscribeTicker(String symbol) {
-        symbol = normalize(symbol);
+        String sym = normalize(symbol);
+        if (sym.isEmpty()) return;
 
-        if (!subscribedSymbols.remove(symbol)) {
-            return; // нечего отписывать
-        }
+        String topic = "tickers." + sym;
+        if (!subscribedTopics.remove(topic)) return;
 
-        sendUnsubscribe(symbol);
-    }
-
-    public synchronized void unsubscribeAll() {
-        for (String s : subscribedSymbols) {
-            sendUnsubscribe(s);
-        }
-        subscribedSymbols.clear();
+        send("unsubscribe", topic);
     }
 
     // ============================================================
-    // 📡 SEND subscribe/unsubscribe
+    // 📨 SEND
     // ============================================================
 
-    private void sendSubscribe(String symbol) {
+    private void send(String op, String topic) {
         if (webSocket == null) {
-            log.warn("⚠️ Bybit WS sendSubscribe: webSocket == null");
+            log.warn("⚠️ Bybit WS send skipped — ws == null, topic={}", topic);
             return;
         }
 
-        String topic = "tickers." + symbol;
-
         JSONObject req = new JSONObject()
-                .put("op", "subscribe")
+                .put("op", op)
                 .put("args", new JSONArray().put(topic));
 
         webSocket.send(req.toString());
-
-        log.info("📡 [BYBIT] SUBSCRIBE {}", topic);
-    }
-
-    private void sendUnsubscribe(String symbol) {
-        if (webSocket == null) {
-            log.warn("⚠️ Bybit WS sendUnsubscribe: webSocket == null");
-            return;
-        }
-
-        String topic = "tickers." + symbol;
-
-        JSONObject req = new JSONObject()
-                .put("op", "unsubscribe")
-                .put("args", new JSONArray().put(topic));
-
-        webSocket.send(req.toString());
-        log.info("🔕 [BYBIT] UNSUBSCRIBE {}", topic);
+        log.info("📡 [BYBIT] {} {}", op.toUpperCase(), topic);
     }
 
     // ============================================================
@@ -143,96 +112,78 @@ public class BybitMarketStreamAdapter {
     private class BybitListener extends WebSocketListener {
 
         @Override
-        public void onOpen(WebSocket webSocket, Response response) {
-            log.info("✅ Bybit WS onOpen: {}", response.message());
+        public void onOpen(WebSocket ws, Response response) {
+            log.info("✅ Bybit WS onOpen");
         }
 
         @Override
-        public void onMessage(WebSocket webSocket, String text) {
+        public void onMessage(WebSocket ws, String text) {
             try {
-                handleMessage(text);
+                JSONObject obj = new JSONObject(text);
+
+                if ("pong".equalsIgnoreCase(obj.optString("op"))) return;
+                if (obj.optBoolean("success")) return;
+
+                String topic = obj.optString("topic", "");
+                if (topic.startsWith("tickers.")) {
+                    parseTicker(obj);
+                }
+
             } catch (Exception e) {
                 log.error("❌ Bybit WS parse error: {}", e.getMessage(), e);
             }
         }
 
         @Override
-        public void onMessage(WebSocket webSocket, ByteString bytes) {
-            onMessage(webSocket, bytes.utf8());
+        public void onMessage(WebSocket ws, ByteString bytes) {
+            onMessage(ws, bytes.utf8());
         }
 
         @Override
-        public void onClosing(WebSocket webSocket, int code, String reason) {
-            log.warn("⚠️ Bybit WS closing: {} / {}", code, reason);
-            webSocket.close(1000, null);
-            BybitMarketStreamAdapter.this.webSocket = null;
-        }
-
-        @Override
-        public void onFailure(WebSocket webSocket, Throwable t, Response response) {
+        public void onFailure(WebSocket ws, Throwable t, Response response) {
             log.error("❌ Bybit WS failure: {}", t.getMessage(), t);
-            BybitMarketStreamAdapter.this.webSocket = null;
-
-            // ВАЖНО — не трогаем subscribedSymbols, стратегии пересоздадут подписки
+            webSocket = null;
         }
     }
 
     // ============================================================
-    // 🔍 MESSAGE PARSER
+    // 📌 TICKER → MarketStreamRouter
     // ============================================================
 
-    private void handleMessage(String raw) throws IOException {
-        JSONObject obj = new JSONObject(raw);
+    private void parseTicker(JSONObject obj) {
+        Object node = obj.opt("data");
+        if (node == null) return;
 
-        if ("pong".equalsIgnoreCase(obj.optString("op"))) return;
-        if (obj.optBoolean("success")) return;
+        JSONObject data = (node instanceof JSONArray arr && !arr.isEmpty())
+                ? arr.getJSONObject(0)
+                : (node instanceof JSONObject o ? o : null);
 
-        String topic = obj.optString("topic", "");
-        if (!topic.startsWith("tickers.")) return;
+        if (data == null) return;
 
-        if (!obj.has("data")) return;
+        String symbol = data.optString("symbol", "");
+        if (symbol.isEmpty()) return;
 
-        JSONObject data;
+        String priceStr = data.optString("lastPrice",
+                data.optString("bid1Price", null));
+        if (priceStr == null) return;
 
-        Object node = obj.get("data");
-        if (node instanceof JSONArray arr) {
-            if (arr.isEmpty()) return;
-            data = arr.getJSONObject(0);
-        } else {
-            data = (JSONObject) node;
-        }
-
-        String symbol = data.optString("symbol", null);
-        if (symbol == null || symbol.isEmpty()) {
-            if (topic.contains(".")) {
-                symbol = topic.substring(topic.indexOf('.') + 1);
-            } else return;
-        }
-
-        String lastPriceStr = data.optString("lastPrice", null);
-        if (lastPriceStr == null || lastPriceStr.isEmpty())
-            lastPriceStr = data.optString("bid1Price", null);
-
-        if (lastPriceStr == null || lastPriceStr.isEmpty()) return;
-
-        BigDecimal price;
         try {
-            price = new BigDecimal(lastPriceStr);
+            BigDecimal price = new BigDecimal(priceStr);
+            long ts = obj.optLong("ts", System.currentTimeMillis());
+
+            router.route(new Tick(
+                    "BYBIT",
+                    symbol,
+                    price,
+                    ts
+            ));
+
         } catch (Exception e) {
-            return;
+            log.debug("⚠️ Bybit bad price '{}'", priceStr);
         }
-
-        long ts = obj.optLong("ts", System.currentTimeMillis());
-
-        router.route(new Tick("BYBIT", symbol, price, ts));
     }
-
-    // ============================================================
-    // 🔧 HELPERS
-    // ============================================================
 
     private String normalize(String s) {
-        if (s == null) return "";
-        return s.replace("/", "").trim().toUpperCase();
+        return s == null ? "" : s.replace("/", "").trim().toUpperCase();
     }
 }
