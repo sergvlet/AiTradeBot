@@ -1,10 +1,31 @@
 "use strict";
 
-import { ChartController } from "/js/chart/chart-controller.js";
-import { LayerRenderer }   from "/js/chart/layer-renderer.js";
+/**
+ * StrategyDashboard (ШАГ 11)
+ * -------------------------
+ * ОРКЕСТРАТОР.
+ *
+ * Делает ТОЛЬКО:
+ * - создаёт chart-controller
+ * - создаёт layer-renderer
+ * - создаёт strategy по type
+ * - прокидывает ВСЕ события (REST + WS) в strategy.onEvent(ev)
+ *
+ * НЕ:
+ * - рисует
+ * - знает логику фич
+ * - знает бизнес-логику стратегии
+ */
+
+import { ChartController } from "./chart-controller.js";
+import { LayerRenderer }   from "./layer-renderer.js";
+
+import { ScalpingStrategy }   from "../strategies/scalping.strategy.js";
+import { FibonacciStrategy }  from "../strategies/fibonacci.strategy.js";
+import { SmartFusionStrategy } from "../strategies/smartfusion.strategy.js";
 
 document.addEventListener("DOMContentLoaded", () => {
-    console.log("📊 Strategy Dashboard (clean architecture)");
+    console.log("📊 Strategy Dashboard (orchestrator)");
 
     // =====================================================
     // CONTEXT
@@ -15,11 +36,9 @@ document.addEventListener("DOMContentLoaded", () => {
         return;
     }
 
-    const chatId       = root.dataset.chatId;
-    const strategyType = root.dataset.type;
-    const symbol       = root.dataset.symbol;
-
-    console.log("🧩 CONTEXT", { chatId, strategyType, symbol });
+    const chatId = root.dataset.chatId;
+    const type   = root.dataset.type;
+    const symbol = root.dataset.symbol;
 
     const container = document.getElementById("strategy-chart");
     if (!container) {
@@ -33,96 +52,85 @@ document.addEventListener("DOMContentLoaded", () => {
     const chartCtrl = new ChartController(container);
     const layers    = new LayerRenderer(chartCtrl.chart, chartCtrl.candles);
 
-    console.log("✅ Chart initialized");
+    // =====================================================
+    // INIT STRATEGY
+    // =====================================================
+    const ctx = { chatId, type, symbol };
+
+    let strategy;
+
+    switch (type) {
+        case "SCALPING":
+            strategy = new ScalpingStrategy({ layers, ctx });
+            break;
+
+        case "FIBONACCI":
+            strategy = new FibonacciStrategy({ layers, ctx });
+            break;
+
+        case "SMART_FUSION":
+            strategy = new SmartFusionStrategy({ layers, ctx });
+            break;
+
+        default:
+            console.error("❌ Unknown strategy type:", type);
+            return;
+    }
+
+    console.log("🧠 Strategy initialized:", type);
 
     // =====================================================
-    // HISTORY (REST)
+    // HISTORY (REST = SNAPSHOT)
     // =====================================================
     fetch(
         `/api/chart/strategy` +
         `?chatId=${encodeURIComponent(chatId)}` +
-        `&type=${encodeURIComponent(strategyType)}` +
+        `&type=${encodeURIComponent(type)}` +
         `&symbol=${encodeURIComponent(symbol)}` +
         `&timeframe=1m&limit=500`
     )
         .then(r => r.ok ? r.json() : null)
-        .then(d => {
-            if (!d || !Array.isArray(d.candles) || d.candles.length === 0) {
-                console.warn("⚠ No candles from REST");
+        .then(data => {
+            if (!data) return;
 
-                // =================================================
-                // REST SNAPSHOT CLEANUP
-                // =================================================
-                // ⚠️ REST = snapshot
-                // ❗️ЧИСТИМ ТОЛЬКО snapshot-слои
-                if (typeof layers.clearLevels === "function") layers.clearLevels();
-                if (typeof layers.clearZone === "function") layers.clearZone();
-                if (typeof layers.clearTpSl === "function") layers.clearTpSl();
-                if (typeof layers.clearTradeZone === "function") layers.clearTradeZone();
+            // --- candles ---
+            if (Array.isArray(data.candles) && data.candles.length > 0) {
+                const candles = data.candles.map(c => ({
+                    time: Number(c.time),
+                    open: +c.open,
+                    high: +c.high,
+                    low:  +c.low,
+                    close:+c.close
+                }));
 
-                // ❌ НЕ ЧИСТИМ:
-                // priceLines / windowZone / atr
-                // они живут ТОЛЬКО через WebSocket
-
-                return;
+                chartCtrl.setHistory(candles);
             }
 
-            const candles = d.candles.map(c => ({
-                time: Number(c.time), // seconds
-                open: +c.open,
-                high: +c.high,
-                low:  +c.low,
-                close:+c.close
-            }));
-
-            chartCtrl.setHistory(candles);
-
-            const minPrice = Math.min(...candles.map(c => c.low));
-            const maxPrice = Math.max(...candles.map(c => c.high));
-            console.log("📊 PRICE RANGE", { minPrice, maxPrice });
-
-            // =================================================
-            // STATIC LAYERS FROM REST (SNAPSHOT)
-            // =================================================
-            // ⚠️ REST — snapshot
-            // сначала чистим snapshot-слои
-            if (typeof layers.clearLevels === "function") layers.clearLevels();
-            if (typeof layers.clearZone === "function") layers.clearZone();
-            if (typeof layers.clearTpSl === "function") layers.clearTpSl();
-            if (typeof layers.clearTradeZone === "function") layers.clearTradeZone();
-
-            // ❌ НЕ ТРОГАЕМ:
-            // clearPriceLines / clearWindowZone / clearAtr
-
-            if (d.layers) {
-
-                // --- LEVELS ---
-                if (Array.isArray(d.layers.levels)) {
-                    console.log("🟣 REST LEVELS", d.layers.levels);
-                    if (d.layers.levels.length > 0) {
-                        layers.renderLevels(d.layers.levels);
-                    }
+            // --- snapshot layers ---
+            if (data.layers) {
+                if (Array.isArray(data.layers.levels)) {
+                    strategy.onEvent({
+                        type: "levels",
+                        levels: data.layers.levels
+                    });
                 }
 
-                // --- ZONE ---
-                if (d.layers.zone && typeof layers.renderZone === "function") {
-                    console.log("🟠 REST ZONE", d.layers.zone);
-                    layers.renderZone(d.layers.zone);
+                if (data.layers.zone) {
+                    strategy.onEvent({
+                        type: "zone",
+                        zone: data.layers.zone
+                    });
                 }
 
-                // --- TP/SL ---
-                if (d.layers.tpSl && typeof layers.renderTpSl === "function") {
-                    console.log("📍 REST TP/SL", d.layers.tpSl);
-                    layers.renderTpSl(d.layers.tpSl);
+                if (data.layers.tpSl) {
+                    strategy.onEvent({
+                        type: "tp_sl",
+                        tpSl: data.layers.tpSl
+                    });
                 }
-
-                // ⚠️ PRICE LINES / WINDOW / ATR
-                // REST НЕ является их источником
             }
-
-            chartCtrl.chart.timeScale().scrollToRealTime();
         })
-        .catch(e => console.error("❌ REST history error", e));
+        .catch(e => console.error("❌ REST error", e));
 
     // =====================================================
     // WEBSOCKET
@@ -132,95 +140,37 @@ document.addEventListener("DOMContentLoaded", () => {
     stomp.debug = () => {};
 
     stomp.connect({}, () => {
-        const topic = `/topic/strategy/${chatId}/${strategyType}`;
+        const topic = `/topic/strategy/${chatId}/${type}`;
         console.log("📡 SUBSCRIBE", topic);
 
         stomp.subscribe(topic, msg => {
             let ev;
             try {
                 ev = JSON.parse(msg.body);
-            } catch (e) {
-                console.warn("⚠ Bad WS message", msg.body);
+            } catch {
                 return;
             }
 
             if (!ev || !ev.type) return;
 
-            switch (ev.type) {
-
-                case "candle":
-                    chartCtrl.onCandle(ev);
-                    break;
-
-                case "price":
-                    console.log("🔥 PRICE RECEIVED", ev.price);
-                    chartCtrl.onPrice(ev);
-                    if (typeof layers.onPriceUpdate === "function") {
-                        layers.onPriceUpdate(Number(ev.price));
-                    }
-                    break;
-
-                case "levels":
-                    if (Array.isArray(ev.levels)) {
-                        if (ev.levels.length === 0) {
-                            layers.clearLevels?.();
-                        } else {
-                            layers.renderLevels(ev.levels);
-                        }
-                    }
-                    break;
-
-                case "price_line":
-                    ev.priceLine
-                        ? layers.renderPriceLine?.(ev.priceLine)
-                        : layers.clearPriceLines?.();
-                    break;
-
-                case "window_zone":
-                    ev.windowZone
-                        ? layers.renderWindowZone?.(ev.windowZone)
-                        : layers.clearWindowZone?.();
-                    break;
-
-                case "atr":
-                    ev.atr
-                        ? layers.renderAtr?.(ev.atr)
-                        : layers.clearAtr?.();
-                    break;
-
-                case "trade_zone":
-                    ev.tradeZone
-                        ? layers.renderTradeZone?.(ev.tradeZone)
-                        : layers.clearTradeZone?.();
-                    break;
-
-                case "tp_sl":
-                    ev.tpSl
-                        ? layers.renderTpSl?.(ev.tpSl)
-                        : layers.clearTpSl?.();
-                    break;
-
-                case "order":
-                    layers.renderOrder?.(ev.order);
-                    break;
-
-                case "magnet":
-                    layers.onMagnet?.(ev.magnet);
-                    break;
-
-                case "trade":
-                    layers.renderTrade?.(
-                        ev.trade,
-                        ev.time ? Math.floor(ev.time / 1000) : undefined
-                    );
-                    break;
-
-                default:
-                    break;
+            // market events go directly to chart
+            if (ev.type === "candle") {
+                chartCtrl.onCandle(ev);
+                return;
             }
+
+            if (ev.type === "price") {
+                chartCtrl.onPrice(ev);
+                layers.onPriceUpdate?.(Number(ev.price));
+                return;
+            }
+
+            // ВСЁ ОСТАЛЬНОЕ — в стратегию
+            strategy.onEvent(ev);
         });
 
-        fetch(`/api/strategy/${chatId}/${strategyType}/replay`, {
+        // replay
+        fetch(`/api/strategy/${chatId}/${type}/replay`, {
             method: "POST"
         }).catch(() => {});
     });

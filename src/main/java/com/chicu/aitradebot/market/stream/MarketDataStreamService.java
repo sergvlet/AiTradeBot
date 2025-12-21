@@ -6,33 +6,85 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class MarketDataStreamService {
 
-    /**
-     * Binance WS-клиент подтягивается из Spring-контекста,
-     * у него уже внедрены BinanceKlineParser + MarketStreamService.
-     */
     private final BinanceSpotWebSocketClient binanceSpotWebSocketClient;
 
     /**
-     * Подписывает стратегию на Binance KLINES (UnifiedKline → MarketStreamService → StrategyLive)
+     * Активные подписки:
+     * chatId → set of keys
      */
-    public void subscribeCandles(long chatId,
-                                 StrategyType strategyType,
-                                 String symbol,
-                                 String timeframe) {
+    private final Map<Long, Set<SubscriptionKey>> activeSubscriptions = new ConcurrentHashMap<>();
 
+    /**
+     * Подписка на свечи (V4-safe)
+     */
+    public synchronized void subscribeCandles(long chatId,
+                                              StrategyType strategyType,
+                                              String symbol,
+                                              String timeframe) {
+
+        String sym = symbol.toUpperCase();
+        String tf  = timeframe.toLowerCase();
+
+        SubscriptionKey key = new SubscriptionKey(strategyType, sym, tf);
+
+        Set<SubscriptionKey> subs =
+                activeSubscriptions.computeIfAbsent(chatId, k -> ConcurrentHashMap.newKeySet());
+
+        if (subs.contains(key)) {
+            log.debug("⏭ Already subscribed: {} {} {} (chatId={})",
+                    strategyType, sym, tf, chatId);
+            return;
+        }
+
+        // 👉 WS subscribe
         binanceSpotWebSocketClient.subscribeKline(
-                symbol.toLowerCase(),
-                timeframe,
+                sym.toLowerCase(),
+                tf,
                 chatId,
                 strategyType
         );
 
+        subs.add(key);
+
         log.info("📡 SUBSCRIBE Binance KLINE: {} {} (chatId={}, strategy={})",
-                symbol, timeframe, chatId, strategyType);
+                sym, tf, chatId, strategyType);
     }
+
+    /**
+     * Отписка (на будущее — понадобится)
+     */
+    public synchronized void unsubscribeAll(long chatId) {
+
+        Set<SubscriptionKey> subs = activeSubscriptions.remove(chatId);
+        if (subs == null || subs.isEmpty()) return;
+
+        for (SubscriptionKey key : subs) {
+            binanceSpotWebSocketClient.unsubscribeKline(
+                    key.symbol().toLowerCase(),
+                    key.timeframe(),
+                    chatId,
+                    key.strategyType()
+            );
+        }
+
+        log.info("🧹 UNSUBSCRIBE ALL for chatId={}", chatId);
+    }
+
+    /**
+     * Ключ подписки
+     */
+    private record SubscriptionKey(
+            StrategyType strategyType,
+            String symbol,
+            String timeframe
+    ) {}
 }

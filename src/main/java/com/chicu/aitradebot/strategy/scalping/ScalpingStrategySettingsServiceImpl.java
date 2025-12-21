@@ -1,5 +1,6 @@
 package com.chicu.aitradebot.strategy.scalping;
 
+import com.chicu.aitradebot.strategy.core.SettingsSnapshot;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -22,7 +23,7 @@ public class ScalpingStrategySettingsServiceImpl implements ScalpingStrategySett
 
                     ScalpingStrategySettings def = ScalpingStrategySettings.builder()
                             .chatId(chatId)
-                            .build();  // все defaults подтянутся из @Builder.Default / @PrePersist
+                            .build();
 
                     log.info("🆕 Созданы настройки SCALPING (chatId={})", chatId);
                     return repo.save(def);
@@ -38,61 +39,62 @@ public class ScalpingStrategySettingsServiceImpl implements ScalpingStrategySett
     }
 
     // =====================================================================
-    // 3) Частичное обновление
+    // 3) Частичное обновление (ТОЛЬКО АКТУАЛЬНЫЕ ПОЛЯ)
     // =====================================================================
     @Override
     public ScalpingStrategySettings update(Long chatId, ScalpingStrategySettings dto) {
 
         ScalpingStrategySettings s = getOrCreate(chatId);
 
-        // === УНИВЕРСАЛЬНЫЕ ПАРАМЕТРЫ ===
+        // === БАЗОВЫЕ ПАРАМЕТРЫ ===
 
-        if (dto.getSymbol() != null && !dto.getSymbol().isBlank())
+        if (dto.getSymbol() != null && !dto.getSymbol().isBlank()) {
             s.setSymbol(dto.getSymbol());
+        }
 
-        if (dto.getTimeframe() != null && !dto.getTimeframe().isBlank())
+        if (dto.getTimeframe() != null && !dto.getTimeframe().isBlank()) {
             s.setTimeframe(dto.getTimeframe());
+        }
 
-        if (dto.getCachedCandlesLimit() > 0)
+        if (dto.getCachedCandlesLimit() > 0) {
             s.setCachedCandlesLimit(dto.getCachedCandlesLimit());
+        }
 
-        if (dto.getCapitalUsd() > 0)
-            s.setCapitalUsd(dto.getCapitalUsd());
+        // === SCALPING-ПАРАМЕТРЫ ===
 
-        if (dto.getCommissionPct() > 0)
-            s.setCommissionPct(dto.getCommissionPct());
-
-        if (dto.getRiskPerTradePct() > 0)
-            s.setRiskPerTradePct(dto.getRiskPerTradePct());
-
-        if (dto.getDailyLossLimitPct() > 0)
-            s.setDailyLossLimitPct(dto.getDailyLossLimitPct());
-
-        if (dto.getLeverage() > 0)
-            s.setLeverage(dto.getLeverage());
-
-        s.setReinvestProfit(dto.isReinvestProfit());
-
-        if (dto.getTakeProfitPct() > 0)
-            s.setTakeProfitPct(dto.getTakeProfitPct());
-
-        if (dto.getStopLossPct() > 0)
-            s.setStopLossPct(dto.getStopLossPct());
-
-        // === УНИКАЛЬНЫЕ ДЛЯ SCALPING ===
-
-        if (dto.getWindowSize() > 0)
+        if (dto.getWindowSize() > 0) {
             s.setWindowSize(dto.getWindowSize());
+        }
 
-        if (dto.getPriceChangeThreshold() > 0)
+        if (dto.getPriceChangeThreshold() > 0) {
             s.setPriceChangeThreshold(dto.getPriceChangeThreshold());
+        }
 
-        if (dto.getSpreadThreshold() > 0)
+        if (dto.getSpreadThreshold() > 0) {
             s.setSpreadThreshold(dto.getSpreadThreshold());
+        }
 
-        if (dto.getOrderVolume() > 0)
-            s.setOrderVolume(dto.getOrderVolume());
+        if (dto.getTakeProfitPct() > 0) {
+            s.setTakeProfitPct(dto.getTakeProfitPct());
+        }
+
+        if (dto.getStopLossPct() > 0) {
+            s.setStopLossPct(dto.getStopLossPct());
+        }
+
+        // ⚠️ orderVolume: double в entity
+        if (dto.getOrderVolume().signum() > 0) {
+            s.setOrderVolume(dto.getOrderVolume().doubleValue());
+        }
 
         return repo.save(s);
+    }
+
+    // =====================================================================
+    // 4) Snapshot (ПОКА МОЖНО ПРОСТО NULL)
+    // =====================================================================
+    @Override
+    public SettingsSnapshot getSnapshot(long chatId) {
+        return null;
     }
 }

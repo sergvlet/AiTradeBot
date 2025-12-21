@@ -7,104 +7,85 @@ import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.List;
 
+
 /**
- * 🔥 ЕДИНЫЙ LIVE-КОНТРАКТ ДЛЯ ВСЕХ СТРАТЕГИЙ (v4 FINAL)
- * Strategy → WebSocket → UI (график)
+ * 🔥 ЕДИНЫЙ LIVE-КОНТРАКТ ДЛЯ ВСЕХ СТРАТЕГИЙ (v4 FINAL — STABLE)
  */
 @Getter
 @Setter
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
+@EqualsAndHashCode(onlyExplicitlyIncluded = true)
 public class StrategyLiveEvent {
 
-    /**
-     * Тип события:
-     *
-     * CORE:
-     *  candle | price | trade | state | metric
-     *
-     * LAYERS:
-     *  levels | zone | active_level | trade_zone | tp_sl
-     *
-     * ORDERS:
-     *  order
-     *
-     * UX:
-     *  signal | magnet
-     *
-     * EXTRA (SCALPING):
-     *  price_line | window_zone | atr
-     */
+    // ======================================================
+    // 🔑 IDENTITY (для дедупликации)
+    // ======================================================
+
+    @EqualsAndHashCode.Include
     private String type;
 
-    /** Telegram chatId */
+    @EqualsAndHashCode.Include
     private Long chatId;
 
-    /** Тип стратегии */
+    @EqualsAndHashCode.Include
     private StrategyType strategyType;
 
-    /** Торговый символ */
+    @EqualsAndHashCode.Include
     private String symbol;
+
+    // ======================================================
+    // META
+    // ======================================================
 
     /** Время события (epoch millis) */
     private long time;
 
     // ======================================================
-    // PAYLOADS (РОВНО ОДИН ИСПОЛЬЗУЕТСЯ ПО type)
+    // PAYLOADS (РОВНО ОДИН ПО type)
     // ======================================================
 
-    /** Свеча */
     private CandlePayload kline;
-
-    /** Текущая цена */
     private BigDecimal price;
-
-    /** Рыночная сделка */
     private TradePayload trade;
-
-    /** Лимитный / активный ордер */
     private OrderPayload order;
 
-    /** 🟣 УРОВНИ (grid / fib / bb) */
     private List<LevelPayload> levels;
-
-    /** 🟠 Общая зона сетки */
     private ZonePayload zone;
-
-    /** 🔥 Активный уровень (support / resistance) */
     private ActiveLevelPayload activeLevel;
-
-    /** 🔴 BUY / SELL зона */
     private TradeZonePayload tradeZone;
-
-    /** 📍 TP / SL */
     private TpSlPayload tpSl;
-
-    /** 🧲 Магнит к уровню */
     private MagnetPayload magnet;
 
-    /** Состояние стратегии */
     private String state;
-
-    /** Сигнал (confidence / entry / exit) */
     private SignalPayload signal;
-
-    /** Метрика (PnL, confidence, score) */
     private Double metric;
-
-    /** 📍 Линия цены (ENTRY / TP / SL и т.д.) */
     private PriceLinePayload priceLine;
-
-    /** 🔲 Зона окна (high/low) */
     private WindowZonePayload windowZone;
-
-    /** 🧠 ATR / волатильность (если шлёшь в UI) */
     private AtrPayload atr;
+
+    // ======================================================
+    // NORMALIZATION
+    // ======================================================
+
+    public void normalize() {
+        if (this.symbol != null) {
+            this.symbol = this.symbol.trim().toUpperCase();
+            if (this.symbol.isEmpty()) {
+                this.symbol = null;
+            }
+        }
+
+        if (this.time <= 0) {
+            this.time = nowMillis();
+        }
+    }
 
     // ======================================================
     // UTILS
     // ======================================================
+
     public static long nowMillis() {
         return Instant.now().toEpochMilli();
     }
@@ -124,27 +105,27 @@ public class StrategyLiveEvent {
     }
 
     // ======================================================
-    // 📌 TRADE (рыночное исполнение)
+    // 📌 TRADE
     // ======================================================
     @Getter @Setter @Builder
     @NoArgsConstructor @AllArgsConstructor
     public static class TradePayload {
-        private String side; // BUY / SELL
+        private String side;
         private BigDecimal price;
         private BigDecimal qty;
     }
 
     // ======================================================
-    // 📌 ORDER (лимитный / активный)
+    // 📌 ORDER
     // ======================================================
     @Getter @Setter @Builder
     @NoArgsConstructor @AllArgsConstructor
     public static class OrderPayload {
         private String orderId;
-        private String side;   // BUY / SELL
+        private String side;
         private BigDecimal price;
         private BigDecimal qty;
-        private String status; // NEW / FILLED / CANCELED
+        private String status;
     }
 
     // ======================================================
@@ -163,8 +144,8 @@ public class StrategyLiveEvent {
     @NoArgsConstructor @AllArgsConstructor
     public static class ActiveLevelPayload {
         private BigDecimal price;
-        private String role;        // SUPPORT / RESISTANCE
-        private double distancePct; // расстояние до цены
+        private String role;
+        private double distancePct;
     }
 
     // ======================================================
@@ -173,7 +154,7 @@ public class StrategyLiveEvent {
     @Getter @Setter @Builder
     @NoArgsConstructor @AllArgsConstructor
     public static class TradeZonePayload {
-        private String side; // BUY / SELL
+        private String side;
         private BigDecimal top;
         private BigDecimal bottom;
     }
@@ -195,21 +176,23 @@ public class StrategyLiveEvent {
     @NoArgsConstructor @AllArgsConstructor
     public static class MagnetPayload {
         private BigDecimal target;
-        private double strength; // 0..1
+        private double strength;
     }
 
     // ======================================================
-    // 📈 SIGNAL
+    // 🚦 SIGNAL (FINAL)
     // ======================================================
     @Getter @Setter @Builder
     @NoArgsConstructor @AllArgsConstructor
     public static class SignalPayload {
-        private String name;
-        private double value;
+        private String name;       // BUY / SELL / HOLD
+        private double confidence;
+        private String reason;
+        private String timeframe;
     }
 
     // ======================================================
-    // 🟠 ZONE (общая)
+    // 🟠 ZONE
     // ======================================================
     @Getter @Setter @Builder
     @NoArgsConstructor @AllArgsConstructor
@@ -220,14 +203,14 @@ public class StrategyLiveEvent {
     }
 
     // ======================================================
-    // 📍 PRICE LINE (entry / tp / sl)
+    // 📍 PRICE LINE
     // ======================================================
     @Getter @Setter @Builder
     @NoArgsConstructor @AllArgsConstructor
     public static class PriceLinePayload {
-        private String name;   // ENTRY / TP / SL
+        private String name;
         private BigDecimal price;
-        private String color;  // optional
+        private String color;
     }
 
     // ======================================================
@@ -241,7 +224,7 @@ public class StrategyLiveEvent {
     }
 
     // ======================================================
-    // 🧠 ATR PAYLOAD
+    // 🧠 ATR
     // ======================================================
     @Getter @Setter @Builder
     @NoArgsConstructor @AllArgsConstructor

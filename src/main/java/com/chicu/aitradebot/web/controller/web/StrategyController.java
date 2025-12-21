@@ -18,7 +18,6 @@ public class StrategyController {
     private final WebStrategyFacade strategyFacade;
     private final UserProfileService userProfileService;
 
-
     // ================================================================
     // 📋 СПИСОК СТРАТЕГИЙ
     // ================================================================
@@ -32,15 +31,12 @@ public class StrategyController {
 
         model.addAttribute("active", "strategies");
         model.addAttribute("pageTitle", "Стратегии");
-
-        // layout/app подключит views/strategies.html
         model.addAttribute("page", "strategies");
         model.addAttribute("strategies", strategyFacade.getStrategies(chatId));
         model.addAttribute("chatId", chatId);
 
         return "layout/app";
     }
-
 
     // ================================================================
     // 📊 ДАШБОРД СТРАТЕГИИ
@@ -58,7 +54,7 @@ public class StrategyController {
         var all = strategyFacade.getStrategies(chatId);
 
         var uiOpt = all.stream()
-                .filter(s -> s.type() == type)
+                .filter(s -> type.name().equals(s.type()))
                 .findFirst();
 
         if (uiOpt.isEmpty()) {
@@ -79,12 +75,10 @@ public class StrategyController {
         model.addAttribute("type", type);
         model.addAttribute("symbol", finalSymbol);
         model.addAttribute("info", ui);
-
         model.addAttribute("page", "strategy-dashboard");
 
         return "layout/app";
     }
-
 
     // ================================================================
     // ▶️ START / STOP / TOGGLE
@@ -112,7 +106,6 @@ public class StrategyController {
         strategyFacade.stop(chatId, type);
         return "redirect:/strategies?chatId=" + chatId;
     }
-
 
     // ================================================================
     // 🎯 HELPERS

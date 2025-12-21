@@ -16,6 +16,13 @@ public class UnifiedKline {
     /** Время открытия свечи (ms epoch) */
     private long openTime;
 
+    /**
+     * Время закрытия свечи (ms epoch)
+     * Если биржа не отдаёт closeTime — ставим openTime + duration(timeframe) - 1,
+     * либо просто = openTime (как fallback).
+     */
+    private long closeTime;
+
     private BigDecimal open;
     private BigDecimal high;
     private BigDecimal low;

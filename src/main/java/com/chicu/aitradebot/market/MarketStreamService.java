@@ -3,7 +3,9 @@ package com.chicu.aitradebot.market;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.market.model.Candle;
 import com.chicu.aitradebot.market.model.UnifiedKline;
+import com.chicu.aitradebot.strategy.core.TradingStrategy;
 import com.chicu.aitradebot.strategy.live.StrategyLivePublisher;
+import com.chicu.aitradebot.strategy.registry.StrategyRegistry;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -19,68 +21,95 @@ public class MarketStreamService {
 
     private final MarketStreamManager streamManager;
     private final StrategyLivePublisher live;
+    private final StrategyRegistry strategyRegistry;
 
-    /** Глобальный рынок: кэшируем свечу */
+    // =====================================================================
+    // GLOBAL MARKET CACHE
+    // =====================================================================
     public void onKline(UnifiedKline kline) {
-        if (kline == null) {
-            log.warn("onKline: null kline (global market stream)");
+
+        if (kline == null) return;
+        if (kline.getSymbol() == null || kline.getTimeframe() == null) return;
+        if (kline.getOpen() == null || kline.getHigh() == null
+            || kline.getLow() == null || kline.getClose() == null) {
             return;
         }
 
-        String symbol = kline.getSymbol() != null ? kline.getSymbol().toUpperCase(Locale.ROOT) : "";
-        String timeframe = kline.getTimeframe() != null ? kline.getTimeframe().toLowerCase(Locale.ROOT) : "";
+        String symbol = kline.getSymbol().trim().toUpperCase(Locale.ROOT);
+        String timeframe = kline.getTimeframe().trim().toLowerCase(Locale.ROOT);
 
-        if (symbol.isEmpty() || timeframe.isEmpty()) {
-            log.warn("onKline: пустой symbol/timeframe для kline={}", kline);
-            return;
-        }
-
-        double volume = (kline.getVolume() != null) ? kline.getVolume().doubleValue() : 0.0;
-
-        // ❗ UnifiedKline.isClosed() у тебя нет — НЕ трогаем его
         Candle candle = new Candle(
-                kline.getOpenTime(),
+                kline.getOpenTime(),                 // время открытия свечи
                 kline.getOpen().doubleValue(),
                 kline.getHigh().doubleValue(),
                 kline.getLow().doubleValue(),
                 kline.getClose().doubleValue(),
-                volume,
-                true // считаем закрытой/валидной для кэша
+                kline.getVolume() != null
+                        ? kline.getVolume().doubleValue()
+                        : 0.0,
+                true
         );
 
         streamManager.addCandle(symbol, timeframe, candle);
-
-        log.trace("📦 cached candle {} {} [{}]",
-                symbol, timeframe, Instant.ofEpochMilli(kline.getOpenTime()));
     }
 
-    /**
-     * ✅ ВОТ ОНО: “стратегический” вход.
-     * Здесь мы и оживляем график: пушим candle в /topic/strategy/{chatId}/{strategyType}
-     */
+    // =====================================================================
+    // STRATEGY PIPELINE v4 — ЖИВОЙ UI
+    // =====================================================================
     public void onKline(long chatId, StrategyType strategyType, UnifiedKline kline) {
-        onKline(kline);
 
         if (kline == null || strategyType == null) return;
 
-        String symbol = kline.getSymbol() != null ? kline.getSymbol().toUpperCase(Locale.ROOT) : "";
-        String timeframe = kline.getTimeframe() != null ? kline.getTimeframe().toLowerCase(Locale.ROOT) : "";
-        if (symbol.isEmpty() || timeframe.isEmpty()) return;
+        // 1️⃣ ВСЕГДА сначала обновляем рынок
+        onKline(kline);
 
-        BigDecimal o = kline.getOpen();
-        BigDecimal h = kline.getHigh();
-        BigDecimal l = kline.getLow();
-        BigDecimal c = kline.getClose();
-        BigDecimal v = kline.getVolume() != null ? kline.getVolume() : BigDecimal.ZERO;
+        String symbol = kline.getSymbol().toUpperCase(Locale.ROOT);
+        String timeframe = kline.getTimeframe().toLowerCase(Locale.ROOT);
 
-        // 🔥 живые свечи в UI
+        BigDecimal open  = kline.getOpen();
+        BigDecimal high  = kline.getHigh();
+        BigDecimal low   = kline.getLow();
+        BigDecimal close = kline.getClose();
+        BigDecimal vol   = kline.getVolume() != null
+                ? kline.getVolume()
+                : BigDecimal.ZERO;
+
+        Instant candleTime = Instant.ofEpochMilli(kline.getOpenTime());
+
+        // 2️⃣ UI — CANDLE (OHLC)
         live.pushCandleOhlc(
                 chatId,
                 strategyType,
                 symbol,
                 timeframe,
-                o, h, l, c, v,
-                Instant.ofEpochMilli(kline.getOpenTime())
+                open,
+                high,
+                low,
+                close,
+                vol,
+                candleTime
+        );
+
+        // 3️⃣ UI — PRICE TICK (КРИТИЧНО ДЛЯ ЖИВОЙ ЛИНИИ ЦЕНЫ)
+        live.pushPriceTick(
+                chatId,
+                strategyType,
+                symbol,
+                close,          // текущая цена
+                candleTime
+        );
+
+        // 4️⃣ СТРАТЕГИЯ (ТОЛЬКО ЕСЛИ АКТИВНА)
+        TradingStrategy strategy = strategyRegistry.get(strategyType);
+        if (strategy == null || !strategy.isActive(chatId)) {
+            return;
+        }
+
+        strategy.onPriceUpdate(
+                chatId,
+                symbol,
+                close,
+                candleTime
         );
     }
 }

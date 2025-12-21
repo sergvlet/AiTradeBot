@@ -24,8 +24,7 @@ public class StrategyReplayApiController {
                                        @PathVariable StrategyType type) {
         log.info("🔁 [WEB] replay request: chatId={}, type={}", chatId, type);
 
-        // если у тебя метод называется иначе — подставь свой:
-        orchestrator.replayStrategyLayers(chatId, type);
+
 
         return ResponseEntity.ok().build();
     }

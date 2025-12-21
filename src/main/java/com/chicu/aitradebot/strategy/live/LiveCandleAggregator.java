@@ -10,13 +10,6 @@ import java.time.Instant;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
-/**
- * 🔥 LIVE v4 Candle Aggregator
- * Собирает OHLC из price ticks по timeframe и:
- *  - отправляет свечи в UI (StrategyLivePublisher)
- *  - сохраняет свечи в CandleProvider
- * ❗ volume НЕ хардкодится в стратегии
- */
 @Slf4j
 @Component
 public class LiveCandleAggregator {
@@ -33,7 +26,7 @@ public class LiveCandleAggregator {
     }
 
     // ============================================================
-    // KEY (record сам генерирует equals/hashCode)
+    // KEY
     // ============================================================
     private record Key(
             Long chatId,
@@ -50,7 +43,7 @@ public class LiveCandleAggregator {
         BigDecimal high;
         BigDecimal low;
         BigDecimal close;
-        double volume;     // ✅ double, не null
+        double volume;
         Instant start;
     }
 
@@ -69,42 +62,48 @@ public class LiveCandleAggregator {
 
         if (price == null || ts == null) return;
 
+        symbol = symbol.toUpperCase();
+        timeframe = timeframe.toLowerCase();
+
         Key key = new Key(chatId, strategy, symbol, timeframe);
+
         long now = ts.toEpochMilli();
+        long bucketStartMs = now - (now % timeframeMillis);
+        Instant bucketStart = Instant.ofEpochMilli(bucketStartMs);
 
         Candle c = candles.get(key);
 
-        // =======================
-        // NEW CANDLE
-        // =======================
-        if (c == null || now - c.start.toEpochMilli() >= timeframeMillis) {
-
-            if (c != null) {
-                closeAndPublish(chatId, strategy, symbol, timeframe, timeframeMillis, c);
-            }
-
-            Candle nc = new Candle();
-            nc.start  = Instant.ofEpochMilli(now - (now % timeframeMillis));
-            nc.open   = price;
-            nc.high   = price;
-            nc.low    = price;
-            nc.close  = price;
-            nc.volume = 0.0;
-
-            candles.put(key, nc);
+        // ========================================================
+        // FIRST CANDLE
+        // ========================================================
+        if (c == null) {
+            candles.put(key, newCandle(bucketStart, price));
             return;
         }
 
-        // =======================
+        // ========================================================
+        // CLOSE OLD CANDLES (catch-up)
+        // ========================================================
+        while (c.start.toEpochMilli() < bucketStartMs) {
+            closeAndPublish(chatId, strategy, symbol, timeframe, timeframeMillis, c);
+            c = newCandle(
+                    c.start.plusMillis(timeframeMillis),
+                    c.close
+            );
+            candles.put(key, c);
+        }
+
+        // ========================================================
         // UPDATE CURRENT
-        // =======================
-        c.high  = c.high.max(price);
-        c.low   = c.low.min(price);
+        // ========================================================
+        c.high = c.high.max(price);
+        c.low  = c.low.min(price);
         c.close = price;
+        c.volume += 1.0; // ⚠ approximate tick volume
     }
 
     // ============================================================
-    // FLUSH (STOP)
+    // FLUSH
     // ============================================================
     public void flush(Long chatId,
                       StrategyType strategy,
@@ -112,17 +111,33 @@ public class LiveCandleAggregator {
                       String timeframe,
                       long timeframeMillis) {
 
-        Key key = new Key(chatId, strategy, symbol, timeframe);
-        Candle c = candles.remove(key);
+        Key key = new Key(
+                chatId,
+                strategy,
+                symbol.toUpperCase(),
+                timeframe.toLowerCase()
+        );
 
+        Candle c = candles.remove(key);
         if (c != null) {
             closeAndPublish(chatId, strategy, symbol, timeframe, timeframeMillis, c);
         }
     }
 
     // ============================================================
-    // CLOSE + SAVE
+    // HELPERS
     // ============================================================
+    private Candle newCandle(Instant start, BigDecimal price) {
+        Candle c = new Candle();
+        c.start = start;
+        c.open = price;
+        c.high = price;
+        c.low = price;
+        c.close = price;
+        c.volume = 1.0;
+        return c;
+    }
+
     private void closeAndPublish(Long chatId,
                                  StrategyType strategy,
                                  String symbol,
@@ -132,7 +147,7 @@ public class LiveCandleAggregator {
 
         Instant closeTime = c.start.plusMillis(timeframeMillis);
 
-        // 🔥 UI
+        // UI
         live.pushCandleOhlc(
                 chatId,
                 strategy,
@@ -146,7 +161,7 @@ public class LiveCandleAggregator {
                 closeTime
         );
 
-        // 💾 STRATEGIES (RSI / EMA / ML)
+        // STRATEGIES
         candleProvider.addCandle(
                 chatId,
                 symbol,

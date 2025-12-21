@@ -7,6 +7,7 @@ import com.chicu.aitradebot.exchange.enums.OrderSide;
 import com.chicu.aitradebot.strategy.core.CandleProvider;
 import com.chicu.aitradebot.strategy.core.ContextAwareStrategy;
 import com.chicu.aitradebot.strategy.core.TradingStrategy;
+import com.chicu.aitradebot.strategy.core.signal.Signal;
 import com.chicu.aitradebot.strategy.live.LiveCandleAggregator;
 import com.chicu.aitradebot.strategy.live.StrategyLivePublisher;
 import com.chicu.aitradebot.strategy.registry.StrategyBinding;
@@ -103,24 +104,30 @@ public class SmartFusionStrategy implements TradingStrategy, ContextAwareStrateg
             this.symbol = symbol.toUpperCase(Locale.ROOT);
         }
 
-        // ✅ ЕДИНСТВЕННО КОРРЕКТНЫЙ СПОСОБ ПОЛУЧИТЬ НАСТРОЙКИ
         loadSettings();
 
         running.set(true);
         startedAt = Instant.now();
 
-        // сброс дедупов для UI
         lastEmaFast = null;
         lastEmaSlow = null;
         lastSupport = null;
         lastResistance = null;
 
-        // уведомляем UI
         live.pushState(
                 this.chatId,
                 StrategyType.SMART_FUSION,
                 this.symbol,
                 true
+        );
+
+        // ✅ чтобы UI видел сигнал сразу
+        live.pushSignal(
+                this.chatId,
+                StrategyType.SMART_FUSION,
+                this.symbol,
+                cfg.getTimeframe(),
+                Signal.hold("started")
         );
 
         log.info("▶️ SMART_FUSION START chatId={} symbol={}", this.chatId, this.symbol);
@@ -133,6 +140,11 @@ public class SmartFusionStrategy implements TradingStrategy, ContextAwareStrateg
 
         long tfMillis = TimeframeUtils.toMillis(cfg.getTimeframe());
         candleAggregator.flush(chatId, StrategyType.SMART_FUSION, symbol, cfg.getTimeframe(), tfMillis);
+
+        live.clearTpSl(chatId, StrategyType.SMART_FUSION, symbol);
+        live.clearPriceLines(chatId, StrategyType.SMART_FUSION, symbol);
+        live.clearTradeZone(chatId, StrategyType.SMART_FUSION, symbol);
+        live.clearZone(chatId, StrategyType.SMART_FUSION, symbol);
 
         live.pushState(chatId, StrategyType.SMART_FUSION, symbol, false);
         log.info("⏹ SMART_FUSION STOP chatId={} symbol={}", chatId, symbol);
@@ -162,9 +174,7 @@ public class SmartFusionStrategy implements TradingStrategy, ContextAwareStrateg
 
         Instant time = ts != null ? ts : Instant.now();
 
-        // =====================================================
-        // 🔥 ВСЕГДА пушим цену (визуализация)
-        // =====================================================
+        // 🔥 ВСЕГДА пушим цену
         live.pushPriceTick(
                 this.chatId,
                 StrategyType.SMART_FUSION,
@@ -173,12 +183,9 @@ public class SmartFusionStrategy implements TradingStrategy, ContextAwareStrateg
                 time
         );
 
-        // =====================================================
-        // 🟣 ЕСЛИ СТРАТЕГИЯ НЕ ЗАПУЩЕНА — ТОЛЬКО ВИЗУАЛ
-        // =====================================================
+        // 🟣 если не запущена — только визуал
         if (!running.get()) {
 
-            // fallback уровни ±0.2%
             BigDecimal priceBd = price;
             BigDecimal delta =
                     priceBd.multiply(BigDecimal.valueOf(0.002))
@@ -194,12 +201,19 @@ public class SmartFusionStrategy implements TradingStrategy, ContextAwareStrateg
                     )
             );
 
+            // ✅ HOLD всегда
+            live.pushSignal(
+                    this.chatId,
+                    StrategyType.SMART_FUSION,
+                    this.symbol,
+                    cfg != null ? cfg.getTimeframe() : null,
+                    Signal.hold("visual only (stopped)")
+            );
+
             return;
         }
 
-        // =====================================================
-        // ✅ СТРАТЕГИЯ АКТИВНА — ПОЛНЫЙ ЦИКЛ
-        // =====================================================
+        // ✅ стратегия активна — полный цикл
         long tfMillis = TimeframeUtils.toMillis(cfg.getTimeframe());
 
         candleAggregator.onPriceTick(
@@ -230,9 +244,6 @@ public class SmartFusionStrategy implements TradingStrategy, ContextAwareStrateg
 
         BigDecimal priceBd = BigDecimal.valueOf(lastPrice);
 
-        // =====================================================
-        // ⏳ FALLBACK — пока не хватает свечей
-        // =====================================================
         int need = Math.max(
                 Math.max(cfg.getEmaSlowPeriod(), cfg.getAtrPeriod()),
                 cfg.getRsiPeriod()
@@ -240,7 +251,6 @@ public class SmartFusionStrategy implements TradingStrategy, ContextAwareStrateg
 
         if (candles == null || candles.size() < need) {
 
-            // минимальный псевдо-ATR (0.2%)
             BigDecimal fallbackAtr =
                     priceBd.multiply(BigDecimal.valueOf(0.002))
                             .setScale(8, RoundingMode.HALF_UP);
@@ -248,7 +258,6 @@ public class SmartFusionStrategy implements TradingStrategy, ContextAwareStrateg
             BigDecimal support    = priceBd.subtract(fallbackAtr);
             BigDecimal resistance = priceBd.add(fallbackAtr);
 
-            // уровни сразу в UI
             live.pushLevels(
                     chatId,
                     StrategyType.SMART_FUSION,
@@ -256,13 +265,21 @@ public class SmartFusionStrategy implements TradingStrategy, ContextAwareStrateg
                     List.of(support, resistance)
             );
 
-            // базовая зона
             live.pushZone(
                     chatId,
                     StrategyType.SMART_FUSION,
                     symbol,
                     resistance,
                     support
+            );
+
+            // ✅ HOLD всегда
+            live.pushSignal(
+                    chatId,
+                    StrategyType.SMART_FUSION,
+                    symbol,
+                    cfg.getTimeframe(),
+                    Signal.hold("waiting candles")
             );
 
             log.debug(
@@ -274,9 +291,6 @@ public class SmartFusionStrategy implements TradingStrategy, ContextAwareStrateg
             return;
         }
 
-        // =====================================================
-        // ✅ НОРМАЛЬНЫЙ РАСЧЁТ (когда свечей достаточно)
-        // =====================================================
         double[] closes = candles.stream()
                 .mapToDouble(CandleProvider.Candle::close)
                 .toArray();
@@ -288,15 +302,11 @@ public class SmartFusionStrategy implements TradingStrategy, ContextAwareStrateg
 
         BigDecimal atrBd = BigDecimal.valueOf(atr).setScale(8, RoundingMode.HALF_UP);
 
-        // =====================================================
         // 📈 EMA
-        // =====================================================
         pushPriceLineDedup("EMA_FAST", emaFast, true);
         pushPriceLineDedup("EMA_SLOW", emaSlow, false);
 
-        // =====================================================
         // 🟣 SMART LEVELS (ATR-based)
-        // =====================================================
         BigDecimal support    = priceBd.subtract(atrBd.multiply(BigDecimal.valueOf(1.5)));
         BigDecimal resistance = priceBd.add(atrBd.multiply(BigDecimal.valueOf(1.5)));
 
@@ -313,9 +323,7 @@ public class SmartFusionStrategy implements TradingStrategy, ContextAwareStrateg
             lastResistance = resistance;
         }
 
-        // =====================================================
         // 🟠 ZONE
-        // =====================================================
         live.pushZone(
                 chatId,
                 StrategyType.SMART_FUSION,
@@ -324,9 +332,7 @@ public class SmartFusionStrategy implements TradingStrategy, ContextAwareStrateg
                 support
         );
 
-        // =====================================================
         // 📊 ATR
-        // =====================================================
         live.pushAtr(
                 chatId,
                 StrategyType.SMART_FUSION,
@@ -335,17 +341,18 @@ public class SmartFusionStrategy implements TradingStrategy, ContextAwareStrateg
                 atr / lastPrice * 100
         );
 
-        // =====================================================
+        boolean fired = false;
+
         // 🔴🟢 SIGNALS / TRADES
-        // =====================================================
         if (rsi < cfg.getRsiBuyThreshold() && emaFast > emaSlow) {
 
+            // ✅ новый контракт: pushSignal(timeframe, Signal)
             live.pushSignal(
                     chatId,
                     StrategyType.SMART_FUSION,
                     symbol,
-                    "BUY",
-                    1.0
+                    cfg.getTimeframe(),
+                    Signal.buy(1.0, "RSI low + EMA fast>slow")
             );
 
             live.pushTradeZone(
@@ -358,16 +365,18 @@ public class SmartFusionStrategy implements TradingStrategy, ContextAwareStrateg
             );
 
             processTrade(OrderSide.BUY, lastPrice, cfg);
+            fired = true;
         }
 
         if (rsi > cfg.getRsiSellThreshold() && emaFast < emaSlow) {
 
+            // ✅ новый контракт: pushSignal(timeframe, Signal)
             live.pushSignal(
                     chatId,
                     StrategyType.SMART_FUSION,
                     symbol,
-                    "SELL",
-                    1.0
+                    cfg.getTimeframe(),
+                    Signal.sell(1.0, "RSI high + EMA fast<slow")
             );
 
             live.pushTradeZone(
@@ -380,11 +389,22 @@ public class SmartFusionStrategy implements TradingStrategy, ContextAwareStrateg
             );
 
             processTrade(OrderSide.SELL, lastPrice, cfg);
+            fired = true;
         }
 
-        // =====================================================
+        // ✅ HOLD всегда, если не было BUY/SELL
+        if (!fired) {
+            live.pushSignal(
+                    chatId,
+                    StrategyType.SMART_FUSION,
+                    symbol,
+                    cfg.getTimeframe(),
+                    Signal.hold("no signal")
+            );
+            live.clearTradeZone(chatId, StrategyType.SMART_FUSION, symbol);
+        }
+
         // 🎯 TP / SL
-        // =====================================================
         live.pushTpSl(
                 chatId,
                 StrategyType.SMART_FUSION,
@@ -462,8 +482,8 @@ public class SmartFusionStrategy implements TradingStrategy, ContextAwareStrateg
     }
 
     // =========================================================
-// TRADE
-// =========================================================
+    // TRADE
+    // =========================================================
     private void processTrade(OrderSide side, double price, SmartFusionStrategySettings cfg) {
 
         double qty = cfg.getCapitalUsd() / price;
@@ -498,5 +518,4 @@ public class SmartFusionStrategy implements TradingStrategy, ContextAwareStrateg
             );
         }
     }
-
 }

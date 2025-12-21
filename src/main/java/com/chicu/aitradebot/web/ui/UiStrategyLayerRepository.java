@@ -20,10 +20,6 @@ public interface UiStrategyLayerRepository
     // 📊 ДЛЯ ГРАФИКА (FULL SNAPSHOT)
     // =====================================================
 
-    /**
-     * Все слои стратегии для графика
-     * (используется при первичной загрузке)
-     */
     @Query("""
         select l
         from UiStrategyLayerEntity l
@@ -42,10 +38,6 @@ public interface UiStrategyLayerRepository
     // 🔁 REPLAY (ПОСЛЕДНЕЕ СОСТОЯНИЕ)
     // =====================================================
 
-    /**
-     * Последние слои определённого типа
-     * (LEVELS / ZONE)
-     */
     @Query("""
         select l
         from UiStrategyLayerEntity l
@@ -66,9 +58,6 @@ public interface UiStrategyLayerRepository
     // 🧹 CLEANUP
     // =====================================================
 
-    /**
-     * Удалить старые слои (TTL)
-     */
     @Transactional
     @Modifying
     @Query("""
@@ -77,10 +66,6 @@ public interface UiStrategyLayerRepository
     """)
     int deleteOlderThan(@Param("before") Instant before);
 
-    /**
-     * Очистить слои стратегии
-     * (stop / restart)
-     */
     @Transactional
     @Modifying
     @Query("""
@@ -95,19 +80,19 @@ public interface UiStrategyLayerRepository
             @Param("symbol") String symbol
     );
 
+    @Transactional
     @Modifying
     @Query("""
-    delete from UiStrategyLayerEntity l
-    where l.chatId = :chatId
-      and l.strategyType = :strategyType
-      and l.symbol = :symbol
-      and l.layerType = :layerType
-""")
+        delete from UiStrategyLayerEntity l
+        where l.chatId = :chatId
+          and l.strategyType = :strategyType
+          and l.symbol = :symbol
+          and l.layerType = :layerType
+    """)
     void deleteByType(
             @Param("chatId") Long chatId,
             @Param("strategyType") StrategyType strategyType,
             @Param("symbol") String symbol,
             @Param("layerType") String layerType
     );
-
 }

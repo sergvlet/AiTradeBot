@@ -16,30 +16,41 @@ public class StrategyChartApiController {
     private final WebChartFacade chartFacade;
 
     /**
-     * FULL стратегический график (SNAPSHOT):
+     * FULL стратегический график (SNAPSHOT)
      *  — свечи (market)
-     *  — индикаторы
-     *  — сделки
-     *  — 🔥 СЛОИ СТРАТЕГИИ (levels / zone)
+     *  — last price
+     *  — UI layers (levels / zone / tp-sl и т.д.)
+     * ❗️Без чтения БД стратегии
      */
     @GetMapping("/strategy")
     public StrategyChartDto getStrategyChart(
-            @RequestParam long chatId,
-            @RequestParam StrategyType type,   // ✅ enum, а не String
+            @RequestParam long chatId,                 // ✅ ИСПРАВЛЕНО
+            @RequestParam StrategyType type,
             @RequestParam String symbol,
             @RequestParam(defaultValue = "1m") String timeframe,
             @RequestParam(defaultValue = "500") int limit
     ) {
+
+        if (symbol == null || symbol.isBlank()) {
+            throw new IllegalArgumentException("Symbol must be provided");
+        }
+
+        if (limit < 10 || limit > 2000) {
+            throw new IllegalArgumentException("Limit must be between 10 and 2000");
+        }
+
+        String tf = timeframe.toLowerCase();
+
         log.info(
                 "📈 StrategyChart → chatId={} type={} symbol={} tf={} limit={}",
-                chatId, type, symbol, timeframe, limit
+                chatId, type, symbol, tf, limit
         );
 
         return chartFacade.buildChart(
                 chatId,
                 type,
-                symbol,
-                timeframe,
+                symbol.toUpperCase(),
+                tf,
                 limit
         );
     }

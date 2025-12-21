@@ -5,12 +5,14 @@ import com.chicu.aitradebot.domain.OrderEntity;
 import com.chicu.aitradebot.exchange.model.Order;
 import com.chicu.aitradebot.repository.OrderRepository;
 import com.chicu.aitradebot.service.OrderService;
+import com.chicu.aitradebot.strategy.live.StrategyLivePublisher;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.util.Arrays;
 import java.util.List;
@@ -22,6 +24,8 @@ import java.util.stream.Collectors;
 public class OrderServiceImpl implements OrderService {
 
     private final OrderRepository orderRepository;
+    private final StrategyLivePublisher livePublisher;
+
 
     // ==========================
     // MARKET
@@ -40,8 +44,7 @@ public class OrderServiceImpl implements OrderService {
 
         OrderEntity entity = new OrderEntity();
         entity.setChatId(chatId);
-        entity.setUserId(chatId); // ✅ ИСПРАВЛЕНИЕ
-
+        entity.setUserId(chatId);
         entity.setSymbol(symbol);
         entity.setSide(side);
         entity.setPrice(executionPrice);
@@ -57,6 +60,24 @@ public class OrderServiceImpl implements OrderService {
         }
 
         orderRepository.save(entity);
+
+        // =====================================================
+        // 🔥 LIVE TRADE В ГРАФИК
+        // =====================================================
+        try {
+            livePublisher.pushTrade(
+                    chatId,
+                    StrategyType.valueOf(strategyType),
+                    symbol,
+                    side,
+                    executionPrice,
+                    quantity,
+                    Instant.now()
+            );
+        } catch (Exception e) {
+            log.warn("⚠️ Live trade publish skipped: {}", e.getMessage());
+        }
+
         return mapToDto(entity);
     }
 

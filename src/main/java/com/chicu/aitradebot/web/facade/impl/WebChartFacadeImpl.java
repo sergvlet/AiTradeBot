@@ -4,7 +4,6 @@ import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.exchange.client.ExchangeClient;
 import com.chicu.aitradebot.market.MarketService;
 import com.chicu.aitradebot.market.stream.MarketDataStreamService;
-import com.chicu.aitradebot.service.StrategySettingsService;
 import com.chicu.aitradebot.web.dto.StrategyChartDto;
 import com.chicu.aitradebot.web.facade.WebChartFacade;
 import com.chicu.aitradebot.web.ui.UiStrategyLayerService;
@@ -21,7 +20,6 @@ import java.util.Map;
 public class WebChartFacadeImpl implements WebChartFacade {
 
     private final MarketService marketService;
-    private final StrategySettingsService settingsService;
     private final MarketDataStreamService marketDataStreamService;
     private final UiStrategyLayerService uiLayerService;
 
@@ -34,11 +32,11 @@ public class WebChartFacadeImpl implements WebChartFacade {
             int limit
     ) {
 
-        var settings = settingsService.getOrCreate(chatId, strategyType);
+        if (symbol == null || symbol.isBlank()) {
+            throw new IllegalArgumentException("Symbol must be provided for chart");
+        }
 
-        String finalSymbol = (symbol != null && !symbol.isBlank())
-                ? symbol
-                : settings.getSymbol();
+        String finalSymbol = symbol.toUpperCase();
 
         log.info(
                 "📊 BuildChart chatId={} strategy={} symbol={} tf={} limit={}",
@@ -46,7 +44,7 @@ public class WebChartFacadeImpl implements WebChartFacade {
         );
 
         // =====================================================
-        // 🔴 LIVE подписка
+        // 🔴 LIVE подписка (WS)
         // =====================================================
         try {
             marketDataStreamService.subscribeCandles(
@@ -85,10 +83,9 @@ public class WebChartFacadeImpl implements WebChartFacade {
                 : candles.get(candles.size() - 1).getClose();
 
         // =====================================================
-        // 🧠 UI LAYERS — ЧЕРЕЗ SERVICE (БЕЗ JSON)
+        // 🧠 UI LAYERS (SNAPSHOT, БЕЗ БД)
         // =====================================================
 
-        // LEVELS
         List<Double> levels =
                 uiLayerService.loadLatestLevels(
                         chatId,
@@ -96,7 +93,6 @@ public class WebChartFacadeImpl implements WebChartFacade {
                         finalSymbol
                 );
 
-        // ZONE
         StrategyChartDto.Zone zone = null;
         Map<String, Object> zoneMap =
                 uiLayerService.loadLatestZone(
@@ -105,16 +101,19 @@ public class WebChartFacadeImpl implements WebChartFacade {
                         finalSymbol
                 );
 
-        if (zoneMap != null) {
+        if (zoneMap != null
+            && zoneMap.get("top") instanceof Number top
+            && zoneMap.get("bottom") instanceof Number bottom) {
+
             zone = StrategyChartDto.Zone.builder()
-                    .top(((Number) zoneMap.get("top")).doubleValue())
-                    .bottom(((Number) zoneMap.get("bottom")).doubleValue())
+                    .top(top.doubleValue())
+                    .bottom(bottom.doubleValue())
                     .color((String) zoneMap.get("color"))
                     .build();
         }
 
         log.info(
-                "🧠 UI layers loaded: levels={} zone={}",
+                "🧠 UI snapshot loaded: levels={} zone={}",
                 levels.size(),
                 zone != null
         );

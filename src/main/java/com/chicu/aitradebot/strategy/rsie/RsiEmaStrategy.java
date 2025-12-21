@@ -5,6 +5,7 @@ import com.chicu.aitradebot.common.util.TimeframeUtils;
 import com.chicu.aitradebot.strategy.core.CandleProvider;
 import com.chicu.aitradebot.strategy.core.ContextAwareStrategy;
 import com.chicu.aitradebot.strategy.core.TradingStrategy;
+import com.chicu.aitradebot.strategy.core.signal.Signal;
 import com.chicu.aitradebot.strategy.live.LiveCandleAggregator;
 import com.chicu.aitradebot.strategy.live.StrategyLivePublisher;
 import com.chicu.aitradebot.strategy.registry.StrategyBinding;
@@ -46,12 +47,7 @@ public class RsiEmaStrategy implements TradingStrategy, ContextAwareStrategy {
         BigDecimal lastEmaFast;
         BigDecimal lastEmaSlow;
 
-        BigDecimal lastSentEntry;
-        BigDecimal lastSentTp;
-        BigDecimal lastSentSl;
-
         String lastSignalName;
-        Double lastSignalConfidence;
     }
 
     private final Map<Long, State> states = new ConcurrentHashMap<>();
@@ -83,22 +79,27 @@ public class RsiEmaStrategy implements TradingStrategy, ContextAwareStrategy {
         st.active = true;
         st.startedAt = Instant.now();
 
-        // 🔧 FIX: полный сброс UI-состояния
         st.entryPrice = null;
         st.entrySide = null;
         st.lastEmaFast = null;
         st.lastEmaSlow = null;
-        st.lastSentEntry = null;
-        st.lastSentTp = null;
-        st.lastSentSl = null;
         st.lastSignalName = null;
-        st.lastSignalConfidence = null;
 
         cfg.setActive(true);
         cfg.setSymbol(st.symbol);
         settingsService.save(cfg);
 
         live.pushState(chatId, StrategyType.RSI_EMA, st.symbol, true);
+
+        // ✅ сразу HOLD, чтобы UI не был пустым
+        live.pushSignal(
+                chatId,
+                StrategyType.RSI_EMA,
+                st.symbol,
+                cfg.getTimeframe(),
+                Signal.hold("started")
+        );
+
         log.info("▶️ RSI/EMA START chatId={} symbol={}", chatId, st.symbol);
     }
 
@@ -123,6 +124,10 @@ public class RsiEmaStrategy implements TradingStrategy, ContextAwareStrategy {
                 tfMillis
         );
 
+        live.clearPriceLines(chatId, StrategyType.RSI_EMA, st.symbol);
+        live.clearTradeZone(chatId, StrategyType.RSI_EMA, st.symbol);
+        live.clearTpSl(chatId, StrategyType.RSI_EMA, st.symbol);
+
         live.pushState(chatId, StrategyType.RSI_EMA, st.symbol, false);
         log.info("⏹ RSI/EMA STOP chatId={} symbol={}", chatId, st.symbol);
     }
@@ -137,10 +142,8 @@ public class RsiEmaStrategy implements TradingStrategy, ContextAwareStrategy {
         if (st == null || !st.active || price == null) return;
 
         RsiEmaStrategySettings cfg = settingsService.getOrCreate(chatId);
-
         Instant time = ts != null ? ts : Instant.now();
 
-        // 🔥 PRICE → UI
         live.pushPriceTick(chatId, StrategyType.RSI_EMA, st.symbol, price, time);
 
         long tfMillis = TimeframeUtils.toMillis(cfg.getTimeframe());
@@ -154,7 +157,7 @@ public class RsiEmaStrategy implements TradingStrategy, ContextAwareStrategy {
                 time
         );
 
-        executeCycle(st, cfg, price, time);
+        executeCycle(st, cfg, price);
     }
 
     // ============================================================
@@ -162,10 +165,8 @@ public class RsiEmaStrategy implements TradingStrategy, ContextAwareStrategy {
     // ============================================================
     private void executeCycle(State st,
                               RsiEmaStrategySettings cfg,
-                              BigDecimal lastPrice,
-                              Instant time) {
+                              BigDecimal lastPrice) {
 
-        // ✅ ЧИТАЕМ ЧЕРЕЗ CandleProvider (он уже наполняется агрегатором)
         List<CandleProvider.Candle> candles =
                 candleProvider.getRecentCandles(
                         st.chatId,
@@ -193,34 +194,16 @@ public class RsiEmaStrategy implements TradingStrategy, ContextAwareStrategy {
 
         double rsi = rsi(closes, cfg.getRsiPeriod());
 
-        // =========================================================
-        // EMA → UI (price_line)
-        // =========================================================
         if (st.lastEmaFast == null || emaFast.compareTo(st.lastEmaFast) != 0) {
-            live.pushPriceLine(
-                    st.chatId,
-                    StrategyType.RSI_EMA,
-                    st.symbol,
-                    "EMA_FAST",
-                    emaFast
-            );
+            live.pushPriceLine(st.chatId, StrategyType.RSI_EMA, st.symbol, "EMA_FAST", emaFast);
             st.lastEmaFast = emaFast;
         }
 
         if (st.lastEmaSlow == null || emaSlow.compareTo(st.lastEmaSlow) != 0) {
-            live.pushPriceLine(
-                    st.chatId,
-                    StrategyType.RSI_EMA,
-                    st.symbol,
-                    "EMA_SLOW",
-                    emaSlow
-            );
+            live.pushPriceLine(st.chatId, StrategyType.RSI_EMA, st.symbol, "EMA_SLOW", emaSlow);
             st.lastEmaSlow = emaSlow;
         }
 
-        // =========================================================
-        // SIGNAL LOGIC
-        // =========================================================
         boolean buy =
                 rsi <= cfg.getRsiBuyThreshold()
                 && emaFast.compareTo(emaSlow) > 0;
@@ -229,23 +212,48 @@ public class RsiEmaStrategy implements TradingStrategy, ContextAwareStrategy {
                 rsi >= cfg.getRsiSellThreshold()
                 && emaFast.compareTo(emaSlow) < 0;
 
-        if (buy) {
-            pushSignalDedup(
-                    st,
-                    "BUY",
-                    confidenceFromRsi(rsi, cfg.getRsiBuyThreshold(), true)
+        if (buy && !"BUY".equals(st.lastSignalName)) {
+
+            double conf = confidenceFromRsi(rsi, cfg.getRsiBuyThreshold(), true);
+
+            live.pushSignal(
+                    st.chatId,
+                    StrategyType.RSI_EMA,
+                    st.symbol,
+                    cfg.getTimeframe(),
+                    Signal.buy(conf, "RSI low + EMA fast>slow")
             );
+
+            st.lastSignalName = "BUY";
+            return;
         }
 
-        if (sell) {
-            pushSignalDedup(
-                    st,
-                    "SELL",
-                    confidenceFromRsi(rsi, cfg.getRsiSellThreshold(), false)
+        if (sell && !"SELL".equals(st.lastSignalName)) {
+
+            double conf = confidenceFromRsi(rsi, cfg.getRsiSellThreshold(), false);
+
+            live.pushSignal(
+                    st.chatId,
+                    StrategyType.RSI_EMA,
+                    st.symbol,
+                    cfg.getTimeframe(),
+                    Signal.sell(conf, "RSI high + EMA fast<slow")
             );
+
+            st.lastSignalName = "SELL";
+            return;
         }
+
+        // ✅ HOLD всегда
+        live.pushSignal(
+                st.chatId,
+                StrategyType.RSI_EMA,
+                st.symbol,
+                cfg.getTimeframe(),
+                Signal.hold("no signal")
+        );
+        st.lastSignalName = "HOLD";
     }
-
 
     // ============================================================
     // REPLAY
@@ -288,13 +296,6 @@ public class RsiEmaStrategy implements TradingStrategy, ContextAwareStrategy {
     // ============================================================
     // HELPERS
     // ============================================================
-    private void pushSignalDedup(State st, String name, double conf) {
-        if (name.equals(st.lastSignalName)) return;
-        live.pushSignal(st.chatId, StrategyType.RSI_EMA, st.symbol, name, conf);
-        st.lastSignalName = name;
-        st.lastSignalConfidence = conf;
-    }
-
     private double ema(double[] arr, int p) {
         double k = 2.0 / (p + 1);
         double v = arr[0];
@@ -317,9 +318,10 @@ public class RsiEmaStrategy implements TradingStrategy, ContextAwareStrategy {
         double raw = buy ? (t - rsi) : (rsi - t);
         return Math.min(1, Math.max(0, raw / 30.0));
     }
+
     // ============================================================
-// INFO (TradingStrategy contract)
-// ============================================================
+    // INFO
+    // ============================================================
     @Override
     public boolean isActive(Long chatId) {
         State st = states.get(chatId);
@@ -339,6 +341,4 @@ public class RsiEmaStrategy implements TradingStrategy, ContextAwareStrategy {
                 ? "RSI_EMA-" + chatId
                 : "RSI_EMA-" + chatId + "-" + st.symbol;
     }
-
-
 }
