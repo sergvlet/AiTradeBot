@@ -10,7 +10,6 @@ document.addEventListener("DOMContentLoaded", () => {
 
     const root = document.querySelector(".strategy-settings-page");
 
-    // chatId и type берём надёжно
     const chatId =
         root?.dataset.chatId ||
         document.querySelector("input[name='chatId']")?.value ||
@@ -27,7 +26,6 @@ document.addEventListener("DOMContentLoaded", () => {
         console.warn("settings.js: chatId или type не определены", { chatId, type });
     }
 
-    // ВАЖНО: контроллер живёт по /strategies/{type}/config
     const baseUrl = `/strategies/${encodeURIComponent(type)}/config`;
 
     const tabs  = document.querySelectorAll(".tab-btn");
@@ -43,9 +41,8 @@ document.addEventListener("DOMContentLoaded", () => {
     const marketResults = document.getElementById("marketResults");
     const symbolInput   = document.getElementById("symbolInput");
 
-
     // -------------------------------------------------------------
-    //  ВКЛАДКИ (TAB'Ы) — хранение активной вкладки
+    //  TAB'Ы
     // -------------------------------------------------------------
 
     const TAB_KEY = "strategy_settings_active_tab";
@@ -65,7 +62,6 @@ document.addEventListener("DOMContentLoaded", () => {
         localStorage.setItem(TAB_KEY, tabId);
     }
 
-    // восстановить вкладку из localStorage или по умолчанию "network"
     const savedTab = localStorage.getItem(TAB_KEY);
     if (savedTab && document.getElementById(savedTab)) {
         activateTab(savedTab);
@@ -75,15 +71,12 @@ document.addEventListener("DOMContentLoaded", () => {
 
     tabs.forEach(btn => {
         btn.addEventListener("click", () => {
-            const tabId = btn.dataset.tab;
-            activateTab(tabId);
+            activateTab(btn.dataset.tab);
         });
     });
 
-
     // -------------------------------------------------------------
-    //  ПЕРЕЗАГРУЗКА ПРИ СМЕНЕ БИРЖИ / СЕТИ
-    //  (чтобы перетащить diagnostics, баланс, таймфреймы)
+    //  RELOAD при смене биржи / сети
     // -------------------------------------------------------------
 
     function reloadWithParams() {
@@ -105,74 +98,8 @@ document.addEventListener("DOMContentLoaded", () => {
     if (exSel) exSel.addEventListener("change", reloadWithParams);
     if (ntSel) ntSel.addEventListener("change", reloadWithParams);
 
-
     // -------------------------------------------------------------
-    //  ЗАГРУЗКА РЕАЛЬНОЙ КОМИССИИ (RealFee)
-    // -------------------------------------------------------------
-
-    async function loadRealFee() {
-        if (!exSel || !ntSel || !chatId || !type) return;
-
-        const exchange = exSel.value;
-        const network  = ntSel.value;
-
-        const url =
-            `${baseUrl}/real-fee` +
-            `?chatId=${encodeURIComponent(chatId)}` +
-            `&exchange=${encodeURIComponent(exchange)}` +
-            `&network=${encodeURIComponent(network)}`;
-
-        try {
-            const res = await fetch(url);
-            if (!res.ok) {
-                throw new Error(res.status);
-            }
-
-            const data = await res.json();
-
-            if (commissionInput && typeof data.fee !== "undefined") {
-                commissionInput.value = Number(data.fee).toFixed(3);
-            }
-
-            if (data.ok && window.showToast) {
-                const vip = data.vipLevel ?? "?";
-                const bnb = data.bnb ? "да" : "нет";
-                showToast(`Комиссия обновлена (VIP${vip}, BNB: ${bnb})`, true);
-            }
-
-        } catch (e) {
-            console.error("Ошибка загрузки комиссии:", e);
-            if (window.showToast) {
-                showToast("Ошибка загрузки комиссии", false);
-            }
-        }
-    }
-
-    // автозагрузка комиссии, если поле есть
-    if (commissionInput) {
-        loadRealFee();
-    }
-
-    // кнопка обновить комиссию
-    if (refreshBtn) {
-        refreshBtn.addEventListener("click", async () => {
-
-            refreshBtn.disabled = true;
-            const oldText = refreshBtn.innerText;
-            refreshBtn.innerText = "Обновляем…";
-
-            try {
-                await loadRealFee();
-            } finally {
-                refreshBtn.disabled = false;
-                refreshBtn.innerText = oldText;
-            }
-        });
-    }
-
-
-    // -------------------------------------------------------------
-    //  ПОИСК МОНЕТ (MARKET SEARCH)
+    //  MARKET SEARCH (без изменений)
     // -------------------------------------------------------------
 
     let searchTimer = null;
@@ -181,10 +108,10 @@ document.addEventListener("DOMContentLoaded", () => {
         if (!marketResults || !exSel || !ntSel) return;
 
         if (!query || query.trim().length < 1) {
-            marketResults.innerHTML = `
-                <div class="text-center text-secondary p-3">
+            marketResults.innerHTML =
+                `<div class="text-center text-secondary p-3">
                     Введите поисковый запрос…
-                </div>`;
+                 </div>`;
             return;
         }
 
@@ -198,23 +125,17 @@ document.addEventListener("DOMContentLoaded", () => {
             `&q=${encodeURIComponent(query)}`;
 
         try {
-            marketResults.innerHTML = `
-                <div class="text-center text-info p-3">
-                    Поиск…
-                </div>`;
+            marketResults.innerHTML =
+                `<div class="text-center text-info p-3">Поиск…</div>`;
 
             const res  = await fetch(url);
-            if (!res.ok) {
-                throw new Error(res.status);
-            }
+            if (!res.ok) throw new Error(res.status);
 
             const list = await res.json();
 
             if (!Array.isArray(list) || list.length === 0) {
-                marketResults.innerHTML = `
-                    <div class="text-center text-secondary p-3">
-                        Ничего не найдено
-                    </div>`;
+                marketResults.innerHTML =
+                    `<div class="text-center text-secondary p-3">Ничего не найдено</div>`;
                 return;
             }
 
@@ -251,37 +172,85 @@ document.addEventListener("DOMContentLoaded", () => {
             });
 
             html += "</tbody></table>";
-
             marketResults.innerHTML = html;
 
-            // обработка кнопок "Выбрать"
             document.querySelectorAll(".select-symbol").forEach(btn => {
                 btn.addEventListener("click", () => {
-                    const symbol = btn.dataset.symbol;
-                    if (symbolInput) {
-                        symbolInput.value = symbol;
-                    }
-                    if (window.showToast) {
-                        showToast(`Выбрана пара: ${symbol}`, true);
-                    }
+                    symbolInput && (symbolInput.value = btn.dataset.symbol);
+                    window.showToast?.(`Выбрана пара: ${btn.dataset.symbol}`, true);
                 });
             });
 
         } catch (e) {
             console.error("Ошибка поиска монет:", e);
             marketResults.innerHTML =
-                `<div class="text-danger text-center p-3">
-                    Ошибка загрузки данных
-                 </div>`;
+                `<div class="text-danger text-center p-3">Ошибка загрузки данных</div>`;
         }
     }
 
     if (marketSearch) {
         marketSearch.addEventListener("input", () => {
-            const q = marketSearch.value.trim();
             clearTimeout(searchTimer);
-            searchTimer = setTimeout(() => loadMarketSearch(q), 250);
+            searchTimer = setTimeout(
+                () => loadMarketSearch(marketSearch.value.trim()),
+                250
+            );
         });
     }
+
+    // -------------------------------------------------------------
+    //  AJAX — СМЕНА АКТИВА СЧЁТА (SAFE + FORM-COMPATIBLE)
+    // -------------------------------------------------------------
+
+    const assetSelect = document.getElementById("accountAssetSelect");
+    const assetHidden = document.getElementById("accountAssetHidden");
+
+    if (assetSelect && assetHidden) {
+        assetSelect.addEventListener("change", async () => {
+
+            const asset = assetSelect.value;
+            if (!asset) return;
+
+            // 🔥 синхронизация для FORM submit
+            assetHidden.value = asset;
+
+            const ex = exSel?.value;
+            const nt = ntSel?.value;
+
+            if (!ex || !nt) {
+                console.warn("Не удалось определить exchange / network", { ex, nt });
+                return;
+            }
+
+            try {
+                await fetch(`${baseUrl}/asset`, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/x-www-form-urlencoded"
+                    },
+                    body: new URLSearchParams({
+                        chatId: String(chatId),
+                        exchange: ex,
+                        network: nt,
+                        asset
+                    })
+                });
+            } catch (e) {
+                console.error("Ошибка смены актива", e);
+            }
+        });
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+        const select = document.getElementById('accountAssetSelect');
+        const hidden = document.getElementById('accountAssetHidden');
+
+        if (select && hidden) {
+            select.addEventListener('change', () => {
+                hidden.value = select.value;
+                console.log('accountAsset changed ->', select.value);
+            });
+        }
+    });
 
 });

@@ -1,46 +1,60 @@
-/* =========================================================
-   SETTINGS PAGE — FULL STYLESHEET
-   static/css/views/strategies/settings.css
-   ========================================================= */
+/* ========================================================================
+   STRATEGY SETTINGS — UI V4 INTEGRATION
+   Работает строго поверх ChatGPT-like Design System
+   ======================================================================== */
+
+/* ========================================================================
+   ROOT PAGE
+   ======================================================================== */
 
 .strategy-settings-page {
-    color: #e5e7eb;
+    color: var(--text-main);
 }
 
-/* ---------------------- CARD ---------------------- */
-.strategy-settings-page .card-theme {
-    background: #15171a;
-    border: 1px solid #2a2d31;
-    border-radius: 16px;
+/* ========================================================================
+   CARDS
+   ======================================================================== */
+
+.strategy-settings-page .card-theme,
+.strategy-settings-page .card {
+    background: var(--bg-elevated-soft);
+    border: 1px solid var(--border-soft);
+    border-radius: 14px;
     padding: 20px;
+    box-shadow: var(--shadow-soft);
+    color: var(--text-main);
 }
 
-/* ---------------------- TABS ----------------------- */
+/* ========================================================================
+   TABS
+   ======================================================================== */
+
 .strategy-settings-page .nav-tabs {
-    border-bottom: 1px solid rgba(148, 163, 184, 0.3);
+    border-bottom: 1px solid var(--border-soft);
 }
 
 .strategy-settings-page .nav-tabs .nav-link {
-    padding: 12px 20px;
-    color: #c7cbd1;
-    border: none;
+    padding: 12px 18px;
+    color: var(--text-muted);
     background: transparent;
-    cursor: pointer;
+    border: none;
     font-weight: 500;
-    transition: all .15s ease-in-out;
 }
 
 .strategy-settings-page .nav-tabs .nav-link:hover {
-    color: #fff;
+    color: var(--text-main);
 }
 
 .strategy-settings-page .nav-tabs .nav-link.active {
-    color: #fff;
-    border-bottom: 2px solid #0d6efd;
-    background: rgba(13, 110, 253, 0.05);
+    color: var(--accent);
+    border-bottom: 2px solid var(--accent);
+    background: var(--accent-soft);
 }
 
-/* ---------------------- TAB CONTENT ---------------------- */
+/* ========================================================================
+   TAB CONTENT
+   ======================================================================== */
+
 .strategy-settings-page .tab-pane {
     display: none;
     padding-top: 20px;
@@ -50,82 +64,215 @@
     display: block;
 }
 
-/* ---------------------- SECTION TITLES ---------------------- */
+/* ========================================================================
+   SECTION TITLES
+   ======================================================================== */
+
 .strategy-settings-page .section-title {
-    font-size: 1.1rem;
-    margin: 20px 0 10px;
+    font-size: 1.05rem;
     font-weight: 600;
-    color: #f0f0f0;
+    margin: 22px 0 10px;
+    color: var(--text-main);
 }
 
-/* ---------------------- TABLE DIAGNOSTICS -------------------- */
-.strategy-settings-page table {
-    border-radius: 10px;
-    overflow: hidden;
+/* ========================================================================
+   TEXT NORMALIZATION (ГЛАВНЫЙ ФИКС ЧИТАЕМОСТИ)
+   ======================================================================== */
+
+.strategy-settings-page p,
+.strategy-settings-page span,
+.strategy-settings-page div,
+.strategy-settings-page label,
+.strategy-settings-page li,
+.strategy-settings-page td,
+.strategy-settings-page th {
+    color: var(--text-main);
 }
 
-.strategy-settings-page table td {
-    padding: 12px;
-    font-size: 0.95rem;
+/* вторичный текст */
+.strategy-settings-page .text-muted,
+.strategy-settings-page .form-text,
+.strategy-settings-page small,
+.strategy-settings-page .text-secondary {
+    color: var(--text-muted) !important;
 }
 
-/* ---------------------- MARKET SEARCH BOX ---------------------- */
-.market-results-box {
-    border: 1px solid #2b2d31;
-    background: #16181d;
-    border-radius: 10px;
-    padding: 0;
-    max-height: 420px;
-    overflow-y: auto;
-}
+/* ========================================================================
+   FORMS
+   ======================================================================== */
 
-.market-results-box table {
-    margin-bottom: 0;
-}
-
-/* placeholder text */
-.market-results-box .placeholder {
-    padding: 20px;
-    text-align: center;
-    color: #9ca3af;
-}
-
-.select-symbol {
-    padding: 4px 10px !important;
-}
-
-/* ---------------------- LOADER ---------------------- */
-#loader-overlay {
-    backdrop-filter: blur(3px);
-}
-
-
-/* ---------------------- FORM ---------------------- */
 .strategy-settings-page input,
-.strategy-settings-page select {
-    background: #0e0f11 !important;
-    border: 1px solid #32363c !important;
-    color: #e5e7eb !important;
+.strategy-settings-page select,
+.strategy-settings-page textarea {
+    background: var(--bg-main);
+    border: 1px solid var(--border-soft);
+    color: var(--text-main);
+}
+
+.strategy-settings-page input::placeholder {
+    color: var(--text-muted);
 }
 
 .strategy-settings-page input:focus,
-.strategy-settings-page select:focus {
-    border-color: #0d6efd !important;
-    box-shadow: 0 0 0 0.15rem rgba(13,110,253,0.25) !important;
+.strategy-settings-page select:focus,
+.strategy-settings-page textarea:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 0.15rem var(--accent-soft);
 }
 
-/* ---------------------- BUTTONS ---------------------- */
-.strategy-settings-page .btn-outline-info {
-    border-color: #3aa1ff;
-    color: #3aa1ff;
+/* input group (USDT / %) */
+.strategy-settings-page .input-group-text {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-soft);
+    color: var(--text-muted);
 }
 
-.strategy-settings-page .btn-outline-info:hover {
-    background: #3aa1ff;
-    color: #000;
+/* ========================================================================
+   CHECKBOX (CUSTOM, STABLE)
+   ======================================================================== */
+
+.strategy-settings-page .form-check-input[type="checkbox"] {
+    width: 1.1rem;
+    height: 1.1rem;
+
+    appearance: none;
+    -webkit-appearance: none;
+
+    border: 1.5px solid var(--border-soft);
+    border-radius: 4px;
+    background: transparent;
+
+    position: relative;
+    cursor: pointer;
 }
 
-.strategy-settings-page .btn-primary {
-    background: #0d6efd;
-    border: none;
+.strategy-settings-page .form-check-input[type="checkbox"]:checked {
+    background: var(--accent);
+    border-color: var(--accent);
+}
+
+.strategy-settings-page .form-check-input[type="checkbox"]:checked::after {
+    content: "";
+    position: absolute;
+    left: 0.32rem;
+    top: 0.12rem;
+    width: 0.25rem;
+    height: 0.55rem;
+    border: solid #fff;
+    border-width: 0 2px 2px 0;
+    transform: rotate(45deg);
+}
+
+/* ========================================================================
+   ALERTS — ПОЛНОСТЬЮ УНИФИЦИРОВАНЫ
+   ======================================================================== */
+
+.strategy-settings-page .alert {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-soft);
+    color: var(--text-main);
+}
+
+.strategy-settings-page .alert-info {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+}
+
+.strategy-settings-page .alert-warning {
+    background: rgba(245,158,11,0.15);
+}
+
+.strategy-settings-page .alert-secondary {
+    background: rgba(255,255,255,0.05);
+}
+
+.strategy-settings-page .alert-dark {
+    background: var(--bg-elevated);
+}
+
+/* текст внутри alert — ВСЕГДА читаемый */
+.strategy-settings-page .alert,
+.strategy-settings-page .alert * {
+    color: var(--text-main) !important;
+}
+
+/* ========================================================================
+   TABLES / DIAGNOSTICS
+   ======================================================================== */
+
+.strategy-settings-page table td {
+    padding: 12px;
+    color: var(--text-main);
+}
+
+/* статусы */
+.strategy-settings-page .text-success { color: var(--accent) !important; }
+.strategy-settings-page .text-danger  { color: #ef4444 !important; }
+.strategy-settings-page .text-warning { color: #f59e0b !important; }
+.strategy-settings-page .text-info    { color: #38bdf8 !important; }
+
+/* ========================================================================
+   HR / DIVIDERS
+   ======================================================================== */
+
+.strategy-settings-page hr {
+    border-color: var(--border-soft);
+    opacity: 0.6;
+}
+/* ========================================================================
+   🚨 BOOTSTRAP HARD OVERRIDES (LIGHT/DARK SAFE)
+   Решает: bg-dark / text-white / alert-dark / list-group-dark
+   ======================================================================== */
+
+/* ---------- bg-dark ---------- */
+.strategy-settings-page .bg-dark {
+    background: var(--bg-elevated-soft) !important;
+    color: var(--text-main) !important;
+}
+
+/* ---------- text-white / text-light ---------- */
+.strategy-settings-page .text-white,
+.strategy-settings-page .text-light {
+    color: var(--text-main) !important;
+}
+
+/* ---------- alert-dark ---------- */
+.strategy-settings-page .alert-dark {
+    background: var(--bg-elevated-soft) !important;
+    border: 1px solid var(--border-soft) !important;
+    color: var(--text-main) !important;
+}
+
+/* ---------- list-group dark ---------- */
+.strategy-settings-page .list-group-item-dark {
+    background: var(--bg-elevated-soft) !important;
+    border-color: var(--border-soft) !important;
+    color: var(--text-main) !important;
+}
+
+/* ---------- table-dark ---------- */
+.strategy-settings-page .table-dark {
+    background: var(--bg-elevated-soft) !important;
+    color: var(--text-main) !important;
+}
+
+.strategy-settings-page .table-dark td,
+.strategy-settings-page .table-dark th {
+    background: transparent !important;
+    color: var(--text-main) !important;
+}
+
+/* ========================================================================
+   ✔ STATUS / CHECK MARK ROWS (API VALIDATION BLOCK)
+   ======================================================================== */
+
+.strategy-settings-page .status-ok,
+.strategy-settings-page .status-success {
+    color: var(--accent) !important;
+    font-weight: 500;
+}
+
+.strategy-settings-page .status-ok .bi,
+.strategy-settings-page .status-success .bi {
+    color: var(--accent) !important;
 }

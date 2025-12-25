@@ -12,7 +12,7 @@ import java.time.Instant;
  * Хранится ВНЕ стратегии и передаётся через StrategyContext
  * ✔ используется для исполнения
  * ✔ используется для UI / WebSocket
- * ✔ НЕ содержит логики
+ * ✔ НЕ содержит бизнес-логики (только состояние + безопасные helper-методы)
  */
 @Getter
 @Setter
@@ -55,24 +55,25 @@ public class StrategyRuntimeState {
 
     private String lastSignal = "NONE";
     private String lastReason = "";
-    private Instant lastUpdatedAt = Instant.now();
+    private Instant lastUpdatedAt;
 
     // ============================================================
-    // HELPERS
+    // HELPERS (потокобезопасные)
     // ============================================================
 
     public boolean hasOpenPosition() {
         return openPosition;
     }
 
-    public void openPosition() {
+    public synchronized void openPosition() {
         this.openPosition = true;
-        this.positionOpenedAt = Instant.now();
-        this.lastTradeAt = Instant.now();
+        Instant now = Instant.now();
+        this.positionOpenedAt = now;
+        this.lastTradeAt = now;
         touch();
     }
 
-    public void closePosition() {
+    public synchronized void closePosition() {
         this.openPosition = false;
         this.positionOpenedAt = null;
         this.lastTradeAt = Instant.now();
@@ -85,7 +86,7 @@ public class StrategyRuntimeState {
         touch();
     }
 
-    public void touch() {
+    public synchronized void touch() {
         this.lastUpdatedAt = Instant.now();
     }
 }

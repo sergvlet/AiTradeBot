@@ -5,6 +5,8 @@ import com.chicu.aitradebot.strategy.core.TradingStrategy;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.config.BeanDefinition;
+import org.springframework.context.annotation.Role;
 import org.springframework.stereotype.Component;
 
 import java.util.*;
@@ -13,11 +15,11 @@ import java.util.*;
  * Универсальный реестр стратегий (v4):
  *  1) UI-метаданные (FieldMeta) — старый модуль, оставлен полностью.
  *  2) Реестр Java-бинов стратегий (register/getStrategy) — ядро v4.
- *
  * StrategyBindingProcessor вызывает register() автоматически.
  */
 @Slf4j
 @Component
+@Role(BeanDefinition.ROLE_INFRASTRUCTURE)
 public class StrategyRegistry {
 
     // =====================================================================

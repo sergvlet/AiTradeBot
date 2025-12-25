@@ -11,11 +11,11 @@ import java.lang.annotation.Target;
 
 /**
  * Аннотация для автоматической регистрации стратегии в StrategyRegistry.
- *
+
  * Пример:
  *   @StrategyBinding(StrategyType.SCALPING)
  *   public class ScalpingStrategy implements TradingStrategy { ... }
- *
+
  * Обрабатывается StrategyBindingProcessor, который вытаскивает value()
  * и регистрирует бин в StrategyRegistry.
  */

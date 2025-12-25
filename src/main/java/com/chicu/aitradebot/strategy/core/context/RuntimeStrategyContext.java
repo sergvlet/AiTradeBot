@@ -7,13 +7,19 @@ import lombok.Builder;
 import lombok.Getter;
 
 import java.math.BigDecimal;
+import java.util.Arrays;
 
 /**
  * 🧠 RuntimeStrategyContext (V4)
  * Immutable snapshot данных для evaluate()
+ *
+ * Важно:
+ * - стратегия читает только этот контекст
+ * - settings хранится как Object (тип зависит от strategyType)
+ * - closes защищаем от мутаций (копия)
  */
 @Getter
-@Builder
+@Builder(toBuilder = true)
 public class RuntimeStrategyContext implements StrategyContext {
 
     // =================================================
@@ -25,6 +31,7 @@ public class RuntimeStrategyContext implements StrategyContext {
 
     /**
      * 🔥 V4: тип стратегии (SCALPING / FIBONACCI / SMART_FUSION ...)
+     * ВАЖНО: должен быть задан builder'ом. (Не через StrategyContext fallback)
      */
     private final StrategyType strategyType;
 
@@ -40,12 +47,21 @@ public class RuntimeStrategyContext implements StrategyContext {
     // =================================================
 
     private final BigDecimal price;
+
+    /**
+     * Закрытия свечей (старые → новые).
+     * Держим ссылку только на копию, чтобы никто снаружи не мутировал snapshot.
+     */
     private final double[] closes;
 
     // =================================================
     // SETTINGS SNAPSHOT
     // =================================================
 
+    /**
+     * Snapshot настроек стратегии (тип зависит от strategyType).
+     * Например: ScalpingStrategySettings / FibonacciGridStrategySettings / StrategySettings / ...
+     */
     private final Object settings;
 
     // =================================================
@@ -53,6 +69,36 @@ public class RuntimeStrategyContext implements StrategyContext {
     // =================================================
 
     private final StrategyRuntimeState state;
+
+    // =================================================
+    // StrategyContext contract
+    // =================================================
+
+    @Override
+    public Object getSettings() {
+        return settings;
+    }
+
+    /**
+     * Переопределяем, чтобы не зависеть от fallback-логики интерфейса.
+     * В V4 "истина" — поле strategyType.
+     */
+    @Override
+    public StrategyType getStrategyType() {
+        return strategyType;
+    }
+
+    /**
+     * Защита массива от внешней мутации:
+     * если кто-то передал массив и потом его меняет — snapshot не должен "плыть".
+     */
+    public static class RuntimeStrategyContextBuilder {
+
+        public RuntimeStrategyContextBuilder closes(double[] closes) {
+            this.closes = (closes == null) ? null : Arrays.copyOf(closes, closes.length);
+            return this;
+        }
+    }
 
     // =================================================
     // SAFETY

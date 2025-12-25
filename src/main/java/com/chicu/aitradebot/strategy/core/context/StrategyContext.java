@@ -65,9 +65,27 @@ public interface StrategyContext {
     Object getSettings();
 
     /**
+     * Алиас для читаемости — явно подчёркивает,
+     * что стратегия работает со snapshot'ом.
+     */
+    default Object getSettingsSnapshot() {
+        return getSettings();
+    }
+
+    /**
      * Безопасное получение типизированных настроек.
      */
     <T> T getTypedSettings(Class<T> clazz);
+
+    /**
+     * 🔁 LIVE-обновление snapshot'а настроек.
+     *
+     * ⚠️ По умолчанию — no-op.
+     * Реальная логика будет в runtime-контексте.
+     */
+    default void updateSettingsSnapshot(Object newSnapshot) {
+        // default no-op (не ломаем старые реализации)
+    }
 
     // =================================================
     // RUNTIME STATE

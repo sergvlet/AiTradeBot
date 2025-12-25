@@ -9,7 +9,7 @@ import java.util.Map;
 @Builder
 public class ApiKeyDiagnostics {
 
-    private boolean ok;              // все проверки пройдены
+    private boolean ok;              // итог: всё ок
     private String exchange;         // BINANCE / BYBIT
     private String message;          // итоговое сообщение
 
@@ -22,4 +22,47 @@ public class ApiKeyDiagnostics {
     private boolean networkOk;
 
     private Map<String, Object> extra;
+
+    // ============================================================
+    // 🧠 FACTORY-МЕТОДЫ (то, чего не хватало)
+    // ============================================================
+
+    public static ApiKeyDiagnostics notConfigured(String exchange, String message) {
+        return ApiKeyDiagnostics.builder()
+                .ok(false)
+                .exchange(exchange)
+                .message(message)
+                .apiKeyValid(false)
+                .secretValid(false)
+                .signatureValid(false)
+                .accountReadable(false)
+                .tradingAllowed(false)
+                .ipAllowed(false)
+                .networkOk(false)
+                .build();
+    }
+
+    public static ApiKeyDiagnostics networkError(String exchange, String message) {
+        return ApiKeyDiagnostics.builder()
+                .ok(false)
+                .exchange(exchange)
+                .message(message)
+                .networkOk(false)
+                .build();
+    }
+
+    public static ApiKeyDiagnostics success(String exchange, String message) {
+        return ApiKeyDiagnostics.builder()
+                .ok(true)
+                .exchange(exchange)
+                .message(message)
+                .apiKeyValid(true)
+                .secretValid(true)
+                .signatureValid(true)
+                .accountReadable(true)
+                .tradingAllowed(true)
+                .ipAllowed(true)
+                .networkOk(true)
+                .build();
+    }
 }

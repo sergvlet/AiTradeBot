@@ -1,5 +1,6 @@
 package com.chicu.aitradebot.web.facade.impl;
 
+import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
 import com.chicu.aitradebot.orchestrator.AiStrategyOrchestrator;
@@ -22,13 +23,16 @@ public class WebStrategyFacadeImpl implements WebStrategyFacade {
     private final StrategySettingsService settingsService;
 
     // ================================================================
-    // 📋 LIST
+    // 📋 LIST (ФИЛЬТР ПО БИРЖЕ / СЕТИ)
     // ================================================================
     @Override
-    public List<StrategyUi> getStrategies(Long chatId) {
-
+    public List<StrategyUi> getStrategies(
+            Long chatId,
+            String exchange,
+            NetworkType network
+    ) {
         List<StrategySettings> settings =
-                settingsService.findAllByChatId(chatId);
+                settingsService.findAllByChatId(chatId, exchange, network);
 
         return StrategyUi.fromSettings(settings);
     }
@@ -37,42 +41,61 @@ public class WebStrategyFacadeImpl implements WebStrategyFacade {
     // ▶️ START
     // ================================================================
     @Override
-    public void start(Long chatId, StrategyType type) {
-        orchestrator.startStrategy(chatId, type);
+    public StrategyRunInfo start(
+            Long chatId,
+            StrategyType type,
+            String exchange,
+            NetworkType network
+    ) {
+        return orchestrator.startStrategy(chatId, type);
     }
 
     // ================================================================
     // ⏹ STOP
     // ================================================================
     @Override
-    public void stop(Long chatId, StrategyType type) {
-        orchestrator.stopStrategy(chatId, type);
+    public StrategyRunInfo stop(
+            Long chatId,
+            StrategyType type,
+            String exchange,
+            NetworkType network
+    ) {
+        return orchestrator.stopStrategy(chatId, type);
     }
 
     // ================================================================
     // 🔁 TOGGLE
     // ================================================================
     @Override
-    public void toggle(Long chatId, StrategyType type) {
-        StrategySettings s = settingsService.getOrCreate(chatId, type);
+    public StrategyRunInfo toggle(
+            Long chatId,
+            StrategyType type,
+            String exchange,
+            NetworkType network
+    ) {
+        StrategySettings s =
+                settingsService.getOrCreate(chatId, type, exchange, network);
 
-        if (s.isActive()) {
-            stop(chatId, type);
-        } else {
-            start(chatId, type);
-        }
+        return s.isActive()
+                ? orchestrator.stopStrategy(chatId, type)
+                : orchestrator.startStrategy(chatId, type);
     }
 
     // ================================================================
     // 🔁 TOGGLE (advanced)
     // ================================================================
     @Override
-    public StrategyRunInfo toggleStrategy(Long chatId,
-                                          StrategyType type,
-                                          String symbol,
-                                          String timeframe) {
+    public StrategyRunInfo toggleStrategy(
+            Long chatId,
+            StrategyType type,
+            String exchange,
+            NetworkType network,
+            String symbol,
+            String timeframe
+    ) {
 
-        StrategySettings s = settingsService.getOrCreate(chatId, type);
+        StrategySettings s =
+                settingsService.getOrCreate(chatId, type, exchange, network);
 
         if (symbol != null && !symbol.isBlank()) {
             s.setSymbol(symbol);
@@ -92,7 +115,12 @@ public class WebStrategyFacadeImpl implements WebStrategyFacade {
     // ℹ STATUS
     // ================================================================
     @Override
-    public StrategyRunInfo getRunInfo(Long chatId, StrategyType type) {
+    public StrategyRunInfo getRunInfo(
+            Long chatId,
+            StrategyType type,
+            String exchange,
+            NetworkType network
+    ) {
         return orchestrator.getStatus(chatId, type);
     }
 }

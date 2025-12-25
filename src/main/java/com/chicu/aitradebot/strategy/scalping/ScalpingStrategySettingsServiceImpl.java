@@ -5,22 +5,24 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.math.BigDecimal;
+
 @Slf4j
 @Service
 @RequiredArgsConstructor
-public class ScalpingStrategySettingsServiceImpl implements ScalpingStrategySettingsService {
+public class ScalpingStrategySettingsServiceImpl
+        implements ScalpingStrategySettingsService {
 
     private final ScalpingStrategySettingsRepository repo;
 
     // =====================================================================
-    // 1) Получение или создание настроек
+    // 1) Получение или создание
     // =====================================================================
     @Override
     public ScalpingStrategySettings getOrCreate(Long chatId) {
 
         return repo.findTopByChatIdOrderByIdDesc(chatId)
                 .orElseGet(() -> {
-
                     ScalpingStrategySettings def = ScalpingStrategySettings.builder()
                             .chatId(chatId)
                             .build();
@@ -39,62 +41,60 @@ public class ScalpingStrategySettingsServiceImpl implements ScalpingStrategySett
     }
 
     // =====================================================================
-    // 3) Частичное обновление (ТОЛЬКО АКТУАЛЬНЫЕ ПОЛЯ)
+    // 3) Частичное обновление (ТОЛЬКО SCALPING)
     // =====================================================================
     @Override
-    public ScalpingStrategySettings update(Long chatId, ScalpingStrategySettings dto) {
+    public ScalpingStrategySettings update(Long chatId,
+                                           ScalpingStrategySettings incoming) {
 
         ScalpingStrategySettings s = getOrCreate(chatId);
 
-        // === БАЗОВЫЕ ПАРАМЕТРЫ ===
-
-        if (dto.getSymbol() != null && !dto.getSymbol().isBlank()) {
-            s.setSymbol(dto.getSymbol());
+        // windowSize
+        if (incoming.getWindowSize() != null && incoming.getWindowSize() > 0) {
+            s.setWindowSize(incoming.getWindowSize());
         }
 
-        if (dto.getTimeframe() != null && !dto.getTimeframe().isBlank()) {
-            s.setTimeframe(dto.getTimeframe());
+        // priceChangeThreshold (%)
+        if (incoming.getPriceChangeThreshold() != null
+            && incoming.getPriceChangeThreshold() > 0) {
+            s.setPriceChangeThreshold(incoming.getPriceChangeThreshold());
         }
 
-        if (dto.getCachedCandlesLimit() > 0) {
-            s.setCachedCandlesLimit(dto.getCachedCandlesLimit());
+        // spreadThreshold (%)
+        if (incoming.getSpreadThreshold() != null
+            && incoming.getSpreadThreshold() > 0) {
+            s.setSpreadThreshold(incoming.getSpreadThreshold());
         }
 
-        // === SCALPING-ПАРАМЕТРЫ ===
-
-        if (dto.getWindowSize() > 0) {
-            s.setWindowSize(dto.getWindowSize());
-        }
-
-        if (dto.getPriceChangeThreshold() > 0) {
-            s.setPriceChangeThreshold(dto.getPriceChangeThreshold());
-        }
-
-        if (dto.getSpreadThreshold() > 0) {
-            s.setSpreadThreshold(dto.getSpreadThreshold());
-        }
-
-        if (dto.getTakeProfitPct() > 0) {
-            s.setTakeProfitPct(dto.getTakeProfitPct());
-        }
-
-        if (dto.getStopLossPct() > 0) {
-            s.setStopLossPct(dto.getStopLossPct());
-        }
-
-        // ⚠️ orderVolume: double в entity
-        if (dto.getOrderVolume().signum() > 0) {
-            s.setOrderVolume(dto.getOrderVolume().doubleValue());
+        // orderVolume (USDT)
+        if (incoming.getOrderVolume() != null
+            && incoming.getOrderVolume().compareTo(BigDecimal.ZERO) > 0) {
+            s.setOrderVolume(incoming.getOrderVolume());
         }
 
         return repo.save(s);
     }
 
     // =====================================================================
-    // 4) Snapshot (ПОКА МОЖНО ПРОСТО NULL)
+    // 4) Snapshot — КАНОНИЧЕСКИЙ ВАРИАНТ
     // =====================================================================
     @Override
     public SettingsSnapshot getSnapshot(long chatId) {
-        return null;
+
+        ScalpingStrategySettings s = getOrCreate(chatId);
+
+        return SettingsSnapshot.builder()
+                .chatId(chatId)
+
+                // идентификация стратегии
+                .put("strategy", "SCALPING")
+
+                // параметры стратегии
+                .put("windowSize", s.getWindowSize())
+                .put("priceChangeThreshold", s.getPriceChangeThreshold())
+                .put("spreadThreshold", s.getSpreadThreshold())
+                .put("orderVolume", s.getOrderVolume())
+
+                .build();
     }
 }

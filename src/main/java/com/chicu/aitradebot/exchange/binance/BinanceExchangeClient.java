@@ -209,24 +209,29 @@ public class BinanceExchangeClient implements ExchangeClient {
 
     @Override
     public Order placeMarketOrder(String symbol, OrderSide side, BigDecimal qty) throws Exception {
-        OrderResult r = placeOrder(0L, symbol, side.name(), "MARKET", qty.doubleValue(), null);
 
-        return new Order(
-                null,
-                "BINANCE",
-                0L,
-                r.symbol(),
-                r.side(),
-                r.type(),
-                BigDecimal.valueOf(r.qty()),
-                BigDecimal.valueOf(r.price()),
-                BigDecimal.valueOf(r.qty()),
-                r.status(),
-                r.timestamp(),
-                r.timestamp(),
-                true,
-                StrategyType.SMART_FUSION
+        ExchangeClient.OrderResult r = placeOrder(
+                0L,                    // chatId не нужен бирже
+                symbol,
+                side.name(),
+                "MARKET",
+                qty.doubleValue(),
+                null
         );
+
+        return Order.builder()
+                .orderId(r.orderId())
+                .chatId(0L)                             // Binance не знает chatId
+                .symbol(r.symbol())
+                .side(r.side())
+                .type(r.type())
+                .price(BigDecimal.valueOf(r.price()))
+                .quantity(BigDecimal.valueOf(r.qty()))
+                .status(r.status())
+                .filled("FILLED".equalsIgnoreCase(r.status()))
+                .time(r.timestamp())
+                .strategyType(StrategyType.SCALPING)
+                .build();
     }
 
     @Override

@@ -1,5 +1,6 @@
 package com.chicu.aitradebot.web.controller.api;
 
+import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.orchestrator.dto.StrategyRunInfo;
 import com.chicu.aitradebot.web.facade.WebStrategyFacade;
@@ -14,10 +15,16 @@ import org.springframework.web.bind.annotation.*;
 @Slf4j
 @RestController
 @RequiredArgsConstructor
-@RequestMapping("/api/strategy") // ← ОСТАВЛЯЕМ ЭТОТ ПУТЬ
+@RequestMapping("/api/strategy") // ← ОСТАВЛЯЕМ
 public class StrategyToggleApiController {
 
     private final WebStrategyFacade webStrategyFacade;
+
+    // =============================================================
+    // 🌍 DEFAULT CONTEXT (API)
+    // =============================================================
+    private static final String DEFAULT_EXCHANGE = "BINANCE";
+    private static final NetworkType DEFAULT_NETWORK = NetworkType.MAINNET;
 
     /**
      * POST /api/strategy/toggle
@@ -30,8 +37,10 @@ public class StrategyToggleApiController {
             @RequestParam String symbol,
             @RequestParam(required = false, defaultValue = "1m") String timeframe
     ) {
-        log.info("🌐 [WEB] toggle strategy: chatId={}, type={}, symbol={}, timeframe={}",
-                chatId, type, symbol, timeframe);
+        log.info(
+                "🌐 [API] toggle strategy: chatId={}, type={}, exchange={}, network={}, symbol={}, timeframe={}",
+                chatId, type, DEFAULT_EXCHANGE, DEFAULT_NETWORK, symbol, timeframe
+        );
 
         // === Валидация ===
         if (chatId == null || chatId <= 0) {
@@ -45,11 +54,23 @@ public class StrategyToggleApiController {
         }
 
         try {
-            // ⚡ ВАЖНО — вызываем единый фасад
-            StrategyRunInfo info = webStrategyFacade.toggleStrategy(chatId, type, symbol, timeframe);
+            // ✅ ЕДИНАЯ ТОЧКА УПРАВЛЕНИЯ (v4)
+            StrategyRunInfo info =
+                    webStrategyFacade.toggleStrategy(
+                            chatId,
+                            type,
+                            DEFAULT_EXCHANGE,
+                            DEFAULT_NETWORK,
+                            symbol,
+                            timeframe
+                    );
 
             return ResponseEntity.ok(
-                    ToggleResponse.success(info.isActive(), info.getMessage(), info)
+                    ToggleResponse.success(
+                            info.isActive(),
+                            info.getMessage(),
+                            info
+                    )
             );
 
         } catch (Exception ex) {

@@ -1,19 +1,23 @@
 "use strict";
 
 /**
- * LayerRenderer — ADVANCED (v4)
- * -----------------------------
- * ✔ Fibonacci / Grid уровни
- * ✔ Active level (реальная сделка)
- * ✔ BUY / SELL зоны
- * ✔ Generic ZONE (grid / fib / fallback)
- * ✔ TP / SL линии (legacy + price_line)
- * ✔ Лимитные ордера
- * ✔ Магнит к уровню (визуальный)
- * ✔ 📍 ENTRY / TP / SL price lines
- * ✔ 🔲 WINDOW ZONE (scalping)
- * ✔ 🧠 ATR / volatility (overlay-ready)
+ * PUBLIC API (used by features)
+ *
+ * ✔ renderLevels / clearLevels
+ * ✔ renderZone / clearZone
+ * ✔ renderTradeZone / clearTradeZone
+ * ✔ renderTpSl / clearTpSl
+ * ✔ renderOrder
+ * ✔ renderTrade
+ * ✔ renderWindowZone / clearWindowZone
+ * ✔ renderAtr / clearAtr
+ *
+ * INTERNAL / LEGACY (not for features)
+ * ✖ onActiveLevel
+ * ✖ onMagnet
+ * ✖ renderPriceLine
  */
+
 export class LayerRenderer {
 
     constructor(chart, candleSeries) {

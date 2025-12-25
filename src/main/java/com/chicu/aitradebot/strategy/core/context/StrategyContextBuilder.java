@@ -9,8 +9,12 @@ import java.math.BigDecimal;
 import java.util.List;
 
 /**
- * 🧱 Builder для StrategyContext (V4)
- * ЕДИНСТВЕННАЯ точка сборки контекста стратегии
+ * 🧱 StrategyContextBuilder (V4)
+ * ЕДИНСТВЕННАЯ точка сборки RuntimeStrategyContext
+ *
+ * ✔ собирает immutable snapshot
+ * ✔ используется в live / backtest / AI
+ * ❌ НЕ хранит ссылок на БД
  */
 public class StrategyContextBuilder {
 
@@ -19,13 +23,21 @@ public class StrategyContextBuilder {
     private String exchange;
     private NetworkType networkType;
 
-    // 🔥 V4: тип стратегии
+    /** 🔥 V4: тип стратегии */
     private StrategyType strategyType;
 
     private BigDecimal price;
-    private double[] closes;
+    private double[] closes = new double[0];
 
+    /**
+     * ⚠️ SNAPSHOT настроек стратегии
+     * НЕ entity, НЕ proxy, НЕ lazy
+     */
     private Object settings;
+
+    /**
+     * Runtime state стратегии (позиция, TP/SL, UI)
+     */
     private StrategyRuntimeState state;
 
     // =================================================
@@ -102,11 +114,15 @@ public class StrategyContextBuilder {
 
     public StrategyContext build() {
 
+        // ===== обязательные =====
         if (chatId == null) {
             throw new IllegalStateException("StrategyContext: chatId is null");
         }
         if (symbol == null || symbol.isBlank()) {
             throw new IllegalStateException("StrategyContext: symbol is empty");
+        }
+        if (exchange == null || exchange.isBlank()) {
+            throw new IllegalStateException("StrategyContext: exchange is empty");
         }
         if (price == null) {
             throw new IllegalStateException("StrategyContext: price is null");
@@ -115,18 +131,26 @@ public class StrategyContextBuilder {
             throw new IllegalStateException("StrategyContext: strategyType is null");
         }
 
-        double[] safeCloses = (closes != null) ? closes : new double[0];
+        // ===== дефолты =====
+        NetworkType safeNetwork =
+                (networkType != null) ? networkType : NetworkType.MAINNET;
+
+        StrategyRuntimeState safeState =
+                (state != null) ? state : new StrategyRuntimeState();
+
+        double[] safeCloses =
+                (closes != null) ? closes : new double[0];
 
         return RuntimeStrategyContext.builder()
                 .chatId(chatId)
                 .symbol(symbol)
                 .exchange(exchange)
-                .networkType(networkType != null ? networkType : NetworkType.MAINNET)
+                .networkType(safeNetwork)
                 .strategyType(strategyType)
                 .price(price)
                 .closes(safeCloses)
                 .settings(settings)
-                .state(state)
+                .state(safeState)
                 .build();
     }
 }

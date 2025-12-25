@@ -1,5 +1,6 @@
 package com.chicu.aitradebot.web.controller.web;
 
+import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.service.UserProfileService;
 import com.chicu.aitradebot.web.facade.WebStrategyFacade;
@@ -19,6 +20,12 @@ public class StrategyController {
     private final UserProfileService userProfileService;
 
     // ================================================================
+    // 🌍 DEFAULT CONTEXT (WEB UI)
+    // ================================================================
+    private static final String DEFAULT_EXCHANGE = "BINANCE";
+    private static final NetworkType DEFAULT_NETWORK = NetworkType.MAINNET;
+
+    // ================================================================
     // 📋 СПИСОК СТРАТЕГИЙ
     // ================================================================
     @GetMapping
@@ -32,8 +39,19 @@ public class StrategyController {
         model.addAttribute("active", "strategies");
         model.addAttribute("pageTitle", "Стратегии");
         model.addAttribute("page", "strategies");
-        model.addAttribute("strategies", strategyFacade.getStrategies(chatId));
+
+        model.addAttribute(
+                "strategies",
+                strategyFacade.getStrategies(
+                        chatId,
+                        DEFAULT_EXCHANGE,
+                        DEFAULT_NETWORK
+                )
+        );
+
         model.addAttribute("chatId", chatId);
+        model.addAttribute("exchange", DEFAULT_EXCHANGE);
+        model.addAttribute("network", DEFAULT_NETWORK);
 
         return "layout/app";
     }
@@ -51,7 +69,11 @@ public class StrategyController {
                 ? chatIdParam
                 : resolveCurrentChatIdOrThrow();
 
-        var all = strategyFacade.getStrategies(chatId);
+        var all = strategyFacade.getStrategies(
+                chatId,
+                DEFAULT_EXCHANGE,
+                DEFAULT_NETWORK
+        );
 
         var uiOpt = all.stream()
                 .filter(s -> type.name().equals(s.type()))
@@ -77,6 +99,9 @@ public class StrategyController {
         model.addAttribute("info", ui);
         model.addAttribute("page", "strategy-dashboard");
 
+        model.addAttribute("exchange", DEFAULT_EXCHANGE);
+        model.addAttribute("network", DEFAULT_NETWORK);
+
         return "layout/app";
     }
 
@@ -87,7 +112,13 @@ public class StrategyController {
     public String toggleStrategy(@RequestParam Long chatId,
                                  @RequestParam StrategyType type) {
 
-        strategyFacade.toggle(chatId, type);
+        strategyFacade.toggle(
+                chatId,
+                type,
+                DEFAULT_EXCHANGE,
+                DEFAULT_NETWORK
+        );
+
         return "redirect:/strategies?chatId=" + chatId;
     }
 
@@ -95,7 +126,13 @@ public class StrategyController {
     public String startStrategy(@RequestParam Long chatId,
                                 @RequestParam StrategyType type) {
 
-        strategyFacade.start(chatId, type);
+        strategyFacade.start(
+                chatId,
+                type,
+                DEFAULT_EXCHANGE,
+                DEFAULT_NETWORK
+        );
+
         return "redirect:/strategies?chatId=" + chatId;
     }
 
@@ -103,7 +140,13 @@ public class StrategyController {
     public String stopStrategy(@RequestParam Long chatId,
                                @RequestParam StrategyType type) {
 
-        strategyFacade.stop(chatId, type);
+        strategyFacade.stop(
+                chatId,
+                type,
+                DEFAULT_EXCHANGE,
+                DEFAULT_NETWORK
+        );
+
         return "redirect:/strategies?chatId=" + chatId;
     }
 

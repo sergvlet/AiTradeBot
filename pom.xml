@@ -27,16 +27,22 @@
 
     <dependencies>
 
-        <!-- Web / REST API -->
+        <!-- ================= WEB / API ================= -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
+            <!-- ⛔ исключаем commons-logging -->
+            <exclusions>
+                <exclusion>
+                    <groupId>commons-logging</groupId>
+                    <artifactId>commons-logging</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
 
         <dependency>
-            <groupId>com.squareup.okhttp3</groupId>
-            <artifactId>okhttp</artifactId>
-            <version>4.11.0</version>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-websocket</artifactId>
         </dependency>
 
         <dependency>
@@ -45,12 +51,14 @@
             <version>3.3.0</version>
         </dependency>
 
+        <!-- ================= HTTP ================= -->
         <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-websocket</artifactId>
+            <groupId>com.squareup.okhttp3</groupId>
+            <artifactId>okhttp</artifactId>
+            <version>4.11.0</version>
         </dependency>
 
-        <!-- Data persistence -->
+        <!-- ================= DATA ================= -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-data-jpa</artifactId>
@@ -61,34 +69,47 @@
             <artifactId>spring-boot-starter-thymeleaf</artifactId>
         </dependency>
 
-        <!-- Database -->
+        <!-- ================= DATABASE ================= -->
         <dependency>
             <groupId>org.postgresql</groupId>
             <artifactId>postgresql</artifactId>
             <scope>runtime</scope>
         </dependency>
 
-        <!-- DB migrations -->
+        <!-- ================= MIGRATIONS ================= -->
         <dependency>
             <groupId>org.flywaydb</groupId>
             <artifactId>flyway-core</artifactId>
             <version>11.9.0</version>
         </dependency>
 
-        <!-- Telegram Bot -->
+        <!-- ================= TELEGRAM ================= -->
         <dependency>
             <groupId>org.telegram</groupId>
             <artifactId>telegrambots-spring-boot-starter</artifactId>
             <version>6.9.7.1</version>
         </dependency>
 
-        <!-- Monitoring -->
+        <!-- ================= MONITORING ================= -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
 
-        <!-- Lombok -->
+        <!-- ================= VALIDATION ================= -->
+        <dependency>
+            <groupId>org.hibernate.validator</groupId>
+            <artifactId>hibernate-validator</artifactId>
+        </dependency>
+
+        <!-- ================= JSON ================= -->
+        <dependency>
+            <groupId>org.json</groupId>
+            <artifactId>json</artifactId>
+            <version>20231013</version>
+        </dependency>
+
+        <!-- ================= LOMBOK ================= -->
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
@@ -96,29 +117,46 @@
             <optional>true</optional>
         </dependency>
 
-        <dependency>
-            <groupId>org.hibernate.validator</groupId>
-            <artifactId>hibernate-validator</artifactId>
-        </dependency>
-
-        <dependency>
-            <groupId>org.json</groupId>
-            <artifactId>json</artifactId>
-            <version>20231013</version>
-        </dependency>
-
-        <!-- Tests -->
+        <!-- ================= TESTS ================= -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter</artifactId>
+            <exclusions>
+                <exclusion>
+                    <groupId>commons-logging</groupId>
+                    <artifactId>commons-logging</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <version>1.18.38</version>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-context</artifactId>
+            <version>6.2.6</version>
+        </dependency>
+        <dependency>
+            <groupId>jakarta.transaction</groupId>
+            <artifactId>jakarta.transaction-api</artifactId>
+            <version>2.0.1</version>
+        </dependency>
+
+
     </dependencies>
 
     <build>
         <plugins>
 
-            <!-- Компилятор -->
+            <!-- ================= COMPILER ================= -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
@@ -128,26 +166,16 @@
                     <encoding>UTF-8</encoding>
 
                     <annotationProcessorPaths>
-
-                        <!-- Lombok -->
                         <path>
                             <groupId>org.projectlombok</groupId>
                             <artifactId>lombok</artifactId>
                             <version>1.18.42</version>
                         </path>
-
-                        <!-- Thymeleaf Layout Dialect -->
-                        <path>
-                            <groupId>nz.net.ultraq.thymeleaf</groupId>
-                            <artifactId>thymeleaf-layout-dialect</artifactId>
-                            <version>3.3.0</version>
-                        </path>
-
                     </annotationProcessorPaths>
                 </configuration>
             </plugin>
 
-            <!-- Ресурсы -->
+            <!-- ================= RESOURCES ================= -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-resources-plugin</artifactId>
@@ -156,7 +184,7 @@
                 </configuration>
             </plugin>
 
-            <!-- Spring Boot -->
+            <!-- ================= SPRING BOOT ================= -->
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>

@@ -8,19 +8,69 @@ import java.util.List;
 
 public interface ExchangeSettingsService {
 
-    // === Основные CRUD ===
-    ExchangeSettings save(ExchangeSettings settings);
+    // =====================================================================
+    // NETWORK TAB (биржа + сеть)
+    // =====================================================================
 
+    /**
+     * Получить или создать настройки биржи/сети для chatId.
+     * Ключи всегда создаются как "" (не null).
+     */
     ExchangeSettings getOrCreate(Long chatId, String exchange, NetworkType network);
+
+    /**
+     * Обновить ТОЛЬКО биржу и сеть.
+     * ❗ НЕ трогает API ключи.
+     */
+    ExchangeSettings saveNetwork(Long chatId, String exchange, NetworkType network);
+
+    // =====================================================================
+    // API KEYS (без затирания)
+    // =====================================================================
+
+    /**
+     * Сохранить API ключи.
+     * ❗ Пустые значения ИГНОРИРУЮТСЯ.
+     * ❗ Существующие ключи НЕ ЗАТИРАЮТСЯ.
+     */
+    ExchangeSettings saveKeys(
+            Long chatId,
+            String exchange,
+            NetworkType network,
+            String apiKey,
+            String apiSecret,
+            String passphrase
+    );
+
+    // =====================================================================
+    // FIND / DELETE
+    // =====================================================================
+
+    List<ExchangeSettings> findAllByChatId(Long chatId);
 
     void delete(Long chatId, String exchange, NetworkType network);
 
-    // === REST методы (для контроллера) ===
-    List<ExchangeSettings> findAllByChatId(Long chatId);
+    /**
+     * Прямое сохранение entity (редко используется, для внутренних нужд).
+     */
+    ExchangeSettings save(ExchangeSettings settings);
 
-    // === Быстрая проверка ключей (true/false) ===
+    // =====================================================================
+    // DIAGNOSTICS
+    // =====================================================================
+
+    /**
+     * Быстрая проверка: true / false.
+     */
     boolean testConnection(ExchangeSettings settings);
 
-    // === Углублённая диагностика Binance & Bybit ===
+    /**
+     * Детальная диагностика (Binance / Bybit).
+     */
     ApiKeyDiagnostics testConnectionDetailed(ExchangeSettings settings);
+
+    /**
+     * Диагностика по chatId + exchange + network (для AJAX / UI).
+     */
+    ApiKeyDiagnostics diagnose(Long chatId, String exchange, NetworkType network);
 }

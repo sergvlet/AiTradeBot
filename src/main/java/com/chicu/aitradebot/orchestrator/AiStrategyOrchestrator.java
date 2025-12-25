@@ -1,5 +1,6 @@
 package com.chicu.aitradebot.orchestrator;
 
+import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
 import com.chicu.aitradebot.exchange.model.Order;
@@ -17,7 +18,6 @@ import org.springframework.stereotype.Component;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.LocalDateTime;
-import java.util.ArrayList;
 import java.util.List;
 
 @Slf4j
@@ -41,9 +41,9 @@ public class AiStrategyOrchestrator {
 
     public StrategyRunInfo startStrategy(Long chatId, StrategyType type) {
 
-        StrategySettings s = settingsService.getOrCreate(chatId, type);
+        StrategySettings s = loadSettings(chatId, type);
 
-        String symbol   = s.getSymbol();
+        String symbol = s.getSymbol();
         String exchange = s.getExchangeName();
 
         if (symbol == null || symbol.isBlank()) {
@@ -81,8 +81,8 @@ public class AiStrategyOrchestrator {
 
     public StrategyRunInfo stopStrategy(Long chatId, StrategyType type) {
 
+        StrategySettings s = loadSettings(chatId, type);
         TradingStrategy strategy = strategyRegistry.get(type);
-        StrategySettings s = settingsService.getOrCreate(chatId, type);
 
         if (strategy != null) {
             try {
@@ -101,26 +101,13 @@ public class AiStrategyOrchestrator {
     }
 
     // =====================================================================
-    // 📋 STRATEGY LIST
-    // =====================================================================
-
-    public record StrategyInfo(StrategyType type, boolean active) {}
-
-    public List<StrategyInfo> getStrategies(Long chatId) {
-        List<StrategyInfo> list = new ArrayList<>();
-        for (StrategyType t : StrategyType.values()) {
-            boolean active = settingsService.getOrCreate(chatId, t).isActive();
-            list.add(new StrategyInfo(t, active));
-        }
-        return list;
-    }
-
-    // =====================================================================
     // ❓ STATUS
     // =====================================================================
 
     public StrategyRunInfo getStatus(Long chatId, StrategyType type) {
-        StrategySettings s = settingsService.getOrCreate(chatId, type);
+
+        StrategySettings s = loadSettings(chatId, type);
+
         return buildRunInfo(
                 s,
                 s.isActive(),
@@ -140,11 +127,14 @@ public class AiStrategyOrchestrator {
 
     public GlobalState getGlobalState(Long chatId) {
         int active = 0;
+
         for (StrategyType t : StrategyType.values()) {
-            if (settingsService.getOrCreate(chatId, t).isActive()) {
+            StrategySettings s = loadSettings(chatId, t);
+            if (s.isActive()) {
                 active++;
             }
         }
+
         return new GlobalState(BigDecimal.ZERO, BigDecimal.ZERO, active);
     }
 
@@ -166,7 +156,7 @@ public class AiStrategyOrchestrator {
                 .exchangeName(s.getExchangeName())
                 .networkType(s.getNetworkType())
 
-                // === ФИНАНСЫ / РИСК (🔴 ВАЖНО) ===
+                // === ФИНАНСЫ / РИСК ===
                 .capitalUsd(s.getCapitalUsd())
                 .totalProfitPct(s.getTotalProfitPct())
                 .commissionPct(s.getCommissionPct())
@@ -188,9 +178,10 @@ public class AiStrategyOrchestrator {
 
                 .build();
     }
+
     // =====================================================================
-// 💰 ORDER MANAGEMENT (for Web UI)
-// =====================================================================
+    // 💰 ORDER MANAGEMENT (Web UI)
+    // =====================================================================
 
     public record OrderResult(
             boolean success,
@@ -203,20 +194,20 @@ public class AiStrategyOrchestrator {
             String symbol,
             String side,
             String status,
-            java.math.BigDecimal price,
-            java.math.BigDecimal quantity,
+            BigDecimal price,
+            BigDecimal quantity,
             Boolean filled,
             Long timestamp
     ) {}
 
-    public OrderResult marketBuy(Long chatId, String symbol, java.math.BigDecimal qty) {
+    public OrderResult marketBuy(Long chatId, String symbol, BigDecimal qty) {
         try {
             Order order = orderService.placeMarket(
                     chatId,
                     symbol,
                     "BUY",
                     qty,
-                    java.math.BigDecimal.ZERO,
+                    BigDecimal.ZERO,
                     "WEB_UI"
             );
             return new OrderResult(true, "BUY OK", order.getId());
@@ -226,14 +217,14 @@ public class AiStrategyOrchestrator {
         }
     }
 
-    public OrderResult marketSell(Long chatId, String symbol, java.math.BigDecimal qty) {
+    public OrderResult marketSell(Long chatId, String symbol, BigDecimal qty) {
         try {
             Order order = orderService.placeMarket(
                     chatId,
                     symbol,
                     "SELL",
                     qty,
-                    java.math.BigDecimal.ZERO,
+                    BigDecimal.ZERO,
                     "WEB_UI"
             );
             return new OrderResult(true, "SELL OK", order.getId());
@@ -273,4 +264,31 @@ public class AiStrategyOrchestrator {
         }
     }
 
+    // =====================================================================
+    // 🔑 CORE: загрузка настроек с учётом exchange + network
+    // =====================================================================
+
+    private StrategySettings loadSettings(Long chatId, StrategyType type) {
+
+        // 1️⃣ Берём последнюю активную связку exchange+network из БД
+        StrategySettings base =
+                settingsService
+                        .findAllByChatId(chatId, null, null)
+                        .stream()
+                        .filter(s -> s.getType() == type)
+                        .findFirst()
+                        .orElse(null);
+
+        String exchange =
+                base != null && base.getExchangeName() != null
+                        ? base.getExchangeName()
+                        : "BINANCE";
+
+        NetworkType network =
+                base != null && base.getNetworkType() != null
+                        ? base.getNetworkType()
+                        : NetworkType.TESTNET;
+
+        return settingsService.getOrCreate(chatId, type, exchange, network);
+    }
 }

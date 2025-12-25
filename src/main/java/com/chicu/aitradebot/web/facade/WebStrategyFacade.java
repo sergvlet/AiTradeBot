@@ -1,5 +1,6 @@
 package com.chicu.aitradebot.web.facade;
 
+import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.orchestrator.dto.StrategyRunInfo;
 
@@ -7,18 +8,64 @@ import java.util.List;
 
 public interface WebStrategyFacade {
 
-    List<StrategyUi> getStrategies(Long chatId);
+    // ================================================================
+    // 📋 СПИСОК СТРАТЕГИЙ (ДЛЯ КОНКРЕТНОЙ БИРЖИ / СЕТИ)
+    // ================================================================
+    List<StrategyUi> getStrategies(
+            Long chatId,
+            String exchange,
+            NetworkType network
+    );
 
-    void toggle(Long chatId, StrategyType type);
+    // ================================================================
+    // ▶️ START
+    // ================================================================
+    StrategyRunInfo start(
+            Long chatId,
+            StrategyType type,
+            String exchange,
+            NetworkType network
+    );
 
-    void start(Long chatId, StrategyType type);
+    // ================================================================
+    // ⏹ STOP
+    // ================================================================
+    StrategyRunInfo stop(
+            Long chatId,
+            StrategyType type,
+            String exchange,
+            NetworkType network
+    );
 
-    void stop(Long chatId, StrategyType type);
+    // ================================================================
+    // 🔁 TOGGLE
+    // ================================================================
+    StrategyRunInfo toggle(
+            Long chatId,
+            StrategyType type,
+            String exchange,
+            NetworkType network
+    );
 
-    StrategyRunInfo toggleStrategy(Long chatId,
-                                   StrategyType type,
-                                   String symbol,
-                                   String timeframe);
+    // ================================================================
+    // 🔁 TOGGLE + UPDATE PARAMS
+    // ================================================================
+    StrategyRunInfo toggleStrategy(
+            Long chatId,
+            StrategyType type,
+            String exchange,
+            NetworkType network,
+            String symbol,
+            String timeframe
+    );
 
-    StrategyRunInfo getRunInfo(Long chatId, StrategyType type);
+    // ================================================================
+    // ℹ STATUS
+    // ================================================================
+    StrategyRunInfo getRunInfo(
+            Long chatId,
+            StrategyType type,
+            String exchange,
+            NetworkType network
+    );
 }

@@ -1,15 +1,20 @@
 "use strict";
 
 /**
- * ChartController
- * ----------------
- * Отвечает ТОЛЬКО за рынок:
- * - свечи (candle)
- * - price tick → обновление последней свечи
- * - одна price-line (Binance style)
+ * ChartController = MARKET ENGINE
  *
- * НЕ знает ничего про стратегии, уровни, зоны, трейды
+ * ✔ Candles (history + live)
+ * ✔ Price tick → update last candle
+ * ✔ One price line
+ *
+ * ❌ Levels
+ * ❌ Zones
+ * ❌ Orders
+ * ❌ Trades
+ *
+ * NEVER call LayerRenderer here.
  */
+
 export class ChartController {
 
     constructor(container) {

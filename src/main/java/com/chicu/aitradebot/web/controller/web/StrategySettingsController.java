@@ -1,22 +1,18 @@
 package com.chicu.aitradebot.web.controller.web;
 
+import com.chicu.aitradebot.account.AccountBalanceService;
+import com.chicu.aitradebot.account.AccountBalanceSnapshot;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.ExchangeSettings;
 import com.chicu.aitradebot.domain.StrategySettings;
-import com.chicu.aitradebot.exchange.client.ExchangeClient;
-import com.chicu.aitradebot.exchange.client.ExchangeClientFactory;
 import com.chicu.aitradebot.exchange.model.ApiKeyDiagnostics;
 import com.chicu.aitradebot.exchange.service.ExchangeSettingsService;
-import com.chicu.aitradebot.exchange.service.RealFeeService;
 import com.chicu.aitradebot.service.StrategySettingsService;
 import com.chicu.aitradebot.strategy.core.cache.StrategySettingsCache;
-import com.chicu.aitradebot.strategy.fibonacci.FibonacciGridStrategySettings;
-import com.chicu.aitradebot.strategy.fibonacci.FibonacciGridStrategySettingsService;
 import com.chicu.aitradebot.strategy.rsie.RsiEmaStrategySettings;
 import com.chicu.aitradebot.strategy.rsie.RsiEmaStrategySettingsService;
-import com.chicu.aitradebot.strategy.scalping.ScalpingStrategySettings;
-import com.chicu.aitradebot.strategy.scalping.ScalpingStrategySettingsService;
+import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Controller;
@@ -24,7 +20,9 @@ import org.springframework.ui.Model;
 import org.springframework.web.bind.annotation.*;
 
 import java.math.BigDecimal;
-import java.util.*;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 
 @Slf4j
 @Controller
@@ -34,24 +32,16 @@ public class StrategySettingsController {
 
     private final StrategySettingsService strategySettingsService;
     private final ExchangeSettingsService exchangeSettingsService;
-    private final RealFeeService realFeeService;
-    private final ExchangeClientFactory clientFactory;
-
-    private final ScalpingStrategySettingsService scalpingSettingsService;
     private final RsiEmaStrategySettingsService rsiEmaSettingsService;
-    private final FibonacciGridStrategySettingsService fibonacciSettingsService;
-
-    /** 🔥 V4 — глобальный инвалидатор кэша стратегий */
     private final StrategySettingsCache settingsCache;
+    private final AccountBalanceService accountBalanceService;
 
     private static final List<String> DEFAULT_TIMEFRAMES = List.of(
-            "1s", "5s", "15s",
-            "1m", "3m", "5m", "15m", "30m",
-            "1h", "4h", "1d"
+            "1s","5s","15s","1m","3m","5m","15m","30m","1h","4h","1d"
     );
 
     private static final List<String> AVAILABLE_EXCHANGES =
-            List.of("BINANCE", "BYBIT", "OKX");
+            List.of("BINANCE","BYBIT","OKX");
 
     // =====================================================
     // GET — ОТКРЫТЬ НАСТРОЙКИ
@@ -60,226 +50,319 @@ public class StrategySettingsController {
     public String openSettings(
             @PathVariable("type") String type,
             @RequestParam("chatId") long chatId,
-            @RequestParam(value = "exchange", required = false) String exchangeParam,
-            @RequestParam(value = "network", required = false) NetworkType networkParam,
             @RequestParam(value = "tab", required = false) String tab,
+            HttpServletRequest request,
             Model model
     ) {
 
         StrategyType strategyType = StrategyType.valueOf(type);
 
-        StrategySettings strategy = strategySettingsService.getOrCreate(chatId, strategyType);
-        ensureConcreteSettingsExist(strategyType, chatId);
-        pullConcreteIntoUnified(strategyType, chatId, strategy);
-        strategySettingsService.save(strategy);
+        // =====================================================
+        // exchange / network — source of truth
+        // =====================================================
+        String exchange = Optional.ofNullable(request.getParameter("exchange"))
+                .orElse("BINANCE");
 
-        List<ExchangeSettings> exchanges = exchangeSettingsService.findAllByChatId(chatId);
+        NetworkType network = Optional.ofNullable(request.getParameter("network"))
+                .map(NetworkType::valueOf)
+                .orElse(NetworkType.TESTNET);
 
-        String selectedExchange = exchangeParam != null ? exchangeParam :
-                strategy.getExchangeName() != null ? strategy.getExchangeName() :
-                        !exchanges.isEmpty() ? exchanges.get(0).getExchange() : "BINANCE";
+        // =====================================================
+        // StrategySettings — UI STATE (SOURCE OF TRUTH)
+        // =====================================================
+        StrategySettings strategy =
+                strategySettingsService
+                        .findLatest(chatId, strategyType, exchange, network)
+                        .orElseGet(() ->
+                                strategySettingsService.getOrCreate(
+                                        chatId, strategyType, exchange, network
+                                )
+                        );
 
-        NetworkType selectedNetwork = networkParam != null ? networkParam :
-                strategy.getNetworkType() != null ? strategy.getNetworkType() :
-                        !exchanges.isEmpty() ? exchanges.get(0).getNetwork() : NetworkType.TESTNET;
+        pullRsiEmaIntoUnifiedIfEmpty(strategyType, chatId, strategy);
 
-        strategy.setExchangeName(selectedExchange);
-        strategy.setNetworkType(selectedNetwork);
-        strategySettingsService.save(strategy);
+        // =====================================================
+        // BALANCE SNAPSHOT (READ-ONLY)
+        // =====================================================
+        AccountBalanceSnapshot balance =
+                accountBalanceService.getSnapshot(
+                        chatId, strategyType, exchange, network
+                );
 
+        // =====================================================
+        // Exchange + diagnostics
+        // =====================================================
         ExchangeSettings exchangeSettings =
-                exchangeSettingsService.getOrCreate(chatId, selectedExchange, selectedNetwork);
+                exchangeSettingsService.getOrCreate(chatId, exchange, network);
 
-        ApiKeyDiagnostics diagnostics = null;
-        boolean connectionOk = false;
+        ApiKeyDiagnostics diagnostics =
+                exchangeSettings.hasKeys()
+                        ? exchangeSettingsService.testConnectionDetailed(exchangeSettings)
+                        : null;
 
-        if (exchangeSettings.hasKeys()) {
-            diagnostics = exchangeSettingsService.testConnectionDetailed(exchangeSettings);
-            connectionOk = diagnostics != null && diagnostics.isOk();
+        // =====================================================
+        // 🔥 ВЫБРАННЫЙ АКТИВ — ТОЛЬКО ИЗ StrategySettings
+        // =====================================================
+        String selectedAsset = strategy.getAccountAsset();
+
+        // fallback, если ещё не сохранён
+        if (selectedAsset == null || selectedAsset.isBlank()) {
+            // если в snapshot есть какой-то "текущий" актив — используй его
+            // (если такого метода нет — просто оставь null, UI покажет дефолт)
+            try {
+                selectedAsset = balance.getSelectedAsset(); // если у тебя такого метода нет — убери эту строку
+            } catch (Exception ignored) {
+                // ничего, selectedAsset останется null
+            }
         }
 
-        double usdtBalance = 0.0;
-        List<String> availableTimeframes = new ArrayList<>(DEFAULT_TIMEFRAMES);
-
-        try {
-            ExchangeClient client = clientFactory.get(selectedExchange, selectedNetwork);
-
-            var bal = client.getBalance(chatId, "USDT", selectedNetwork);
-            if (bal != null) usdtBalance = bal.free();
-
-            var tf = client.getAvailableTimeframes();
-            if (tf != null && !tf.isEmpty()) availableTimeframes = tf;
-
-        } catch (Exception e) {
-            log.warn("Ошибка загрузки данных биржи: {}", e.getMessage());
-        }
-
-        if (tab == null || tab.isBlank()) tab = "network";
-
+        // =====================================================
+        // MODEL
+        // =====================================================
         model.addAttribute("page", "strategies/settings");
-        model.addAttribute("pageTitle", "Настройки стратегии");
         model.addAttribute("chatId", chatId);
         model.addAttribute("type", strategyType);
         model.addAttribute("strategy", strategy);
-        model.addAttribute("activeTab", tab);
+
+        model.addAttribute("activeTab", tab != null ? tab : "network");
         model.addAttribute("availableExchanges", AVAILABLE_EXCHANGES);
-        model.addAttribute("selectedExchange", selectedExchange);
-        model.addAttribute("selectedNetwork", selectedNetwork);
+        model.addAttribute("availableTimeframes", DEFAULT_TIMEFRAMES);
+
+        model.addAttribute("selectedExchange", exchange);
+        model.addAttribute("selectedNetwork", network);
         model.addAttribute("exchangeSettings", exchangeSettings);
         model.addAttribute("diagnostics", diagnostics);
-        model.addAttribute("connectionOk", connectionOk);
-        model.addAttribute("usdtBalance", usdtBalance);
-        model.addAttribute("availableTimeframes", availableTimeframes);
+        model.addAttribute("connectionOk", diagnostics != null && diagnostics.isOk());
+
+        // =====================================================
+        // BALANCE → UI (НЕ источник истины)
+        // =====================================================
+        model.addAttribute("availableAssets", balance.getAvailableAssets());
+
+        // ❗ выбранный актив — что сохранили в StrategySettings
+        model.addAttribute("selectedAsset", selectedAsset);
+
+        // ✅ безопасно: у snapshot есть только "selectedFreeBalance"
+        model.addAttribute("availableBalance", balance.getSelectedFreeBalance());
+        model.addAttribute("balanceConnectionOk", balance.isConnectionOk());
 
         return "layout/app";
     }
 
+
+
+
+
     // =====================================================
-    // POST — СОХРАНИТЬ НАСТРОЙКИ
+    // POST — СОХРАНЕНИЕ (FIXED)
     // =====================================================
     @PostMapping
     public String saveSettings(
             @PathVariable("type") String type,
             @RequestParam("chatId") long chatId,
-            @RequestParam(value = "tab", required = false) String tab,
-            @ModelAttribute("strategy") StrategySettings form,
-            @RequestParam Map<String, String> params
+            @RequestParam("saveScope") String saveScope,
+            @RequestParam Map<String, String> params,
+            @ModelAttribute("strategy") StrategySettings form
     ) {
 
         StrategyType strategyType = StrategyType.valueOf(type);
 
-        String exchangeName = params.get("exchange");
-        NetworkType networkType = NetworkType.valueOf(params.get("network"));
+        String exchange = params.getOrDefault("exchange", "BINANCE");
+        NetworkType network =
+                NetworkType.valueOf(params.getOrDefault("network", "TESTNET"));
 
-        if (tab == null || tab.isBlank()) tab = "general";
+        log.info(
+                "💾 SAVE SETTINGS START type={} chatId={} scope={} ex={} net={}",
+                strategyType, chatId, saveScope, exchange, network
+        );
+        log.debug("📥 RAW PARAMS: {}", params);
 
-        StrategySettings s = strategySettingsService.getOrCreate(chatId, strategyType);
+        // =====================================================
+        // 🔥 КРИТИЧЕСКИЙ FIX — POST ГАРАНТИРУЕТ НАЛИЧИЕ ЗАПИСИ
+        // =====================================================
+        StrategySettings s =
+                strategySettingsService
+                        .findLatest(chatId, strategyType, exchange, network)
+                        .orElseGet(() -> {
+                            log.warn(
+                                    "⚠️ StrategySettings not found → create new (chatId={} type={} ex={} net={})",
+                                    chatId, strategyType, exchange, network
+                            );
+                            return strategySettingsService.getOrCreate(
+                                    chatId, strategyType, exchange, network
+                            );
+                        });
 
-        s.setSymbol(form.getSymbol());
-        s.setTimeframe(form.getTimeframe());
-        s.setCachedCandlesLimit(form.getCachedCandlesLimit());
-        s.setCapitalUsd(form.getCapitalUsd());
-        s.setCommissionPct(form.getCommissionPct());
-        s.setRiskPerTradePct(form.getRiskPerTradePct());
-        s.setDailyLossLimitPct(form.getDailyLossLimitPct());
-        s.setTakeProfitPct(form.getTakeProfitPct());
-        s.setStopLossPct(form.getStopLossPct());
-        s.setReinvestProfit(form.isReinvestProfit());
-        s.setLeverage(form.getLeverage());
-        s.setExchangeName(exchangeName);
-        s.setNetworkType(networkType);
+        log.info(
+                "📄 Loaded settings id={} asset={} symbol={} tf={}",
+                s.getId(), s.getAccountAsset(), s.getSymbol(), s.getTimeframe()
+        );
 
-        s = strategySettingsService.save(s);
+        // =====================================================
+        // 💰 accountAsset — ЕДИНСТВЕННОЕ МЕСТО
+        // =====================================================
+        String accountAsset = params.get("accountAsset");
+        if (accountAsset != null && !accountAsset.isBlank()) {
+            log.info("💰 accountAsset: {} -> {}", s.getAccountAsset(), accountAsset);
+            s.setAccountAsset(accountAsset);
+        }
 
-        syncConcreteStrategySettings(strategyType, chatId, s);
+        // =====================================================
+        // 🔀 SAVE BY SCOPE
+        // =====================================================
+        switch (saveScope) {
 
-        // 🔥 V4 — ИНВАЛИДАЦИЯ КЭША СТРАТЕГИИ
+            case "network" -> {
+                s.setExchangeName(exchange);
+                s.setNetworkType(network);
+                strategySettingsService.save(s);
+                exchangeSettingsService.saveNetwork(chatId, exchange, network);
+            }
+
+            case "trade" -> {
+                s.setSymbol(form.getSymbol());
+                s.setTimeframe(form.getTimeframe());
+                s.setCachedCandlesLimit(form.getCachedCandlesLimit());
+                strategySettingsService.save(s);
+            }
+
+            case "risk" -> {
+                s.setRiskPerTradePct(form.getRiskPerTradePct());
+                s.setDailyLossLimitPct(form.getDailyLossLimitPct());
+                s.setTakeProfitPct(form.getTakeProfitPct());
+                s.setStopLossPct(form.getStopLossPct());
+                strategySettingsService.save(s);
+            }
+
+            case "general" -> {
+                boolean reinvest = params.containsKey("reinvestProfit");
+                s.setReinvestProfit(reinvest);
+
+                BigDecimal maxExposureUsd = parseBigDecimalOrNull(params.get("maxExposureUsd"));
+                Integer maxExposurePct   = parseIntOrNull(params.get("maxExposurePct"));
+
+                if (maxExposureUsd != null && maxExposureUsd.signum() <= 0) {
+                    maxExposureUsd = null;
+                }
+                if (maxExposurePct != null && (maxExposurePct <= 0 || maxExposurePct > 100)) {
+                    maxExposurePct = null;
+                }
+
+                s.setMaxExposureUsd(maxExposureUsd);
+                s.setMaxExposurePct(maxExposurePct);
+
+                strategySettingsService.save(s);
+            }
+
+            case "advanced" -> {
+                if (form.getAdvancedControlMode() != null) {
+                    s.setAdvancedControlMode(form.getAdvancedControlMode());
+                    strategySettingsService.save(s);
+                }
+            }
+
+            default -> log.warn("⚠️ Unknown saveScope='{}'", saveScope);
+        }
+
+        // =====================================================
+        // 🔄 POST SAVE
+        // =====================================================
+        syncRsiEmaFromUnified(strategyType, chatId, s);
         settingsCache.invalidate(chatId, strategyType);
 
-        ExchangeSettings ex =
-                exchangeSettingsService.getOrCreate(chatId, exchangeName, networkType);
+        log.info("✅ SAVE SETTINGS DONE id={} scope={}", s.getId(), saveScope);
 
-        ex.setApiKey(params.get("apiKey"));
-        ex.setApiSecret(params.get("apiSecret"));
-        ex.setPassphrase(params.get("passphrase"));
+        return "redirect:/strategies/" + type +
+               "/config?chatId=" + chatId +
+               "&exchange=" + exchange +
+               "&network=" + network.name() +
+               "&tab=" + saveScope;
+    }
 
-        if (ex.hasKeys()) {
-            ApiKeyDiagnostics diag = exchangeSettingsService.testConnectionDetailed(ex);
-            ex.setEnabled(diag != null && diag.isOk());
-        }
 
-        exchangeSettingsService.save(ex);
 
-        return "redirect:/strategies/" + type + "/config"
-               + "?chatId=" + chatId
-               + "&exchange=" + exchangeName
-               + "&network=" + networkType
-               + "&tab=" + tab;
+
+
+    // =====================================================
+    // AJAX — СМЕНА АКТИВА (FIXED)
+    // =====================================================
+    @PostMapping("/asset")
+    @ResponseBody
+    public AccountBalanceSnapshot changeAccountAsset(
+            @PathVariable("type") String type,
+            @RequestParam("chatId") long chatId,
+            @RequestParam("exchange") String exchange,
+            @RequestParam("network") NetworkType network,
+            @RequestParam("asset") String asset
+    ) {
+
+        StrategyType strategyType = StrategyType.valueOf(type);
+
+        // 🔥 FIX — тоже findLatest
+        StrategySettings settings =
+                strategySettingsService
+                        .findLatest(chatId, strategyType, exchange, network)
+                        .orElseThrow(() ->
+                                new IllegalStateException("StrategySettings not found for asset change"));
+
+        settings.setAccountAsset(asset);
+        strategySettingsService.save(settings);
+
+        settingsCache.invalidate(chatId, strategyType);
+
+        return accountBalanceService.getSnapshot(
+                chatId, strategyType, exchange, network
+        );
     }
 
     // =====================================================
-    // остальная логика (без изменений)
+    // RSI EMA legacy
     // =====================================================
-    private void ensureConcreteSettingsExist(StrategyType type, long chatId) {
-        switch (type) {
-            case SCALPING -> scalpingSettingsService.getOrCreate(chatId);
-            case RSI_EMA -> rsiEmaSettingsService.getOrCreate(chatId);
-            case FIBONACCI_GRID -> fibonacciSettingsService.getOrCreate(chatId);
+    private void pullRsiEmaIntoUnifiedIfEmpty(
+            StrategyType type,
+            long chatId,
+            StrategySettings s
+    ) {
+        if (type != StrategyType.RSI_EMA) return;
+        if (s.getSymbol() != null && s.getTimeframe() != null) return;
+
+        RsiEmaStrategySettings t = rsiEmaSettingsService.getOrCreate(chatId);
+        s.setSymbol(t.getSymbol());
+        s.setTimeframe(t.getTimeframe());
+        s.setCachedCandlesLimit(t.getCachedCandlesLimit());
+        s.setNetworkType(t.getNetworkType());
+
+        strategySettingsService.save(s);
+    }
+
+    private void syncRsiEmaFromUnified(
+            StrategyType type,
+            long chatId,
+            StrategySettings s
+    ) {
+        if (type != StrategyType.RSI_EMA) return;
+
+        RsiEmaStrategySettings t = rsiEmaSettingsService.getOrCreate(chatId);
+        t.setSymbol(s.getSymbol());
+        t.setTimeframe(s.getTimeframe());
+        t.setCachedCandlesLimit(s.getCachedCandlesLimit());
+        t.setNetworkType(s.getNetworkType());
+        rsiEmaSettingsService.save(t);
+    }
+
+    private BigDecimal parseBigDecimalOrNull(String v) {
+        try {
+            return v == null ? null : new BigDecimal(v.trim());
+        } catch (Exception e) {
+            return null;
         }
     }
 
-    private void pullConcreteIntoUnified(StrategyType type, long chatId, StrategySettings s) {
-        switch (type) {
-            case SCALPING -> {
-                ScalpingStrategySettings t = scalpingSettingsService.getOrCreate(chatId);
-                s.setSymbol(t.getSymbol());
-                s.setTimeframe(t.getTimeframe());
-                s.setCachedCandlesLimit(t.getCachedCandlesLimit());
-                s.setTakeProfitPct(BigDecimal.valueOf(t.getTakeProfitPct()));
-                s.setStopLossPct(BigDecimal.valueOf(t.getStopLossPct()));
-                s.setNetworkType(t.getNetworkType());
-            }
-            case RSI_EMA -> {
-                RsiEmaStrategySettings t = rsiEmaSettingsService.getOrCreate(chatId);
-                s.setSymbol(t.getSymbol());
-                s.setTimeframe(t.getTimeframe());
-                s.setCachedCandlesLimit(t.getCachedCandlesLimit());
-                s.setCapitalUsd(BigDecimal.valueOf(t.getCapitalUsd()));
-                s.setCommissionPct(BigDecimal.valueOf(t.getCommissionPct()));
-                s.setRiskPerTradePct(BigDecimal.valueOf(t.getRiskPerTradePct()));
-                s.setDailyLossLimitPct(BigDecimal.valueOf(t.getDailyLossLimitPct()));
-                s.setTakeProfitPct(BigDecimal.valueOf(t.getTakeProfitPct()));
-                s.setStopLossPct(BigDecimal.valueOf(t.getStopLossPct()));
-                s.setReinvestProfit(t.isReinvestProfit());
-                s.setLeverage(t.getLeverage());
-                s.setNetworkType(t.getNetworkType());
-            }
-            case FIBONACCI_GRID -> {
-                FibonacciGridStrategySettings t = fibonacciSettingsService.getOrCreate(chatId);
-                s.setSymbol(t.getSymbol());
-                s.setTimeframe(t.getTimeframe());
-                s.setCachedCandlesLimit(t.getCandleLimit());
-                s.setNetworkType(t.getNetworkType());
-            }
-        }
-    }
-
-    private void syncConcreteStrategySettings(StrategyType type, long chatId, StrategySettings s) {
-        switch (type) {
-            case SCALPING -> {
-                ScalpingStrategySettings t = scalpingSettingsService.getOrCreate(chatId);
-                t.setSymbol(s.getSymbol());
-                t.setTimeframe(s.getTimeframe());
-                t.setCachedCandlesLimit(s.getCachedCandlesLimit());
-                if (s.getTakeProfitPct() != null) t.setTakeProfitPct(s.getTakeProfitPct().doubleValue());
-                if (s.getStopLossPct() != null) t.setStopLossPct(s.getStopLossPct().doubleValue());
-                t.setNetworkType(s.getNetworkType());
-                scalpingSettingsService.save(t);
-            }
-            case RSI_EMA -> {
-                RsiEmaStrategySettings t = rsiEmaSettingsService.getOrCreate(chatId);
-                t.setSymbol(s.getSymbol());
-                t.setTimeframe(s.getTimeframe());
-                t.setCachedCandlesLimit(s.getCachedCandlesLimit());
-                if (s.getCapitalUsd() != null) t.setCapitalUsd(s.getCapitalUsd().doubleValue());
-                if (s.getCommissionPct() != null) t.setCommissionPct(s.getCommissionPct().doubleValue());
-                if (s.getRiskPerTradePct() != null) t.setRiskPerTradePct(s.getRiskPerTradePct().doubleValue());
-                if (s.getDailyLossLimitPct() != null) t.setDailyLossLimitPct(s.getDailyLossLimitPct().doubleValue());
-                if (s.getTakeProfitPct() != null) t.setTakeProfitPct(s.getTakeProfitPct().doubleValue());
-                if (s.getStopLossPct() != null) t.setStopLossPct(s.getStopLossPct().doubleValue());
-                t.setReinvestProfit(s.isReinvestProfit());
-                t.setLeverage(s.getLeverage());
-                t.setNetworkType(s.getNetworkType());
-                rsiEmaSettingsService.save(t);
-            }
-            case FIBONACCI_GRID -> {
-                FibonacciGridStrategySettings t = fibonacciSettingsService.getOrCreate(chatId);
-                t.setSymbol(s.getSymbol());
-                t.setTimeframe(s.getTimeframe());
-                t.setCandleLimit(s.getCachedCandlesLimit());
-                t.setNetworkType(s.getNetworkType());
-                fibonacciSettingsService.save(t);
-            }
+    private Integer parseIntOrNull(String v) {
+        try {
+            return v == null ? null : Integer.parseInt(v.trim());
+        } catch (Exception e) {
+            return null;
         }
     }
 }

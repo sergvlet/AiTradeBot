@@ -30,37 +30,57 @@ public class StrategyRunnerImpl implements StrategyRunner {
     private final MarketPriceService priceService;
 
     @Override
-    public void onTick(Long chatId, String symbol, String exchange, NetworkType networkType) {
+    public void onTick(
+            Long chatId,
+            String symbol,
+            String exchange,
+            NetworkType networkType
+    ) {
 
         if (chatId == null || chatId <= 0) return;
         if (symbol == null || symbol.isBlank()) return;
+        if (exchange == null || networkType == null) return;
 
-        // 1) Цена
+        // 1️⃣ Цена
         BigDecimal price = priceService.getLastPrice(symbol).orElse(null);
         if (price == null || price.signum() <= 0) return;
 
-        // 2) Прогон по стратегиям (V4-live)
+        // 2️⃣ Прогон по стратегиям
         for (StrategyType type : StrategyType.values()) {
 
             StrategySettings s;
             try {
-                s = settingsService.getSettings(chatId, type);
+                s = settingsService.getSettings(
+                        chatId,
+                        type,
+                        exchange,
+                        networkType
+                );
             } catch (Exception e) {
                 continue;
             }
 
-            if (s == null || !s.isActive()) continue;
-            if (s.getSymbol() == null || !symbol.equalsIgnoreCase(s.getSymbol())) continue;
+            if (s == null) continue;
+            if (!s.isActive()) continue;
+
+            // 🔒 защита по инструменту
+            if (s.getSymbol() == null ||
+                !symbol.equalsIgnoreCase(s.getSymbol())) {
+                continue;
+            }
 
             TradingStrategy strategy = strategyRegistry.get(type);
-            if (strategy == null || !strategy.isActive(chatId)) continue;
+            if (strategy == null) continue;
 
-            // 3) ЕДИНЫЙ ВХОД В СТРАТЕГИЮ (V4)
+            // 🔒 защита по runtime-активности
+            if (!strategy.isActive(chatId)) continue;
+
+            // 3️⃣ ЕДИНЫЙ ВХОД В СТРАТЕГИЮ (V4)
             strategy.onPriceUpdate(
                     chatId,
                     symbol,
                     price,
-                    null // ts может быть null — стратегия сама поставит Instant.now()
+                    null // стратегия сама подставит Instant.now()
             );
         }
     }

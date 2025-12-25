@@ -2,6 +2,7 @@ package com.chicu.aitradebot.domain;
 
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
+import com.chicu.aitradebot.domain.enums.AdvancedControlMode;
 import jakarta.persistence.*;
 import lombok.*;
 
@@ -21,95 +22,146 @@ public class StrategySettings {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    /** Привязка к пользователю / Telegram */
+    // =====================================================================
+    // ИДЕНТИФИКАЦИЯ
+    // =====================================================================
+
     @Column(nullable = false)
     private Long chatId;
 
-    /** Тип стратегии */
     @Enumerated(EnumType.STRING)
     @Column(nullable = false)
     private StrategyType type;
 
-    /** Торговая пара */
+    // =====================================================================
+    // ИНСТРУМЕНТ
+    // =====================================================================
+
     @Column(nullable = false)
     private String symbol;
 
-    /** Таймфрейм свечей */
     @Column(nullable = false)
     private String timeframe;
 
-    /** Количество свечей в кэше */
     @Builder.Default
     private Integer cachedCandlesLimit = 500;
 
-    // ========================= Капитал / риск =========================
+    // =====================================================================
+    // КАПИТАЛ / РИСК (ОБЩИЕ)
+    // =====================================================================
 
-    /** Капитал в USDT (может быть null для старых записей) */
+    /**
+     * ⚠️ TODO: DEPRECATE
+     * Историческое поле — в будущем капитал берётся ТОЛЬКО с биржи
+     */
     @Column(precision = 18, scale = 6)
     private BigDecimal capitalUsd;
 
-    /** Комиссия биржи (%) */
+    // =====================================================================
+// 💰 АКТИВ АККАУНТА (ВЫБРАННЫЙ, FREE > 0)
+// =====================================================================
+
+    /**
+     * Актив аккаунта, которым оперирует стратегия (USDT, BTC, ETH и т.д.)
+     * Выбирается автоматически из баланса (free > 0) или пользователем через UI.
+     */
+    @Column(name = "account_asset")
+    private String accountAsset;
+
+
+    /**
+     * ⚠️ TODO: DEPRECATE
+     * Комиссии будут браться из ExchangeClient#getAccountInfo
+     */
     @Builder.Default
     @Column(nullable = false, precision = 10, scale = 6)
-    private BigDecimal commissionPct = BigDecimal.valueOf(0.05); // 0.05%
+    private BigDecimal commissionPct = BigDecimal.valueOf(0.05);
 
-    /** Риск на сделку, % (может быть null для старых записей) */
     @Column(precision = 10, scale = 4)
     private BigDecimal riskPerTradePct;
 
-    /** Дневной лимит потерь, % (может быть null для старых записей) */
     @Column(precision = 10, scale = 4)
     private BigDecimal dailyLossLimitPct;
 
-    /** Реинвест прибыли */
-    @Builder.Default
-    private boolean reinvestProfit = false;
+    @Column(nullable = false)
+    private boolean reinvestProfit;
 
-    /** Плечо */
+
+    /**
+     * ⚠️ TODO: DEPRECATE
+     * Плечо должно приходить с аккаунта биржи
+     */
     @Builder.Default
     private int leverage = 1;
 
-    // ========================= TP / SL =========================
+    // =====================================================================
+    // 🔥 ЛИМИТЫ ИСПОЛЬЗОВАНИЯ СРЕДСТВ (НОВОЕ, КЛЮЧЕВОЕ)
+    // =====================================================================
+
+    /** Максимальная сумма, доступная стратегии (USDT) */
+    @Column(precision = 18, scale = 6)
+    private BigDecimal maxExposureUsd;
+
+    /** Максимальный процент от баланса */
+    @Column(precision = 5, scale = 2)
+    private Integer maxExposurePct;
+
+    // =====================================================================
+    // TP / SL (ГЛОБАЛЬНЫЕ)
+    // =====================================================================
 
     @Builder.Default
     @Column(nullable = false, precision = 10, scale = 6)
-    private BigDecimal takeProfitPct = BigDecimal.valueOf(1.0); // 1.0%
+    private BigDecimal takeProfitPct = BigDecimal.valueOf(1.0);
 
     @Builder.Default
     @Column(nullable = false, precision = 10, scale = 6)
-    private BigDecimal stopLossPct = BigDecimal.valueOf(1.0);   // 1.0%
+    private BigDecimal stopLossPct = BigDecimal.valueOf(1.0);
 
-    // ========================= PnL / ML =========================
+    // =====================================================================
+    // AI / ML / УПРАВЛЕНИЕ
+    // =====================================================================
 
-    /** Накопленный PnL в % */
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false, length = 16)
     @Builder.Default
-    @Column(precision = 12, scale = 6)
-    private BigDecimal totalProfitPct = BigDecimal.ZERO;
+    private AdvancedControlMode advancedControlMode = AdvancedControlMode.MANUAL;
 
-    /** Уверенность ML (0..1) */
     @Builder.Default
     @Column(precision = 10, scale = 6)
     private BigDecimal mlConfidence = BigDecimal.ZERO;
 
-    // ========================= Версия / активность =========================
+    // =====================================================================
+    // PnL / СТАТИСТИКА
+    // =====================================================================
 
     @Builder.Default
-    private int version = 1;
+    @Column(precision = 12, scale = 6)
+    private BigDecimal totalProfitPct = BigDecimal.ZERO;
+
+    // =====================================================================
+    // СОСТОЯНИЕ
+    // =====================================================================
 
     @Builder.Default
     private boolean active = false;
 
-    // ========================= Биржа + Сеть (на каждую стратегию) =========================
+    @Builder.Default
+    private int version = 1;
 
-    /** BINANCE / BYBIT / OKX */
+    // =====================================================================
+    // БИРЖА / СЕТЬ
+    // =====================================================================
+
     @Column(length = 32)
     private String exchangeName;
 
-    /** MAINNET / TESTNET */
     @Enumerated(EnumType.STRING)
     private NetworkType networkType;
 
-    // ========================= Служебные поля =========================
+    // =====================================================================
+    // СЛУЖЕБНЫЕ
+    // =====================================================================
 
     @Builder.Default
     @Column(nullable = false, updatable = false)
@@ -129,17 +181,19 @@ public class StrategySettings {
         updatedAt = LocalDateTime.now();
     }
 
-    // ========================= Удобные геттеры для старого кода =========================
+    // =====================================================================
+    // СОВМЕСТИМОСТЬ
+    // =====================================================================
 
-    /** Совместимость со старым кодом: заменить getStrategyType() -> возвращает поле type */
     @Transient
     public StrategyType getStrategyType() {
         return this.type;
     }
 
-    /** Удобочитаемое имя из enum (для UI), чтобы не хранить его в БД */
     @Transient
     public String getStrategyName() {
-        return (this.type != null) ? this.type.name().replace('_', ' ') : "Unknown";
+        return (this.type != null)
+                ? this.type.name().replace('_', ' ')
+                : "Unknown";
     }
 }

@@ -1,22 +1,12 @@
-<!-- templates/views/strategies/settings.html -->
 <div th:fragment="content"
      class="container py-4 strategy-settings-page"
-     th:with="
-        chatId=${chatId},
-        type=${type},
-        strategy=${strategy},
-        exchangeSettings=${exchangeSettings},
-        connectionOk=${connectionOk},
-        selectedExchange=${selectedExchange},
-        selectedNetwork=${selectedNetwork},
-        diagnostics=${diagnostics},
-        availableExchanges=${availableExchanges},
-        usdtBalance=${usdtBalance},
-        availableTimeframes=${availableTimeframes}
-     "
-     th:attr="data-chat-id=${chatId}, data-type=${type}">
+     th:attr="
+        data-chat-id=${chatId},
+        data-type=${type},
+        data-exchange=${selectedExchange},
+        data-network=${selectedNetwork}
+     ">
 
-    <!-- LOCAL PAGE CSS -->
     <link rel="stylesheet" th:href="@{/css/views/strategies/settings.css}"/>
 
     <h2 class="fw-bold mb-4">
@@ -24,332 +14,574 @@
         Настройки стратегии — <span th:text="${type}">TYPE</span>
     </h2>
 
-    <!-- ==================== ФОРМА ==================== -->
-    <form method="post"
-          th:action="@{|/strategies/${type}/config?chatId=${chatId}|}"
-          class="card card-theme p-4">
+    <hr class="my-4"/>
 
-        <!-- ====================== ТАБЫ ====================== -->
-        <ul class="nav nav-tabs mb-3">
-            <li class="nav-item"><span class="nav-link tab-btn active" data-tab="tab-network">Сеть</span></li>
-            <li class="nav-item"><span class="nav-link tab-btn" data-tab="tab-general">Общие</span></li>
-            <li class="nav-item"><span class="nav-link tab-btn" data-tab="tab-risk">Риск</span></li>
-            <li class="nav-item"><span class="nav-link tab-btn" data-tab="tab-trade">Торговля</span></li>
-            <li class="nav-item"><span class="nav-link tab-btn" data-tab="tab-advanced">Продвинутое</span></li>
-        </ul>
+    <!-- ====================== ТАБЫ ====================== -->
+    <ul class="nav nav-tabs mb-3">
+        <li class="nav-item"><span class="nav-link tab-btn active" data-tab="tab-network">Сеть</span></li>
+        <li class="nav-item"><span class="nav-link tab-btn" data-tab="tab-general">Общие</span></li>
+        <li class="nav-item"><span class="nav-link tab-btn" data-tab="tab-risk">Риск</span></li>
+        <li class="nav-item"><span class="nav-link tab-btn" data-tab="tab-trade">Торговля</span></li>
+        <li class="nav-item"><span class="nav-link tab-btn" data-tab="tab-advanced">Продвинутое</span></li>
+    </ul>
+
+    <!-- ===================================================== -->
+    <!-- TAB CONTENT (ВАЖНО)                                   -->
+    <!-- ===================================================== -->
+    <div class="tab-content">
 
         <!-- ===================================================== -->
-        <!-- ====================== NETWORK TAB ================== -->
+        <!-- TAB: NETWORK  (ВАЖНО: ОТДЕЛЬНЫЕ ФОРМЫ, НЕ ВЛОЖЕННЫЕ)   -->
         <!-- ===================================================== -->
         <div class="tab-pane active" id="tab-network">
 
-            <div class="section-title">Биржа и сеть</div>
+            <div class="card card-theme p-4">
 
-            <div class="row g-4">
+                <!-- ===================================================== -->
+                <!-- 1) БИРЖА + СЕТЬ -->
+                <!-- ===================================================== -->
+                <div class="section-title">Биржа и сеть</div>
 
-                <!-- Биржа -->
-                <div class="col-md-4">
-                    <label class="form-label">Биржа</label>
-                    <select id="exchangeSelect" class="form-control" name="exchange">
-                        <option th:each="ex : ${availableExchanges}"
-                                th:value="${ex}"
-                                th:text="${ex}"
-                                th:selected="${selectedExchange == ex}"></option>
-                    </select>
-                </div>
+                <form method="post"
+                      th:action="@{|/strategies/${type}/config?chatId=${chatId}|}">
 
-                <!-- Сеть -->
-                <div class="col-md-4">
-                    <label class="form-label">Сеть</label>
-                    <select id="networkSelect" class="form-control" name="network">
-                        <option value="MAINNET" th:selected="${selectedNetwork?.name() == 'MAINNET'}">MAINNET</option>
-                        <option value="TESTNET" th:selected="${selectedNetwork?.name() == 'TESTNET'}">TESTNET</option>
-                    </select>
-                </div>
+                    <input type="hidden" name="saveScope" value="network"/>
+                    <input type="hidden" name="tab" value="network"/>
 
-                <!-- Статус -->
-                <div class="col-md-4 d-flex flex-column justify-content-end">
-                    <div class="fw-bold mb-1"
-                         th:classappend="${connectionOk} ? 'text-success' : 'text-danger'">
-                        <span th:text="${connectionOk} ? 'Подключено' : 'Нет подключения'"></span>
+                    <div class="row g-4">
+
+                        <!-- Биржа -->
+                        <div class="col-md-4">
+                            <label class="form-label">Биржа</label>
+                            <select id="exchangeSelect"
+                                    class="form-control"
+                                    name="exchange">
+                                <option th:each="ex : ${availableExchanges}"
+                                        th:value="${ex}"
+                                        th:text="${ex}"
+                                        th:selected="${selectedExchange == ex}">
+                                </option>
+                            </select>
+                        </div>
+
+                        <!-- Сеть -->
+                        <div class="col-md-4">
+                            <label class="form-label">Сеть</label>
+                            <select id="networkSelect"
+                                    class="form-control"
+                                    name="network">
+                                <option value="MAINNET"
+                                        th:selected="${selectedNetwork?.name() == 'MAINNET'}">
+                                    MAINNET
+                                </option>
+                                <option value="TESTNET"
+                                        th:selected="${selectedNetwork?.name() == 'TESTNET'}">
+                                    TESTNET
+                                </option>
+                            </select>
+                        </div>
+
+                        <!-- Статус -->
+                        <div class="col-md-4 d-flex flex-column justify-content-end">
+                            <div class="fw-bold mb-1"
+                                 th:classappend="${connectionOk} ? 'text-success' : 'text-danger'">
+                                <span th:text="${connectionOk} ? 'Подключено' : 'Нет подключения'"></span>
+                            </div>
+
+                            <div>
+                            <span class="badge bg-success"
+                                  th:if="${exchangeSettings != null and exchangeSettings.hasKeys()}">
+                                Ключи сохранены
+                            </span>
+                                <span class="badge bg-secondary"
+                                      th:if="${exchangeSettings == null or !exchangeSettings.hasKeys()}">
+                                Ключи не заданы
+                            </span>
+                            </div>
+                        </div>
+
                     </div>
 
-                    <div>
-                        <span class="badge bg-success" th:if="${exchangeSettings?.apiKey != null}">
-                            Ключи сохранены
-                        </span>
-                        <span class="badge bg-secondary" th:if="${exchangeSettings?.apiKey == null}">
-                            Ключи не заданы
-                        </span>
-                    </div>
-                </div>
+                    <!-- Кнопки -->
+                    <div class="d-flex gap-2 mt-4">
+                        <a th:href="@{/strategies(chatId=${chatId})}"
+                           class="btn btn-outline-secondary">
+                            ◀ Назад
+                        </a>
 
-            </div>
-
-            <div class="section-title mt-4">Диагностика API</div>
-
-            <div id="diagnostics-box">
-
-                <div th:if="${selectedExchange != 'BINANCE'}" class="text-warning">
-                    Диагностика доступна только для Binance.
-                </div>
-
-                <div th:if="${selectedExchange == 'BINANCE'}">
-
-                    <div th:if="${diagnostics == null}" class="text-secondary">
-                        Нет данных диагностики.
+                        <div class="ms-auto">
+                            <button type="submit"
+                                    class="btn btn-primary">
+                                ✔ Сохранить «Сеть»
+                            </button>
+                        </div>
                     </div>
 
-                    <table th:if="${diagnostics != null}"
+                </form>
+
+                <!-- ===================================================== -->
+                <!-- 2) ДИАГНОСТИКА (AJAX, БЕЗ save) -->
+                <!-- ===================================================== -->
+                <div class="section-title mt-4">Диагностика API</div>
+
+                <div id="diagnostics-box">
+
+                    <div class="d-flex align-items-center gap-2 mb-2">
+                        <button type="button"
+                                id="btn-diagnose"
+                                class="btn btn-outline-info btn-sm"
+                                th:data-chat-id="${chatId}"
+                                th:data-exchange="${selectedExchange}"
+                                th:data-network="${selectedNetwork}">
+                            🔍 Запустить диагностику
+                        </button>
+
+                        <span id="diag-status" class="text-secondary small">
+                        Нажмите «Запустить диагностику».
+                    </span>
+                    </div>
+
+                    <div id="diag-not-supported"
+                         class="text-warning"
+                         style="display:none;">
+                        Диагностика поддерживается только для Binance и Bybit.
+                    </div>
+
+                    <table id="diag-table"
                            class="table table-dark table-bordered align-middle text-center mt-2"
-                           style="max-width:600px;">
+                           style="max-width:600px; display:none;">
                         <tbody>
-
-                        <tr><td>API Key валиден</td>
-                            <td th:text="${diagnostics.apiKeyValid ? '✔' : '✖'}"
-                                th:classappend="${diagnostics.apiKeyValid} ? 'text-success' : 'text-danger'"></td></tr>
-
-                        <tr><td>Secret валиден</td>
-                            <td th:text="${diagnostics.secretValid ? '✔' : '✖'}"
-                                th:classappend="${diagnostics.secretValid} ? 'text-success' : 'text-danger'"></td></tr>
-
-                        <tr><td>Подпись</td>
-                            <td th:text="${diagnostics.signatureValid ? '✔' : '✖'}"
-                                th:classappend="${diagnostics.signatureValid} ? 'text-success' : 'text-danger'"></td></tr>
-
-                        <tr><td>Доступ к аккаунту</td>
-                            <td th:text="${diagnostics.accountReadable ? '✔' : '✖'}"
-                                th:classappend="${diagnostics.accountReadable} ? 'text-success' : 'text-danger'"></td></tr>
-
-                        <tr><td>Разрешена торговля</td>
-                            <td th:text="${diagnostics.tradingAllowed ? '✔' : '✖'}"
-                                th:classappend="${diagnostics.tradingAllowed} ? 'text-success' : 'text-danger'"></td></tr>
-
-                        <tr><td>IP разрешён</td>
-                            <td th:text="${diagnostics.ipAllowed ? '✔' : '✖'}"
-                                th:classappend="${diagnostics.ipAllowed} ? 'text-success' : 'text-danger'"></td></tr>
-
-                        <tr><td>Сеть корректна</td>
-                            <td th:text="${diagnostics.networkOk ? '✔' : '✖'}"
-                                th:classappend="${diagnostics.networkOk} ? 'text-success' : 'text-danger'"></td></tr>
-
+                        <tr><td>API Key валиден</td><td id="d-apiKeyValid">—</td></tr>
+                        <tr><td>Secret валиден</td><td id="d-secretValid">—</td></tr>
+                        <tr><td>Подпись</td><td id="d-signatureValid">—</td></tr>
+                        <tr><td>Доступ к аккаунту</td><td id="d-accountReadable">—</td></tr>
+                        <tr><td>Разрешена торговля</td><td id="d-tradingAllowed">—</td></tr>
+                        <tr><td>IP разрешён</td><td id="d-ipAllowed">—</td></tr>
+                        <tr><td>Сеть корректна</td><td id="d-networkOk">—</td></tr>
                         </tbody>
                     </table>
 
+                    <div id="diag-message"
+                         class="text-secondary mt-2"
+                         style="display:none;"></div>
+
                 </div>
+
+                <!-- ===================================================== -->
+                <!-- 3) API КЛЮЧИ -->
+                <!-- ===================================================== -->
+                <div class="section-title mt-4">API ключи</div>
+
+                <form method="post"
+                      th:action="@{|/strategies/${type}/config?chatId=${chatId}|}">
+
+                    <input type="hidden" name="saveScope" value="keys"/>
+                    <input type="hidden" name="tab" value="network"/>
+
+                    <input type="hidden" name="exchange" th:value="${selectedExchange}"/>
+                    <input type="hidden" name="network" th:value="${selectedNetwork?.name()}"/>
+
+                    <div class="row g-4">
+
+                        <div class="col-md-4">
+                            <label class="form-label">API Key</label>
+                            <input class="form-control"
+                                   name="apiKey"
+                                   type="password"
+                                   autocomplete="off"
+                                   placeholder="••••••••••">
+                            <div class="form-text text-secondary">
+                                Оставьте пустым, если не хотите менять.
+                            </div>
+                        </div>
+
+                        <div class="col-md-4">
+                            <label class="form-label">API Secret</label>
+                            <input class="form-control"
+                                   name="apiSecret"
+                                   type="password"
+                                   autocomplete="off"
+                                   placeholder="••••••••••">
+                            <div class="form-text text-secondary">
+                                Оставьте пустым, если не хотите менять.
+                            </div>
+                        </div>
+
+                        <div class="col-md-4">
+                            <label class="form-label">Passphrase</label>
+                            <input class="form-control"
+                                   name="passphrase"
+                                   type="password"
+                                   autocomplete="off"
+                                   placeholder="••••••••••">
+                            <div class="form-text text-secondary">
+                                Нужно только для некоторых бирж (например OKX).
+                            </div>
+                        </div>
+
+                    </div>
+
+                    <div class="d-flex gap-2 mt-4">
+                        <div class="ms-auto">
+                            <button type="submit"
+                                    class="btn btn-primary">
+                                ✔ Сохранить «Ключи»
+                            </button>
+                        </div>
+                    </div>
+
+                </form>
 
             </div>
-
-            <div class="section-title mt-4">API ключи</div>
-
-            <div class="row g-4">
-
-                <div class="col-md-4">
-                    <label class="form-label">API Key</label>
-                    <input class="form-control"
-                           name="apiKey"
-                           th:value="${exchangeSettings?.apiKey}">
-                </div>
-
-                <div class="col-md-4">
-                    <label class="form-label">API Secret</label>
-                    <input class="form-control"
-                           name="apiSecret"
-                           th:value="${exchangeSettings?.apiSecret}">
-                </div>
-
-                <div class="col-md-4">
-                    <label class="form-label">Passphrase</label>
-                    <input class="form-control"
-                           name="passphrase"
-                           th:value="${exchangeSettings?.passphrase}">
-                </div>
-
-            </div>
-
         </div>
 
         <!-- ===================================================== -->
-        <!-- ====================== GENERAL TAB ================== -->
+        <!-- NETWORK TAB: JS -->
         <!-- ===================================================== -->
-        <div class="tab-pane" id="tab-general">
+        <script src="/js/strategies/network.tab.js"></script>
 
-            <div class="section-title">Капитал и комиссия</div>
+        <!-- ===================================================== -->
+        <!-- ЕДИНСТВЕННЫЙ FORM ДЛЯ: GENERAL / RISK / TRADE / ADV   -->
+        <!-- ===================================================== -->
+        <form method="post"
+              th:object="${strategy}"
+              th:action="@{|/strategies/${type}/config?chatId=${chatId}|}"
+              class="card card-theme p-4">
 
-            <div class="row g-4">
-                <div class="col-md-4">
-                    <label class="form-label">Капитал (USDT)</label>
-                    <input type="number" step="0.01" class="form-control"
-                           name="capitalUsd"
-                           th:value="${strategy.capitalUsd}">
+            <input type="hidden" name="exchange" th:value="${selectedExchange}"/>
+            <input type="hidden" name="network" th:value="${selectedNetwork}"/>
+
+            <!-- ====================== GENERAL TAB ================== -->
+            <div class="tab-pane" id="tab-general">
+
+                <div class="section-title">Баланс аккаунта</div>
+
+                <div class="row g-4">
+
+                    <!-- 💰 ДОСТУПНО СРЕДСТВ -->
+                    <div class="col-md-4">
+                        <label class="form-label">Доступно средств</label>
+                        <div class="input-group">
+                            <input class="form-control" readonly
+                                   th:value="${availableBalance != null ? availableBalance : '—'}">
+                            <span class="input-group-text"
+                                  th:text="${selectedAsset != null ? selectedAsset : '—'}">
+                    USDT
+                </span>
+                        </div>
+                        <div class="form-text">
+                            Фактический доступный баланс на бирже (free).
+                        </div>
+                    </div>
+
+                    <!-- 💱 ВЫБОР АКТИВА (AJAX + FORM SAFE) -->
+                    <div class="col-md-4">
+                        <label class="form-label">Актив счёта</label>
+
+                        <!-- ✅ ЕДИНСТВЕННОЕ поле, уходящее в submit -->
+                        <input type="hidden"
+                               id="accountAssetHidden"
+                               name="accountAsset"
+                               th:value="${selectedAsset}" />
+
+                        <!-- ❗ select БЕЗ name -->
+                        <select id="accountAssetSelect"
+                                class="form-select"
+                                th:disabled="${#lists.isEmpty(availableAssets)}"
+                                th:data-chat-id="${chatId}"
+                                th:data-type="${type}"
+                                th:data-exchange="${selectedExchange}"
+                                th:data-network="${selectedNetwork}">
+
+                            <option th:each="asset : ${availableAssets}"
+                                    th:value="${asset}"
+                                    th:text="${asset}"
+                                    th:selected="${asset == selectedAsset}">
+                            </option>
+                        </select>
+
+                        <div class="form-text">
+                            Отображаются только активы с доступным балансом.
+                        </div>
+                    </div>
                 </div>
 
-                <div class="col-md-4">
-                    <label class="form-label">Комиссия (%)</label>
-                    <input class="form-control"
-                           step="0.001" type="number"
-                           name="commissionPct"
-                           th:value="${strategy.commissionPct}">
+                <hr class="my-4"/>
 
-                    <button id="refreshFeeBtn" type="button"
-                            class="btn btn-outline-info btn-sm mt-3">
-                        🔄 Обновить комиссию
+                <div class="section-title">Использование средств</div>
+
+                <div class="row g-4 align-items-end">
+
+                    <!-- MODE -->
+                    <div class="col-md-4">
+                        <label class="form-label">Лимит</label>
+
+                        <select class="form-select"
+                                id="exposureMode">
+                            <option value="NONE">Без лимита (весь баланс)</option>
+                            <option value="USD">Фиксированная сумма</option>
+                            <option value="PCT">Процент от баланса</option>
+                        </select>
+
+                        <div class="form-text">
+                            Выбери, как ограничивать использование средств.
+                        </div>
+                    </div>
+
+                    <!-- VALUE -->
+                    <div class="col-md-4">
+                        <label class="form-label" id="exposureValueLabel">Значение</label>
+
+                        <!-- 🔢 для USD / PCT -->
+                        <input type="number"
+                               class="form-control"
+                               id="exposureValue"
+                               step="1"
+                               min="0"
+                               placeholder="Напр. 500"/>
+
+                        <!-- 🔒 для NONE -->
+                        <input type="text"
+                               class="form-control d-none"
+                               id="exposureValueReadonly"
+                               readonly
+                               value="Весь доступный баланс"/>
+
+                        <div class="form-text" id="exposureValueHint"></div>
+                    </div>
+
+                    <!-- PREVIEW -->
+                    <div class="col-md-4">
+                        <div class="alert alert-info small mt-4" id="exposurePreview">
+                            Выбери режим лимита.
+                        </div>
+                    </div>
+
+                    <!-- 🔥 ИСТОЧНИК ИСТИНЫ ИЗ BACKEND -->
+                    <input type="hidden"
+                           id="exposureInitialMode"
+                           th:value="${strategy.maxExposureUsd != null
+                ? 'USD'
+                : (strategy.maxExposurePct != null ? 'PCT' : 'NONE')}" />
+
+                    <!-- ✅ ТО, ЧТО УХОДИТ В БД -->
+                    <input type="hidden"
+                           id="maxExposureUsdHidden"
+                           name="maxExposureUsd"
+                           th:value="${strategy.maxExposureUsd}">
+
+                    <input type="hidden"
+                           id="maxExposurePctHidden"
+                           name="maxExposurePct"
+                           th:value="${strategy.maxExposurePct}">
+                </div>
+
+
+
+                <script>
+                    (function () {
+
+                        const mode      = document.getElementById('exposureMode');
+
+                        const valueNum  = document.getElementById('exposureValue');
+                        const valueRO   = document.getElementById('exposureValueReadonly');
+
+                        const label     = document.getElementById('exposureValueLabel');
+                        const hint      = document.getElementById('exposureValueHint');
+                        const preview   = document.getElementById('exposurePreview');
+
+                        const usdHidden = document.getElementById('maxExposureUsdHidden');
+                        const pctHidden = document.getElementById('maxExposurePctHidden');
+
+                        const asset =
+                            document.getElementById('accountAssetHidden')?.value || 'USDT';
+
+                        const initialMode =
+                            document.getElementById('exposureInitialMode')?.value || 'NONE';
+
+                        mode.value = initialMode;
+
+                        // восстановление значения
+                        if (initialMode === 'USD') {
+                            valueNum.value = usdHidden.value || '';
+                        } else if (initialMode === 'PCT') {
+                            valueNum.value = pctHidden.value || '';
+                        }
+
+                        applyUi();
+
+                        function applyUi() {
+                            const m = mode.value;
+
+                            // ===== NONE =====
+                            if (m === 'NONE') {
+                                valueNum.classList.add('d-none');
+                                valueRO.classList.remove('d-none');
+
+                                label.textContent = 'Значение';
+                                hint.textContent = 'Будет использован весь доступный баланс.';
+                                preview.textContent = 'Лимит: весь баланс';
+
+                                // 🔥 КАНОНИЧЕСКИЙ СМЫСЛ
+                                usdHidden.value = '';
+                                pctHidden.value = '';
+                                return;
+                            }
+
+                            // ===== USD / PCT =====
+                            valueRO.classList.add('d-none');
+                            valueNum.classList.remove('d-none');
+
+                            if (m === 'USD') {
+                                label.textContent = `Сумма (${asset})`;
+                                valueNum.placeholder = 'Напр. 500';
+                                valueNum.max = '';
+                                hint.textContent = `Максимальная сумма в ${asset}.`;
+                            }
+
+                            if (m === 'PCT') {
+                                label.textContent = 'Процент (%)';
+                                valueNum.placeholder = 'Напр. 50';
+                                valueNum.max = '100';
+                                hint.textContent = 'Процент от доступного баланса.';
+                            }
+
+                            syncHidden();
+                        }
+
+                        function syncHidden() {
+                            const m = mode.value;
+                            const raw = valueNum.value.trim();
+
+                            if (!raw || m === 'NONE') {
+                                usdHidden.value = '';
+                                pctHidden.value = '';
+                                preview.textContent = 'Лимит: весь баланс';
+                                return;
+                            }
+
+                            const v = Number(raw);
+                            if (!Number.isFinite(v) || v < 0) return;
+
+                            if (m === 'USD') {
+                                usdHidden.value = raw;
+                                pctHidden.value = '';
+                                preview.textContent = `Лимит: ${raw} ${asset}`;
+                            }
+
+                            if (m === 'PCT') {
+                                const clamped = Math.min(100, v);
+                                pctHidden.value = String(clamped);
+                                usdHidden.value = '';
+                                valueNum.value = clamped;
+                                preview.textContent = `Лимит: ${clamped}%`;
+                            }
+                        }
+
+                        mode.addEventListener('change', applyUi);
+                        valueNum.addEventListener('input', syncHidden);
+
+                    })();
+                </script>
+
+
+
+
+
+
+
+                <hr class="my-4"/>
+
+                <div class="section-title">Прибыль</div>
+
+                <div class="row g-4">
+                    <div class="col-md-4">
+                        <div class="form-check">
+                            <input class="form-check-input"
+                                   type="checkbox"
+                                   id="reinvestProfit"
+                                   name="reinvestProfit"
+                                   value="true"
+                                   th:checked="${strategy.reinvestProfit}"/>
+
+                            <label class="form-check-label" for="reinvestProfit">
+                                Реинвестировать прибыль
+                            </label>
+                        </div>
+
+                        <div class="form-text">
+                            Прибыль автоматически участвует в следующих сделках.
+                        </div>
+                    </div>
+                </div>
+
+                <hr class="my-4"/>
+
+                <div class="section-title">Комиссии биржи</div>
+
+                <div class="row g-4">
+                    <div class="col-md-4">
+                        <label class="form-label">Комиссия Maker</label>
+                        <input class="form-control" readonly
+                               th:value="${accountFees?.makerPct != null ? accountFees.makerPct : '—'}">
+                    </div>
+
+                    <div class="col-md-4">
+                        <label class="form-label">Комиссия Taker</label>
+                        <input class="form-control" readonly
+                               th:value="${accountFees?.takerPct != null ? accountFees.takerPct : '—'}">
+                    </div>
+
+                    <div class="col-md-4">
+                        <div class="alert alert-secondary small mt-4">
+                            Комиссии подтягиваются с биржи и учитываются автоматически.
+                        </div>
+                    </div>
+                </div>
+
+                <div class="d-flex justify-content-end mt-4">
+                    <button type="submit"
+                            class="btn btn-primary"
+                            name="saveScope"
+                            value="general">
+                        ✔ Сохранить «Общие»
                     </button>
                 </div>
+            </div>
+            <script>
+                document.addEventListener('DOMContentLoaded', () => {
+                    const select = document.getElementById('accountAssetSelect');
+                    const hidden = document.getElementById('accountAssetHidden');
 
-                <div class="col-md-4 d-flex align-items-end">
-                    <label class="form-check form-switch">
-                        <input class="form-check-input"
-                               type="checkbox"
-                               name="reinvestProfit"
-                               th:checked="${strategy.reinvestProfit}">
-                        <span class="ms-2">Реинвестировать прибыль</span>
-                    </label>
-                </div>
+                    if (select && hidden) {
+                        select.addEventListener('change', () => {
+                            hidden.value = select.value;
+                            console.log('accountAsset changed ->', select.value);
+                        });
+                    }
+                });
+            </script>
+
+
+
+            <!-- ====================== RISK TAB ===================== -->
+            <div class="tab-pane" id="tab-risk">
+                <!-- Оставь тут твой текущий Risk (или временную заглушку) -->
             </div>
 
-        </div>
-
-        <!-- ===================================================== -->
-        <!-- ====================== RISK TAB ===================== -->
-        <!-- ===================================================== -->
-        <div class="tab-pane" id="tab-risk">
-
-            <div class="section-title">Риск-менеджмент</div>
-
-            <div class="row g-4">
-
-                <div class="col-md-4">
-                    <label class="form-label">Риск на сделку (%)</label>
-                    <input type="number" step="0.1"
-                           class="form-control"
-                           name="riskPerTradePct"
-                           th:value="${strategy.riskPerTradePct}">
-                </div>
-
-                <div class="col-md-4">
-                    <label class="form-label">Дневной лимит потерь (%)</label>
-                    <input type="number" step="0.1"
-                           class="form-control"
-                           name="dailyLossLimitPct"
-                           th:value="${strategy.dailyLossLimitPct}">
-                </div>
-
-                <div class="col-md-4">
-                    <label class="form-label">Плечо</label>
-                    <input type="number" min="1"
-                           class="form-control"
-                           name="leverage"
-                           th:value="${strategy.leverage}">
-                </div>
-
+            <!-- ====================== TRADE TAB ==================== -->
+            <div class="tab-pane" id="tab-trade">
+                <!-- Оставь тут твой текущий Trade (или временную заглушку) -->
             </div>
 
-            <div class="section-title">TP / SL</div>
-
-            <div class="row g-4">
-
-                <div class="col-md-4">
-                    <label class="form-label">Take Profit (%)</label>
-                    <input type="number" step="0.1"
-                           class="form-control"
-                           name="takeProfitPct"
-                           th:value="${strategy.takeProfitPct}">
-                </div>
-
-                <div class="col-md-4">
-                    <label class="form-label">Stop Loss (%)</label>
-                    <input type="number" step="0.1"
-                           class="form-control"
-                           name="stopLossPct"
-                           th:value="${strategy.stopLossPct}">
-                </div>
-
+            <!-- ====================== ADVANCED TAB ================= -->
+            <div class="tab-pane" id="tab-advanced">
+                <!-- Оставь тут твой текущий Advanced (или временную заглушку) -->
             </div>
 
-        </div>
+        </form>
 
-        <!-- ===================================================== -->
-        <!-- ====================== TRADE TAB ==================== -->
-        <!-- ===================================================== -->
-        <div class="tab-pane" id="tab-trade">
+    </div> <!-- /tab-content -->
 
-            <div class="section-title">Торговая пара</div>
-
-            <div class="row g-4">
-
-                <div class="col-md-4">
-                    <label class="form-label">Пара</label>
-                    <input id="symbolInput" class="form-control"
-                           name="symbol"
-                           th:value="${strategy.symbol}">
-                </div>
-
-                <div class="col-md-4">
-                    <label class="form-label">Таймфрейм</label>
-                    <select class="form-select" name="timeframe">
-                        <option th:each="tf : ${availableTimeframes}"
-                                th:text="${tf}"
-                                th:selected="${strategy.timeframe == tf}"></option>
-                    </select>
-                </div>
-
-                <div class="col-md-4">
-                    <label class="form-label">Свечей в кэше</label>
-                    <input type="number"
-                           class="form-control"
-                           min="100" max="5000" step="50"
-                           name="cachedCandlesLimit"
-                           th:value="${strategy.cachedCandlesLimit}">
-                </div>
-
-            </div>
-
-            <hr class="my-4"/>
-
-            <div class="section-title">Поиск монет</div>
-
-            <input id="marketSearch"
-                   class="form-control mb-3"
-                   placeholder="BTC, ETH, XRP…">
-
-            <div id="marketResults" class="market-results-box">
-                <div class="text-center text-secondary p-3">
-                    Введите поисковый запрос…
-                </div>
-            </div>
-
-        </div>
-
-        <!-- ===================================================== -->
-        <!-- ====================== ADVANCED TAB ================= -->
-        <!-- ===================================================== -->
-        <div class="tab-pane" id="tab-advanced">
-
-            <div class="section-title">Дополнительно</div>
-
-            <div class="alert alert-secondary small">
-                Здесь появятся настройки ML/RL и SmartFusion.
-            </div>
-
-        </div>
-
-        <!-- ==================== SUBMIT ===================== -->
-        <hr class="my-4"/>
-
-        <div class="d-flex gap-3">
-            <a href="/strategies" class="btn btn-outline-secondary">
-                ◀ Назад
-            </a>
-
-            <button type="submit" class="btn btn-primary px-4">
-                ✔ Сохранить
-            </button>
-        </div>
-
-    </form>
-
-    <!-- LOCAL PAGE JS -->
     <script th:src="@{/js/views/strategies/settings.js}"></script>
-
 </div>

@@ -1,7 +1,5 @@
 package com.chicu.aitradebot.strategy.scalping;
 
-import com.chicu.aitradebot.common.enums.NetworkType;
-import com.chicu.aitradebot.strategy.core.settings.OrderVolumeProvider;
 import jakarta.persistence.*;
 import lombok.*;
 
@@ -15,7 +13,7 @@ import java.time.Instant;
 @NoArgsConstructor
 @AllArgsConstructor
 @Builder
-public class ScalpingStrategySettings implements OrderVolumeProvider {
+public class ScalpingStrategySettings {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -24,75 +22,49 @@ public class ScalpingStrategySettings implements OrderVolumeProvider {
     @Column(nullable = false)
     private Long chatId;
 
-    // ============================================================
-    // STRATEGY PARAMS
-    // ============================================================
+    // =========================
+    // LOGIC PARAMS
+    // =========================
 
     @Builder.Default
     @Column(nullable = false)
-    private String symbol = "BTCUSDT";
+    private Integer windowSize = 20;
 
     @Builder.Default
     @Column(nullable = false)
-    private String timeframe = "1m";
-
-    @Builder.Default
-    @Column(name = "cached_candles_limit", nullable = false)
-    private int cachedCandlesLimit = 300;
+    private Double priceChangeThreshold = 0.3;
 
     @Builder.Default
     @Column(nullable = false)
-    private int windowSize = 20;
+    private Double spreadThreshold = 0.1;
 
+    /**
+     * Объём сделки (USDT)
+     */
     @Builder.Default
-    @Column(nullable = false)
-    private double priceChangeThreshold = 0.3; // %
+    @Column(nullable = false, precision = 18, scale = 8)
+    private BigDecimal orderVolume = BigDecimal.valueOf(20);
 
-    @Builder.Default
-    @Column(nullable = false)
-    private double spreadThreshold = 0.1; // %
-
-    @Builder.Default
-    @Column(nullable = false)
-    private double takeProfitPct = 0.5;
-
-    @Builder.Default
-    @Column(nullable = false)
-    private double stopLossPct = 0.5;
-
-    // ⚠️ ХРАНИМ double
-    @Builder.Default
-    @Column(nullable = false)
-    private double orderVolume = 20.0;
-
-    // ============================================================
-    // ✅ КОНТРАКТ v4
-    // ============================================================
-
-    @Override
-    public BigDecimal getOrderVolume() {
-        return BigDecimal.valueOf(orderVolume);
-    }
-
-    // ============================================================
-    // SYSTEM
-    // ============================================================
-
-    @Enumerated(EnumType.STRING)
-    @Builder.Default
-    @Column(nullable = false)
-    private NetworkType networkType = NetworkType.TESTNET;
-
-    @Builder.Default
-    @Column(nullable = false)
-    private boolean active = false;
+    // =========================
+    // AUDIT
+    // =========================
 
     @Builder.Default
     @Column(nullable = false, updatable = false)
     private Instant createdAt = Instant.now();
 
+    @Column(nullable = true)
+    private Instant updatedAt;
+
     @PrePersist
     public void prePersist() {
-        if (createdAt == null) createdAt = Instant.now();
+        if (createdAt == null) {
+            createdAt = Instant.now();
+        }
+    }
+
+    @PreUpdate
+    public void preUpdate() {
+        updatedAt = Instant.now();
     }
 }

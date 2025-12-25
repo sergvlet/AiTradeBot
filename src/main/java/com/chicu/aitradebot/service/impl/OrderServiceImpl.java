@@ -26,7 +26,6 @@ public class OrderServiceImpl implements OrderService {
     private final OrderRepository orderRepository;
     private final StrategyLivePublisher livePublisher;
 
-
     // ==========================
     // MARKET
     // ==========================
@@ -39,17 +38,20 @@ public class OrderServiceImpl implements OrderService {
                              BigDecimal executionPrice,
                              String strategyType) {
 
+        String sideNorm = side != null ? side.toUpperCase() : "BUY";
+        String strategyNorm = strategyType != null ? strategyType.toUpperCase() : "UNKNOWN";
+
         log.info("📥 [MARKET] chatId={}, symbol={}, side={}, qty={}, price={}, strategy={}",
-                chatId, symbol, side, quantity, executionPrice, strategyType);
+                chatId, symbol, sideNorm, quantity, executionPrice, strategyNorm);
 
         OrderEntity entity = new OrderEntity();
         entity.setChatId(chatId);
         entity.setUserId(chatId);
         entity.setSymbol(symbol);
-        entity.setSide(side);
+        entity.setSide(sideNorm);
         entity.setPrice(executionPrice);
         entity.setQuantity(quantity);
-        entity.setStrategyType(strategyType);
+        entity.setStrategyType(strategyNorm);
         entity.setStatus("FILLED");
         entity.setFilled(true);
         entity.setTimestamp(System.currentTimeMillis());
@@ -61,15 +63,13 @@ public class OrderServiceImpl implements OrderService {
 
         orderRepository.save(entity);
 
-        // =====================================================
         // 🔥 LIVE TRADE В ГРАФИК
-        // =====================================================
         try {
             livePublisher.pushTrade(
                     chatId,
-                    StrategyType.valueOf(strategyType),
+                    StrategyType.valueOf(strategyNorm),
                     symbol,
-                    side,
+                    sideNorm,
                     executionPrice,
                     quantity,
                     Instant.now()
@@ -94,18 +94,14 @@ public class OrderServiceImpl implements OrderService {
                             String timeInForce,
                             String strategyType) {
 
-        log.info("📥 [LIMIT] chatId={}, symbol={}, side={}, qty={}, limitPrice={}, tif={}, strategy={}",
-                chatId, symbol, side, quantity, limitPrice, timeInForce, strategyType);
-
         OrderEntity entity = new OrderEntity();
         entity.setChatId(chatId);
-        entity.setUserId(chatId); // ✅
-
+        entity.setUserId(chatId);
         entity.setSymbol(symbol);
-        entity.setSide(side);
+        entity.setSide(side.toUpperCase());
         entity.setPrice(limitPrice);
         entity.setQuantity(quantity);
-        entity.setStrategyType(strategyType);
+        entity.setStrategyType(strategyType.toUpperCase());
         entity.setStatus("NEW");
         entity.setFilled(false);
         entity.setTimestamp(System.currentTimeMillis());
@@ -132,18 +128,13 @@ public class OrderServiceImpl implements OrderService {
                           BigDecimal stopLimitPrice,
                           String strategyType) {
 
-        log.info("📥 [OCO] chatId={}, symbol={}, qty={}, tp={}, stop={}, stopLimit={}, strategy={}",
-                chatId, symbol, quantity, takeProfitPrice, stopPrice, stopLimitPrice, strategyType);
-
         OrderEntity entity = new OrderEntity();
         entity.setChatId(chatId);
-        entity.setUserId(chatId); // ✅
-
+        entity.setUserId(chatId);
         entity.setSymbol(symbol);
         entity.setSide("SELL");
-        entity.setPrice(takeProfitPrice != null ? takeProfitPrice : stopLimitPrice);
         entity.setQuantity(quantity);
-        entity.setStrategyType(strategyType);
+        entity.setStrategyType(strategyType.toUpperCase());
         entity.setStatus("NEW");
         entity.setFilled(false);
         entity.setTimestamp(System.currentTimeMillis());
@@ -152,8 +143,10 @@ public class OrderServiceImpl implements OrderService {
         entity.setTakeProfitPrice(takeProfitPrice);
         entity.setStopLossPrice(stopLimitPrice != null ? stopLimitPrice : stopPrice);
 
-        if (entity.getPrice() != null && quantity != null) {
-            entity.setTotal(entity.getPrice().multiply(quantity));
+        BigDecimal refPrice = takeProfitPrice != null ? takeProfitPrice : stopLimitPrice;
+        if (refPrice != null && quantity != null) {
+            entity.setPrice(refPrice);
+            entity.setTotal(refPrice.multiply(quantity));
         }
 
         orderRepository.save(entity);
@@ -161,8 +154,86 @@ public class OrderServiceImpl implements OrderService {
     }
 
     // ==========================
-    // CANCEL
+    // HISTORY (DTO)
     // ==========================
+    @Override
+    @Transactional(readOnly = true)
+    public List<Order> getOrdersByChatIdAndSymbol(long chatId, String symbol) {
+        return orderRepository
+                .findByChatIdAndSymbolOrderByTimestampAsc(chatId, symbol)
+                .stream()
+                .map(this::mapToDto)
+                .collect(Collectors.toList());
+    }
+
+    // ==========================
+    // HISTORY (ENTITY) ❗ ОБЯЗАТЕЛЬНО
+    // ==========================
+    @Override
+    @Transactional(readOnly = true)
+    public List<OrderEntity> getOrderEntitiesByChatIdAndSymbol(long chatId, String symbol) {
+        return orderRepository.findByChatIdAndSymbolOrderByTimestampAsc(chatId, symbol);
+    }
+
+    // ==========================
+    // МАППЕР
+    // ==========================
+    private Order mapToDto(OrderEntity e) {
+        if (e == null) return null;
+
+        Order o = new Order();
+        o.setId(e.getId());
+        o.setChatId(e.getChatId());
+        o.setSymbol(e.getSymbol());
+        o.setSide(e.getSide());
+        o.setPrice(e.getPrice());
+        o.setQuantity(e.getQuantity());
+        o.setStatus(e.getStatus());
+        o.setFilled(e.getFilled());
+        o.setTime(e.getTimestamp());
+
+        try {
+            if (e.getStrategyType() != null) {
+                o.setStrategyType(StrategyType.valueOf(e.getStrategyType()));
+            }
+        } catch (Exception ignore) {}
+
+        return o;
+    }
+    public Order createOrder(com.chicu.aitradebot.exchange.model.Order order) {
+        if (order == null) return null;
+
+        log.info("📥 [CREATE] order DTO = {}", order);
+
+        OrderEntity entity = new OrderEntity();
+        entity.setChatId(order.getChatId());
+        entity.setUserId(order.getChatId());
+
+        entity.setSymbol(order.getSymbol());
+        entity.setSide(order.getSide());
+        entity.setPrice(order.getPrice());
+        entity.setQuantity(order.getQuantity());
+        entity.setStatus(order.getStatus() != null ? order.getStatus() : "NEW");
+        entity.setFilled(order.isFilled());
+        entity.setTimestamp(order.getTime() != null ? order.getTime() : System.currentTimeMillis());
+        entity.setCreatedAt(LocalDateTime.now());
+
+        if (order.getStrategyType() != null) {
+            entity.setStrategyType(order.getStrategyType().name());
+        } else {
+            entity.setStrategyType("UNKNOWN");
+        }
+
+        if (entity.getPrice() != null && entity.getQuantity() != null) {
+            entity.setTotal(entity.getPrice().multiply(entity.getQuantity()));
+        }
+
+        orderRepository.save(entity);
+        return mapToDto(entity);
+    }
+    // ==========================
+// CANCEL
+// ==========================
     @Override
     @Transactional
     public boolean cancelOrder(Long chatId, Long orderId) {
@@ -195,111 +266,26 @@ public class OrderServiceImpl implements OrderService {
 
         orderRepository.saveAll(openOrders);
 
-        log.info("❌ [CANCEL_ALL] chatId={}, symbol={}, count={}", chatId, symbol, openOrders.size());
+        log.info("❌ [CANCEL_ALL] chatId={}, symbol={}, count={}",
+                chatId, symbol, openOrders.size());
+
         return openOrders.size();
     }
 
     // ==========================
-    // OPEN ORDERS
-    // ==========================
+// OPEN ORDERS
+// ==========================
     @Override
     @Transactional(readOnly = true)
     public List<Order> getOpenOrders(Long chatId, String symbol) {
         List<String> openStatuses = Arrays.asList("NEW", "OPEN", "PARTIALLY_FILLED");
 
-        List<OrderEntity> openOrders =
-                orderRepository.findByChatIdAndSymbolAndStatusIn(chatId, symbol, openStatuses);
-
-        return openOrders.stream()
+        return orderRepository
+                .findByChatIdAndSymbolAndStatusIn(chatId, symbol, openStatuses)
+                .stream()
                 .map(this::mapToDto)
                 .collect(Collectors.toList());
     }
 
-    // ==========================
-    // CREATE (generic)
-    // ==========================
-    @Override
-    @Transactional
-    public Order createOrder(Order order) {
-        if (order == null) return null;
-
-        log.info("📥 [CREATE] order DTO = {}", order);
-
-        OrderEntity entity = new OrderEntity();
-        entity.setChatId(order.getChatId());
-        entity.setUserId(order.getChatId()); // ✅
-
-        entity.setSymbol(order.getSymbol());
-        entity.setSide(order.getSide());
-        entity.setPrice(order.getPrice());
-        entity.setQuantity(order.getQuantity());
-        entity.setStatus(order.getStatus() != null ? order.getStatus() : "NEW");
-        entity.setFilled(Boolean.TRUE.equals(order.isFilled()));
-        entity.setTimestamp(order.getTimestamp() != null
-                ? order.getTimestamp()
-                : System.currentTimeMillis());
-        entity.setCreatedAt(LocalDateTime.now());
-
-        if (order.getStrategyType() != null) {
-            entity.setStrategyType(String.valueOf(order.getStrategyType()));
-        } else {
-            entity.setStrategyType("UNKNOWN");
-        }
-
-        if (entity.getPrice() != null && entity.getQuantity() != null) {
-            entity.setTotal(entity.getPrice().multiply(entity.getQuantity()));
-        }
-
-        orderRepository.save(entity);
-        return mapToDto(entity);
-    }
-
-    // ==========================
-    // HISTORY (DTO)
-    // ==========================
-    @Override
-    @Transactional(readOnly = true)
-    public List<Order> getOrdersByChatIdAndSymbol(long chatId, String symbol) {
-        List<OrderEntity> entities =
-                orderRepository.findByChatIdAndSymbolOrderByTimestampAsc(chatId, symbol);
-
-        return entities.stream()
-                .map(this::mapToDto)
-                .collect(Collectors.toList());
-    }
-
-    // ==========================
-    // HISTORY (ENTITY)
-    // ==========================
-    @Override
-    @Transactional(readOnly = true)
-    public List<OrderEntity> getOrderEntitiesByChatIdAndSymbol(long chatId, String symbol) {
-        return orderRepository.findByChatIdAndSymbolOrderByTimestampAsc(chatId, symbol);
-    }
-
-    // ==========================
-    // МАППЕР
-    // ==========================
-    private Order mapToDto(OrderEntity e) {
-        if (e == null) return null;
-
-        Order o = new Order();
-        o.setId(e.getId());
-        o.setChatId(e.getChatId());
-        o.setSymbol(e.getSymbol());
-        o.setSide(e.getSide());
-        o.setPrice(e.getPrice());
-        o.setQuantity(e.getQuantity());
-        o.setStatus(e.getStatus());
-        o.setFilled(e.getFilled());
-        o.setTimestamp(e.getTimestamp());
-
-        try {
-            if (e.getStrategyType() != null) {
-                o.setStrategyType(StrategyType.valueOf(e.getStrategyType()));
-            }
-        } catch (Exception ignore) {}
-
-        return o;
-    }
 }
+
