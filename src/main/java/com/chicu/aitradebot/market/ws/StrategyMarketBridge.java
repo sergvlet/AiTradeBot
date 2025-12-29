@@ -1,7 +1,10 @@
 package com.chicu.aitradebot.market.ws;
 
 import com.chicu.aitradebot.common.enums.StrategyType;
+import com.chicu.aitradebot.strategy.core.CandleProvider;
+import com.chicu.aitradebot.strategy.core.TradingStrategy;
 import com.chicu.aitradebot.strategy.live.StrategyLivePublisher;
+import com.chicu.aitradebot.strategy.registry.StrategyRegistry;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -14,10 +17,13 @@ import java.time.Instant;
 @RequiredArgsConstructor
 public class StrategyMarketBridge {
 
+    private final CandleProvider candleProvider;
     private final StrategyLivePublisher livePublisher;
+    private final StrategyRegistry strategyRegistry; // ✅ ДОБАВЛЕНО
 
     /**
-     * LIVE-свеча стратегии (ОБЯЗАТЕЛЬНО с StrategyType)
+     * 🔥 LIVE-СВЕЧА
+     * ⚠️ Принимаем любую, но пишем и публикуем ТОЛЬКО 1m
      */
     public void onKline(
             Long chatId,
@@ -32,22 +38,50 @@ public class StrategyMarketBridge {
             Instant closedAt
     ) {
 
-        log.debug("📡 LIVE CANDLE → chatId={}, type={}, {} {} O:{} C:{}",
-                chatId, strategyType, symbol, timeframe, open, close);
+        // =================================================
+        // 🔒 ФИЛЬТР: ТОЛЬКО 1m
+        // =================================================
+        if (!"1m".equalsIgnoreCase(timeframe)) {
+            return;
+        }
 
+        Instant time = closedAt != null ? closedAt : Instant.now();
+
+        // =================================================
+        // 1️⃣ ПИШЕМ В CANDLE PROVIDER
+        // =================================================
+        candleProvider.addCandle(
+                chatId,
+                symbol,
+                "1m",
+                time,
+                open.doubleValue(),
+                high.doubleValue(),
+                low.doubleValue(),
+                close.doubleValue(),
+                volume.doubleValue()
+        );
+
+        // =================================================
+        // 2️⃣ ПУБЛИКУЕМ В LIVE UI (ГРАФИК)
+        // =================================================
         livePublisher.pushCandleOhlc(
                 chatId,
                 strategyType,
                 symbol,
-                timeframe,
-                open, high, low, close,
+                "1m",
+                open,
+                high,
+                low,
+                close,
                 volume,
-                closedAt
+                time
         );
     }
 
     /**
-     * LIVE-тик цены (опционально)
+     * 💲 LIVE-тик цены
+     * 🔥 КЛЮЧЕВО: тут же прокидываем цену в стратегию
      */
     public void onPriceTick(
             Long chatId,
@@ -55,13 +89,36 @@ public class StrategyMarketBridge {
             String symbol,
             BigDecimal price
     ) {
+        if (price == null || price.signum() <= 0) {
+            return;
+        }
 
+        Instant now = Instant.now();
+
+        // =================================================
+        // 1️⃣ UI / ГРАФИК
+        // =================================================
         livePublisher.pushPriceTick(
                 chatId,
                 strategyType,
                 symbol,
                 price,
-                Instant.now()
+                now
         );
+
+        // =================================================
+        // 2️⃣ 🔥 STRATEGY (САМОЕ ВАЖНОЕ)
+        // =================================================
+        TradingStrategy strategy = strategyRegistry.get(strategyType);
+        if (strategy != null) {
+            strategy.onPriceUpdate(
+                    chatId,
+                    symbol, // ignored в ScalpingStrategyV4 — это ОК
+                    price,
+                    now
+            );
+        } else {
+            log.warn("⚠ Strategy not found for type={}", strategyType);
+        }
     }
 }

@@ -68,10 +68,10 @@ public class ScalpingStrategyV4 implements TradingStrategy {
         BigDecimal sl;
 
         Long entryOrderId;
-        Long exitOrderId;
-
         BigDecimal entryQty;
         String entrySide;
+
+        Instant lastTradeClosedAt;
     }
 
     // =====================================================
@@ -98,8 +98,6 @@ public class ScalpingStrategyV4 implements TradingStrategy {
         live.pushState(chatId, StrategyType.SCALPING, st.symbol, true);
         live.pushSignal(chatId, StrategyType.SCALPING, st.symbol, null,
                 Signal.hold("started"));
-
-        log.info("▶ SCALPING START chatId={} {} {}", chatId, st.exchange, st.symbol);
     }
 
     @Override
@@ -114,8 +112,6 @@ public class ScalpingStrategyV4 implements TradingStrategy {
         live.clearPriceLines(chatId, StrategyType.SCALPING, symbol);
         live.clearWindowZone(chatId, StrategyType.SCALPING, symbol);
         live.pushState(chatId, StrategyType.SCALPING, symbol, false);
-
-        log.info("⏹ SCALPING STOP chatId={} {}", chatId, symbol);
     }
 
     @Override
@@ -166,9 +162,21 @@ public class ScalpingStrategyV4 implements TradingStrategy {
                                  .divide(first, 8, RoundingMode.HALF_UP)
                                  .doubleValue() * 100.0;
 
+        // =====================================================
+        // ENTRY
+        // =====================================================
         if (!st.inPosition && Math.abs(diffPct) >= cfg.getPriceChangeThreshold()) {
 
-            // ===== BALANCE SNAPSHOT =====
+            Integer cooldown = strategy.getCooldownSeconds();
+            if (cooldown != null && cooldown > 0 && st.lastTradeClosedAt != null) {
+                long passed = Duration.between(st.lastTradeClosedAt, time).getSeconds();
+                if (passed < cooldown) {
+                    live.pushSignal(chatId, StrategyType.SCALPING, symbol, null,
+                            Signal.hold("cooldown"));
+                    return;
+                }
+            }
+
             AccountBalanceSnapshot snapshot =
                     accountBalanceService.getSnapshot(
                             chatId,
@@ -180,23 +188,15 @@ public class ScalpingStrategyV4 implements TradingStrategy {
             BigDecimal available =
                     snapshot != null ? snapshot.getSelectedFreeBalance() : null;
 
-            if (available == null || available.signum() <= 0) {
-                live.pushSignal(chatId, StrategyType.SCALPING, symbol, null,
-                        Signal.hold("no balance"));
-                return;
-            }
+            if (available == null || available.signum() <= 0) return;
 
             BigDecimal maxAllowed =
                     resolveMaxExposureAmount(strategy, available);
 
             BigDecimal tradeAmount =
-                    pickTradeAmount(cfg.getOrderVolume(), maxAllowed);
+                    resolveTradeAmount(strategy, available, maxAllowed);
 
-            if (tradeAmount.signum() <= 0) {
-                live.pushSignal(chatId, StrategyType.SCALPING, symbol, null,
-                        Signal.hold("limit is zero"));
-                return;
-            }
+            if (tradeAmount.signum() <= 0) return;
 
             BigDecimal qty =
                     tradeAmount.divide(price, 8, RoundingMode.DOWN);
@@ -220,27 +220,22 @@ public class ScalpingStrategyV4 implements TradingStrategy {
 
             String entrySide = st.isLong ? "BUY" : "SELL";
 
-            try {
-                Order entry = orderService.placeMarket(
-                        chatId, symbol, entrySide, qty, price, StrategyType.SCALPING.name()
-                );
-                st.entryOrderId = entry != null ? entry.getId() : null;
-                st.entryQty = qty;
-                st.entrySide = entrySide;
-            } catch (Exception e) {
-                st.inPosition = false;
-                st.entryQty = null;
-                return;
-            }
+            Order entry = orderService.placeMarket(
+                    chatId, symbol, entrySide, qty, price, StrategyType.SCALPING.name()
+            );
+
+            st.entryQty = qty;
+            st.entrySide = entrySide;
 
             live.pushPriceLine(chatId, StrategyType.SCALPING, symbol, "ENTRY", price);
             live.pushTpSl(chatId, StrategyType.SCALPING, symbol, st.tp, st.sl);
 
             st.window.clear();
-            return;
         }
 
-        // ===== EXIT =====
+        // =====================================================
+        // EXIT
+        // =====================================================
         if (st.inPosition && st.entryQty != null) {
 
             boolean hitTp = st.isLong ? price.compareTo(st.tp) >= 0 : price.compareTo(st.tp) <= 0;
@@ -250,17 +245,13 @@ public class ScalpingStrategyV4 implements TradingStrategy {
 
                 String exitSide = st.isLong ? "SELL" : "BUY";
 
-                try {
-                    orderService.placeMarket(
-                            chatId, symbol, exitSide, st.entryQty, price, StrategyType.SCALPING.name()
-                    );
-                } catch (Exception e) {
-                    return;
-                }
+                orderService.placeMarket(
+                        chatId, symbol, exitSide, st.entryQty, price, StrategyType.SCALPING.name()
+                );
 
                 st.inPosition = false;
                 st.entryQty = null;
-                st.window.clear();
+                st.lastTradeClosedAt = time;
 
                 live.clearTpSl(chatId, StrategyType.SCALPING, symbol);
                 live.clearPriceLines(chatId, StrategyType.SCALPING, symbol);
@@ -291,7 +282,7 @@ public class ScalpingStrategyV4 implements TradingStrategy {
                 .stream()
                 .filter(s -> s.getType() == StrategyType.SCALPING)
                 .findFirst()
-                .orElse(null);
+                .orElseThrow();
     }
 
     private double safePct(BigDecimal pct) {
@@ -302,33 +293,44 @@ public class ScalpingStrategyV4 implements TradingStrategy {
             StrategySettings settings,
             BigDecimal available
     ) {
-        if (available == null || available.signum() <= 0) {
-            return BigDecimal.ZERO;
-        }
+        if (settings.getMaxExposureUsd() != null)
+            return settings.getMaxExposureUsd();
 
-        // 1️⃣ Фиксированная сумма
-        if (settings.getMaxExposureUsd() != null) {
-            return settings.getMaxExposureUsd().max(BigDecimal.ZERO);
-        }
-
-        // 2️⃣ Процент от баланса (Integer → BigDecimal)
-        if (settings.getMaxExposurePct() != null) {
-            int pct = settings.getMaxExposurePct();
-            if (pct <= 0) return BigDecimal.ZERO;
-
+        if (settings.getMaxExposurePct() != null)
             return available
-                    .multiply(BigDecimal.valueOf(pct))
+                    .multiply(BigDecimal.valueOf(settings.getMaxExposurePct()))
                     .divide(BigDecimal.valueOf(100), 8, RoundingMode.DOWN);
-        }
 
-        // 3️⃣ NONE → весь баланс
         return available;
     }
 
+    private BigDecimal resolveTradeAmount(
+            StrategySettings settings,
+            BigDecimal available,
+            BigDecimal maxAllowed
+    ) {
+        if (available == null || available.signum() <= 0) return BigDecimal.ZERO;
+        if (maxAllowed == null || maxAllowed.signum() <= 0) return BigDecimal.ZERO;
 
+        // 1) Фиксированная сумма (capitalUsd) — приоритетнее
+        if (settings.getCapitalUsd() != null && settings.getCapitalUsd().signum() > 0) {
+            return settings.getCapitalUsd().min(maxAllowed);
+        }
 
-    private BigDecimal pickTradeAmount(BigDecimal desired, BigDecimal maxAllowed) {
-        if (desired == null || desired.signum() <= 0) return maxAllowed;
-        return desired.min(maxAllowed);
+        // 2) Процент от доступного баланса (riskPerTradePct)
+        BigDecimal riskPct = settings.getRiskPerTradePct();
+        if (riskPct != null && riskPct.signum() > 0) {
+
+            // available * pct / 100
+            BigDecimal byPct = available
+                    .multiply(riskPct)
+                    .divide(BigDecimal.valueOf(100), 8, RoundingMode.DOWN);
+
+            return byPct.min(maxAllowed);
+        }
+
+        // 3) Если ничего не задано — используем максимум по лимитам
+        return maxAllowed;
     }
+
 }

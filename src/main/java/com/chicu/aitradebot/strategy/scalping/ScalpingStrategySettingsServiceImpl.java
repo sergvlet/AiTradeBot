@@ -46,7 +46,6 @@ public class ScalpingStrategySettingsServiceImpl
     @Override
     public ScalpingStrategySettings update(Long chatId,
                                            ScalpingStrategySettings incoming) {
-
         ScalpingStrategySettings s = getOrCreate(chatId);
 
         // windowSize
@@ -66,12 +65,6 @@ public class ScalpingStrategySettingsServiceImpl
             s.setSpreadThreshold(incoming.getSpreadThreshold());
         }
 
-        // orderVolume (USDT)
-        if (incoming.getOrderVolume() != null
-            && incoming.getOrderVolume().compareTo(BigDecimal.ZERO) > 0) {
-            s.setOrderVolume(incoming.getOrderVolume());
-        }
-
         return repo.save(s);
     }
 
@@ -85,16 +78,12 @@ public class ScalpingStrategySettingsServiceImpl
 
         return SettingsSnapshot.builder()
                 .chatId(chatId)
-
                 // идентификация стратегии
                 .put("strategy", "SCALPING")
-
                 // параметры стратегии
                 .put("windowSize", s.getWindowSize())
                 .put("priceChangeThreshold", s.getPriceChangeThreshold())
                 .put("spreadThreshold", s.getSpreadThreshold())
-                .put("orderVolume", s.getOrderVolume())
-
                 .build();
     }
 }

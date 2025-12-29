@@ -1,6 +1,7 @@
 package com.chicu.aitradebot.strategy.live;
 
 import com.chicu.aitradebot.common.enums.StrategyType;
+import com.chicu.aitradebot.strategy.core.signal.Signal;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -21,16 +22,55 @@ public class StrategyLivePublisher {
     // 🧩 HELPERS
     // =====================================================
 
-    private static long now(Instant ts) {
-        return ts != null ? ts.toEpochMilli() : StrategyLiveEvent.nowMillis();
+    /**
+     * epoch millis — UI V4 / LightweightCharts
+     */
+    private static long nowMs(Instant ts) {
+        return ts != null ? ts.toEpochMilli() : System.currentTimeMillis();
     }
 
+
+    /**
+     * null если пусто
+     */
     private static String sanitizeSymbol(String symbol) {
-        return symbol == null ? null : symbol.trim();
+        if (symbol == null) return null;
+        String s = symbol.trim();
+        return s.isEmpty() ? null : s;
     }
 
-    private static boolean baseOk(Long chatId, StrategyType strategyType, String symbol) {
-        return chatId != null && strategyType != null && sanitizeSymbol(symbol) != null && !sanitizeSymbol(symbol).isBlank();
+    /**
+     * true = можно публиковать
+     */
+    private static boolean baseOk(Long chatId, StrategyType type, String symbol) {
+        return symbol != null && type != null;
+    }
+
+
+    private static String sanitizeTf(String tf) {
+        if (tf == null) return null;
+        String s = tf.trim().toLowerCase();
+        return s.isBlank() ? null : s;
+    }
+
+    /**
+     * ЕДИНАЯ защита + лог
+     */
+    private boolean guard(Long chatId, StrategyType type, String symbol, String event) {
+
+        if (symbol == null || type == null) {
+            log.warn("⚠️ LIVE SKIP [{}] chatId={}, type={}, symbol={}",
+                    event, chatId, type, symbol);
+            return false;
+        }
+
+        // chatId обязателен ТОЛЬКО для стратегии
+        if (chatId == null && !event.equals("candle") && !event.equals("price")) {
+            log.warn("⚠️ LIVE SKIP [{}] missing chatId", event);
+            return false;
+        }
+
+        return true;
     }
 
     // =====================================================
@@ -48,15 +88,22 @@ public class StrategyLivePublisher {
                                Instant ts) {
 
         symbol = sanitizeSymbol(symbol);
-        if (!baseOk(chatId, strategyType, symbol)) return;
+        timeframe = sanitizeTf(timeframe);
+        if (!guard(chatId, strategyType, symbol, "candle")) return;
 
-        StrategyLiveEvent event =
+        if (open == null || high == null || low == null || close == null) {
+            log.warn("❌ CANDLE invalid OHLC chatId={} symbol={}", chatId, symbol);
+            return;
+        }
+
+        bridge.publish(
                 StrategyLiveEvent.builder()
                         .type("candle")
                         .chatId(chatId)
                         .strategyType(strategyType)
                         .symbol(symbol)
-                        .time(now(ts))
+                        .timeframe(timeframe) // ✅ ОБЯЗАТЕЛЬНО
+                        .time(nowMs(ts))
                         .kline(
                                 StrategyLiveEvent.CandlePayload.builder()
                                         .open(open)
@@ -64,39 +111,55 @@ public class StrategyLivePublisher {
                                         .low(low)
                                         .close(close)
                                         .volume(volume)
-                                        .timeframe(timeframe)
                                         .build()
                         )
-                        .build();
+                        .build()
+        );
+    }
 
-        bridge.publish(event);
+
+    // =====================================================
+// 💲 PRICE
+// =====================================================
+    public void pushPriceTick(Long chatId,
+                              StrategyType strategyType,
+                              String symbol,
+                              String timeframe,   // ✅ ДОБАВЛЕНО
+                              BigDecimal price,
+                              Instant ts) {
+
+        symbol = sanitizeSymbol(symbol);
+        timeframe = sanitizeTf(timeframe);
+        if (!guard(chatId, strategyType, symbol, "price")) return;
+        if (price == null) return;
+
+        bridge.publish(
+                StrategyLiveEvent.builder()
+                        .type("price")
+                        .chatId(chatId)
+                        .strategyType(strategyType)
+                        .symbol(symbol)
+                        .timeframe(timeframe) // ✅ ТЕПЕРЬ СУЩЕСТВУЕТ
+                        .price(price)
+                        .time(nowMs(ts))
+                        .build()
+        );
     }
 
     // =====================================================
-    // 💲 PRICE
-    // =====================================================
+// 💲 PRICE (BACKWARD COMPATIBILITY)
+// =====================================================
     public void pushPriceTick(Long chatId,
                               StrategyType strategyType,
                               String symbol,
                               BigDecimal price,
                               Instant ts) {
 
-        symbol = sanitizeSymbol(symbol);
-        if (!baseOk(chatId, strategyType, symbol)) return;
-        if (price == null) return;
-
-        StrategyLiveEvent event =
-                StrategyLiveEvent.builder()
-                        .type("price")
-                        .chatId(chatId)
-                        .strategyType(strategyType)
-                        .symbol(symbol)
-                        .price(price)
-                        .time(now(ts))
-                        .build();
-
-        bridge.publish(event);
+        // ⬅️ делегируем в новый метод без таймфрейма
+        pushPriceTick(chatId, strategyType, symbol, null, price, ts);
     }
+
+
 
     // =====================================================
     // 🟣 LEVELS
@@ -107,57 +170,34 @@ public class StrategyLivePublisher {
                            List<BigDecimal> levels) {
 
         symbol = sanitizeSymbol(symbol);
-        if (!baseOk(chatId, strategyType, symbol)) return;
+        if (!guard(chatId, strategyType, symbol, "levels")) return;
         if (levels == null || levels.isEmpty()) return;
 
         List<StrategyLiveEvent.LevelPayload> payload =
                 levels.stream()
                         .filter(Objects::nonNull)
-                        .map(p -> StrategyLiveEvent.LevelPayload.builder()
-                                .price(p)
-                                .build())
+                        .map(p -> StrategyLiveEvent.LevelPayload.builder().price(p).build())
                         .toList();
 
-        if (payload.isEmpty()) return;
-
-        StrategyLiveEvent event =
+        bridge.publish(
                 StrategyLiveEvent.builder()
                         .type("levels")
                         .chatId(chatId)
                         .strategyType(strategyType)
                         .symbol(symbol)
                         .levels(payload)
-                        .time(StrategyLiveEvent.nowMillis())
-                        .build();
-
-        bridge.publish(event);
+                        .time(nowMs(
+                                null))
+                        .build()
+        );
     }
 
-    /**
-     * ✅ Очистка уровней (важно: раньше UI мог навсегда оставаться со старыми уровнями)
-     */
-    public void clearLevels(Long chatId,
-                            StrategyType strategyType,
-                            String symbol) {
-
-        symbol = sanitizeSymbol(symbol);
-        if (!baseOk(chatId, strategyType, symbol)) return;
-
-        StrategyLiveEvent event =
-                StrategyLiveEvent.builder()
-                        .type("levels")
-                        .chatId(chatId)
-                        .strategyType(strategyType)
-                        .symbol(symbol)
-                        .levels(List.of()) // 👈 явная очистка
-                        .time(StrategyLiveEvent.nowMillis())
-                        .build();
-
-        bridge.publish(event);
+    public void clearLevels(Long chatId, StrategyType strategyType, String symbol) {
+        pushLevels(chatId, strategyType, symbol, List.of());
     }
 
     // =====================================================
-    // 🟠 ZONE (общая зона)
+    // 🟠 ZONE
     // =====================================================
     public void pushZone(Long chatId,
                          StrategyType strategyType,
@@ -166,49 +206,30 @@ public class StrategyLivePublisher {
                          BigDecimal bottom) {
 
         symbol = sanitizeSymbol(symbol);
-        if (!baseOk(chatId, strategyType, symbol)) return;
-        if (top == null || bottom == null) return;
+        if (!guard(chatId, strategyType, symbol, "zone")) return;
 
-        StrategyLiveEvent event =
+        bridge.publish(
                 StrategyLiveEvent.builder()
                         .type("zone")
                         .chatId(chatId)
                         .strategyType(strategyType)
                         .symbol(symbol)
                         .zone(
-                                StrategyLiveEvent.ZonePayload.builder()
-                                        .top(top.max(bottom))
-                                        .bottom(top.min(bottom))
-                                        .color("rgba(59,130,246,0.12)")
-                                        .build()
+                                top == null || bottom == null ? null :
+                                        StrategyLiveEvent.ZonePayload.builder()
+                                                .top(top.max(bottom))
+                                                .bottom(top.min(bottom))
+                                                .color("rgba(59,130,246,0.12)")
+                                                .build()
                         )
-                        .time(StrategyLiveEvent.nowMillis())
-                        .build();
-
-        bridge.publish(event);
+                        .time(nowMs(
+                                null))
+                        .build()
+        );
     }
 
-    /**
-     * ✅ Очистка общей зоны
-     */
-    public void clearZone(Long chatId,
-                          StrategyType strategyType,
-                          String symbol) {
-
-        symbol = sanitizeSymbol(symbol);
-        if (!baseOk(chatId, strategyType, symbol)) return;
-
-        StrategyLiveEvent event =
-                StrategyLiveEvent.builder()
-                        .type("zone")
-                        .chatId(chatId)
-                        .strategyType(strategyType)
-                        .symbol(symbol)
-                        .zone(null) // 👈 явная очистка
-                        .time(StrategyLiveEvent.nowMillis())
-                        .build();
-
-        bridge.publish(event);
+    public void clearZone(Long chatId, StrategyType strategyType, String symbol) {
+        pushZone(chatId, strategyType, symbol, null, null);
     }
 
     // =====================================================
@@ -221,52 +242,33 @@ public class StrategyLivePublisher {
                                 String role) {
 
         symbol = sanitizeSymbol(symbol);
-        if (!baseOk(chatId, strategyType, symbol)) return;
-        if (level == null) return;
+        if (!guard(chatId, strategyType, symbol, "active_level")) return;
 
-        StrategyLiveEvent event =
+        bridge.publish(
                 StrategyLiveEvent.builder()
                         .type("active_level")
                         .chatId(chatId)
                         .strategyType(strategyType)
                         .symbol(symbol)
                         .activeLevel(
-                                StrategyLiveEvent.ActiveLevelPayload.builder()
-                                        .price(level)
-                                        .role(role)
-                                        .build()
+                                level == null ? null :
+                                        StrategyLiveEvent.ActiveLevelPayload.builder()
+                                                .price(level)
+                                                .role(role)
+                                                .build()
                         )
-                        .time(StrategyLiveEvent.nowMillis())
-                        .build();
-
-        bridge.publish(event);
+                        .time(nowMs(
+                                null))
+                        .build()
+        );
     }
 
-    /**
-     * ✅ Очистка активного уровня
-     */
-    public void clearActiveLevel(Long chatId,
-                                 StrategyType strategyType,
-                                 String symbol) {
-
-        symbol = sanitizeSymbol(symbol);
-        if (!baseOk(chatId, strategyType, symbol)) return;
-
-        StrategyLiveEvent event =
-                StrategyLiveEvent.builder()
-                        .type("active_level")
-                        .chatId(chatId)
-                        .strategyType(strategyType)
-                        .symbol(symbol)
-                        .activeLevel(null) // 👈 очистка
-                        .time(StrategyLiveEvent.nowMillis())
-                        .build();
-
-        bridge.publish(event);
+    public void clearActiveLevel(Long chatId, StrategyType strategyType, String symbol) {
+        pushActiveLevel(chatId, strategyType, symbol, null, null);
     }
 
     // =====================================================
-    // 🔴 BUY / SELL ZONE
+    // 🔴 TRADE ZONE
     // =====================================================
     public void pushTradeZone(Long chatId,
                               StrategyType strategyType,
@@ -276,49 +278,30 @@ public class StrategyLivePublisher {
                               BigDecimal bottom) {
 
         symbol = sanitizeSymbol(symbol);
-        if (!baseOk(chatId, strategyType, symbol)) return;
-        if (side == null || top == null || bottom == null) return;
+        if (!guard(chatId, strategyType, symbol, "trade_zone")) return;
 
-        StrategyLiveEvent event =
+        bridge.publish(
                 StrategyLiveEvent.builder()
                         .type("trade_zone")
                         .chatId(chatId)
                         .strategyType(strategyType)
                         .symbol(symbol)
                         .tradeZone(
-                                StrategyLiveEvent.TradeZonePayload.builder()
-                                        .side(side)
-                                        .top(top)
-                                        .bottom(bottom)
-                                        .build()
+                                side == null ? null :
+                                        StrategyLiveEvent.TradeZonePayload.builder()
+                                                .side(side)
+                                                .top(top)
+                                                .bottom(bottom)
+                                                .build()
                         )
-                        .time(StrategyLiveEvent.nowMillis())
-                        .build();
-
-        bridge.publish(event);
+                        .time(nowMs(
+                                null))
+                        .build()
+        );
     }
 
-    /**
-     * ✅ Очистка trade-zone
-     */
-    public void clearTradeZone(Long chatId,
-                               StrategyType strategyType,
-                               String symbol) {
-
-        symbol = sanitizeSymbol(symbol);
-        if (!baseOk(chatId, strategyType, symbol)) return;
-
-        StrategyLiveEvent event =
-                StrategyLiveEvent.builder()
-                        .type("trade_zone")
-                        .chatId(chatId)
-                        .strategyType(strategyType)
-                        .symbol(symbol)
-                        .tradeZone(null)
-                        .time(StrategyLiveEvent.nowMillis())
-                        .build();
-
-        bridge.publish(event);
+    public void clearTradeZone(Long chatId, StrategyType strategyType, String symbol) {
+        pushTradeZone(chatId, strategyType, symbol, null, null, null);
     }
 
     // =====================================================
@@ -334,9 +317,9 @@ public class StrategyLivePublisher {
                           String status) {
 
         symbol = sanitizeSymbol(symbol);
-        if (!baseOk(chatId, strategyType, symbol)) return;
+        if (!guard(chatId, strategyType, symbol, "order")) return;
 
-        StrategyLiveEvent event =
+        bridge.publish(
                 StrategyLiveEvent.builder()
                         .type("order")
                         .chatId(chatId)
@@ -351,10 +334,10 @@ public class StrategyLivePublisher {
                                         .status(status)
                                         .build()
                         )
-                        .time(StrategyLiveEvent.nowMillis())
-                        .build();
-
-        bridge.publish(event);
+                        .time(nowMs(
+                                null))
+                        .build()
+        );
     }
 
     // =====================================================
@@ -367,35 +350,28 @@ public class StrategyLivePublisher {
                          BigDecimal sl) {
 
         symbol = sanitizeSymbol(symbol);
-        if (!baseOk(chatId, strategyType, symbol)) return;
+        if (!guard(chatId, strategyType, symbol, "tp_sl")) return;
 
-        // ✅ ВАЖНО: tp/sl могут быть null, когда нужно очистить линии в UI
-        StrategyLiveEvent event =
+        bridge.publish(
                 StrategyLiveEvent.builder()
                         .type("tp_sl")
                         .chatId(chatId)
                         .strategyType(strategyType)
                         .symbol(symbol)
                         .tpSl(
-                                (tp == null && sl == null)
-                                        ? null
-                                        : StrategyLiveEvent.TpSlPayload.builder()
-                                        .tp(tp)
-                                        .sl(sl)
-                                        .build()
+                                tp == null && sl == null ? null :
+                                        StrategyLiveEvent.TpSlPayload.builder()
+                                                .tp(tp)
+                                                .sl(sl)
+                                                .build()
                         )
-                        .time(StrategyLiveEvent.nowMillis())
-                        .build();
-
-        bridge.publish(event);
+                        .time(nowMs(
+                                null))
+                        .build()
+        );
     }
 
-    /**
-     * ✅ Явная очистка TP/SL
-     */
-    public void clearTpSl(Long chatId,
-                          StrategyType strategyType,
-                          String symbol) {
+    public void clearTpSl(Long chatId, StrategyType strategyType, String symbol) {
         pushTpSl(chatId, strategyType, symbol, null, null);
     }
 
@@ -408,19 +384,19 @@ public class StrategyLivePublisher {
                            double pnlPct) {
 
         symbol = sanitizeSymbol(symbol);
-        if (!baseOk(chatId, strategyType, symbol)) return;
+        if (!guard(chatId, strategyType, symbol, "metric")) return;
 
-        StrategyLiveEvent event =
+        bridge.publish(
                 StrategyLiveEvent.builder()
                         .type("metric")
                         .chatId(chatId)
                         .strategyType(strategyType)
                         .symbol(symbol)
                         .metric(pnlPct)
-                        .time(StrategyLiveEvent.nowMillis())
-                        .build();
-
-        bridge.publish(event);
+                        .time(nowMs(
+                                null))
+                        .build()
+        );
     }
 
     // =====================================================
@@ -432,19 +408,19 @@ public class StrategyLivePublisher {
                           boolean running) {
 
         symbol = sanitizeSymbol(symbol);
-        if (!baseOk(chatId, strategyType, symbol)) return;
+        if (!guard(chatId, strategyType, symbol, "state")) return;
 
-        StrategyLiveEvent event =
+        bridge.publish(
                 StrategyLiveEvent.builder()
                         .type("state")
                         .chatId(chatId)
                         .strategyType(strategyType)
                         .symbol(symbol)
                         .state(running ? "running" : "stopped")
-                        .time(StrategyLiveEvent.nowMillis())
-                        .build();
-
-        bridge.publish(event);
+                        .time(nowMs(
+                                null))
+                        .build()
+        );
     }
 
     // =====================================================
@@ -457,60 +433,60 @@ public class StrategyLivePublisher {
                            double strength) {
 
         symbol = sanitizeSymbol(symbol);
-        if (!baseOk(chatId, strategyType, symbol)) return;
-        if (target == null) return;
+        if (!guard(chatId, strategyType, symbol, "magnet")) return;
 
-        StrategyLiveEvent event =
+        bridge.publish(
                 StrategyLiveEvent.builder()
                         .type("magnet")
                         .chatId(chatId)
                         .strategyType(strategyType)
                         .symbol(symbol)
                         .magnet(
-                                StrategyLiveEvent.MagnetPayload.builder()
-                                        .target(target)
-                                        .strength(strength)
-                                        .build()
+                                target == null ? null :
+                                        StrategyLiveEvent.MagnetPayload.builder()
+                                                .target(target)
+                                                .strength(strength)
+                                                .build()
                         )
-                        .time(StrategyLiveEvent.nowMillis())
-                        .build();
-
-        bridge.publish(event);
+                        .time(nowMs(
+                                null))
+                        .build()
+        );
     }
 
     // =====================================================
-// 🚦 SIGNAL (V4 — ИЗ StrategyEngine)
-// =====================================================
+    // 🚦 SIGNAL
+    // =====================================================
     public void pushSignal(Long chatId,
                            StrategyType strategyType,
                            String symbol,
                            String timeframe,
-                           com.chicu.aitradebot.strategy.core.signal.Signal signal) {
+                           Signal signal) {
 
         symbol = sanitizeSymbol(symbol);
-        if (!baseOk(chatId, strategyType, symbol)) return;
+        timeframe = sanitizeTf(timeframe);
+        if (!guard(chatId, strategyType, symbol, "signal")) return;
         if (signal == null) return;
 
-        StrategyLiveEvent event =
+        bridge.publish(
                 StrategyLiveEvent.builder()
                         .type("signal")
                         .chatId(chatId)
                         .strategyType(strategyType)
                         .symbol(symbol)
-                        .time(StrategyLiveEvent.nowMillis())
                         .signal(
                                 StrategyLiveEvent.SignalPayload.builder()
-                                        .name(signal.getType().name())   // BUY / SELL / HOLD
-                                        .reason(signal.getReason())       // 👈 КЛЮЧЕВО
+                                        .name(signal.getType().name())
+                                        .reason(signal.getReason())
                                         .confidence(signal.getConfidence())
                                         .timeframe(timeframe)
                                         .build()
                         )
-                        .build();
-
-        bridge.publish(event);
+                        .time(nowMs(
+                                null))
+                        .build()
+        );
     }
-
 
     // =====================================================
     // 📈 TRADE
@@ -524,10 +500,9 @@ public class StrategyLivePublisher {
                           Instant ts) {
 
         symbol = sanitizeSymbol(symbol);
-        if (!baseOk(chatId, strategyType, symbol)) return;
-        if (side == null || price == null || qty == null) return;
+        if (!guard(chatId, strategyType, symbol, "trade")) return;
 
-        StrategyLiveEvent event =
+        bridge.publish(
                 StrategyLiveEvent.builder()
                         .type("trade")
                         .chatId(chatId)
@@ -540,10 +515,10 @@ public class StrategyLivePublisher {
                                         .qty(qty)
                                         .build()
                         )
-                        .time(now(ts))
-                        .build();
-
-        bridge.publish(event);
+                        .time(nowMs(
+                                ts))
+                        .build()
+        );
     }
 
     // =====================================================
@@ -556,36 +531,28 @@ public class StrategyLivePublisher {
                               BigDecimal price) {
 
         symbol = sanitizeSymbol(symbol);
-        if (!baseOk(chatId, strategyType, symbol)) return;
+        if (!guard(chatId, strategyType, symbol, "price_line")) return;
 
-        // ✅ ВАЖНО: price может быть null, когда нужно очистить линию в UI
-        StrategyLiveEvent.PriceLinePayload payload =
-                (price == null)
-                        ? null
-                        : StrategyLiveEvent.PriceLinePayload.builder()
-                        .name(name)
-                        .price(price)
-                        .build();
-
-        StrategyLiveEvent event =
+        bridge.publish(
                 StrategyLiveEvent.builder()
                         .type("price_line")
                         .chatId(chatId)
                         .strategyType(strategyType)
                         .symbol(symbol)
-                        .priceLine(payload)
-                        .time(StrategyLiveEvent.nowMillis())
-                        .build();
-
-        bridge.publish(event);
+                        .priceLine(
+                                price == null ? null :
+                                        StrategyLiveEvent.PriceLinePayload.builder()
+                                                .name(name)
+                                                .price(price)
+                                                .build()
+                        )
+                        .time(nowMs(
+                                null))
+                        .build()
+        );
     }
 
-    /**
-     * ✅ Очистка всех price-line в UI (JS должен на это реагировать: payload=null)
-     */
-    public void clearPriceLines(Long chatId,
-                                StrategyType strategyType,
-                                String symbol) {
+    public void clearPriceLines(Long chatId, StrategyType strategyType, String symbol) {
         pushPriceLine(chatId, strategyType, symbol, null, null);
     }
 
@@ -599,41 +566,33 @@ public class StrategyLivePublisher {
                                BigDecimal low) {
 
         symbol = sanitizeSymbol(symbol);
-        if (!baseOk(chatId, strategyType, symbol)) return;
+        if (!guard(chatId, strategyType, symbol, "window_zone")) return;
 
-        // ✅ ВАЖНО: high/low могут быть null, когда нужно очистить зону
-        StrategyLiveEvent.WindowZonePayload payload =
-                (high == null || low == null)
-                        ? null
-                        : StrategyLiveEvent.WindowZonePayload.builder()
-                        .high(high)
-                        .low(low)
-                        .build();
-
-        StrategyLiveEvent event =
+        bridge.publish(
                 StrategyLiveEvent.builder()
                         .type("window_zone")
                         .chatId(chatId)
                         .strategyType(strategyType)
                         .symbol(symbol)
-                        .windowZone(payload)
-                        .time(StrategyLiveEvent.nowMillis())
-                        .build();
-
-        bridge.publish(event);
+                        .windowZone(
+                                high == null || low == null ? null :
+                                        StrategyLiveEvent.WindowZonePayload.builder()
+                                                .high(high)
+                                                .low(low)
+                                                .build()
+                        )
+                        .time(nowMs(
+                                null))
+                        .build()
+        );
     }
 
-    /**
-     * ✅ Очистка window-zone
-     */
-    public void clearWindowZone(Long chatId,
-                                StrategyType strategyType,
-                                String symbol) {
+    public void clearWindowZone(Long chatId, StrategyType strategyType, String symbol) {
         pushWindowZone(chatId, strategyType, symbol, null, null);
     }
 
     // =====================================================
-    // 📊 ATR (если payload есть в StrategyLiveEvent)
+    // 📊 ATR
     // =====================================================
     public void pushAtr(Long chatId,
                         StrategyType strategyType,
@@ -642,9 +601,9 @@ public class StrategyLivePublisher {
                         double volatilityPct) {
 
         symbol = sanitizeSymbol(symbol);
-        if (!baseOk(chatId, strategyType, symbol)) return;
+        if (!guard(chatId, strategyType, symbol, "atr")) return;
 
-        StrategyLiveEvent event =
+        bridge.publish(
                 StrategyLiveEvent.builder()
                         .type("atr")
                         .chatId(chatId)
@@ -656,9 +615,33 @@ public class StrategyLivePublisher {
                                         .volatilityPct(volatilityPct)
                                         .build()
                         )
-                        .time(StrategyLiveEvent.nowMillis())
-                        .build();
+                        .time(nowMs(
+                                null))
+                        .build()
+        );
+    }
 
-        bridge.publish(event);
+    // =====================================================
+    // ⏸ COOLDOWN
+    // =====================================================
+    public void pushCooldown(Long chatId,
+                             StrategyType strategyType,
+                             String symbol,
+                             long secondsLeft) {
+
+        symbol = sanitizeSymbol(symbol);
+        if (!guard(chatId, strategyType, symbol, "cooldown")) return;
+
+        bridge.publish(
+                StrategyLiveEvent.builder()
+                        .type("cooldown")
+                        .chatId(chatId)
+                        .strategyType(strategyType)
+                        .symbol(symbol)
+                        .metric(secondsLeft > 0 ? (double) secondsLeft : null)
+                        .time(nowMs(
+                                null))
+                        .build()
+        );
     }
 }

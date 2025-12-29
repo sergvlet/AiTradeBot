@@ -235,10 +235,7 @@
             </div>
         </div>
 
-        <!-- ===================================================== -->
-        <!-- NETWORK TAB: JS -->
-        <!-- ===================================================== -->
-        <script src="/js/strategies/network.tab.js"></script>
+
 
         <!-- ===================================================== -->
         <!-- ЕДИНСТВЕННЫЙ FORM ДЛЯ: GENERAL / RISK / TRADE / ADV   -->
@@ -519,25 +516,55 @@
 
                 <div class="section-title">Комиссии биржи</div>
 
-                <div class="row g-4">
+                <div class="row g-4 align-items-end">
+
+                    <!-- MAKER -->
                     <div class="col-md-4">
                         <label class="form-label">Комиссия Maker</label>
-                        <input class="form-control" readonly
-                               th:value="${accountFees?.makerPct != null ? accountFees.makerPct : '—'}">
-                    </div>
 
-                    <div class="col-md-4">
-                        <label class="form-label">Комиссия Taker</label>
-                        <input class="form-control" readonly
-                               th:value="${accountFees?.takerPct != null ? accountFees.takerPct : '—'}">
-                    </div>
+                        <div class="input-group">
+                            <input class="form-control" readonly
+                                   th:value="${(accountFees != null and accountFees.makerPct != null)
+                        ? (#numbers.formatDecimal(accountFees.makerPct, 1, 'POINT', 4, 'POINT') + ' %')
+                        : '—'}">
+                            <span class="input-group-text">%</span>
+                        </div>
 
-                    <div class="col-md-4">
-                        <div class="alert alert-secondary small mt-4">
-                            Комиссии подтягиваются с биржи и учитываются автоматически.
+                        <div class="form-text">
+                            Комиссия за лимитные ордера (maker).
                         </div>
                     </div>
+
+                    <!-- TAKER -->
+                    <div class="col-md-4">
+                        <label class="form-label">Комиссия Taker</label>
+
+                        <div class="input-group">
+                            <input class="form-control" readonly
+                                   th:value="${(accountFees != null and accountFees.takerPct != null)
+                        ? (#numbers.formatDecimal(accountFees.takerPct, 1, 'POINT', 4, 'POINT') + ' %')
+                        : '—'}">
+                            <span class="input-group-text">%</span>
+                        </div>
+
+                        <div class="form-text">
+                            Комиссия за рыночные ордера (taker).
+                        </div>
+                    </div>
+
+                    <!-- INFO -->
+                    <div class="col-md-4">
+                        <div class="alert alert-secondary small mb-0">
+                            Комиссии подтягиваются с биржи и учитываются автоматически.
+                            <span class="d-block mt-1"
+                                  th:if="${accountFees == null}">
+                Нет данных: проверь API-ключи или соединение.
+            </span>
+                        </div>
+                    </div>
+
                 </div>
+
 
                 <div class="d-flex justify-content-end mt-4">
                     <button type="submit"
@@ -566,22 +593,654 @@
 
             <!-- ====================== RISK TAB ===================== -->
             <div class="tab-pane" id="tab-risk">
-                <!-- Оставь тут твой текущий Risk (или временную заглушку) -->
+
+                <!-- ================== DAILY / PER-TRADE LOSS ================== -->
+                <div class="section-title">Ограничения потерь</div>
+
+                <div class="row g-4">
+                    <div class="col-md-4">
+                        <label class="form-label">
+                            Максимальная потеря за день (%)
+                            <span class="badge bg-secondary ms-1">Лимит</span>
+                        </label>
+                        <input type="number"
+                               step="0.1"
+                               min="0"
+                               max="100"
+                               class="form-control"
+                               name="dailyLossLimitPct"
+                               th:value="${strategy.dailyLossLimitPct}">
+                        <div class="form-text">
+                            Если суммарные потери за день достигнут этого значения —
+                            бот остановит торговлю до следующего дня.
+                        </div>
+                    </div>
+
+                    <div class="col-md-4">
+                        <label class="form-label">
+                            Максимальная потеря на одну сделку (%)
+                            <span class="badge bg-info ms-1">AI</span>
+                        </label>
+                        <input type="number"
+                               step="0.1"
+                               min="0"
+                               max="100"
+                               class="form-control"
+                               name="riskPerTradePct"
+                               th:value="${strategy.riskPerTradePct}">
+                        <div class="form-text">
+                            Верхний предел риска на одну сделку.
+                            Стратегия может снижать риск автоматически.
+                        </div>
+                    </div>
+
+                    <div class="col-md-4">
+                        <div class="alert alert-warning small mt-4">
+                            Рекомендуется: 1–2% на сделку и не более 5% в день.
+                        </div>
+                    </div>
+                </div>
+
+                <hr class="my-4"/>
+
+                <!-- ================== COOLDOWN (AI / RUNTIME) ================== -->
+                <div class="section-title">Частота торговли</div>
+
+                <div class="row g-4">
+                    <div class="col-md-4">
+                        <label class="form-label">
+                            Текущая пауза (расчёт AI)
+                            <span class="badge bg-info ms-1">Runtime</span>
+                        </label>
+
+                        <!-- ❗ Runtime indicator — НЕ сохраняется -->
+                        <input type="number"
+                               class="form-control"
+                               value="30"
+                               readonly>
+
+                        <div class="form-text">
+                            Значение рассчитывается стратегией в реальном времени
+                            и <b>не сохраняется</b> в настройках.
+                        </div>
+                    </div>
+
+                    <div class="col-md-4">
+                        <div class="alert alert-secondary small mt-4">
+                            Используется для предотвращения слишком частых входов
+                            и хаотичной торговли.
+                        </div>
+                    </div>
+                </div>
+
+
+                <hr class="my-4"/>
+
+                <!-- ================== TP / SL ================== -->
+                <div class="section-title">Защита одной сделки</div>
+
+                <div class="row g-4">
+                    <div class="col-md-4">
+                        <label class="form-label">
+                            Stop Loss (%)
+                            <span class="badge bg-danger ms-1">Обязательно</span>
+                        </label>
+                        <input type="number"
+                               step="0.1"
+                               min="0.1"
+                               class="form-control"
+                               name="stopLossPct"
+                               th:value="${strategy.stopLossPct}">
+                        <div class="form-text">
+                            Минимальный уровень защиты.
+                            Не может быть полностью отключён.
+                        </div>
+                    </div>
+
+                    <div class="col-md-4">
+                        <label class="form-label">
+                            Take Profit (%)
+                            <span class="badge bg-info ms-1">AI</span>
+                        </label>
+                        <input type="number"
+                               step="0.1"
+                               min="0"
+                               class="form-control"
+                               name="takeProfitPct"
+                               th:value="${strategy.takeProfitPct}">
+                        <div class="form-text">
+                            Базовый ориентир для фиксации прибыли.
+                            Стратегия может закрыть сделку раньше.
+                        </div>
+                    </div>
+
+                    <div class="col-md-4">
+                        <label class="form-label">
+                            Максимальное проскальзывание (%)
+                            <span class="badge bg-info ms-1">AI</span>
+                        </label>
+                        <!-- ❗ RUNTIME / НЕ СОХРАНЯЕТСЯ -->
+                        <input type="number"
+                               step="0.01"
+                               class="form-control"
+                               placeholder="0.20"
+                               readonly>
+                        <div class="form-text">
+                            Управляется автоматически системой.
+                        </div>
+                    </div>
+                </div>
+
+                <div class="d-flex justify-content-end mt-4">
+                    <button type="submit"
+                            class="btn btn-primary"
+                            name="saveScope"
+                            value="risk">
+                        ✔ Сохранить «Риск»
+                    </button>
+                </div>
+
             </div>
 
             <!-- ====================== TRADE TAB ==================== -->
             <div class="tab-pane" id="tab-trade">
-                <!-- Оставь тут твой текущий Trade (или временную заглушку) -->
+
+                <!-- ================== INSTRUMENT ================== -->
+                <div class="section-title">Инструмент торговли</div>
+
+                <div class="col-md-4">
+
+                    <label class="form-label">
+                        Торговая пара
+                        <span class="badge bg-secondary ms-1">Рынок</span>
+                    </label>
+
+                    <!-- ================= MODE SWITCH ================= -->
+                    <div class="btn-group btn-group-sm mb-2 w-100" role="group">
+                        <button type="button"
+                                class="btn btn-outline-secondary active"
+                                data-symbol-mode="POPULAR">
+                            Популярные
+                        </button>
+                        <button type="button"
+                                class="btn btn-outline-secondary"
+                                data-symbol-mode="GAINERS">
+                            Растущие
+                        </button>
+                        <button type="button"
+                                class="btn btn-outline-secondary"
+                                data-symbol-mode="LOSERS">
+                            Падающие
+                        </button>
+                    </div>
+
+                    <!-- ================= SYMBOL PICKER ================= -->
+                    <div class="dropdown">
+
+                        <!-- ВАЖНО: div.form-control — чтобы выглядел как input -->
+                        <div id="symbolDropdown"
+                             class="form-control strategy-input dropdown-toggle text-start"
+                             data-bs-toggle="dropdown"
+                             aria-expanded="false"
+                             role="button"
+                             tabindex="0">
+
+            <span id="symbolLabel"
+                  th:text="${strategy.symbol != null ? strategy.symbol : 'Выберите торговую пару'}">
+            </span>
+                        </div>
+
+                        <ul class="dropdown-menu w-100 strategy-dropdown" id="symbolList">
+                            <!-- список заполняется ТОЛЬКО через JS -->
+                        </ul>
+                    </div>
+
+                    <!-- реально уходит в POST -->
+                    <input type="hidden"
+                           name="symbol"
+                           id="symbolHidden"
+                           th:value="${strategy.symbol}">
+
+                    <div class="form-text">
+                        Пара, по которой бот будет совершать сделки.
+                    </div>
+
+                </div>
+
+                <hr class="my-4"/>
+
+                <!-- ================== TIMEFRAME ================== -->
+                <div class="section-title">Таймфрейм</div>
+
+                <div class="row g-4">
+                    <div class="col-md-4">
+                        <label class="form-label"
+                               th:text="${strategy.advancedControlMode.name() == 'AI'
+                    ? 'Базовый таймфрейм (fallback)'
+                    : (strategy.advancedControlMode.name() == 'HYBRID'
+                        ? 'Базовый таймфрейм (AI может рекомендовать)'
+                        : 'Таймфрейм стратегии')}">
+                            Таймфрейм стратегии
+                        </label>
+
+                        <!-- ✅ AI: показываем текущий активный TF (read-only) -->
+                        <div class="form-control"
+                             th:if="${strategy.advancedControlMode.name() == 'AI'}"
+                             th:text="${aiTimeframe != null ? aiTimeframe : (strategy.timeframe != null ? strategy.timeframe : '1m')}"
+                             style="cursor: not-allowed; opacity: .85;">
+                        </div>
+
+                        <!-- ✅ MANUAL / HYBRID: обычный select -->
+                        <select class="form-select"
+                                name="timeframe"
+                                th:if="${strategy.advancedControlMode.name() != 'AI'}"
+                                required>
+
+                            <option th:if="${availableTimeframes == null || #lists.isEmpty(availableTimeframes)}"
+                                    th:value="${strategy.timeframe != null ? strategy.timeframe : '1m'}"
+                                    th:text="${strategy.timeframe != null ? strategy.timeframe : '1m'}">
+                            </option>
+
+                            <option th:each="tf : ${availableTimeframes}"
+                                    th:value="${tf}"
+                                    th:text="${tf}"
+                                    th:selected="${tf == strategy.timeframe}">
+                            </option>
+                        </select>
+
+                        <!-- ✅ AI: select скрываем, но fallback timeframe ОБЯЗАТЕЛЬНО уходит в POST -->
+                        <input type="hidden"
+                               name="timeframe"
+                               th:value="${strategy.timeframe != null ? strategy.timeframe : '1m'}"
+                               th:if="${strategy.advancedControlMode.name() == 'AI'}"/>
+
+                        <div class="form-text"
+                             th:text="${strategy.advancedControlMode.name() == 'AI'
+                  ? 'Сейчас используется таймфрейм, выбранный AI. В БД хранится базовый (fallback).'
+                  : (strategy.advancedControlMode.name() == 'HYBRID'
+                      ? 'AI может рекомендовать, но менять можно только вручную.'
+                      : 'Используется стратегией как основной таймфрейм.')}">
+                        </div>
+                    </div>
+
+                    <div class="col-md-8" th:if="${strategy.advancedControlMode.name() == 'AI'}">
+                        <div class="alert alert-info small mt-4">
+                            Таймфрейм в рантайме может меняться AI. Значение в базе — только fallback.
+                        </div>
+                    </div>
+                </div>
+
+                <hr class="my-4"/>
+
+                <!-- ================== HISTORY / DATA ================== -->
+                <div class="section-title">Исторические данные</div>
+
+                <div class="row g-4">
+                    <div class="col-md-4">
+                        <label class="form-label">
+                            Количество свечей
+                            <span class="badge bg-secondary ms-1">Данные</span>
+                        </label>
+
+                        <input type="number"
+                               class="form-control"
+                               name="cachedCandlesLimit"
+                               min="50"
+                               step="50"
+                               th:value="${strategy.cachedCandlesLimit}"
+                               placeholder="Например: 500">
+
+                        <div class="form-text">
+                            Сколько последних свечей загружается для расчётов стратегии.
+                            Больше — точнее, но медленнее.
+                        </div>
+                    </div>
+                </div>
+
+
+                <hr class="my-4"/>
+
+                <!-- ================== EXCHANGE LIMITS ================== -->
+                <div class="section-title">Ограничения биржи</div>
+
+                <!-- ================== EXCHANGE LIMITS (UX+) ================== -->
+                <div class="section-title d-flex align-items-center justify-content-between">
+                    <span class="badge bg-secondary">Биржа</span>
+                </div>
+
+                <div class="row g-4">
+
+                    <!-- MIN NOTIONAL -->
+                    <div class="col-md-3">
+                        <label class="form-label d-flex align-items-center gap-2">
+                            <i class="bi bi-cash-coin"></i>
+                            <span>Мин. сумма</span>
+                        </label>
+
+                        <input id="exMinNotional"
+                               class="form-control"
+                               readonly
+                               value="—">
+
+                        <div class="d-flex align-items-center gap-2 mt-1">
+            <span id="exMinNotionalScope"
+                  class="badge bg-secondary">
+                —
+            </span>
+                            <small class="text-muted">
+                                Минимальная сумма сделки
+                            </small>
+                        </div>
+
+                        <div class="form-text">
+                            Ниже этого значения биржа отклонит ордер.
+                        </div>
+                    </div>
+
+                    <!-- STEP SIZE -->
+                    <div class="col-md-3">
+                        <label class="form-label d-flex align-items-center gap-2">
+                            <i class="bi bi-bounding-box"></i>
+                            <span>Шаг количества</span>
+                        </label>
+
+                        <input id="exStepSize"
+                               class="form-control"
+                               readonly
+                               value="—">
+
+                        <div class="d-flex align-items-center gap-2 mt-1">
+            <span id="exStepSizeScope"
+                  class="badge bg-secondary">
+                —
+            </span>
+                            <small class="text-muted">
+                                Округление количества
+                            </small>
+                        </div>
+
+                        <div class="form-text">
+                            Количество будет округлено под этот шаг.
+                        </div>
+                    </div>
+
+                    <!-- TICK SIZE -->
+                    <div class="col-md-3">
+                        <label class="form-label d-flex align-items-center gap-2">
+                            <i class="bi bi-tag"></i>
+                            <span>Шаг цены</span>
+                        </label>
+
+                        <input id="exTickSize"
+                               class="form-control"
+                               readonly
+                               value="—">
+
+                        <div class="d-flex align-items-center gap-2 mt-1">
+            <span id="exTickSizeScope"
+                  class="badge bg-secondary">
+                —
+            </span>
+                            <small class="text-muted">
+                                Округление цены
+                            </small>
+                        </div>
+
+                        <div class="form-text">
+                            Цена должна быть кратна этому шагу.
+                        </div>
+                    </div>
+
+                    <!-- MAX ORDERS -->
+                    <div class="col-md-3">
+                        <label class="form-label d-flex align-items-center gap-2">
+                            <i class="bi bi-stack"></i>
+                            <span>Лимит ордеров</span>
+                        </label>
+
+                        <input id="exMaxOrders"
+                               class="form-control"
+                               readonly
+                               value="—">
+
+                        <div class="d-flex align-items-center gap-2 mt-1">
+            <span id="exMaxOrdersScope"
+                  class="badge bg-secondary">
+                —
+            </span>
+                            <small class="text-muted">
+                                Активные ордера
+                            </small>
+                        </div>
+
+                        <div class="form-text">
+                            Максимум активных ордеров по символу.
+                        </div>
+                    </div>
+
+                </div>
+
+                <div class="alert alert-secondary small mt-3 d-flex gap-2 align-items-start">
+                    <i class="bi bi-info-circle mt-1"></i>
+                    <div>
+                        Эти параметры задаются биржей и не могут быть изменены.
+                        Бот автоматически подстраивает цену/количество под шаги и минимальные лимиты.
+                    </div>
+                </div>
+
+                <hr class="my-4"/>
+
+                <!-- ================== SAFETY & FLOW CONTROL ================== -->
+                <div class="section-title">Контроль риска и частоты</div>
+
+                <div class="row g-4">
+
+                    <!-- MAX OPEN ORDERS -->
+                    <div class="col-md-4">
+                        <label class="form-label">
+                            Максимум открытых ордеров
+                            <span class="badge bg-secondary ms-1">Стратегия</span>
+                        </label>
+
+                        <input type="number"
+                               class="form-control"
+                               name="maxOpenOrders"
+                               min="1"
+                               step="1"
+                               inputmode="numeric"
+                               th:value="${strategy.maxOpenOrders}"
+                               placeholder="Без ограничения">
+
+                        <div class="form-text">
+                            Ограничивает количество одновременно открытых ордеров.
+                            Оставьте пустым — без ограничения.
+                        </div>
+                    </div>
+
+                    <!-- COOLDOWN -->
+                    <div class="col-md-4">
+                        <label class="form-label">
+                            Пауза после сделки (сек)
+                            <span class="badge bg-secondary ms-1">Стратегия</span>
+                        </label>
+
+                        <input type="number"
+                               class="form-control"
+                               id="cooldownSecondsInput"
+                               name="cooldownSeconds"
+                               min="0"
+                               max="86400"
+                               step="1"
+                               inputmode="numeric"
+                               autocomplete="off"
+                               th:attr="value=${strategy.cooldownSeconds}"
+                               placeholder="Напр. 30 (пусто = без паузы)">
+
+
+                        <div class="form-text">
+                            Минимальная пауза перед следующим входом.
+                            Оставьте пустым или 0 — без паузы.
+                        </div>
+                    </div>
+
+
+                </div>
+
+
+
+
+                <div class="d-flex justify-content-end mt-4">
+                    <button type="submit"
+                            class="btn btn-primary"
+                            name="saveScope"
+                            value="trade">
+                        ✔ Сохранить «Торговля»
+                    </button>
+                </div>
+
             </div>
+
 
             <!-- ====================== ADVANCED TAB ================= -->
             <div class="tab-pane" id="tab-advanced">
-                <!-- Оставь тут твой текущий Advanced (или временную заглушку) -->
+
+                <div class="section-title">Продвинутое: стратегия и AI</div>
+
+                <div class="alert alert-secondary small">
+                    Здесь находятся расширенные параметры стратегии.
+                    Если вы не уверены — оставьте значения по умолчанию.
+                </div>
+
+                <!-- ================== CONTROL MODE ================== -->
+                <div class="section-title mt-4">Управление параметрами</div>
+
+                <div class="row g-4">
+                    <div class="col-md-4">
+                        <label class="form-label">Кто управляет настройками</label>
+
+                        <select class="form-select" name="advancedControlMode">
+                            <option value="MANUAL"
+                                    th:selected="${strategy != null and strategy.advancedControlMode != null and strategy.advancedControlMode.name() == 'MANUAL'}">
+                                Ручной (только пользователь)
+                            </option>
+
+                            <option value="HYBRID"
+                                    th:selected="${strategy != null and strategy.advancedControlMode != null and strategy.advancedControlMode.name() == 'HYBRID'}">
+                                Гибрид (AI предлагает)
+                            </option>
+
+                            <option value="AI"
+                                    th:selected="${strategy != null and strategy.advancedControlMode != null and strategy.advancedControlMode.name() == 'AI'}">
+                                Авто (AI управляет)
+                            </option>
+                        </select>
+
+                        <div class="form-text">
+                            Определяет, кто может изменять параметры стратегии.
+                        </div>
+                    </div>
+
+                    <div class="col-md-8">
+                        <div class="alert alert-info small mt-4">
+                            В режимах <b>Гибрид</b> и <b>Авто</b> параметры могут
+                            изменяться алгоритмами в допустимых пределах.
+                        </div>
+                    </div>
+                </div>
+
+
+                <hr class="my-4"/>
+
+                <!-- ================== STRATEGY-SPECIFIC ================== -->
+                <div class="section-title">Параметры стратегии</div>
+
+                <div class="alert alert-dark small mb-3">
+                    <b>Стратегия:</b>
+                    <span th:text="${type}">TYPE</span><br/>
+                    Ниже отображаются параметры, специфичные для выбранной стратегии.
+                </div>
+
+                <div th:if="${strategyAdvancedHtml != null}"
+                     th:utext="${strategyAdvancedHtml}">
+                </div>
+
+                <div th:if="${strategyAdvancedHtml == null}"
+                     class="alert alert-secondary small">
+                    Для этой стратегии пока нет отдельных продвинутых параметров.
+                </div>
+
+                <hr class="my-4"/>
+
+                <!-- ================== AI / OPTIMIZATION (FUTURE) ================== -->
+                <div class="section-title">AI и автооптимизация</div>
+
+                <div class="alert alert-warning small">
+                    Эти функции находятся в разработке и будут доступны позже.
+                    Интерфейс показан для понимания будущих возможностей.
+                </div>
+
+                <div class="row g-4">
+                    <div class="col-md-4">
+                        <label class="form-label">Режим обучения</label>
+                        <select class="form-select" disabled>
+                            <option>Выключено</option>
+                            <option>Симуляция (paper)</option>
+                            <option>Live</option>
+                        </select>
+                    </div>
+
+                    <div class="col-md-4">
+                        <label class="form-label">Период переобучения (часы)</label>
+                        <input type="number"
+                               class="form-control"
+                               disabled
+                               placeholder="Напр. 12">
+                    </div>
+
+                    <div class="col-md-4">
+                        <label class="form-label">Метрика оптимизации</label>
+                        <select class="form-select" disabled>
+                            <option>PnL</option>
+                            <option>Sharpe</option>
+                            <option>Просадка</option>
+                        </select>
+                    </div>
+                </div>
+
+                <hr class="my-4"/>
+
+                <!-- ================== CHANGE HISTORY ================== -->
+                <div class="section-title">История изменений</div>
+
+                <div class="row g-4">
+                    <div class="col-md-6">
+                        <label class="form-label">Последнее изменение</label>
+                        <input class="form-control" readonly value="—">
+                    </div>
+
+                    <div class="col-md-6">
+                        <label class="form-label">Источник изменения</label>
+                        <input class="form-control" readonly value="—">
+                    </div>
+                </div>
+
+                <div class="d-flex justify-content-end mt-4">
+                    <button type="submit"
+                            class="btn btn-primary"
+                            name="saveScope"
+                            value="advanced">
+                        ✔ Сохранить «Продвинутое»
+                    </button>
+                </div>
+
             </div>
+
 
         </form>
 
     </div> <!-- /tab-content -->
+    <!-- ===================================================== -->
+    <!-- NETWORK TAB: JS -->
+    <!-- ===================================================== -->
 
-    <script th:src="@{/js/views/strategies/settings.js}"></script>
 </div>

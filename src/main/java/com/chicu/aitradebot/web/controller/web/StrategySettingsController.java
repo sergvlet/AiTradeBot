@@ -6,12 +6,19 @@ import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.ExchangeSettings;
 import com.chicu.aitradebot.domain.StrategySettings;
+import com.chicu.aitradebot.domain.enums.AdvancedControlMode;
+import com.chicu.aitradebot.exchange.model.AccountFees;
 import com.chicu.aitradebot.exchange.model.ApiKeyDiagnostics;
 import com.chicu.aitradebot.exchange.service.ExchangeSettingsService;
+import com.chicu.aitradebot.market.model.SymbolDescriptor;
+import com.chicu.aitradebot.market.service.MarketSymbolService;
 import com.chicu.aitradebot.service.StrategySettingsService;
 import com.chicu.aitradebot.strategy.core.cache.StrategySettingsCache;
 import com.chicu.aitradebot.strategy.rsie.RsiEmaStrategySettings;
 import com.chicu.aitradebot.strategy.rsie.RsiEmaStrategySettingsService;
+import com.chicu.aitradebot.web.advanced.AdvancedRenderContext;
+import com.chicu.aitradebot.web.advanced.StrategyAdvancedRegistry;
+import com.chicu.aitradebot.web.advanced.StrategyAdvancedRenderer;
 import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -35,13 +42,15 @@ public class StrategySettingsController {
     private final RsiEmaStrategySettingsService rsiEmaSettingsService;
     private final StrategySettingsCache settingsCache;
     private final AccountBalanceService accountBalanceService;
-
+    private final MarketSymbolService marketSymbolService;
+    private final StrategyAdvancedRegistry strategyAdvancedRegistry;
     private static final List<String> DEFAULT_TIMEFRAMES = List.of(
             "1s","5s","15s","1m","3m","5m","15m","30m","1h","4h","1d"
     );
 
     private static final List<String> AVAILABLE_EXCHANGES =
             List.of("BINANCE","BYBIT","OKX");
+
 
     // =====================================================
     // GET — ОТКРЫТЬ НАСТРОЙКИ
@@ -58,7 +67,7 @@ public class StrategySettingsController {
         StrategyType strategyType = StrategyType.valueOf(type);
 
         // =====================================================
-        // exchange / network — source of truth
+        // exchange / network
         // =====================================================
         String exchange = Optional.ofNullable(request.getParameter("exchange"))
                 .orElse("BINANCE");
@@ -68,7 +77,7 @@ public class StrategySettingsController {
                 .orElse(NetworkType.TESTNET);
 
         // =====================================================
-        // StrategySettings — UI STATE (SOURCE OF TRUTH)
+        // StrategySettings (unified)
         // =====================================================
         StrategySettings strategy =
                 strategySettingsService
@@ -82,7 +91,7 @@ public class StrategySettingsController {
         pullRsiEmaIntoUnifiedIfEmpty(strategyType, chatId, strategy);
 
         // =====================================================
-        // BALANCE SNAPSHOT (READ-ONLY)
+        // BALANCE SNAPSHOT
         // =====================================================
         AccountBalanceSnapshot balance =
                 accountBalanceService.getSnapshot(
@@ -101,19 +110,62 @@ public class StrategySettingsController {
                         : null;
 
         // =====================================================
-        // 🔥 ВЫБРАННЫЙ АКТИВ — ТОЛЬКО ИЗ StrategySettings
+        // SELECTED ASSET
         // =====================================================
         String selectedAsset = strategy.getAccountAsset();
-
-        // fallback, если ещё не сохранён
         if (selectedAsset == null || selectedAsset.isBlank()) {
-            // если в snapshot есть какой-то "текущий" актив — используй его
-            // (если такого метода нет — просто оставь null, UI покажет дефолт)
+            selectedAsset = balance.getSelectedAsset();
+        }
+
+        // =====================================================
+        // SYMBOL INFO
+        // =====================================================
+        SymbolDescriptor symbolInfo = null;
+
+        if (strategy.getSymbol() != null && !strategy.getSymbol().isBlank()) {
             try {
-                selectedAsset = balance.getSelectedAsset(); // если у тебя такого метода нет — убери эту строку
-            } catch (Exception ignored) {
-                // ничего, selectedAsset останется null
+                symbolInfo = marketSymbolService.getSymbolInfo(
+                        exchange,
+                        network,
+                        selectedAsset,
+                        strategy.getSymbol()
+                );
+            } catch (Exception e) {
+                log.warn("⚠ Не удалось получить symbolInfo symbol={}: {}",
+                        strategy.getSymbol(), e.getMessage());
             }
+        }
+
+        // =====================================================
+        // FEES
+        // =====================================================
+        AccountFees accountFees = null;
+        if (exchangeSettings.hasKeys() && diagnostics != null && diagnostics.isOk()) {
+            try {
+                accountFees = accountBalanceService.getAccountFees(chatId, exchange, network);
+            } catch (Exception e) {
+                log.warn("⚠ Не удалось получить комиссии: {}", e.getMessage());
+            }
+        }
+
+        // =====================================================
+        // 🔥 STRATEGY ADVANCED (DYNAMIC HTML)
+        // =====================================================
+        String strategyAdvancedHtml = null;
+
+        StrategyAdvancedRenderer advancedRenderer =
+                strategyAdvancedRegistry.get(strategyType);
+
+        if (advancedRenderer != null) {
+            strategyAdvancedHtml = advancedRenderer.render(
+                    AdvancedRenderContext.builder()
+                            .chatId(chatId)
+                            .strategyType(strategyType)
+                            .exchange(exchange)
+                            .networkType(network)
+                            .controlMode(strategy.getAdvancedControlMode())
+                            .build()
+            );
         }
 
         // =====================================================
@@ -134,24 +186,19 @@ public class StrategySettingsController {
         model.addAttribute("diagnostics", diagnostics);
         model.addAttribute("connectionOk", diagnostics != null && diagnostics.isOk());
 
-        // =====================================================
-        // BALANCE → UI (НЕ источник истины)
-        // =====================================================
         model.addAttribute("availableAssets", balance.getAvailableAssets());
-
-        // ❗ выбранный актив — что сохранили в StrategySettings
         model.addAttribute("selectedAsset", selectedAsset);
-
-        // ✅ безопасно: у snapshot есть только "selectedFreeBalance"
         model.addAttribute("availableBalance", balance.getSelectedFreeBalance());
         model.addAttribute("balanceConnectionOk", balance.isConnectionOk());
 
+        model.addAttribute("accountFees", accountFees);
+        model.addAttribute("symbolInfo", symbolInfo);
+
+        // 🔥 ВАЖНОЕ
+        model.addAttribute("strategyAdvancedHtml", strategyAdvancedHtml);
+
         return "layout/app";
     }
-
-
-
-
 
     // =====================================================
     // POST — СОХРАНЕНИЕ (FIXED)
@@ -178,90 +225,188 @@ public class StrategySettingsController {
         log.debug("📥 RAW PARAMS: {}", params);
 
         // =====================================================
-        // 🔥 КРИТИЧЕСКИЙ FIX — POST ГАРАНТИРУЕТ НАЛИЧИЕ ЗАПИСИ
+        // 🔥 POST гарантирует наличие записи
         // =====================================================
         StrategySettings s =
                 strategySettingsService
                         .findLatest(chatId, strategyType, exchange, network)
-                        .orElseGet(() -> {
-                            log.warn(
-                                    "⚠️ StrategySettings not found → create new (chatId={} type={} ex={} net={})",
-                                    chatId, strategyType, exchange, network
-                            );
-                            return strategySettingsService.getOrCreate(
-                                    chatId, strategyType, exchange, network
-                            );
-                        });
-
-        log.info(
-                "📄 Loaded settings id={} asset={} symbol={} tf={}",
-                s.getId(), s.getAccountAsset(), s.getSymbol(), s.getTimeframe()
-        );
+                        .orElseGet(() -> strategySettingsService.getOrCreate(
+                                chatId, strategyType, exchange, network
+                        ));
 
         // =====================================================
-        // 💰 accountAsset — ЕДИНСТВЕННОЕ МЕСТО
+        // 🔐 GLOBAL: advancedControlMode (применяется сразу)
         // =====================================================
-        String accountAsset = params.get("accountAsset");
-        if (accountAsset != null && !accountAsset.isBlank()) {
-            log.info("💰 accountAsset: {} -> {}", s.getAccountAsset(), accountAsset);
-            s.setAccountAsset(accountAsset);
+        if (params.containsKey("advancedControlMode")) {
+            try {
+                s.setAdvancedControlMode(
+                        AdvancedControlMode.valueOf(params.get("advancedControlMode"))
+                );
+            } catch (Exception e) {
+                log.warn("Invalid advancedControlMode: {}", params.get("advancedControlMode"));
+            }
         }
 
         // =====================================================
-        // 🔀 SAVE BY SCOPE
+        // 💰 accountAsset — единая точка
         // =====================================================
+        String accountAsset = params.get("accountAsset");
+        if (accountAsset != null && !accountAsset.isBlank()) {
+            s.setAccountAsset(accountAsset);
+        }
+
+        String redirect;
+
         switch (saveScope) {
 
-            case "network" -> {
+            case "network":
                 s.setExchangeName(exchange);
                 s.setNetworkType(network);
                 strategySettingsService.save(s);
                 exchangeSettingsService.saveNetwork(chatId, exchange, network);
-            }
+                break;
 
-            case "trade" -> {
+            case "trade":
                 s.setSymbol(form.getSymbol());
                 s.setTimeframe(form.getTimeframe());
                 s.setCachedCandlesLimit(form.getCachedCandlesLimit());
+
+                // 🔥 EXECUTION POLICY
+                Integer maxOpenOrders   = parseIntOrNull(params.get("maxOpenOrders"));
+                Integer cooldownSeconds = parseIntOrNull(params.get("cooldownSeconds"));
+
+                // maxOpenOrders: null / <=0 → без ограничения
+                s.setMaxOpenOrders(
+                        (maxOpenOrders != null && maxOpenOrders > 0)
+                                ? maxOpenOrders
+                                : null
+                );
+
+                // cooldownSeconds: null / 0 / <0 → без паузы
+                s.setCooldownSeconds(
+                        (cooldownSeconds != null && cooldownSeconds > 0)
+                                ? cooldownSeconds
+                                : null
+                );
+
                 strategySettingsService.save(s);
-            }
+                break;
 
-            case "risk" -> {
-                s.setRiskPerTradePct(form.getRiskPerTradePct());
-                s.setDailyLossLimitPct(form.getDailyLossLimitPct());
-                s.setTakeProfitPct(form.getTakeProfitPct());
-                s.setStopLossPct(form.getStopLossPct());
-                strategySettingsService.save(s);
-            }
 
-            case "general" -> {
-                boolean reinvest = params.containsKey("reinvestProfit");
-                s.setReinvestProfit(reinvest);
 
-                BigDecimal maxExposureUsd = parseBigDecimalOrNull(params.get("maxExposureUsd"));
-                Integer maxExposurePct   = parseIntOrNull(params.get("maxExposurePct"));
+
+            case "risk":
+                // 🔐 Risk limits — ТОЛЬКО через policy
+                strategySettingsService.updateRiskFromUi(
+                        chatId,
+                        strategyType,
+                        exchange,
+                        network,
+                        parseBigDecimalOrNull(params.get("dailyLossLimitPct")),
+                        parseBigDecimalOrNull(params.get("riskPerTradePct"))
+                );
+
+                // 🔄 перезагружаем актуальное состояние
+                StrategySettings refreshed =
+                        strategySettingsService
+                                .findLatest(chatId, strategyType, exchange, network)
+                                .orElseThrow();
+
+                // TP / SL — напрямую
+                BigDecimal stopLossPct  = parseBigDecimalOrNull(params.get("stopLossPct"));
+                BigDecimal takeProfitPct = parseBigDecimalOrNull(params.get("takeProfitPct"));
+
+                boolean changed = false;
+
+                if (stopLossPct != null) {
+                    refreshed.setStopLossPct(stopLossPct);
+                    changed = true;
+                }
+                if (takeProfitPct != null) {
+                    refreshed.setTakeProfitPct(takeProfitPct);
+                    changed = true;
+                }
+
+                if (changed) {
+                    strategySettingsService.save(refreshed);
+                }
+
+                break;
+
+            case "general":
+                s.setReinvestProfit(params.containsKey("reinvestProfit"));
+
+                BigDecimal maxExposureUsd =
+                        parseBigDecimalOrNull(params.get("maxExposureUsd"));
+                Integer maxExposurePct =
+                        parseIntOrNull(params.get("maxExposurePct"));
 
                 if (maxExposureUsd != null && maxExposureUsd.signum() <= 0) {
                     maxExposureUsd = null;
                 }
-                if (maxExposurePct != null && (maxExposurePct <= 0 || maxExposurePct > 100)) {
+                if (maxExposurePct != null &&
+                    (maxExposurePct <= 0 || maxExposurePct > 100)) {
                     maxExposurePct = null;
                 }
 
                 s.setMaxExposureUsd(maxExposureUsd);
                 s.setMaxExposurePct(maxExposurePct);
-
                 strategySettingsService.save(s);
-            }
+                break;
 
-            case "advanced" -> {
-                if (form.getAdvancedControlMode() != null) {
-                    s.setAdvancedControlMode(form.getAdvancedControlMode());
-                    strategySettingsService.save(s);
+            case "advanced": {
+
+                // 1️⃣ текущий режим ДО изменений
+                AdvancedControlMode currentMode = s.getAdvancedControlMode();
+
+                // 2️⃣ strategy-specific advanced
+                StrategyAdvancedRenderer renderer =
+                        strategyAdvancedRegistry.get(strategyType);
+
+                if (renderer != null && currentMode != AdvancedControlMode.AI) {
+
+                    AdvancedRenderContext ctx =
+                            AdvancedRenderContext.builder()
+                                    .chatId(chatId)
+                                    .strategyType(strategyType)
+                                    .exchange(exchange)
+                                    .networkType(network)
+                                    .controlMode(currentMode)
+                                    .params(params)
+                                    .build();
+
+                    renderer.handleSubmit(ctx);
+
+                } else if (currentMode == AdvancedControlMode.AI) {
+                    log.info(
+                            "🔒 Advanced params ignored (AI mode) chatId={} strategy={}",
+                            chatId, strategyType
+                    );
                 }
+
+                // 3️⃣ смена режима (GLOBAL)
+                String modeRaw = params.get("advancedControlMode");
+                if (modeRaw != null) {
+                    try {
+                        s.setAdvancedControlMode(
+                                AdvancedControlMode.valueOf(modeRaw)
+                        );
+                    } catch (IllegalArgumentException e) {
+                        log.warn("⚠️ Invalid advancedControlMode='{}'", modeRaw);
+                    }
+                }
+
+                // 4️⃣ save
+                strategySettingsService.save(s);
+                break;
             }
 
-            default -> log.warn("⚠️ Unknown saveScope='{}'", saveScope);
+
+
+
+
+            default:
+                log.warn("⚠️ Unknown saveScope='{}'", saveScope);
         }
 
         // =====================================================
@@ -270,18 +415,25 @@ public class StrategySettingsController {
         syncRsiEmaFromUnified(strategyType, chatId, s);
         settingsCache.invalidate(chatId, strategyType);
 
-        log.info("✅ SAVE SETTINGS DONE id={} scope={}", s.getId(), saveScope);
+        redirect = buildRedirect(type, chatId, exchange, network, saveScope);
 
+        log.info("✅ SAVE SETTINGS DONE id={} scope={}", s.getId(), saveScope);
+        return redirect;
+    }
+
+    private String buildRedirect(
+            String type,
+            long chatId,
+            String exchange,
+            NetworkType network,
+            String tab
+    ) {
         return "redirect:/strategies/" + type +
                "/config?chatId=" + chatId +
                "&exchange=" + exchange +
                "&network=" + network.name() +
-               "&tab=" + saveScope;
+               "&tab=" + tab;
     }
-
-
-
-
 
     // =====================================================
     // AJAX — СМЕНА АКТИВА (FIXED)

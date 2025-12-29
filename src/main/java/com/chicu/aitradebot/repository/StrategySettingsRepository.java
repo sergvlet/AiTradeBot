@@ -10,15 +10,31 @@ import java.util.Optional;
 
 public interface StrategySettingsRepository extends JpaRepository<StrategySettings, Long> {
 
+    // =====================================================================
+    // БАЗОВЫЕ
+    // =====================================================================
     List<StrategySettings> findByChatId(long chatId);
 
     List<StrategySettings> findByChatIdAndType(long chatId, StrategyType type);
 
-    // ✅ КЛЮЧЕВОЙ МЕТОД (истина для UI)
-    Optional<StrategySettings> findTopByChatIdAndTypeAndExchangeNameAndNetworkTypeOrderByIdDesc(
+    // =====================================================================
+    // FALLBACK (когда exchange / network ещё не выбраны)
+    // используется ТОЛЬКО для чтения
+    // =====================================================================
+    Optional<StrategySettings> findTopByChatIdAndTypeOrderByUpdatedAtDescIdDesc(
+            long chatId,
+            StrategyType type
+    );
+
+    // =====================================================================
+    // КЛЮЧЕВОЙ МЕТОД (ИСТИНА)
+    // UI / Live / Runner / Toggle
+    // =====================================================================
+    Optional<StrategySettings> findTopByChatIdAndTypeAndExchangeNameAndNetworkTypeOrderByUpdatedAtDescIdDesc(
             long chatId,
             StrategyType type,
             String exchangeName,
             NetworkType networkType
     );
+
 }

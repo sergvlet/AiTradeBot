@@ -6,6 +6,7 @@ import com.chicu.aitradebot.domain.StrategySettings;
 import com.chicu.aitradebot.exchange.client.ExchangeClient;
 import com.chicu.aitradebot.exchange.client.ExchangeClientFactory;
 import com.chicu.aitradebot.exchange.client.ExchangeClient.Balance;
+import com.chicu.aitradebot.exchange.model.AccountFees;
 import com.chicu.aitradebot.service.StrategySettingsService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -73,7 +74,7 @@ public class AccountBalanceService {
 
             boolean changed = false;
             if (selected == null || !positiveFree.containsKey(selected)) {
-                selected = availableAssets.get(0);
+                selected = availableAssets.getFirst();
                 settings.setAccountAsset(selected);
                 changed = true;
             }
@@ -110,6 +111,13 @@ public class AccountBalanceService {
         }
     }
 
+    public AccountFees getAccountFees(long chatId, String exchangeName, NetworkType networkType) {
+        ExchangeClient client = exchangeClientFactory.get(exchangeName, networkType);
+        return client.getAccountFees(chatId, networkType);
+    }
+
+
+
     // =====================================================================
     // helpers
     // =====================================================================
@@ -123,4 +131,6 @@ public class AccountBalanceService {
     private <T> Map<String, T> safeMap(Map<String, T> m) {
         return (m == null) ? Collections.emptyMap() : m;
     }
+
+
 }

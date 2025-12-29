@@ -16,40 +16,59 @@ public class StrategyChartApiController {
     private final WebChartFacade chartFacade;
 
     /**
-     * FULL стратегический график (SNAPSHOT)
-     *  — свечи (market)
-     *  — last price
-     *  — UI layers (levels / zone / tp-sl и т.д.)
-     * ❗️Без чтения БД стратегии
+     * 📈 SNAPSHOT стратегического графика
+
+     * ❗ Единственный источник данных для:
+     *  - UI графика
+     *  - replay
+     *  - backtest визуализации
+
+     * ❌ НЕ:
+     *  - стратегия
+     *  - ордера
+     *  - биржа
      */
     @GetMapping("/strategy")
     public StrategyChartDto getStrategyChart(
-            @RequestParam long chatId,                 // ✅ ИСПРАВЛЕНО
+            @RequestParam long chatId,
             @RequestParam StrategyType type,
             @RequestParam String symbol,
             @RequestParam(defaultValue = "1m") String timeframe,
             @RequestParam(defaultValue = "500") int limit
     ) {
 
+        // ============================
+        // VALIDATION
+        // ============================
+
+        if (chatId <= 0) {
+            throw new IllegalArgumentException("chatId must be positive");
+        }
+
         if (symbol == null || symbol.isBlank()) {
-            throw new IllegalArgumentException("Symbol must be provided");
+            throw new IllegalArgumentException("symbol must be provided");
         }
 
-        if (limit < 10 || limit > 2000) {
-            throw new IllegalArgumentException("Limit must be between 10 and 2000");
+        if (limit < 10 || limit > 1500) {
+            throw new IllegalArgumentException("limit must be between 10 and 1500");
         }
 
-        String tf = timeframe.toLowerCase();
+        String tf = timeframe.trim().toLowerCase();
+        String sym = symbol.trim().toUpperCase();
 
         log.info(
-                "📈 StrategyChart → chatId={} type={} symbol={} tf={} limit={}",
-                chatId, type, symbol, tf, limit
+                "📊 Chart SNAPSHOT → chatId={} type={} symbol={} tf={} limit={}",
+                chatId, type, sym, tf, limit
         );
+
+        // ============================
+        // DELEGATE (ЕДИНАЯ ТОЧКА)
+        // ============================
 
         return chartFacade.buildChart(
                 chatId,
                 type,
-                symbol.toUpperCase(),
+                sym,
                 tf,
                 limit
         );

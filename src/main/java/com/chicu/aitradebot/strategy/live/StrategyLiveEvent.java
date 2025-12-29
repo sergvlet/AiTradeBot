@@ -36,10 +36,13 @@ public class StrategyLiveEvent {
     private String symbol;
 
     // ======================================================
-    // META
+    // 🔥 META (ВАЖНО ДЛЯ UI)
     // ======================================================
 
-    /** Время события (epoch millis) */
+    /** ⏱ Таймфрейм события (1m, 5m, 15m, ...) */
+    private String timeframe;
+
+    /** 🕒 Время события (epoch millis) */
     private long time;
 
     // ======================================================
@@ -74,6 +77,13 @@ public class StrategyLiveEvent {
             this.symbol = this.symbol.trim().toUpperCase();
             if (this.symbol.isEmpty()) {
                 this.symbol = null;
+            }
+        }
+
+        if (this.timeframe != null) {
+            this.timeframe = this.timeframe.trim().toLowerCase();
+            if (this.timeframe.isEmpty()) {
+                this.timeframe = null;
             }
         }
 
@@ -180,7 +190,7 @@ public class StrategyLiveEvent {
     }
 
     // ======================================================
-    // 🚦 SIGNAL (FINAL)
+    // 🚦 SIGNAL
     // ======================================================
     @Getter @Setter @Builder
     @NoArgsConstructor @AllArgsConstructor

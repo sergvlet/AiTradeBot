@@ -12,10 +12,7 @@ import org.springframework.stereotype.Component;
 import java.util.*;
 
 /**
- * Универсальный реестр стратегий (v4):
- *  1) UI-метаданные (FieldMeta) — старый модуль, оставлен полностью.
- *  2) Реестр Java-бинов стратегий (register/getStrategy) — ядро v4.
- * StrategyBindingProcessor вызывает register() автоматически.
+ * Универсальный реестр стратегий (v4)
  */
 @Slf4j
 @Component
@@ -23,18 +20,19 @@ import java.util.*;
 public class StrategyRegistry {
 
     // =====================================================================
-    // 1) МЕТАДАННЫЕ ДЛЯ UI (СТАРЫЙ МЕХАНИЗМ — НЕ УБИРАЕМ)
+    // 1) UI-МЕТАДАННЫЕ (НЕ ТРОГАЕМ)
     // =====================================================================
 
     @Data
     @AllArgsConstructor
     public static class FieldMeta {
-        private String name;     // имя поля в StrategySettings
-        private String label;    // label в UI
-        private String type;     // text | number | checkbox
+        private String name;
+        private String label;
+        private String type;
     }
 
-    private final Map<StrategyType, List<FieldMeta>> fields = new EnumMap<>(StrategyType.class);
+    private final Map<StrategyType, List<FieldMeta>> fields =
+            new EnumMap<>(StrategyType.class);
 
     public StrategyRegistry() {
 
@@ -71,32 +69,52 @@ public class StrategyRegistry {
     }
 
     // =====================================================================
-    // 2) РЕЕСТР JAVA-СТРАТЕГИЙ (ДЛЯ ENGINE)
+    // 2) JAVA-РЕЕСТР СТРАТЕГИЙ (ENGINE)
     // =====================================================================
 
     private final Map<StrategyType, TradingStrategy> strategies =
             new EnumMap<>(StrategyType.class);
 
     /**
-     * Вызывается автопроцессором StrategyBindingProcessor.
+     * Вызывается StrategyBindingProcessor
      */
-    public void register(StrategyType type, TradingStrategy strategy) {
-        strategies.put(type, strategy);
-        log.info("📌 Strategy registered: {} → {}", type, strategy.getClass().getSimpleName());
+    public synchronized void register(StrategyType type, TradingStrategy strategy) {
+
+        TradingStrategy prev = strategies.put(type, strategy);
+
+        if (prev != null) {
+            log.warn(
+                    "⚠ Strategy overwritten: {} | {} → {}",
+                    type,
+                    prev.getClass().getSimpleName(),
+                    strategy.getClass().getSimpleName()
+            );
+        } else {
+            log.info(
+                    "📌 Strategy registered: {} → {}",
+                    type,
+                    strategy.getClass().getSimpleName()
+            );
+        }
     }
 
     /**
-     * Получить стратегию (основной метод).
+     * Основной метод
      */
     public TradingStrategy getStrategy(StrategyType type) {
-        return strategies.get(type);
+        TradingStrategy strategy = strategies.get(type);
+
+        if (strategy == null) {
+            log.error("❌ Strategy NOT FOUND for type={}", type);
+        }
+
+        return strategy;
     }
 
     /**
-     * Алиас для обратной совместимости.
-     * Некоторые сервисы вызывали registry.get(type).
+     * Алиас (используется в StrategyMarketBridge)
      */
     public TradingStrategy get(StrategyType type) {
-        return strategies.get(type);
+        return getStrategy(type);
     }
 }

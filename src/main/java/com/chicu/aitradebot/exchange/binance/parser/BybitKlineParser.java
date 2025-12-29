@@ -1,4 +1,4 @@
-package com.chicu.aitradebot.exchange.bybit;
+package com.chicu.aitradebot.exchange.binance.parser;
 
 import com.chicu.aitradebot.market.model.UnifiedKline;
 import org.json.JSONObject;

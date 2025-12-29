@@ -253,4 +253,45 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     });
 
+// -------------------------------------------------------------
+//  RUNTIME INDICATORS (READ-ONLY)
+// -------------------------------------------------------------
+
+    const cooldownInput = document.getElementById("cooldownIndicator");
+
+    /**
+     * Этот хук вызывается из strategy-live.js
+     * при получении события type === "signal"
+     *
+     * event = {
+     *   type: "signal",
+     *   signal: {
+     *     name: "HOLD",
+     *     reason: "cooldown 12s"
+     *   }
+     * }
+     */
+    window.onStrategyLiveEvent = function (event) {
+        if (!cooldownInput) return;
+        if (!event || event.type !== "signal") return;
+
+        const sig = event.signal;
+        if (!sig || sig.name !== "HOLD" || typeof sig.reason !== "string") return;
+
+        const m = sig.reason.match(/^cooldown\s+(\d+)s$/i);
+
+        if (m) {
+            cooldownInput.value = `${m[1]} сек`;
+            cooldownInput.classList.remove("text-secondary");
+            cooldownInput.classList.add("text-warning");
+        } else {
+            // если HOLD, но не cooldown — очищаем
+            cooldownInput.value = "—";
+            cooldownInput.classList.remove("text-warning");
+            cooldownInput.classList.add("text-secondary");
+        }
+    };
+
+
+
 });

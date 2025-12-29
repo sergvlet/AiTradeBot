@@ -58,6 +58,22 @@ public class StrategyRuntimeState {
     private Instant lastUpdatedAt;
 
     // ============================================================
+// RUNTIME LIMITS (AI / STRATEGY CONTROLLED)
+// ============================================================
+
+    /** Пауза между сделками (секунды) — runtime, НЕ сохраняется */
+    private int tradeCooldownSec = 40;
+
+    // ============================================================
+// EXECUTION LIMITS (AI / RUNTIME)
+// ============================================================
+
+    /** Максимально допустимое проскальзывание (%) */
+    private BigDecimal maxSlippagePct = BigDecimal.valueOf(0.20);
+
+
+
+    // ============================================================
     // HELPERS (потокобезопасные)
     // ============================================================
 
@@ -89,4 +105,39 @@ public class StrategyRuntimeState {
     public synchronized void touch() {
         this.lastUpdatedAt = Instant.now();
     }
+
+    // ============================================================
+// COOLDOWN HELPERS
+// ============================================================
+
+    public boolean canEnterTrade() {
+        if (lastTradeAt == null) return true;
+        return Instant.now()
+                .isAfter(lastTradeAt.plusSeconds(tradeCooldownSec));
+    }
+
+    public long getCooldownRemainingSec() {
+        if (lastTradeAt == null) return 0;
+
+        long elapsed =
+                Instant.now().getEpochSecond() - lastTradeAt.getEpochSecond();
+
+        return Math.max(0, tradeCooldownSec - elapsed);
+    }
+
+
+    public boolean isSlippageAllowed(BigDecimal expectedPrice, BigDecimal actualPrice) {
+        if (expectedPrice == null || actualPrice == null) return true;
+
+        BigDecimal diffPct = actualPrice
+                .subtract(expectedPrice)
+                .abs()
+                .divide(expectedPrice, 6, BigDecimal.ROUND_HALF_UP)
+                .multiply(BigDecimal.valueOf(100));
+
+        return diffPct.compareTo(maxSlippagePct) <= 0;
+    }
+
+
+
 }

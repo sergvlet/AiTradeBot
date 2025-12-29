@@ -1,29 +1,22 @@
 "use strict";
 
-/**
- * ChartController = MARKET ENGINE
- *
- * ✔ Candles (history + live)
- * ✔ Price tick → update last candle
- * ✔ One price line
- *
- * ❌ Levels
- * ❌ Zones
- * ❌ Orders
- * ❌ Trades
- *
- * NEVER call LayerRenderer here.
- */
-
 export class ChartController {
 
     constructor(container) {
         this.container = container;
 
+        if (!container) {
+            console.error("❌ ChartController: container is null");
+            return;
+        }
+
+        const { clientWidth, clientHeight } = container;
+
         const LightweightCharts = window.LightweightCharts;
 
         this.chart = LightweightCharts.createChart(container, {
-            height: 420,
+            width:  clientWidth  || 800,
+            height: clientHeight || 420,
             layout: {
                 background: { color: "#0e0f11" },
                 textColor: "#e0e0e0"
@@ -61,59 +54,85 @@ export class ChartController {
     }
 
     // =====================================================
-    // UTILS
-    // =====================================================
-    toTimeSec(v) {
-        const n = Number(v);
-        if (!Number.isFinite(n)) return null;
-        return n > 10_000_000_000 ? Math.floor(n / 1000) : Math.floor(n);
-    }
-
-    // =====================================================
-    // HISTORY
+    // HISTORY (REST)
     // =====================================================
     setHistory(candles) {
         if (!Array.isArray(candles) || candles.length === 0) return;
 
-        this.candles.setData(candles);
-        this.lastBar = { ...candles[candles.length - 1] };
+        const data = candles
+            .map(c => ({
+                time:  Number(c.time),   // ❗ как приходит — не трогаем
+                open:  +c.open,
+                high:  +c.high,
+                low:   +c.low,
+                close: +c.close
+            }))
+            .filter(c => Number.isFinite(c.time));
 
+        if (data.length === 0) return;
+
+        this.candles.setData(data);
+        this.lastBar = { ...data[data.length - 1] };
         this.updatePriceLine(this.lastBar.close);
         this.chart.timeScale().scrollToRealTime();
     }
 
     // =====================================================
-    // CANDLE (OHLC)
+    // LIVE CANDLE (WS)
     // =====================================================
     onCandle(ev) {
-        if (!ev || !ev.kline) return;
+        if (!ev || !Number.isFinite(ev.time)) return;
 
-        const t = this.toTimeSec(ev.time);
-        if (!t) return;
+        const open  = ev.kline?.open  ?? ev.open;
+        const high  = ev.kline?.high  ?? ev.high;
+        const low   = ev.kline?.low   ?? ev.low;
+        const close = ev.kline?.close ?? ev.close;
+
+        if (
+            !Number.isFinite(open) ||
+            !Number.isFinite(high) ||
+            !Number.isFinite(low)  ||
+            !Number.isFinite(close)
+        ) return;
+
+        // =================================================
+        // 🔑 КЛЮЧЕВОЙ ФИКС: привязка к таймфрейму 1m
+        // =================================================
+        const TF_MS = 60_000; // 1m
+        const candleTime = Math.floor(ev.time / TF_MS) * TF_MS;
 
         const bar = {
-            time: t,
-            open: +ev.kline.open,
-            high: +ev.kline.high,
-            low:  +ev.kline.low,
-            close:+ev.kline.close
+            time:  candleTime,
+            open:  +open,
+            high:  +high,
+            low:   +low,
+            close: +close
         };
 
-        this.candles.update(bar);
-        this.lastBar = { ...bar };
+        // 🔁 update текущей свечи
+        if (this.lastBar && this.lastBar.time === bar.time) {
+            this.candles.update(bar);
+            this.lastBar = { ...bar };
+            this.updatePriceLine(bar.close);
+            return;
+        }
 
-        this.updatePriceLine(bar.close);
-        this.chart.timeScale().scrollToRealTime();
+        // ➕ новая свеча
+        if (!this.lastBar || bar.time > this.lastBar.time) {
+            this.candles.update(bar);
+            this.lastBar = { ...bar };
+            this.chart.timeScale().scrollToRealTime();
+            this.updatePriceLine(bar.close);
+        }
     }
+
 
     // =====================================================
     // PRICE TICK
     // =====================================================
     onPrice(ev) {
         const price = Number(ev.price);
-        if (!Number.isFinite(price)) return;
-
-        if (!this.lastBar) return;
+        if (!Number.isFinite(price) || !this.lastBar) return;
 
         this.lastBar = {
             ...this.lastBar,
@@ -127,7 +146,7 @@ export class ChartController {
     }
 
     // =====================================================
-    // PRICE LINE (ONE)
+    // PRICE LINE
     // =====================================================
     updatePriceLine(price) {
         if (!Number.isFinite(price)) return;

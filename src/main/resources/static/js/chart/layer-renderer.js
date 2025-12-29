@@ -1,21 +1,28 @@
 "use strict";
 
 /**
- * PUBLIC API (used by features)
+ * LayerRenderer
+ * =============
  *
+ * PUBLIC API (used by strategies):
  * ✔ renderLevels / clearLevels
  * ✔ renderZone / clearZone
  * ✔ renderTradeZone / clearTradeZone
  * ✔ renderTpSl / clearTpSl
+ * ✔ renderPriceLine / clearPriceLines
  * ✔ renderOrder
  * ✔ renderTrade
  * ✔ renderWindowZone / clearWindowZone
  * ✔ renderAtr / clearAtr
  *
- * INTERNAL / LEGACY (not for features)
- * ✖ onActiveLevel
- * ✖ onMagnet
- * ✖ renderPriceLine
+ * INTERNAL / LEGACY (not for new features):
+ * ⚠ onActiveLevel
+ * ⚠ onMagnet
+ *
+ * ❗ LayerRenderer:
+ * - НЕ знает стратегию
+ * - НЕ знает таймфрейм
+ * - НЕ знает рынок
  */
 
 export class LayerRenderer {
@@ -24,38 +31,38 @@ export class LayerRenderer {
         this.chart   = chart;
         this.candles = candleSeries;
 
-        // --- LEVELS ---
-        this.levelLines = []; // [{ price, line }]
+        // === LEVELS ===
+        this.levelLines = [];
         this.activeLevelPrice = null;
 
-        // --- GENERIC ZONE ---
+        // === GENERIC ZONE ===
         this.zoneLines = [];
 
-        // --- BUY / SELL ZONE ---
+        // === BUY / SELL ZONE ===
         this.tradeZoneLines = [];
 
-        // --- TP / SL (legacy) ---
+        // === TP / SL (legacy) ===
         this.tpLine = null;
         this.slLine = null;
 
-        // --- PRICE LINES (ENTRY / TP / SL) ---
-        this.priceLines = new Map(); // name -> priceLine
+        // === NAMED PRICE LINES (ENTRY / TP / SL) ===
+        this.priceLines = new Map();
 
-        // --- WINDOW ZONE ---
+        // === WINDOW ZONE (SCALPING) ===
         this.windowHighLine = null;
         this.windowLowLine  = null;
 
-        // --- ATR ---
+        // === ATR / VOLATILITY (INFO ONLY) ===
         this.lastAtr = null;
         this.lastVolatilityPct = null;
 
-        // --- ORDERS ---
-        this.orderLines = new Map(); // orderId -> priceLine
+        // === ORDERS ===
+        this.orderLines = new Map();
 
-        // --- TRADES ---
+        // === TRADES (MARKERS) ===
         this.markers = [];
 
-        // --- MAGNET ---
+        // === LEGACY / INTERNAL ===
         this.magnetTarget = null;
         this.magnetStrength = 0;
 
@@ -78,11 +85,13 @@ export class LayerRenderer {
 
     _safeRemovePriceLine(line) {
         if (!line) return;
-        try { this.candles.removePriceLine(line); } catch {}
+        try {
+            this.candles.removePriceLine(line);
+        } catch {}
     }
 
     // =====================================================
-    // LEVELS (FIB / GRID)
+    // LEVELS
     // =====================================================
     renderLevels(levels) {
         if (!Array.isArray(levels)) return;
@@ -113,7 +122,7 @@ export class LayerRenderer {
     }
 
     // =====================================================
-    // ACTIVE LEVEL
+    // ACTIVE LEVEL (LEGACY)
     // =====================================================
     onActiveLevel(payload) {
         if (!payload) return;
@@ -140,11 +149,10 @@ export class LayerRenderer {
     }
 
     // =====================================================
-    // 🟠 GENERIC ZONE (grid / fib / fallback)
+    // GENERIC ZONE
     // =====================================================
     renderZone(zone) {
         if (!zone) return;
-
         this.clearZone();
 
         const top = Number(zone.top);
@@ -156,7 +164,6 @@ export class LayerRenderer {
 
         const color = zone.color || "rgba(59,130,246,0.15)";
 
-        // делаем заметнее: ширина + подпись
         this.zoneLines = [
             this.candles.createPriceLine({
                 price: hi,
@@ -181,11 +188,10 @@ export class LayerRenderer {
     }
 
     // =====================================================
-    // 🔴 BUY / SELL ZONE
+    // BUY / SELL ZONE
     // =====================================================
     renderTradeZone(zone) {
         if (!zone) return;
-
         this.clearTradeZone();
 
         const top = Number(zone.top);
@@ -200,7 +206,6 @@ export class LayerRenderer {
                 ? "rgba(34,197,94,0.25)"
                 : "rgba(239,68,68,0.25)";
 
-        // делаем заметнее: ширина + подпись
         this.tradeZoneLines = [
             this.candles.createPriceLine({
                 price: hi,
@@ -225,11 +230,10 @@ export class LayerRenderer {
     }
 
     // =====================================================
-    // TP / SL (legacy)
+    // TP / SL (LEGACY)
     // =====================================================
     renderTpSl(tpSl) {
         if (!tpSl) return;
-
         this.clearTpSl();
 
         if (tpSl.tp != null) {
@@ -267,7 +271,7 @@ export class LayerRenderer {
     }
 
     // =====================================================
-    // 📍 PRICE LINE (ENTRY / TP / SL)
+    // NAMED PRICE LINES
     // =====================================================
     renderPriceLine(pl) {
         if (!pl || !pl.name || pl.price == null) return;
@@ -304,11 +308,10 @@ export class LayerRenderer {
     }
 
     // =====================================================
-    // 🔲 WINDOW ZONE (SCALPING)
+    // WINDOW ZONE
     // =====================================================
     renderWindowZone(zone) {
         if (!zone) return;
-
         this.clearWindowZone();
 
         const high = Number(zone.high);
@@ -318,8 +321,6 @@ export class LayerRenderer {
         const hi = Math.max(high, low);
         const lo = Math.min(high, low);
 
-        // ❗ фикс “не видно”: делаем контрастнее + толще + показываем label
-        // (ранее было rgba + lineWidth=1 + без axisLabelVisible)
         const color = "#64748b";
 
         this.windowHighLine = this.candles.createPriceLine({
@@ -347,7 +348,7 @@ export class LayerRenderer {
     }
 
     // =====================================================
-    // 🧠 ATR / VOLATILITY
+    // ATR / VOLATILITY (INFO)
     // =====================================================
     renderAtr(atr) {
         if (!atr) return;
@@ -361,7 +362,7 @@ export class LayerRenderer {
     }
 
     // =====================================================
-    // LIMIT ORDERS
+    // ORDERS
     // =====================================================
     renderOrder(order) {
         if (!order || !order.orderId) return;
@@ -387,7 +388,7 @@ export class LayerRenderer {
     }
 
     // =====================================================
-    // MAGNET
+    // MAGNET (LEGACY)
     // =====================================================
     onMagnet(magnet) {
         if (!magnet) return;

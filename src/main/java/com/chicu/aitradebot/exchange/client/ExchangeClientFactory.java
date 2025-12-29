@@ -19,51 +19,89 @@ public class ExchangeClientFactory {
 
     private final ExchangeSettingsService exchangeSettingsService;
 
+    /**
+     * registry:
+     *   (BINANCE, MAINNET) -> BinanceExchangeClient
+     *   (BINANCE, TESTNET) -> BinanceExchangeClient
+     *   (BYBIT,   MAINNET) -> BybitExchangeClient
+     */
     private final Map<Key, ExchangeClient> registry = new ConcurrentHashMap<>();
 
-    // ============================
-    // РЕГИСТРАЦИЯ
-    // ============================
+    // =====================================================================
+    // REGISTRATION (startup only)
+    // =====================================================================
     public void register(String exchange, NetworkType networkType, ExchangeClient client) {
-        String normalized = normalize(exchange);
-        Key key = new Key(normalized, networkType);
-        registry.put(key, client);
-        log.info("🔌 Зарегистрирован клиент: {} / {}", normalized, networkType);
-    }
 
-    // ============================
-    // ПОЛУЧЕНИЕ ПО EXCHANGE + NETWORK
-    // ============================
-    public ExchangeClient get(String exchange, NetworkType networkType) {
-        String normalized = normalize(exchange);
-        Key key = new Key(normalized, networkType);
+        if (exchange == null || networkType == null || client == null) {
+            throw new IllegalArgumentException("register(): exchange/network/client не могут быть null");
+        }
 
-        ExchangeClient client = registry.get(key);
-        if (client == null) {
+        String ex = normalize(exchange);
+
+        // 🔒 ЖЁСТКАЯ ПРОВЕРКА ИНВАРИАНТА
+        if (!ex.equals(normalize(client.getExchangeName()))) {
             throw new IllegalStateException(
-                    "❌ Клиент не зарегистрирован: " + normalized + " / " + networkType
+                    "❌ Несовпадение exchange: registry=" + ex +
+                    ", client=" + client.getExchangeName()
             );
         }
+
+        Key key = new Key(ex, networkType);
+
+        ExchangeClient prev = registry.putIfAbsent(key, client);
+        if (prev != null) {
+            log.warn(
+                    "⚠️ ExchangeClient уже зарегистрирован: {} / {} (ignored)",
+                    ex, networkType
+            );
+            return;
+        }
+
+        log.info("🔌 ExchangeClient зарегистрирован: {} / {}", ex, networkType);
+    }
+
+    // =====================================================================
+    // LOW-LEVEL GET (exchange + network)
+    // =====================================================================
+    public ExchangeClient get(String exchange, NetworkType networkType) {
+
+        if (exchange == null || networkType == null) {
+            throw new IllegalArgumentException("exchange/network не могут быть null");
+        }
+
+        String ex = normalize(exchange);
+        Key key = new Key(ex, networkType);
+
+        ExchangeClient client = registry.get(key);
+
+        if (client == null) {
+            throw new IllegalStateException(
+                    "❌ ExchangeClient не зарегистрирован: " + ex + " / " + networkType
+            );
+        }
+
         return client;
     }
 
-    // ============================
-    // ПРАВИЛЬНЫЙ ВЫБОР ПО chatId
-    // ============================
+    // =====================================================================
+    // 🔥 MAIN METHOD — chatId → exchange + network → client
+    // =====================================================================
     public ExchangeClient getByChat(Long chatId) {
 
         if (chatId == null) {
             throw new IllegalArgumentException("chatId не может быть null");
         }
 
-        // Берём ВСЕ записи для пользователя
-        List<ExchangeSettings> list = exchangeSettingsService.findAllByChatId(chatId);
+        List<ExchangeSettings> list =
+                exchangeSettingsService.findAllByChatId(chatId);
 
         if (list.isEmpty()) {
-            throw new IllegalStateException("❌ Нет exchange_settings для chatId=" + chatId);
+            throw new IllegalStateException(
+                    "❌ Нет exchange_settings для chatId=" + chatId
+            );
         }
 
-        // 🔥 Выбираем enabled + последнюю по updatedAt
+        // ✅ ENABLED + самая свежая
         ExchangeSettings settings = list.stream()
                 .filter(ExchangeSettings::isEnabled)
                 .sorted((a, b) -> b.getUpdatedAt().compareTo(a.getUpdatedAt()))
@@ -75,16 +113,17 @@ public class ExchangeClientFactory {
         String exchange = settings.getExchange();
         NetworkType network = settings.getNetwork();
 
-        log.debug("🔍 Выбран профиль биржи: exchange={} network={} (chatId={})",
-                exchange, network, chatId);
+        log.debug(
+                "🔍 ExchangeClient выбран: exchange={} network={} chatId={}",
+                exchange, network, chatId
+        );
 
         return get(exchange, network);
     }
 
-
-    // ============================
-    // ВСПОМОГАТЕЛЬНЫЕ
-    // ============================
+    // =====================================================================
+    // HELPERS
+    // =====================================================================
     private String normalize(String exchange) {
         return exchange.trim().toUpperCase(Locale.ROOT);
     }

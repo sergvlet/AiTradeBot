@@ -20,21 +20,28 @@ public class StrategyController {
     private final UserProfileService userProfileService;
 
     // ================================================================
-    // 🌍 DEFAULT CONTEXT (WEB UI)
+    // 🌍 DEFAULT CONTEXT (ТОЛЬКО ДЛЯ СПИСКА)
     // ================================================================
     private static final String DEFAULT_EXCHANGE = "BINANCE";
     private static final NetworkType DEFAULT_NETWORK = NetworkType.MAINNET;
 
     // ================================================================
-    // 📋 СПИСОК СТРАТЕГИЙ
+    // 📋 СПИСОК СТРАТЕГИЙ (UI)
     // ================================================================
     @GetMapping
-    public String strategies(Model model,
-                             @RequestParam(required = false) Long chatIdParam) {
+    public String strategies(
+            Model model,
+            @RequestParam(required = false) Long chatId
+    ) {
 
-        Long chatId = (chatIdParam != null)
-                ? chatIdParam
+        Long resolvedChatId = (chatId != null)
+                ? chatId
                 : resolveCurrentChatIdOrThrow();
+
+        log.info(
+                "📋 OPEN STRATEGIES chatId={} exchange={} network={}",
+                resolvedChatId, DEFAULT_EXCHANGE, DEFAULT_NETWORK
+        );
 
         model.addAttribute("active", "strategies");
         model.addAttribute("pageTitle", "Стратегии");
@@ -43,108 +50,50 @@ public class StrategyController {
         model.addAttribute(
                 "strategies",
                 strategyFacade.getStrategies(
-                        chatId,
+                        resolvedChatId,
                         DEFAULT_EXCHANGE,
                         DEFAULT_NETWORK
                 )
         );
 
-        model.addAttribute("chatId", chatId);
+        model.addAttribute("chatId", resolvedChatId);
+
+        // (опционально) чтобы UI мог прокинуть контекст в формы
         model.addAttribute("exchange", DEFAULT_EXCHANGE);
-        model.addAttribute("network", DEFAULT_NETWORK);
+        model.addAttribute("network", DEFAULT_NETWORK.name());
 
         return "layout/app";
     }
 
     // ================================================================
-    // 📊 ДАШБОРД СТРАТЕГИИ
-    // ================================================================
-    @GetMapping("/{type}/dashboard")
-    public String strategyDashboard(@PathVariable StrategyType type,
-                                    @RequestParam(required = false) Long chatIdParam,
-                                    @RequestParam(required = false) String symbol,
-                                    Model model) {
-
-        Long chatId = (chatIdParam != null)
-                ? chatIdParam
-                : resolveCurrentChatIdOrThrow();
-
-        var all = strategyFacade.getStrategies(
-                chatId,
-                DEFAULT_EXCHANGE,
-                DEFAULT_NETWORK
-        );
-
-        var uiOpt = all.stream()
-                .filter(s -> type.name().equals(s.type()))
-                .findFirst();
-
-        if (uiOpt.isEmpty()) {
-            model.addAttribute("pageTitle", "Ошибка");
-            model.addAttribute("error", "Стратегия не найдена.");
-            return "error";
-        }
-
-        var ui = uiOpt.get();
-
-        String finalSymbol = (symbol != null && !symbol.isBlank())
-                ? symbol
-                : ui.symbol();
-
-        model.addAttribute("active", "strategies");
-        model.addAttribute("pageTitle", "Стратегия — " + type);
-        model.addAttribute("chatId", chatId);
-        model.addAttribute("type", type);
-        model.addAttribute("symbol", finalSymbol);
-        model.addAttribute("info", ui);
-        model.addAttribute("page", "strategy-dashboard");
-
-        model.addAttribute("exchange", DEFAULT_EXCHANGE);
-        model.addAttribute("network", DEFAULT_NETWORK);
-
-        return "layout/app";
-    }
-
-    // ================================================================
-    // ▶️ START / STOP / TOGGLE
+    // 🔁 TOGGLE — ЕДИНСТВЕННАЯ ТОЧКА УПРАВЛЕНИЯ
     // ================================================================
     @PostMapping("/toggle")
-    public String toggleStrategy(@RequestParam Long chatId,
-                                 @RequestParam StrategyType type) {
+    public String toggleStrategy(
+            @RequestParam Long chatId,
+            @RequestParam StrategyType type,
+            @RequestParam(required = false) String exchange,
+            @RequestParam(required = false) NetworkType network
+    ) {
+
+        String resolvedExchange = (exchange != null && !exchange.isBlank())
+                ? exchange
+                : DEFAULT_EXCHANGE;
+
+        NetworkType resolvedNetwork = (network != null)
+                ? network
+                : DEFAULT_NETWORK;
+
+        log.info(
+                "🔁 TOGGLE FROM UI chatId={} type={} exchange={} network={}",
+                chatId, type, resolvedExchange, resolvedNetwork
+        );
 
         strategyFacade.toggle(
                 chatId,
                 type,
-                DEFAULT_EXCHANGE,
-                DEFAULT_NETWORK
-        );
-
-        return "redirect:/strategies?chatId=" + chatId;
-    }
-
-    @PostMapping("/start")
-    public String startStrategy(@RequestParam Long chatId,
-                                @RequestParam StrategyType type) {
-
-        strategyFacade.start(
-                chatId,
-                type,
-                DEFAULT_EXCHANGE,
-                DEFAULT_NETWORK
-        );
-
-        return "redirect:/strategies?chatId=" + chatId;
-    }
-
-    @PostMapping("/stop")
-    public String stopStrategy(@RequestParam Long chatId,
-                               @RequestParam StrategyType type) {
-
-        strategyFacade.stop(
-                chatId,
-                type,
-                DEFAULT_EXCHANGE,
-                DEFAULT_NETWORK
+                resolvedExchange,
+                resolvedNetwork
         );
 
         return "redirect:/strategies?chatId=" + chatId;

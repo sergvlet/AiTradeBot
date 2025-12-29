@@ -30,49 +30,40 @@ public class StrategySettings {
     private Long chatId;
 
     @Enumerated(EnumType.STRING)
-    @Column(nullable = false)
+    @Column(nullable = false, length = 32)
     private StrategyType type;
 
     // =====================================================================
     // ИНСТРУМЕНТ
     // =====================================================================
 
-    @Column(nullable = false)
+    @Column(nullable = false, length = 32)
     private String symbol;
 
-    @Column(nullable = false)
+    @Column(nullable = false, length = 16)
     private String timeframe;
 
     @Builder.Default
+    @Column(name = "cached_candles_limit")
     private Integer cachedCandlesLimit = 500;
 
     // =====================================================================
-    // КАПИТАЛ / РИСК (ОБЩИЕ)
+    // КАПИТАЛ / РИСК
     // =====================================================================
 
     /**
-     * ⚠️ TODO: DEPRECATE
-     * Историческое поле — в будущем капитал берётся ТОЛЬКО с биржи
+     * ⚠️ Историческое поле.
+     * В перспективе капитал должен браться с биржи.
      */
     @Column(precision = 18, scale = 6)
     private BigDecimal capitalUsd;
 
-    // =====================================================================
-// 💰 АКТИВ АККАУНТА (ВЫБРАННЫЙ, FREE > 0)
-// =====================================================================
-
     /**
-     * Актив аккаунта, которым оперирует стратегия (USDT, BTC, ETH и т.д.)
-     * Выбирается автоматически из баланса (free > 0) или пользователем через UI.
+     * Актив аккаунта (USDT, BTC, ETH и т.д.)
      */
-    @Column(name = "account_asset")
+    @Column(name = "account_asset", length = 16)
     private String accountAsset;
 
-
-    /**
-     * ⚠️ TODO: DEPRECATE
-     * Комиссии будут браться из ExchangeClient#getAccountInfo
-     */
     @Builder.Default
     @Column(nullable = false, precision = 10, scale = 6)
     private BigDecimal commissionPct = BigDecimal.valueOf(0.05);
@@ -83,31 +74,28 @@ public class StrategySettings {
     @Column(precision = 10, scale = 4)
     private BigDecimal dailyLossLimitPct;
 
+    @Builder.Default
     @Column(nullable = false)
-    private boolean reinvestProfit;
-
+    private boolean reinvestProfit = false;
 
     /**
-     * ⚠️ TODO: DEPRECATE
-     * Плечо должно приходить с аккаунта биржи
+     * ⚠️ Историческое поле
      */
     @Builder.Default
     private int leverage = 1;
 
     // =====================================================================
-    // 🔥 ЛИМИТЫ ИСПОЛЬЗОВАНИЯ СРЕДСТВ (НОВОЕ, КЛЮЧЕВОЕ)
+    // ЛИМИТЫ ИСПОЛЬЗОВАНИЯ СРЕДСТВ
     // =====================================================================
 
-    /** Максимальная сумма, доступная стратегии (USDT) */
     @Column(precision = 18, scale = 6)
     private BigDecimal maxExposureUsd;
 
-    /** Максимальный процент от баланса */
     @Column(precision = 5, scale = 2)
     private Integer maxExposurePct;
 
     // =====================================================================
-    // TP / SL (ГЛОБАЛЬНЫЕ)
+    // TP / SL
     // =====================================================================
 
     @Builder.Default
@@ -119,7 +107,7 @@ public class StrategySettings {
     private BigDecimal stopLossPct = BigDecimal.valueOf(1.0);
 
     // =====================================================================
-    // AI / ML / УПРАВЛЕНИЕ
+    // AI / УПРАВЛЕНИЕ
     // =====================================================================
 
     @Enumerated(EnumType.STRING)
@@ -140,7 +128,7 @@ public class StrategySettings {
     private BigDecimal totalProfitPct = BigDecimal.ZERO;
 
     // =====================================================================
-    // СОСТОЯНИЕ
+    // СОСТОЯНИЕ СТРАТЕГИИ
     // =====================================================================
 
     @Builder.Default
@@ -160,29 +148,56 @@ public class StrategySettings {
     private NetworkType networkType;
 
     // =====================================================================
-    // СЛУЖЕБНЫЕ
+    // ОГРАНИЧЕНИЯ СТРАТЕГИИ
     // =====================================================================
 
-    @Builder.Default
+    @Column(name = "max_open_orders")
+    private Integer maxOpenOrders;
+
+    @Column(name = "cooldown_seconds")
+    private Integer cooldownSeconds;
+
+    // =====================================================================
+    // ВРЕМЯ ЖИЗНИ ЗАПИСИ
+    // =====================================================================
+
     @Column(nullable = false, updatable = false)
-    private LocalDateTime createdAt = LocalDateTime.now();
+    private LocalDateTime createdAt;
 
     private LocalDateTime updatedAt;
 
+    // =====================================================================
+    // ВРЕМЯ ЗАПУСКА / ОСТАНОВКИ СТРАТЕГИИ
+    // =====================================================================
+
+    /**
+     * Реальный момент последнего запуска стратегии
+     */
+    private LocalDateTime startedAt;
+
+    /**
+     * Реальный момент последней остановки стратегии
+     */
+    private LocalDateTime stoppedAt;
+
+    // =====================================================================
+    // JPA HOOKS
+    // =====================================================================
+
     @PrePersist
-    public void onCreate() {
-        if (createdAt == null) {
-            createdAt = LocalDateTime.now();
-        }
+    protected void onCreate() {
+        LocalDateTime now = LocalDateTime.now();
+        this.createdAt = now;
+        this.updatedAt = now;
     }
 
     @PreUpdate
-    public void onUpdate() {
-        updatedAt = LocalDateTime.now();
+    protected void onUpdate() {
+        this.updatedAt = LocalDateTime.now();
     }
 
     // =====================================================================
-    // СОВМЕСТИМОСТЬ
+    // СОВМЕСТИМОСТЬ / УТИЛИТЫ
     // =====================================================================
 
     @Transient

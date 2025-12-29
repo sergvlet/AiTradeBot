@@ -18,6 +18,7 @@ import org.springframework.stereotype.Component;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.List;
 
 @Slf4j
@@ -36,21 +37,19 @@ public class AiStrategyOrchestrator {
     }
 
     // =====================================================================
-    // ▶️ START STRATEGY
+    // ▶️ START (КОНТЕКСТНЫЙ)
     // =====================================================================
+    public StrategyRunInfo startStrategy(
+            Long chatId,
+            StrategyType type,
+            String exchange,
+            NetworkType network
+    ) {
 
-    public StrategyRunInfo startStrategy(Long chatId, StrategyType type) {
+        StrategySettings s = loadSettingsStrict(chatId, type, exchange, network);
 
-        StrategySettings s = loadSettings(chatId, type);
-
-        String symbol = s.getSymbol();
-        String exchange = s.getExchangeName();
-
-        if (symbol == null || symbol.isBlank()) {
+        if (s.getSymbol() == null || s.getSymbol().isBlank()) {
             return buildRunInfo(s, false, "Ошибка: не выбран символ");
-        }
-        if (exchange == null || exchange.isBlank()) {
-            return buildRunInfo(s, false, "Ошибка: не выбрана биржа");
         }
 
         TradingStrategy strategy = strategyRegistry.get(type);
@@ -58,30 +57,36 @@ public class AiStrategyOrchestrator {
             return buildRunInfo(s, false, "Стратегия не найдена");
         }
 
-        streamManager.subscribeSymbol(exchange, symbol);
+        streamManager.subscribeSymbol(exchange, s.getSymbol());
 
         try {
-            strategy.start(chatId, symbol);
+            strategy.start(chatId, s.getSymbol());
         } catch (Exception e) {
             log.error("❌ startStrategy failed", e);
             return buildRunInfo(s, false, "Ошибка запуска стратегии");
         }
 
+        // ✅ фиксируем реальный старт
         s.setActive(true);
-        s.setUpdatedAt(LocalDateTime.now());
+        s.setStartedAt(LocalDateTime.now());
+        s.setStoppedAt(null);
         settingsService.save(s);
 
-        log.info("▶️ START {} chatId={} {} {}", type, chatId, exchange, symbol);
+        log.info("▶️ START {} chatId={} {} {}", type, chatId, exchange, s.getSymbol());
         return buildRunInfo(s, true, "Стратегия запущена");
     }
 
     // =====================================================================
-    // ⏹ STOP STRATEGY
+    // ⏹ STOP (КОНТЕКСТНЫЙ)
     // =====================================================================
+    public StrategyRunInfo stopStrategy(
+            Long chatId,
+            StrategyType type,
+            String exchange,
+            NetworkType network
+    ) {
 
-    public StrategyRunInfo stopStrategy(Long chatId, StrategyType type) {
-
-        StrategySettings s = loadSettings(chatId, type);
+        StrategySettings s = loadSettingsStrict(chatId, type, exchange, network);
         TradingStrategy strategy = strategyRegistry.get(type);
 
         if (strategy != null) {
@@ -92,21 +97,26 @@ public class AiStrategyOrchestrator {
             }
         }
 
+        // ✅ фиксируем реальную остановку
         s.setActive(false);
-        s.setUpdatedAt(LocalDateTime.now());
+        s.setStoppedAt(LocalDateTime.now());
         settingsService.save(s);
 
-        log.info("⏹ STOP {} chatId={}", type, chatId);
+        log.info("⏹ STOP {} chatId={} {} {}", type, chatId, exchange, s.getSymbol());
         return buildRunInfo(s, false, "Стратегия остановлена");
     }
 
     // =====================================================================
-    // ❓ STATUS
+    // ℹ STATUS (КОНТЕКСТНЫЙ)
     // =====================================================================
+    public StrategyRunInfo getStatus(
+            Long chatId,
+            StrategyType type,
+            String exchange,
+            NetworkType network
+    ) {
 
-    public StrategyRunInfo getStatus(Long chatId, StrategyType type) {
-
-        StrategySettings s = loadSettings(chatId, type);
+        StrategySettings s = loadSettingsStrict(chatId, type, exchange, network);
 
         return buildRunInfo(
                 s,
@@ -116,9 +126,8 @@ public class AiStrategyOrchestrator {
     }
 
     // =====================================================================
-    // 🌍 GLOBAL DASHBOARD STATE
+    // 🌍 GLOBAL DASHBOARD
     // =====================================================================
-
     public record GlobalState(
             BigDecimal totalBalance,
             BigDecimal totalProfitPct,
@@ -129,8 +138,9 @@ public class AiStrategyOrchestrator {
         int active = 0;
 
         for (StrategyType t : StrategyType.values()) {
-            StrategySettings s = loadSettings(chatId, t);
-            if (s.isActive()) {
+            if (settingsService.findLatest(chatId, t, null, null)
+                    .map(StrategySettings::isActive)
+                    .orElse(false)) {
                 active++;
             }
         }
@@ -139,24 +149,41 @@ public class AiStrategyOrchestrator {
     }
 
     // =====================================================================
-    // HELPERS
+    // 🔑 STRICT LOAD (ЕДИНЫЙ ИСТОЧНИК ИСТИНЫ)
     // =====================================================================
+    private StrategySettings loadSettingsStrict(
+            Long chatId,
+            StrategyType type,
+            String exchange,
+            NetworkType network
+    ) {
+        return settingsService
+                .findLatest(chatId, type, exchange, network)
+                .orElseThrow(() ->
+                        new IllegalStateException(
+                                "Настройки стратегии не найдены (chatId="
+                                + chatId + ", type=" + type
+                                + ", exchange=" + exchange
+                                + ", network=" + network + ")"
+                        )
+                );
+    }
 
+    // =====================================================================
+    // 🧱 RUN INFO (DTO)
+    // =====================================================================
     private StrategyRunInfo buildRunInfo(StrategySettings s, boolean active, String msg) {
 
         return StrategyRunInfo.builder()
-                // === ИДЕНТИФИКАЦИЯ ===
                 .chatId(s.getChatId())
                 .type(s.getType())
                 .symbol(s.getSymbol())
                 .active(active)
 
-                // === МАРКЕТ ===
                 .timeframe(s.getTimeframe())
                 .exchangeName(s.getExchangeName())
                 .networkType(s.getNetworkType())
 
-                // === ФИНАНСЫ / РИСК ===
                 .capitalUsd(s.getCapitalUsd())
                 .totalProfitPct(s.getTotalProfitPct())
                 .commissionPct(s.getCommissionPct())
@@ -165,29 +192,30 @@ public class AiStrategyOrchestrator {
                 .riskPerTradePct(s.getRiskPerTradePct())
                 .mlConfidence(s.getMlConfidence())
 
-                // === СЛУЖЕБНОЕ ===
                 .reinvestProfit(s.isReinvestProfit())
                 .version(s.getVersion())
 
-                // === ВРЕМЯ ===
-                .startedAt(active ? Instant.now() : null)
-                .stoppedAt(active ? null : Instant.now())
+                // ✅ честная конвертация времени
+                .startedAt(toInstant(s.getStartedAt()))
+                .stoppedAt(toInstant(s.getStoppedAt()))
 
-                // === СТАТУС ===
+                // ✅ момент формирования DTO
+                .updatedAt(Instant.now())
+
                 .message(msg)
-
                 .build();
     }
 
-    // =====================================================================
-    // 💰 ORDER MANAGEMENT (Web UI)
-    // =====================================================================
+    private Instant toInstant(LocalDateTime time) {
+        return time != null
+                ? time.atZone(ZoneId.systemDefault()).toInstant()
+                : null;
+    }
 
-    public record OrderResult(
-            boolean success,
-            String message,
-            Long orderId
-    ) {}
+    // =====================================================================
+    // 💰 ORDER API
+    // =====================================================================
+    public record OrderResult(boolean success, String message, Long orderId) {}
 
     public record OrderView(
             Long id,
@@ -203,12 +231,7 @@ public class AiStrategyOrchestrator {
     public OrderResult marketBuy(Long chatId, String symbol, BigDecimal qty) {
         try {
             Order order = orderService.placeMarket(
-                    chatId,
-                    symbol,
-                    "BUY",
-                    qty,
-                    BigDecimal.ZERO,
-                    "WEB_UI"
+                    chatId, symbol, "BUY", qty, BigDecimal.ZERO, "WEB_UI"
             );
             return new OrderResult(true, "BUY OK", order.getId());
         } catch (Exception e) {
@@ -220,12 +243,7 @@ public class AiStrategyOrchestrator {
     public OrderResult marketSell(Long chatId, String symbol, BigDecimal qty) {
         try {
             Order order = orderService.placeMarket(
-                    chatId,
-                    symbol,
-                    "SELL",
-                    qty,
-                    BigDecimal.ZERO,
-                    "WEB_UI"
+                    chatId, symbol, "SELL", qty, BigDecimal.ZERO, "WEB_UI"
             );
             return new OrderResult(true, "SELL OK", order.getId());
         } catch (Exception e) {
@@ -262,33 +280,5 @@ public class AiStrategyOrchestrator {
             log.error("❌ listOrders error", e);
             return List.of();
         }
-    }
-
-    // =====================================================================
-    // 🔑 CORE: загрузка настроек с учётом exchange + network
-    // =====================================================================
-
-    private StrategySettings loadSettings(Long chatId, StrategyType type) {
-
-        // 1️⃣ Берём последнюю активную связку exchange+network из БД
-        StrategySettings base =
-                settingsService
-                        .findAllByChatId(chatId, null, null)
-                        .stream()
-                        .filter(s -> s.getType() == type)
-                        .findFirst()
-                        .orElse(null);
-
-        String exchange =
-                base != null && base.getExchangeName() != null
-                        ? base.getExchangeName()
-                        : "BINANCE";
-
-        NetworkType network =
-                base != null && base.getNetworkType() != null
-                        ? base.getNetworkType()
-                        : NetworkType.TESTNET;
-
-        return settingsService.getOrCreate(chatId, type, exchange, network);
     }
 }

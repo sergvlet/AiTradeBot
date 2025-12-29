@@ -9,6 +9,11 @@ import java.time.Instant;
 
 /**
  * 📊 DTO состояния стратегии для дашборда / API / фасада.
+
+ * Важно:
+ * - startedAt / stoppedAt — это "реальные" моменты запуска/остановки (если мы их сохраняем).
+ * - updatedAt — момент формирования этого DTO (обновление статуса для UI).
+ * - многие поля (equityUsd, totalTrades, totalProfitPct и т.п.) могут быть null, если подсчёт ещё не внедрён.
  */
 @Getter
 @Setter
@@ -25,27 +30,28 @@ public class StrategyRunInfo {
 
     // === Маркет-параметры ===
     private String timeframe;
-    private String exchangeName;   // BINANCE / BYBIT
+    private String exchangeName;   // BINANCE / BYBIT / OKX ...
     private NetworkType networkType;
 
     // === Финансы ===
-    private BigDecimal capitalUsd;       // начальный капитал (из настроек)
-    private BigDecimal equityUsd;        // текущий капитал (если считаем)
-    private BigDecimal totalProfitPct;   // общий PnL %
+    private BigDecimal capitalUsd;       // стартовый капитал (из StrategySettings)
+    private BigDecimal equityUsd;        // текущая оценка капитала (опционально)
+    private BigDecimal totalProfitPct;   // общий PnL в % (опционально)
     private BigDecimal commissionPct;    // комиссия
     private BigDecimal takeProfitPct;    // TP
     private BigDecimal stopLossPct;      // SL
-    private BigDecimal riskPerTradePct;  // риск на сделку
-    private BigDecimal mlConfidence;     // 0..1 (для ML стратегий)
+    private BigDecimal riskPerTradePct;  // риск на сделку в %
+    private BigDecimal mlConfidence;     // 0..1 (UI при необходимости умножает на 100)
 
-    // === Бойлерплейт стратегии ===
-    private long totalTrades;      // количество сделок (если будем считать)
+    // === Статистика (опционально) ===
+    private long totalTrades;            // количество сделок (если считаем)
     private boolean reinvestProfit;
-    private Integer version;       // версия настроек стратегии
+    private Integer version;             // версия настроек стратегии
 
     // === Время ===
-    private Instant startedAt;
-    private Instant stoppedAt;
+    private Instant startedAt;           // реальный момент старта (если есть)
+    private Instant stoppedAt;           // реальный момент остановки (если есть)
+    private Instant updatedAt;           // время формирования/обновления статуса для UI
 
     // === Сообщения / статус ===
     private String message;

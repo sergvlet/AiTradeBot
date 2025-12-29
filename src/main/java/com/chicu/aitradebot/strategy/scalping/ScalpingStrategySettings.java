@@ -2,8 +2,6 @@ package com.chicu.aitradebot.strategy.scalping;
 
 import jakarta.persistence.*;
 import lombok.*;
-
-import java.math.BigDecimal;
 import java.time.Instant;
 
 @Entity
@@ -38,12 +36,6 @@ public class ScalpingStrategySettings {
     @Column(nullable = false)
     private Double spreadThreshold = 0.1;
 
-    /**
-     * Объём сделки (USDT)
-     */
-    @Builder.Default
-    @Column(nullable = false, precision = 18, scale = 8)
-    private BigDecimal orderVolume = BigDecimal.valueOf(20);
 
     // =========================
     // AUDIT

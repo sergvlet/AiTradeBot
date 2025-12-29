@@ -1,8 +1,9 @@
 package com.chicu.aitradebot.web.controller.api;
 
-import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
+import com.chicu.aitradebot.domain.StrategySettings;
 import com.chicu.aitradebot.orchestrator.dto.StrategyRunInfo;
+import com.chicu.aitradebot.service.StrategySettingsService;
 import com.chicu.aitradebot.web.facade.WebStrategyFacade;
 import lombok.AllArgsConstructor;
 import lombok.Data;
@@ -15,54 +16,50 @@ import org.springframework.web.bind.annotation.*;
 @Slf4j
 @RestController
 @RequiredArgsConstructor
-@RequestMapping("/api/strategy") // ← ОСТАВЛЯЕМ
+@RequestMapping("/api/strategy")
 public class StrategyToggleApiController {
 
     private final WebStrategyFacade webStrategyFacade;
-
-    // =============================================================
-    // 🌍 DEFAULT CONTEXT (API)
-    // =============================================================
-    private static final String DEFAULT_EXCHANGE = "BINANCE";
-    private static final NetworkType DEFAULT_NETWORK = NetworkType.MAINNET;
+    private final StrategySettingsService strategySettingsService;
 
     /**
      * POST /api/strategy/toggle
-     * chatId=1&type=SMART_FUSION&symbol=BTCUSDT&timeframe=1m
+     * chatId=1&type=SCALPING
      */
     @PostMapping("/toggle")
     public ResponseEntity<ToggleResponse> toggle(
             @RequestParam Long chatId,
-            @RequestParam StrategyType type,
-            @RequestParam String symbol,
-            @RequestParam(required = false, defaultValue = "1m") String timeframe
+            @RequestParam StrategyType type
     ) {
-        log.info(
-                "🌐 [API] toggle strategy: chatId={}, type={}, exchange={}, network={}, symbol={}, timeframe={}",
-                chatId, type, DEFAULT_EXCHANGE, DEFAULT_NETWORK, symbol, timeframe
-        );
 
-        // === Валидация ===
         if (chatId == null || chatId <= 0) {
             return ResponseEntity.badRequest()
                     .body(ToggleResponse.error("Некорректный chatId"));
         }
 
-        if (symbol == null || symbol.isBlank()) {
-            return ResponseEntity.badRequest()
-                    .body(ToggleResponse.error("Не указан символ"));
-        }
-
         try {
-            // ✅ ЕДИНАЯ ТОЧКА УПРАВЛЕНИЯ (v4)
+            // 1️⃣ Берём актуальные настройки стратегии
+            StrategySettings settings =
+                    strategySettingsService.findLatest(chatId, type, null, null)
+                            .orElseThrow(() ->
+                                    new IllegalStateException("Настройки стратегии не найдены")
+                            );
+
+            log.info(
+                    "🌐 [API] toggle strategy: chatId={}, type={}, exchange={}, network={}",
+                    chatId,
+                    type,
+                    settings.getExchangeName(),
+                    settings.getNetworkType()
+            );
+
+            // 2️⃣ Контекстный toggle
             StrategyRunInfo info =
-                    webStrategyFacade.toggleStrategy(
+                    webStrategyFacade.toggle(
                             chatId,
                             type,
-                            DEFAULT_EXCHANGE,
-                            DEFAULT_NETWORK,
-                            symbol,
-                            timeframe
+                            settings.getExchangeName(),
+                            settings.getNetworkType()
                     );
 
             return ResponseEntity.ok(
@@ -72,6 +69,10 @@ public class StrategyToggleApiController {
                             info
                     )
             );
+
+        } catch (IllegalStateException ex) {
+            return ResponseEntity.badRequest()
+                    .body(ToggleResponse.error(ex.getMessage()));
 
         } catch (Exception ex) {
             log.error("❌ Ошибка переключения стратегии", ex);

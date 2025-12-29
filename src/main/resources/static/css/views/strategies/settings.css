@@ -1,278 +1,211 @@
 /* ========================================================================
-   STRATEGY SETTINGS — UI V4 INTEGRATION
-   Работает строго поверх ChatGPT-like Design System
+   STRATEGY SETTINGS — SAFE UI (BOOTSTRAP SAFE)
    ======================================================================== */
 
 /* ========================================================================
-   ROOT PAGE
+   🌙 DARK THEME
    ======================================================================== */
 
-.strategy-settings-page {
-    color: var(--text-main);
+body[data-theme="dark"] .strategy-settings-page {
+    background: #0b0d10;
+    color: #e5e7eb;
 }
 
-/* ========================================================================
-   CARDS
-   ======================================================================== */
-
-.strategy-settings-page .card-theme,
-.strategy-settings-page .card {
-    background: var(--bg-elevated-soft);
-    border: 1px solid var(--border-soft);
+body[data-theme="dark"] .strategy-settings-page .card,
+body[data-theme="dark"] .strategy-settings-page .card-theme {
+    background: #15171a;
+    border: 1px solid rgba(148,163,184,0.25);
     border-radius: 14px;
     padding: 20px;
-    box-shadow: var(--shadow-soft);
-    color: var(--text-main);
 }
 
-/* ========================================================================
-   TABS
-   ======================================================================== */
-
-.strategy-settings-page .nav-tabs {
-    border-bottom: 1px solid var(--border-soft);
+/* tabs */
+body[data-theme="dark"] .strategy-settings-page .nav-tabs {
+    border-bottom: 1px solid rgba(148,163,184,0.25);
 }
 
-.strategy-settings-page .nav-tabs .nav-link {
-    padding: 12px 18px;
-    color: var(--text-muted);
+body[data-theme="dark"] .strategy-settings-page .nav-tabs .nav-link {
+    color: #9ca3af;
+}
+
+body[data-theme="dark"] .strategy-settings-page .nav-tabs .nav-link.active {
+    color: #38bdf8;
+    border-bottom: 2px solid #38bdf8;
     background: transparent;
-    border: none;
-    font-weight: 500;
 }
 
-.strategy-settings-page .nav-tabs .nav-link:hover {
-    color: var(--text-main);
-}
-
-.strategy-settings-page .nav-tabs .nav-link.active {
-    color: var(--accent);
-    border-bottom: 2px solid var(--accent);
-    background: var(--accent-soft);
-}
-
-/* ========================================================================
-   TAB CONTENT
-   ======================================================================== */
-
+/* tab content fix */
 .strategy-settings-page .tab-pane {
     display: none;
-    padding-top: 20px;
 }
-
 .strategy-settings-page .tab-pane.active {
     display: block;
 }
 
-/* ========================================================================
-   SECTION TITLES
-   ======================================================================== */
+/* inputs */
+body[data-theme="dark"] .strategy-settings-page input,
+body[data-theme="dark"] .strategy-settings-page select,
+body[data-theme="dark"] .strategy-settings-page textarea {
+    background-color: #0e0f11;
+    color: #e5e7eb;
+    border: 1px solid #2a2e35;
+}
 
-.strategy-settings-page .section-title {
-    font-size: 1.05rem;
-    font-weight: 600;
-    margin: 22px 0 10px;
-    color: var(--text-main);
+body[data-theme="dark"] .strategy-settings-page input::placeholder {
+    color: #9ca3af;
+}
+
+/* disabled */
+body[data-theme="dark"] .strategy-settings-page input:disabled,
+body[data-theme="dark"] .strategy-settings-page select:disabled,
+body[data-theme="dark"] .strategy-settings-page input[readonly] {
+    background-color: #15171a !important;
+    color: #9ca3af !important;
+}
+
+/* alerts */
+body[data-theme="dark"] .strategy-settings-page .alert {
+    background: #15171a;
+    border: 1px solid #2a2e35;
+    color: #e5e7eb;
+}
+
+/* hr */
+body[data-theme="dark"] .strategy-settings-page hr {
+    border-color: #2a2e35;
 }
 
 /* ========================================================================
-   TEXT NORMALIZATION (ГЛАВНЫЙ ФИКС ЧИТАЕМОСТИ)
+   🔥 SYMBOL PICKER — DARK
    ======================================================================== */
 
-.strategy-settings-page p,
-.strategy-settings-page span,
-.strategy-settings-page div,
-.strategy-settings-page label,
-.strategy-settings-page li,
-.strategy-settings-page td,
-.strategy-settings-page th {
-    color: var(--text-main);
+body[data-theme="dark"] .strategy-settings-page .strategy-input {
+    background-color: #0e0f11 !important;
+    color: #e5e7eb !important;
+    border: 1px solid #2a2e35 !important;
 }
 
-/* вторичный текст */
-.strategy-settings-page .text-muted,
-.strategy-settings-page .form-text,
-.strategy-settings-page small,
-.strategy-settings-page .text-secondary {
-    color: var(--text-muted) !important;
+body[data-theme="dark"] .strategy-settings-page .strategy-input.dropdown-toggle::after {
+    filter: invert(1);
+}
+
+body[data-theme="dark"] .strategy-settings-page .strategy-dropdown {
+    background-color: #15171a;
+    border: 1px solid #2a2e35;
+}
+
+body[data-theme="dark"] .strategy-settings-page .strategy-dropdown .dropdown-item {
+    color: #e5e7eb;
+}
+
+body[data-theme="dark"] .strategy-settings-page .strategy-dropdown .dropdown-item:hover {
+    background-color: #1e2228;
+    color: #ffffff;
+}
+
+body[data-theme="dark"] .strategy-settings-page .strategy-dropdown .text-muted {
+    color: #9ca3af !important;
 }
 
 /* ========================================================================
-   FORMS
+   ☀️ LIGHT THEME — ИСПРАВЛЕНО
    ======================================================================== */
 
-.strategy-settings-page input,
-.strategy-settings-page select,
-.strategy-settings-page textarea {
-    background: var(--bg-main);
-    border: 1px solid var(--border-soft);
-    color: var(--text-main);
+body[data-theme="light"] .strategy-settings-page {
+    background: #f8fafc;
+    color: #111827;
 }
 
-.strategy-settings-page input::placeholder {
-    color: var(--text-muted);
+body[data-theme="light"] .strategy-settings-page .card,
+body[data-theme="light"] .strategy-settings-page .card-theme {
+    background: #ffffff;
+    border: 1px solid #e5e7eb;
+    border-radius: 14px;
+    padding: 20px;
 }
 
-.strategy-settings-page input:focus,
-.strategy-settings-page select:focus,
-.strategy-settings-page textarea:focus {
-    border-color: var(--accent);
-    box-shadow: 0 0 0 0.15rem var(--accent-soft);
+/* tabs */
+body[data-theme="light"] .strategy-settings-page .nav-tabs {
+    border-bottom: 1px solid #e5e7eb;
 }
 
-/* input group (USDT / %) */
-.strategy-settings-page .input-group-text {
-    background: var(--bg-elevated);
-    border: 1px solid var(--border-soft);
-    color: var(--text-muted);
+body[data-theme="light"] .strategy-settings-page .nav-tabs .nav-link {
+    color: #6b7280;
 }
 
-/* ========================================================================
-   CHECKBOX (CUSTOM, STABLE)
-   ======================================================================== */
-
-.strategy-settings-page .form-check-input[type="checkbox"] {
-    width: 1.1rem;
-    height: 1.1rem;
-
-    appearance: none;
-    -webkit-appearance: none;
-
-    border: 1.5px solid var(--border-soft);
-    border-radius: 4px;
+body[data-theme="light"] .strategy-settings-page .nav-tabs .nav-link.active {
+    color: #2563eb;
+    border-bottom: 2px solid #2563eb;
     background: transparent;
-
-    position: relative;
-    cursor: pointer;
 }
 
-.strategy-settings-page .form-check-input[type="checkbox"]:checked {
-    background: var(--accent);
-    border-color: var(--accent);
+/* inputs */
+body[data-theme="light"] .strategy-settings-page input,
+body[data-theme="light"] .strategy-settings-page select,
+body[data-theme="light"] .strategy-settings-page textarea {
+    background-color: #ffffff;
+    color: #111827;
+    border: 1px solid #d1d5db;
 }
 
-.strategy-settings-page .form-check-input[type="checkbox"]:checked::after {
-    content: "";
-    position: absolute;
-    left: 0.32rem;
-    top: 0.12rem;
-    width: 0.25rem;
-    height: 0.55rem;
-    border: solid #fff;
-    border-width: 0 2px 2px 0;
-    transform: rotate(45deg);
+body[data-theme="light"] .strategy-settings-page input::placeholder {
+    color: #9ca3af;
 }
 
-/* ========================================================================
-   ALERTS — ПОЛНОСТЬЮ УНИФИЦИРОВАНЫ
-   ======================================================================== */
-
-.strategy-settings-page .alert {
-    background: var(--bg-elevated);
-    border: 1px solid var(--border-soft);
-    color: var(--text-main);
+/* disabled */
+body[data-theme="light"] .strategy-settings-page input:disabled,
+body[data-theme="light"] .strategy-settings-page select:disabled,
+body[data-theme="light"] .strategy-settings-page input[readonly] {
+    background-color: #f3f4f6 !important;
+    color: #9ca3af !important;
 }
 
-.strategy-settings-page .alert-info {
-    background: var(--accent-soft);
-    border-color: var(--accent);
+/* alerts */
+body[data-theme="light"] .strategy-settings-page .alert {
+    background: #f9fafb;
+    border: 1px solid #e5e7eb;
+    color: #111827;
 }
 
-.strategy-settings-page .alert-warning {
-    background: rgba(245,158,11,0.15);
-}
-
-.strategy-settings-page .alert-secondary {
-    background: rgba(255,255,255,0.05);
-}
-
-.strategy-settings-page .alert-dark {
-    background: var(--bg-elevated);
-}
-
-/* текст внутри alert — ВСЕГДА читаемый */
-.strategy-settings-page .alert,
-.strategy-settings-page .alert * {
-    color: var(--text-main) !important;
+/* hr */
+body[data-theme="light"] .strategy-settings-page hr {
+    border-color: #e5e7eb;
 }
 
 /* ========================================================================
-   TABLES / DIAGNOSTICS
+   🔥 SYMBOL PICKER — LIGHT
    ======================================================================== */
 
-.strategy-settings-page table td {
-    padding: 12px;
-    color: var(--text-main);
+body[data-theme="light"] .strategy-settings-page .strategy-input {
+    background-color: #ffffff !important;
+    color: #111827 !important;
+    border: 1px solid #d1d5db !important;
 }
 
-/* статусы */
-.strategy-settings-page .text-success { color: var(--accent) !important; }
-.strategy-settings-page .text-danger  { color: #ef4444 !important; }
-.strategy-settings-page .text-warning { color: #f59e0b !important; }
-.strategy-settings-page .text-info    { color: #38bdf8 !important; }
-
-/* ========================================================================
-   HR / DIVIDERS
-   ======================================================================== */
-
-.strategy-settings-page hr {
-    border-color: var(--border-soft);
-    opacity: 0.6;
-}
-/* ========================================================================
-   🚨 BOOTSTRAP HARD OVERRIDES (LIGHT/DARK SAFE)
-   Решает: bg-dark / text-white / alert-dark / list-group-dark
-   ======================================================================== */
-
-/* ---------- bg-dark ---------- */
-.strategy-settings-page .bg-dark {
-    background: var(--bg-elevated-soft) !important;
-    color: var(--text-main) !important;
+body[data-theme="light"] .strategy-settings-page .strategy-input.dropdown-toggle::after {
+    filter: none;
 }
 
-/* ---------- text-white / text-light ---------- */
-.strategy-settings-page .text-white,
-.strategy-settings-page .text-light {
-    color: var(--text-main) !important;
+body[data-theme="light"] .strategy-settings-page .strategy-dropdown {
+    background-color: #ffffff;
+    border: 1px solid #d1d5db;
 }
 
-/* ---------- alert-dark ---------- */
-.strategy-settings-page .alert-dark {
-    background: var(--bg-elevated-soft) !important;
-    border: 1px solid var(--border-soft) !important;
-    color: var(--text-main) !important;
+body[data-theme="light"] .strategy-settings-page .strategy-dropdown .dropdown-item {
+    color: #111827;
 }
 
-/* ---------- list-group dark ---------- */
-.strategy-settings-page .list-group-item-dark {
-    background: var(--bg-elevated-soft) !important;
-    border-color: var(--border-soft) !important;
-    color: var(--text-main) !important;
+body[data-theme="light"] .strategy-settings-page .strategy-dropdown .dropdown-item:hover {
+    background-color: #f3f4f6;
+    color: #000000;
 }
 
-/* ---------- table-dark ---------- */
-.strategy-settings-page .table-dark {
-    background: var(--bg-elevated-soft) !important;
-    color: var(--text-main) !important;
+body[data-theme="light"] .strategy-settings-page .strategy-dropdown .text-muted {
+    color: #6b7280 !important;
 }
 
-.strategy-settings-page .table-dark td,
-.strategy-settings-page .table-dark th {
-    background: transparent !important;
-    color: var(--text-main) !important;
-}
-
-/* ========================================================================
-   ✔ STATUS / CHECK MARK ROWS (API VALIDATION BLOCK)
-   ======================================================================== */
-
-.strategy-settings-page .status-ok,
-.strategy-settings-page .status-success {
-    color: var(--accent) !important;
-    font-weight: 500;
-}
-
-.strategy-settings-page .status-ok .bi,
-.strategy-settings-page .status-success .bi {
-    color: var(--accent) !important;
+/* active mode */
+.strategy-settings-page [data-symbol-mode].active {
+    background-color: #2563eb;
+    color: #ffffff;
 }

@@ -5,10 +5,13 @@ import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.ExchangeSettings;
 import com.chicu.aitradebot.exchange.client.ExchangeClient;
 import com.chicu.aitradebot.exchange.enums.OrderSide;
+import com.chicu.aitradebot.exchange.model.AccountFees;
 import com.chicu.aitradebot.exchange.model.AccountInfo;
 import com.chicu.aitradebot.exchange.model.ApiKeyDiagnostics;
 import com.chicu.aitradebot.exchange.model.Order;
 import com.chicu.aitradebot.exchange.service.ExchangeSettingsService;
+import com.chicu.aitradebot.market.model.ExchangeLimitScope;
+import com.chicu.aitradebot.market.model.SymbolDescriptor;
 import lombok.extern.slf4j.Slf4j;
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -21,6 +24,7 @@ import org.springframework.web.client.RestTemplate;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.stream.Collectors;
@@ -50,10 +54,7 @@ public class BinanceExchangeClient implements ExchangeClient {
         return "BINANCE";
     }
 
-    @Override
-    public NetworkType getNetworkType() {
-        throw new UnsupportedOperationException("Use resolve(chatId)");
-    }
+
 
     private String baseUrl(NetworkType net) {
         return net == NetworkType.TESTNET ? TEST : MAIN;
@@ -377,4 +378,164 @@ public class BinanceExchangeClient implements ExchangeClient {
                     .build();
         }
     }
+
+
+    @Override
+    public AccountFees getAccountFees(long chatId, NetworkType networkType) {
+
+        try {
+            ExchangeSettings s = resolve(chatId, networkType);
+
+            // Binance: комиссии возвращаются в bips
+            // 10 = 0.1%  → делим на 10000
+            String body = signedRequest(
+                    s,
+                    "/api/v3/account",
+                    new LinkedHashMap<>(),
+                    HttpMethod.GET
+            );
+
+            JSONObject json = new JSONObject(body);
+
+            BigDecimal makerPct = BigDecimal
+                    .valueOf(json.getInt("makerCommission"))
+                    .divide(BigDecimal.valueOf(10000), 8, RoundingMode.HALF_UP);
+
+            BigDecimal takerPct = BigDecimal
+                    .valueOf(json.getInt("takerCommission"))
+                    .divide(BigDecimal.valueOf(10000), 8, RoundingMode.HALF_UP);
+
+            return AccountFees.builder()
+                    .makerPct(makerPct)
+                    .takerPct(takerPct)
+                    .build();
+
+        } catch (Exception e) {
+            log.warn("⚠️ Binance getAccountFees failed chatId={} network={}: {}",
+                    chatId, networkType, e.getMessage());
+
+            return null;
+        }
+    }
+
+    @Override
+    public List<SymbolDescriptor> getTradableSymbols(String quoteAsset) {
+
+        // ⚠️ Для списка символов Binance ВСЕГДА используем MAINNET
+        String baseUrl = MAIN;
+
+        // =========================================================
+        // 1) exchangeInfo — символы + фильтры
+        // =========================================================
+        String infoBody = rest.getForObject(baseUrl + "/api/v3/exchangeInfo", String.class);
+        JSONObject info = new JSONObject(infoBody);
+        JSONArray symbols = info.getJSONArray("symbols");
+
+        // =========================================================
+        // 2) ticker 24h — цена / объём / изменение
+        // =========================================================
+        String tickerBody = rest.getForObject(baseUrl + "/api/v3/ticker/24hr", String.class);
+        JSONArray tickers = new JSONArray(tickerBody);
+
+        Map<String, JSONObject> tickerMap = new HashMap<>();
+        for (int i = 0; i < tickers.length(); i++) {
+            JSONObject t = tickers.getJSONObject(i);
+            tickerMap.put(t.getString("symbol"), t);
+        }
+
+        List<SymbolDescriptor> out = new ArrayList<>();
+
+        // =========================================================
+        // 3) Основной проход по символам
+        // =========================================================
+        for (int i = 0; i < symbols.length(); i++) {
+
+            JSONObject s = symbols.getJSONObject(i);
+
+            String symbol = s.getString("symbol");
+            String status = s.optString("status");
+            boolean spotAllowed = s.optBoolean("isSpotTradingAllowed", true);
+
+            String base = s.getString("baseAsset");
+            String quote = s.getString("quoteAsset");
+
+            // --- фильтрация ---
+            if (!quoteAsset.equalsIgnoreCase(quote)) continue;
+            if (!"TRADING".equalsIgnoreCase(status)) continue;
+            if (!spotAllowed) continue;
+
+            // =====================================================
+            // 4) Разбор filters (ТОЛЬКО ЗНАЧЕНИЯ)
+            // =====================================================
+            BigDecimal minNotional = null;
+            BigDecimal stepSize    = null;
+            BigDecimal tickSize    = null;
+            Integer maxOrders      = null;
+
+            JSONArray filters = s.getJSONArray("filters");
+            for (int f = 0; f < filters.length(); f++) {
+                JSONObject filter = filters.getJSONObject(f);
+                String type = filter.getString("filterType");
+
+                switch (type) {
+
+                    case "MIN_NOTIONAL" ->
+                            minNotional = bdOrNull(filter.optString("minNotional", null));
+
+                    case "LOT_SIZE" ->
+                            stepSize = bdOrNull(filter.optString("stepSize", null));
+
+                    case "PRICE_FILTER" ->
+                            tickSize = bdOrNull(filter.optString("tickSize", null));
+
+                    case "MAX_NUM_ORDERS" -> {
+                        int v = filter.optInt("maxNumOrders", 0);
+                        maxOrders = v > 0 ? v : null;
+                    }
+                }
+            }
+
+            // =====================================================
+            // 5) Тикер
+            // =====================================================
+            JSONObject t = tickerMap.get(symbol);
+
+            BigDecimal lastPrice =
+                    t != null ? bdOrNull(t.optString("lastPrice", null)) : null;
+
+            BigDecimal priceChangePct =
+                    t != null ? bdOrNull(t.optString("priceChangePercent", null)) : null;
+
+            BigDecimal volume =
+                    t != null ? bdOrNull(t.optString("quoteVolume", null)) : null;
+
+            // =====================================================
+            // 6) Итоговый SymbolDescriptor (ЕДИНЫЙ ИСТОЧНИК SCOPE)
+            // =====================================================
+            out.add(SymbolDescriptor.of(
+                    symbol,
+                    base,
+                    quote,
+                    lastPrice,
+                    priceChangePct,
+                    volume,
+                    minNotional,
+                    stepSize,
+                    tickSize,
+                    maxOrders,
+                    true,
+                    "BINANCE"
+            ));
+        }
+
+        return out;
+    }
+
+
+    private BigDecimal bdOrNull(String v) {
+        if (v == null || v.isBlank() || "null".equalsIgnoreCase(v)) return null;
+        try { return new BigDecimal(v); } catch (Exception e) { return null; }
+    }
+
+
 }

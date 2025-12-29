@@ -28,18 +28,30 @@
     <!-- GLOBAL CSS -->
     <link rel="stylesheet" th:href="@{/css/app.css}"/>
 
-    <!-- PAGE CSS -->
+    <!-- PAGE CSS (исправлено под твои реальные пути в /css/views/strategies/...) -->
     <th:block th:if="${page != null}">
-        <link rel="stylesheet" th:href="@{'/css/views/' + ${page} + '.css'}"/>
+        <!-- если page уже содержит "strategies/..." — используем напрямую -->
+        <th:block th:if="${#strings.contains(page, '/')}">
+            <link rel="stylesheet" th:href="@{'/css/views/' + ${page} + '.css'}"/>
+        </th:block>
+
+        <!-- иначе: маппим короткие имена на реальные папки -->
+        <th:block th:if="${!#strings.contains(page, '/')}">
+            <th:block th:switch="${page}">
+                <link th:case="'strategy_dashboard'" rel="stylesheet" th:href="@{/css/views/strategies/strategy_dashboard.css}"/>
+                <link th:case="'strategies'"         rel="stylesheet" th:href="@{/css/views/strategies/strategies.css}"/>
+                <link th:case="'dashboard'"          rel="stylesheet" th:href="@{/css/views/dashboard.css}"/>
+                <!-- fallback (если вдруг появятся другие страницы без подпапки) -->
+                <link th:case="*" rel="stylesheet" th:href="@{'/css/views/' + ${page} + '.css'}"/>
+            </th:block>
+        </th:block>
     </th:block>
 
     <!-- Lightweight Charts -->
     <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 
-<body class="app-body"
-      id="app-body"
-      th:attr="data-theme=${null}">
+<body class="app-body" id="app-body">
 
 <script>
     // дублируем для body (CSS использует body[data-theme])
@@ -84,13 +96,32 @@
 <script src="https://cdn.jsdelivr.net/npm/sockjs-client@1/dist/sockjs.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/stompjs@2.3.3/lib/stomp.min.js"></script>
 
-<!-- PAGE JS -->
-<th:block th:if="${page != null and page != 'strategy_dashboard'}">
-    <script th:src="@{'/js/views/' + ${page} + '.js'}"></script>
+<!-- ====================== PAGE JS ====================== -->
+
+<!-- ✅ SETTINGS PAGE (settings.html) -->
+<th:block th:if="${page == 'strategies/settings' or page == 'settings'}">
+    <script th:src="@{/js/strategies/network.tab.js}"></script>
+    <script th:src="@{/js/views/strategies/symbol-picker.js}"></script>
+    <script th:src="@{/js/views/strategies/settings.js}"></script>
 </th:block>
 
-<th:block th:if="${page == 'strategy_dashboard'}">
-    <script type="module" th:src="@{/js/chart/strategy-dashboard.js}"></script>
+<!-- ✅ Strategy Dashboard (ВАЖНО: твой файл лежит в /js/views/strategies/strategy-dashboard.js) -->
+<th:block th:if="${page == 'strategy_dashboard' or page == 'strategies/strategy_dashboard'}">
+    <script type="module" th:src="@{/js/views/strategies/strategy-dashboard.js}"></script>
+</th:block>
+
+<!-- ✅ Для остальных страниц — стандартный автоподхват -->
+<th:block th:if="${page != null
+                  and page != 'strategy_dashboard'
+                  and page != 'strategies/strategy_dashboard'
+                  and page != 'strategies/settings'
+                  and page != 'settings'}">
+    <th:block th:if="${#strings.contains(page, '/')}">
+        <script th:src="@{'/js/views/' + ${page} + '.js'}"></script>
+    </th:block>
+    <th:block th:if="${!#strings.contains(page, '/')}">
+        <script th:src="@{'/js/views/' + ${page} + '.js'}"></script>
+    </th:block>
 </th:block>
 
 </body>

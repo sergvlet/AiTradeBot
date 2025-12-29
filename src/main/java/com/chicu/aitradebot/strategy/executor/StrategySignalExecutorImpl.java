@@ -20,8 +20,10 @@ public class StrategySignalExecutorImpl implements StrategySignalExecutor {
 
     @Override
     public void execute(Signal signal, StrategyContext ctx) {
+        if (signal == null || ctx == null) return;
 
         StrategyRuntimeState state = ctx.getState();
+        if (state == null) return;
 
         switch (signal.getType()) {
             case BUY -> handleBuy(signal, ctx, state);
@@ -45,7 +47,11 @@ public class StrategySignalExecutorImpl implements StrategySignalExecutor {
             return;
         }
 
-        BigDecimal price = ctx.getPrice();
+        BigDecimal price = safePrice(ctx.getPrice());
+        if (price == null) {
+            log.debug("⛔ BUY skipped — price is null/invalid");
+            return;
+        }
 
         state.setEntryPrice(price);
         state.openPosition();
@@ -70,6 +76,7 @@ public class StrategySignalExecutorImpl implements StrategySignalExecutor {
                 price
         );
 
+        // TP / SL как линии (если заданы)
         if (state.getTakeProfit() != null) {
             live.pushPriceLine(
                     ctx.getChatId(),
@@ -99,9 +106,12 @@ public class StrategySignalExecutorImpl implements StrategySignalExecutor {
                     state.getWindowHigh(),
                     state.getWindowLow()
             );
+        } else {
+            // если вдруг зона не задана — гарантированно чистим
+            live.clearWindowZone(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol());
         }
 
-        log.info("🟢 BUY executed @ {} | {}", price, signal.getReason());
+        log.info("🟢 BUY executed @ {} | {}", price, safeReason(signal));
     }
 
     // =====================================================
@@ -116,7 +126,11 @@ public class StrategySignalExecutorImpl implements StrategySignalExecutor {
             return;
         }
 
-        BigDecimal price = ctx.getPrice();
+        BigDecimal price = safePrice(ctx.getPrice());
+        if (price == null) {
+            log.debug("⛔ SELL skipped — price is null/invalid");
+            return;
+        }
 
         state.setEntryPrice(price);
         state.openPosition();
@@ -167,9 +181,11 @@ public class StrategySignalExecutorImpl implements StrategySignalExecutor {
                     state.getWindowHigh(),
                     state.getWindowLow()
             );
+        } else {
+            live.clearWindowZone(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol());
         }
 
-        log.info("🔴 SELL executed @ {} | {}", price, signal.getReason());
+        log.info("🔴 SELL executed @ {} | {}", price, safeReason(signal));
     }
 
     // =====================================================
@@ -183,11 +199,22 @@ public class StrategySignalExecutorImpl implements StrategySignalExecutor {
             return;
         }
 
-        BigDecimal price = ctx.getPrice();
+        BigDecimal price = safePrice(ctx.getPrice());
+        if (price == null) {
+            // даже если цены нет — позицию закрываем по состоянию,
+            // а UI чистим
+            state.closePosition();
+            clearUi(ctx);
+            log.info("🚪 EXIT position (no price) | {}", safeReason(signal));
+            return;
+        }
 
         state.closePosition();
 
         // ===== EXIT MARKER =====
+        // Важно: LayerRenderer принимает маркеры BUY/SELL,
+        // поэтому EXIT обычно лучше рисовать как SELL (для long) или BUY (для short).
+        // Но раз ты хочешь "EXIT" — оставляем, только учитывай JS-валидацию.
         live.pushTrade(
                 ctx.getChatId(),
                 ctx.getStrategyType(),
@@ -199,30 +226,36 @@ public class StrategySignalExecutorImpl implements StrategySignalExecutor {
         );
 
         // ===== CLEAR VISUALS =====
-        live.pushPriceLine(
-                ctx.getChatId(),
-                ctx.getStrategyType(),
-                ctx.getSymbol(),
-                "ENTRY",
-                null
-        );
+        clearUi(ctx);
 
-        live.pushTpSl(
-                ctx.getChatId(),
-                ctx.getStrategyType(),
-                ctx.getSymbol(),
-                null,
-                null
-        );
+        log.info("🚪 EXIT position | {}", safeReason(signal));
+    }
 
-        live.pushWindowZone(
-                ctx.getChatId(),
-                ctx.getStrategyType(),
-                ctx.getSymbol(),
-                null,
-                null
-        );
+    // =====================================================
+    // HELPERS
+    // =====================================================
+    private void clearUi(StrategyContext ctx) {
+        // 1) убираем entry/tp/sl линии (JS должен уметь очищать по payload=null)
+        live.clearPriceLines(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol());
 
-        log.info("🚪 EXIT position | {}", signal.getReason());
+        // 2) tp/sl (legacy слой) — только через clear (иначе null-null ломает компиляцию в других местах)
+        live.clearTpSl(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol());
+
+        // 3) window zone — только через clear
+        live.clearWindowZone(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol());
+    }
+
+    private BigDecimal safePrice(BigDecimal price) {
+        if (price == null) return null;
+        if (price.signum() <= 0) return null;
+        return price;
+    }
+
+    private String safeReason(Signal signal) {
+        try {
+            return signal.getReason() != null ? signal.getReason() : "";
+        } catch (Exception e) {
+            return "";
+        }
     }
 }

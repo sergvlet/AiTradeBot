@@ -4,9 +4,12 @@ import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.domain.ExchangeSettings;
 import com.chicu.aitradebot.exchange.client.ExchangeClient;
 import com.chicu.aitradebot.exchange.enums.OrderSide;
+import com.chicu.aitradebot.exchange.model.AccountFees;
 import com.chicu.aitradebot.exchange.model.AccountInfo;
 import com.chicu.aitradebot.exchange.model.Order;
 import com.chicu.aitradebot.exchange.service.ExchangeSettingsService;
+import com.chicu.aitradebot.market.model.ExchangeLimitScope;
+import com.chicu.aitradebot.market.model.SymbolDescriptor;
 import lombok.extern.slf4j.Slf4j;
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -17,6 +20,7 @@ import org.springframework.web.client.RestTemplate;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
@@ -51,10 +55,7 @@ public class BybitExchangeClient implements ExchangeClient {
      * ❗ КЛИЕНТ НЕ ПРИВЯЗАН К СЕТИ
      * Реальная сеть берётся из ExchangeSettings
      */
-    @Override
-    public NetworkType getNetworkType() {
-        return null;
-    }
+
 
     private String baseUrl(NetworkType net) {
         return net == NetworkType.TESTNET ? DEMO : MAIN;
@@ -82,21 +83,39 @@ public class BybitExchangeClient implements ExchangeClient {
 
     @Override
     public List<Kline> getKlines(String symbol, String interval, int limit) {
+
         try {
             String url = MAIN +
-                         "/spot/v3/public/quote/kline?symbol=" + symbol.toUpperCase() +
-                         "&interval=" + mapInterval(interval) +
+                         "/v5/market/kline" +
+                         "?category=spot" +
+                         "&symbol=" + symbol.toUpperCase() +
+                         "&interval=" + mapIntervalV5(interval) +
                          "&limit=" + limit;
 
-            JSONArray arr = new JSONObject(rest.getForObject(url, String.class))
+            JSONObject root = new JSONObject(rest.getForObject(url, String.class));
+
+            if (root.optInt("retCode", -1) != 0) {
+                log.warn("⚠️ BYBIT KLINES retCode={} msg={}",
+                        root.optInt("retCode"),
+                        root.optString("retMsg"));
+                return List.of();
+            }
+
+            JSONArray list = root
                     .getJSONObject("result")
                     .optJSONArray("list");
 
-            if (arr == null) return List.of();
+            if (list == null || list.isEmpty()) {
+                return List.of();
+            }
 
             List<Kline> out = new ArrayList<>();
-            for (int i = 0; i < arr.length(); i++) {
-                JSONArray k = arr.getJSONArray(i);
+
+            for (int i = 0; i < list.length(); i++) {
+                JSONArray k = list.getJSONArray(i);
+
+                // v5 format:
+                // 0 ts, 1 open, 2 high, 3 low, 4 close, 5 volume, 6 turnover
                 out.add(new Kline(
                         k.getLong(0),
                         k.getDouble(1),
@@ -106,29 +125,33 @@ public class BybitExchangeClient implements ExchangeClient {
                         k.getDouble(5)
                 ));
             }
+
             return out;
 
         } catch (Exception e) {
-            log.error("❌ Bybit getKlines: {}", e.getMessage());
+            log.error("❌ Bybit getKlines(v5) failed", e);
             return List.of();
         }
     }
 
-    private String mapInterval(String tf) {
+    /**
+     * Bybit v5 interval mapper
+     */
+    private String mapIntervalV5(String tf) {
         if (tf == null) return "1";
+
         return switch (tf) {
-            case "1m" -> "1";
-            case "3m" -> "3";
-            case "5m" -> "5";
+            case "1m"  -> "1";
+            case "3m"  -> "3";
+            case "5m"  -> "5";
             case "15m" -> "15";
             case "30m" -> "30";
-            case "1h" -> "60";
-            case "4h" -> "240";
-            case "1d" -> "D";
-            default -> "1";
+            case "1h"  -> "60";
+            case "4h"  -> "240";
+            case "1d"  -> "D";
+            default    -> "1";
         };
     }
-
     // =================================================================
     // ORDERS
     // =================================================================
@@ -422,5 +445,209 @@ public class BybitExchangeClient implements ExchangeClient {
 
         return new BigDecimal(s);
     }
+
+
+    @Override
+    public AccountFees getAccountFees(long chatId, NetworkType networkType) {
+
+        try {
+            ExchangeSettings s = resolve(chatId, networkType);
+
+            // Bybit V5 — комиссия для SPOT
+            Map<String, String> params = new LinkedHashMap<>();
+            params.put("category", "spot");
+
+            String raw = signed(
+                    s,
+                    "/v5/account/fee-rate",
+                    params,
+                    HttpMethod.GET
+            );
+
+            JSONObject json = new JSONObject(raw);
+
+            int retCode = json.optInt("retCode", -1);
+            if (retCode != 0) {
+                log.warn("⚠️ Bybit getAccountFees retCode={} msg={}",
+                        retCode, json.optString("retMsg"));
+                return null;
+            }
+
+            JSONObject result = json.optJSONObject("result");
+            if (result == null) return null;
+
+            JSONArray list = result.optJSONArray("list");
+            if (list == null || list.isEmpty()) return null;
+
+            JSONObject fees = list.getJSONObject(0);
+
+            // ⚠️ Bybit даёт ДОЛЮ (0.001 = 0.1%)
+            BigDecimal makerRate = parseBd(fees.optString("makerFeeRate", null));
+            BigDecimal takerRate = parseBd(fees.optString("takerFeeRate", null));
+
+            BigDecimal makerPct = makerRate != null
+                    ? makerRate.multiply(BigDecimal.valueOf(100))
+                    .setScale(6, RoundingMode.HALF_UP)
+                    : null;
+
+            BigDecimal takerPct = takerRate != null
+                    ? takerRate.multiply(BigDecimal.valueOf(100))
+                    .setScale(6, RoundingMode.HALF_UP)
+                    : null;
+
+            return AccountFees.builder()
+                    .makerPct(makerPct)
+                    .takerPct(takerPct)
+                    .build();
+
+        } catch (Exception e) {
+            log.warn("⚠️ Bybit getAccountFees failed (chatId={}, network={}): {}",
+                    chatId, networkType, e.toString());
+            return null;
+        }
+    }
+
+    /** Безопасный парсер BigDecimal (null-safe). */
+    private BigDecimal parseBd(String s) {
+        if (s == null) return null;
+        String t = s.trim();
+        if (t.isEmpty()) return null;
+        try {
+            return new BigDecimal(t);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+    @Override
+    public List<SymbolDescriptor> getTradableSymbols(String quoteAsset) {
+
+        try {
+            // =====================================================
+            // 1) INSTRUMENTS (SPOT, V5)
+            // =====================================================
+            String instrumentsRaw = rest.getForObject(
+                    MAIN + "/v5/market/instruments-info?category=spot",
+                    String.class
+            );
+
+            JSONObject instrumentsRoot = new JSONObject(instrumentsRaw);
+            JSONArray instruments = instrumentsRoot
+                    .getJSONObject("result")
+                    .getJSONArray("list");
+
+            // =====================================================
+            // 2) TICKERS 24H (V5)
+            // =====================================================
+            String tickersRaw = rest.getForObject(
+                    MAIN + "/v5/market/tickers?category=spot",
+                    String.class
+            );
+
+            JSONObject tickersRoot = new JSONObject(tickersRaw);
+            JSONArray tickers = tickersRoot
+                    .getJSONObject("result")
+                    .getJSONArray("list");
+
+            Map<String, JSONObject> tickerMap = new HashMap<>();
+            for (int i = 0; i < tickers.length(); i++) {
+                JSONObject t = tickers.getJSONObject(i);
+                tickerMap.put(t.optString("symbol"), t);
+            }
+
+            List<SymbolDescriptor> out = new ArrayList<>();
+
+            // =====================================================
+            // 3) MAIN LOOP
+            // =====================================================
+            for (int i = 0; i < instruments.length(); i++) {
+
+                JSONObject s = instruments.getJSONObject(i);
+
+                String symbol = s.optString("symbol");
+                String base   = s.optString("baseCoin");
+                String quote  = s.optString("quoteCoin");
+                String status = s.optString("status");
+
+                if (!"Trading".equalsIgnoreCase(status)) continue;
+                if (!Objects.equals(quote, quoteAsset)) continue;
+
+                // =================================================
+                // LIMITS (Bybit специфика)
+                // =================================================
+                JSONObject lotSize = s.optJSONObject("lotSizeFilter");
+                JSONObject price   = s.optJSONObject("priceFilter");
+
+                BigDecimal minNotional = parseBd(
+                        lotSize != null ? lotSize.optString("minOrderAmt", null) : null
+                );
+                BigDecimal stepSize = parseBd(
+                        lotSize != null ? lotSize.optString("qtyStep", null) : null
+                );
+                BigDecimal tickSize = parseBd(
+                        price != null ? price.optString("tickSize", null) : null
+                );
+
+                Integer maxOrders = null; // ❗ Bybit НЕ предоставляет
+
+                ExchangeLimitScope minNotionalScope =
+                        minNotional != null ? ExchangeLimitScope.ACCOUNT : ExchangeLimitScope.UNKNOWN;
+
+                ExchangeLimitScope stepSizeScope =
+                        stepSize != null ? ExchangeLimitScope.SYMBOL : ExchangeLimitScope.UNKNOWN;
+
+                ExchangeLimitScope tickSizeScope =
+                        tickSize != null ? ExchangeLimitScope.SYMBOL : ExchangeLimitScope.UNKNOWN;
+
+                ExchangeLimitScope maxOrdersScope =
+                        ExchangeLimitScope.UNKNOWN;
+
+                // =================================================
+                // TICKER
+                // =================================================
+                JSONObject t = tickerMap.get(symbol);
+
+                BigDecimal lastPrice =
+                        t != null ? parseBd(t.optString("lastPrice", null)) : null;
+
+                BigDecimal priceChangePct =
+                        t != null && t.has("price24hPcnt")
+                                ? parseBd(t.optString("price24hPcnt", null))
+                                .multiply(BigDecimal.valueOf(100))
+                                : null;
+
+                BigDecimal volume =
+                        t != null ? parseBd(t.optString("turnover24h", null)) : null;
+
+                // =================================================
+                // RESULT
+                // =================================================
+                out.add(
+                        SymbolDescriptor.of(
+                                symbol,
+                                base,
+                                quote,
+                                lastPrice,
+                                priceChangePct,
+                                volume,
+                                minNotional,
+                                stepSize,
+                                tickSize,
+                                maxOrders,
+                                true,
+                                "BYBIT"
+                        )
+                );
+
+            }
+
+            log.info("✅ BYBIT symbols loaded: {}", out.size());
+            return out;
+
+        } catch (Exception e) {
+            log.error("❌ Bybit getTradableSymbols failed", e);
+            return List.of();
+        }
+    }
+
 
 }

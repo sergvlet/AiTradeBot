@@ -25,7 +25,9 @@
                     <!-- Статус -->
                     <span class="badge px-3 py-2 mb-2"
                           th:classappend="${s.active} ? ' bg-success' : ' bg-secondary'">
-                        <span th:text="${s.active} ? '🟢 Активна' : '⚫ Остановлена'">⚫ Остановлена</span>
+                        <span th:text="${s.active} ? '🟢 Активна' : '⚫ Остановлена'">
+                            ⚫ Остановлена
+                        </span>
                     </span>
 
                     <!-- Основная инфа -->
@@ -33,36 +35,53 @@
                         <div>
                             PnL:
                             <span th:text="${s.totalProfitPct}"
-                                  th:classappend="${s.totalProfitPct >= 0} ? ' pnl-green' : ' pnl-red'">0</span>%
+                                  th:classappend="${s.totalProfitPct >= 0} ? ' pnl-green' : ' pnl-red'">
+                                0
+                            </span>%
                         </div>
-                        <div>ML доверие: <strong th:text="${s.mlConfidence}">0</strong></div>
-                        <div>Пара: <strong th:text="${s.symbol}">BTCUSDT</strong></div>
-                        <div>Сеть: <strong th:text="${s.networkType}">MAINNET</strong></div>
+                        <div>
+                            ML доверие:
+                            <strong th:text="${s.mlConfidence}">0</strong>
+                        </div>
+                        <div>
+                            Пара:
+                            <strong th:text="${s.symbol}">BTCUSDT</strong>
+                        </div>
+                        <div>
+                            Сеть:
+                            <strong th:text="${s.networkType}">MAINNET</strong>
+                        </div>
                     </div>
 
                     <!-- КНОПКИ -->
                     <div class="mt-4 d-grid gap-2">
 
-                        <!-- 🚀 Запустить / Остановить -->
-                        <button type="button"
-                                class="btn toggle-btn"
-                                th:classappend="${s.active} ? ' btn-outline-danger' : ' btn-outline-success'"
-                                th:data-type="${s.type}"
-                                th:data-chat-id="${s.chatId}"
-                                th:data-symbol="${s.symbol}"
-                                th:data-active="${s.active}">
-                            <i th:class="${s.active} ? 'bi bi-stop-fill' : 'bi bi-play-fill'"></i>
-                            <span th:text="${s.active} ? 'Остановить' : 'Запустить'">Запустить</span>
-                        </button>
+                        <!-- 🔁 TOGGLE (FORM, НЕ JS) -->
+                        <form method="post" th:action="@{/strategies/toggle}">
+
+                            <input type="hidden" name="chatId" th:value="${s.chatId}">
+                            <input type="hidden" name="type" th:value="${s.type}">
+                            <input type="hidden" name="exchange" th:value="${s.exchangeName}">
+                            <input type="hidden" name="network" th:value="${s.networkType}">
+
+                            <button type="submit"
+                                    class="btn"
+                                    th:classappend="${s.active} ? ' btn-outline-danger' : ' btn-outline-success'">
+
+                                <i th:class="${s.active} ? 'bi bi-stop-fill' : 'bi bi-play-fill'"></i>
+                                <span th:text="${s.active} ? 'Остановить' : 'Запустить'">
+                                    Запустить
+                                </span>
+                            </button>
+                        </form>
 
                         <!-- 📊 Дашборд -->
                         <a class="btn btn-outline-primary"
-                           th:href="@{'/strategies/' + ${s.type} + '/strategy_dashboard'(chatId=${s.chatId}, symbol=${s.symbol})}">
-                            <i class="bi bi-graph-up"></i> Дашборт
+                           th:href="@{'/strategies/' + ${s.type} + '/dashboard'(chatId=${s.chatId})}">
+                            <i class="bi bi-graph-up"></i> Дашборд
                         </a>
 
-
-                        <!-- ⚙️ Настройки (ИСПРАВЛЕНО) -->
+                        <!-- ⚙️ Настройки -->
                         <a class="btn btn-outline-primary"
                            th:href="@{'/strategies/' + ${s.type} + '/config'(chatId=${s.chatId})}">
                             <i class="bi bi-gear"></i> Настройки

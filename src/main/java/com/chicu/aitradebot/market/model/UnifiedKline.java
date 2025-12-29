@@ -35,4 +35,11 @@ public class UnifiedKline {
 
     /** Нормализованный символ: BTCUSDT, ETHUSDT и т.п. */
     private String symbol;
+
+    /**
+     * ✅ Свеча закрыта биржей (final kline).
+     * Binance: k.x = true/false
+     * Bybit: аналогично (в их kline тоже есть флаг финальности)
+     */
+    private boolean closed;
 }

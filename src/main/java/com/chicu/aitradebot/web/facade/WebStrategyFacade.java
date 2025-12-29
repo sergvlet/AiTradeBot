@@ -9,7 +9,7 @@ import java.util.List;
 public interface WebStrategyFacade {
 
     // ================================================================
-    // 📋 СПИСОК СТРАТЕГИЙ (ДЛЯ КОНКРЕТНОЙ БИРЖИ / СЕТИ)
+    // 📋 СПИСОК СТРАТЕГИЙ (UI / Dashboard)
     // ================================================================
     List<StrategyUi> getStrategies(
             Long chatId,
@@ -19,7 +19,10 @@ public interface WebStrategyFacade {
 
     // ================================================================
     // ▶️ START
+    // ⚠️ НЕ использовать напрямую из UI / API
+    // Используется внутренними механизмами (миграции, сервисы)
     // ================================================================
+    @Deprecated
     StrategyRunInfo start(
             Long chatId,
             StrategyType type,
@@ -29,7 +32,9 @@ public interface WebStrategyFacade {
 
     // ================================================================
     // ⏹ STOP
+    // ⚠️ НЕ использовать напрямую из UI / API
     // ================================================================
+    @Deprecated
     StrategyRunInfo stop(
             Long chatId,
             StrategyType type,
@@ -39,24 +44,13 @@ public interface WebStrategyFacade {
 
     // ================================================================
     // 🔁 TOGGLE
+    // ЕДИНСТВЕННАЯ точка управления из UI / API
     // ================================================================
     StrategyRunInfo toggle(
             Long chatId,
             StrategyType type,
             String exchange,
             NetworkType network
-    );
-
-    // ================================================================
-    // 🔁 TOGGLE + UPDATE PARAMS
-    // ================================================================
-    StrategyRunInfo toggleStrategy(
-            Long chatId,
-            StrategyType type,
-            String exchange,
-            NetworkType network,
-            String symbol,
-            String timeframe
     );
 
     // ================================================================

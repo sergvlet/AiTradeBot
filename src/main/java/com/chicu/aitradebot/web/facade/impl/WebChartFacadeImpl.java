@@ -2,26 +2,30 @@ package com.chicu.aitradebot.web.facade.impl;
 
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.exchange.client.ExchangeClient;
-import com.chicu.aitradebot.market.MarketService;
-import com.chicu.aitradebot.market.stream.MarketDataStreamService;
+import com.chicu.aitradebot.exchange.client.ExchangeClientFactory;
+import com.chicu.aitradebot.market.MarketStreamManager;
+import com.chicu.aitradebot.market.model.Candle;
+import com.chicu.aitradebot.strategy.core.CandleProvider;
 import com.chicu.aitradebot.web.dto.StrategyChartDto;
 import com.chicu.aitradebot.web.facade.WebChartFacade;
-import com.chicu.aitradebot.web.ui.UiStrategyLayerService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
-import java.util.Map;
+import java.util.Locale;
 
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class WebChartFacadeImpl implements WebChartFacade {
 
-    private final MarketService marketService;
-    private final MarketDataStreamService marketDataStreamService;
-    private final UiStrategyLayerService uiLayerService;
+    private static final int DEFAULT_LIMIT = 500;
+    private static final String DEFAULT_TF = "1m";
+
+    private final CandleProvider candleProvider;
+    private final MarketStreamManager streamManager;
+    private final ExchangeClientFactory exchangeClientFactory;
 
     @Override
     public StrategyChartDto buildChart(
@@ -32,104 +36,100 @@ public class WebChartFacadeImpl implements WebChartFacade {
             int limit
     ) {
 
+        // =====================================================
+        // 1️⃣ NORMALIZE INPUT
+        // =====================================================
+
         if (symbol == null || symbol.isBlank()) {
-            throw new IllegalArgumentException("Symbol must be provided for chart");
+            return StrategyChartDto.builder().candles(List.of()).build();
         }
 
-        String finalSymbol = symbol.toUpperCase();
+        String finalSymbol = symbol.trim().toUpperCase(Locale.ROOT);
 
-        log.info(
-                "📊 BuildChart chatId={} strategy={} symbol={} tf={} limit={}",
-                chatId, strategyType, finalSymbol, timeframe, limit
+        String tf = (timeframe == null || timeframe.isBlank())
+                ? DEFAULT_TF
+                : timeframe.trim().toLowerCase(Locale.ROOT);
+
+        if (tf.startsWith("kline_")) {
+            tf = tf.substring(6);
+        }
+
+        int finalLimit = limit > 0 ? limit : DEFAULT_LIMIT;
+
+        log.debug(
+                "📊 Chart snapshot chatId={} type={} symbol={} tf={} limit={}",
+                chatId, strategyType, finalSymbol, tf, finalLimit
         );
 
         // =====================================================
-        // 🔴 LIVE подписка (WS)
+        // 2️⃣ 🔥 PRELOAD HISTORY IF CACHE EMPTY
         // =====================================================
-        try {
-            marketDataStreamService.subscribeCandles(
-                    chatId,
-                    strategyType,
-                    finalSymbol,
-                    timeframe
-            );
-        } catch (Exception e) {
-            log.warn("⚠ Live subscribe failed: {}", e.getMessage());
+
+        int cached = streamManager.getCandles(finalSymbol, tf, finalLimit).size();
+
+        if (cached < finalLimit) {
+            try {
+                ExchangeClient client = exchangeClientFactory.getByChat(chatId);
+
+                List<ExchangeClient.Kline> klines =
+                        client.getKlines(finalSymbol, tf, finalLimit);
+
+                for (ExchangeClient.Kline k : klines) {
+                    streamManager.addCandle(
+                            finalSymbol,
+                            tf,
+                            new Candle(
+                                    k.openTime(),
+                                    k.open(),
+                                    k.high(),
+                                    k.low(),
+                                    k.close(),
+                                    k.volume(),
+                                    false
+                            )
+                    );
+                }
+
+                log.info("📥 Chart preload {} candles for {} {}", klines.size(), finalSymbol, tf);
+
+            } catch (Exception e) {
+                log.error("❌ Chart preload failed {} {}", finalSymbol, tf, e);
+            }
         }
 
         // =====================================================
-        // 📜 История свечей
+        // 3️⃣ READ FROM CACHE (ЕДИНЫЙ ИСТОЧНИК)
         // =====================================================
-        List<ExchangeClient.Kline> klines = marketService.loadKlines(
-                chatId,
-                finalSymbol,
-                timeframe,
-                limit
-        );
 
-        List<StrategyChartDto.CandleDto> candles = klines.stream()
-                .map(k -> StrategyChartDto.CandleDto.builder()
-                        .time(k.openTime() / 1000)
-                        .open(k.open())
-                        .high(k.high())
-                        .low(k.low())
-                        .close(k.close())
+        List<CandleProvider.Candle> candles =
+                candleProvider.getRecentCandles(
+                        chatId,
+                        finalSymbol,
+                        tf,
+                        finalLimit
+                );
+
+        // =====================================================
+        // 4️⃣ MAP → DTO
+        // =====================================================
+
+        List<StrategyChartDto.CandleDto> candleDtos = candles.stream()
+                .map(c -> StrategyChartDto.CandleDto.builder()
+                        .time(c.time())
+                        .open(c.open())
+                        .high(c.high())
+                        .low(c.low())
+                        .close(c.close())
                         .build()
                 )
                 .toList();
 
-        Double lastPrice = candles.isEmpty()
-                ? null
-                : candles.get(candles.size() - 1).getClose();
-
         // =====================================================
-        // 🧠 UI LAYERS (SNAPSHOT, БЕЗ БД)
+        // 5️⃣ RESULT
         // =====================================================
 
-        List<Double> levels =
-                uiLayerService.loadLatestLevels(
-                        chatId,
-                        strategyType,
-                        finalSymbol
-                );
-
-        StrategyChartDto.Zone zone = null;
-        Map<String, Object> zoneMap =
-                uiLayerService.loadLatestZone(
-                        chatId,
-                        strategyType,
-                        finalSymbol
-                );
-
-        if (zoneMap != null
-            && zoneMap.get("top") instanceof Number top
-            && zoneMap.get("bottom") instanceof Number bottom) {
-
-            zone = StrategyChartDto.Zone.builder()
-                    .top(top.doubleValue())
-                    .bottom(bottom.doubleValue())
-                    .color((String) zoneMap.get("color"))
-                    .build();
-        }
-
-        log.info(
-                "🧠 UI snapshot loaded: levels={} zone={}",
-                levels.size(),
-                zone != null
-        );
-
-        // =====================================================
-        // 📦 RESULT
-        // =====================================================
         return StrategyChartDto.builder()
-                .candles(candles)
-                .lastPrice(lastPrice)
-                .layers(
-                        StrategyChartDto.Layers.builder()
-                                .levels(levels)
-                                .zone(zone)
-                                .build()
-                )
+                .candles(candleDtos)
                 .build();
     }
 }

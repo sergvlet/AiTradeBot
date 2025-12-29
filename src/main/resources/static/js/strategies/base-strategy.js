@@ -1,35 +1,19 @@
 "use strict";
 
 /**
- * BaseStrategy (ШАГ 9)
+ * BaseStrategy (ШАГ 11)
  * -------------------
  * Адаптер между:
  *   - источником событий (WS / REST / replay)
  *   - набором feature
  *
- * НЕ:
- * - рисует
- * - знает про chart-controller
- * - знает про layer-renderer детали
- *
- * ДЕЛАЕТ:
- * - регистрирует features
- * - прокидывает события
- * - управляет lifecycle (clear)
+ * ДОПОЛНИТЕЛЬНО:
+ * ✔ хранит read-only runtime-состояния (cooldown и т.п.)
  */
 export class BaseStrategy {
 
     constructor({ ctx } = {}) {
-        /**
-         * Контекст стратегии (пассивные данные)
-         * Пример:
-         * {
-         *   chatId,
-         *   strategyType,
-         *   symbol,
-         *   timeframe
-         * }
-         */
+
         this.ctx = ctx || {};
 
         /** @type {Array<Object>} */
@@ -37,18 +21,18 @@ export class BaseStrategy {
 
         this.debug = false;
         this.name = this.constructor?.name || "Strategy";
+
+        // =============================
+        // RUNTIME STATE (READ-ONLY)
+        // =============================
+        this.cooldownSeconds = null;
+        this.cooldownUpdatedAt = null;
     }
 
     // =====================================================
     // FEATURE REGISTRATION
     // =====================================================
 
-    /**
-     * Зарегистрировать features стратегии.
-     * Вызывается ОДИН РАЗ при инициализации.
-     *
-     * @param {Array<Object>} features
-     */
     registerFeatures(features = []) {
         if (!Array.isArray(features)) return;
 
@@ -68,41 +52,63 @@ export class BaseStrategy {
 
     /**
      * Главная точка входа событий.
-     * Сюда попадает ВСЁ:
-     *  - candle
-     *  - price
-     *  - levels
-     *  - tp_sl
-     *  - trade
-     *  - order
-     *  - atr
-     *  - window_zone
-     *
-     * Strategy НИЧЕГО не фильтрует —
-     * каждая feature сама решает, что ей нужно.
-     *
-     * @param {Object} ev
      */
     onEvent(ev) {
         if (!ev) return;
 
+        // -----------------------------
+        // SIGNAL PARSING (SYSTEM)
+        // -----------------------------
+        if (ev.type === "signal" && ev.action === "hold") {
+            this._handleHoldSignal(ev);
+        }
+
+        // -----------------------------
+        // FORWARD TO FEATURES
+        // -----------------------------
         for (const f of this.features) {
             try {
                 f.onEvent(ev);
             } catch (e) {
-                // одна фича не должна ломать остальные
                 console.warn(`⚠ ${this.name}: feature error`, e);
             }
         }
     }
 
     // =====================================================
-    // LIFECYCLE
+    // SIGNAL HANDLERS
+    // =====================================================
+
+    _handleHoldSignal(ev) {
+        if (typeof ev.reason !== "string") return;
+
+        // ожидаемый формат: "cooldown 12s"
+        const m = ev.reason.match(/^cooldown\s+(\d+)s$/i);
+        if (!m) return;
+
+        this.cooldownSeconds = Number(m[1]);
+        this.cooldownUpdatedAt = Date.now();
+
+        if (this.debug) {
+            console.log(`⏳ ${this.name}: cooldown ${this.cooldownSeconds}s`);
+        }
+    }
+
+    // =====================================================
+    // READ-ONLY API (для UI)
     // =====================================================
 
     /**
-     * Очистить состояние стратегии (через features)
+     * @returns {number|null}
      */
+    getCooldownSeconds() {
+        return this.cooldownSeconds;
+    }
+
+    // =====================================================
+    // LIFECYCLE
+    // =====================================================
+
     clear() {
         for (const f of this.features) {
             try {
@@ -112,22 +118,16 @@ export class BaseStrategy {
             }
         }
 
+        // сбрасываем runtime-индикаторы
+        this.cooldownSeconds = null;
+        this.cooldownUpdatedAt = null;
+
         if (this.debug) {
             console.log(`🧹 ${this.name}: cleared`);
         }
     }
 
-    // =====================================================
-    // OPTIONAL HOOKS (на будущее)
-    // =====================================================
-
-    /**
-     * Хук при старте стратегии (опционально)
-     */
+    // OPTIONAL HOOKS
     onStart() {}
-
-    /**
-     * Хук при остановке стратегии (опционально)
-     */
     onStop() {}
 }

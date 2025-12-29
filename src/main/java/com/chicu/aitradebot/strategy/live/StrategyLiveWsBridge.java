@@ -31,13 +31,48 @@ public class StrategyLiveWsBridge {
     // =====================================================
     public void publish(StrategyLiveEvent ev) {
 
-        if (ev == null) return;
-        if (ev.getChatId() == null || ev.getStrategyType() == null) return;
+        if (ev == null) {
+            log.warn("🚫 LIVE publish called with NULL event");
+            return;
+        }
+
+        if (ev.getChatId() == null || ev.getStrategyType() == null) {
+            log.warn(
+                    "🚫 LIVE SKIP missing chatId/strategy type={} chatId={} strategy={}",
+                    ev.getType(), ev.getChatId(), ev.getStrategyType()
+            );
+            return;
+        }
+
+        // ===============================
+        // 🔧 NORMALIZE EVENT
+        // ===============================
+        ev.normalize();
 
         String symbol = normalizeSymbol(ev.getSymbol());
         ev.setSymbol(symbol);
 
-        // ❗ FIX: realtime-события НИКОГДА не дедуплицируем
+        // =================================================
+        // ❗ КРИТИЧНОЕ ИСПРАВЛЕНИЕ ВРЕМЕНИ
+        // =================================================
+        if ("price".equals(ev.getType()) || "candle".equals(ev.getType())) {
+            ev.setTime(StrategyLiveEvent.nowMillis()); // ✅ ВСЕГДА REALTIME
+        } else if (ev.getTime() <= 0) {
+            ev.setTime(StrategyLiveEvent.nowMillis());
+        }
+
+        log.info(
+                "🔥 LIVE PUBLISH IN type={} chatId={} strategy={} symbol={} time={}",
+                ev.getType(),
+                ev.getChatId(),
+                ev.getStrategyType(),
+                ev.getSymbol(),
+                ev.getTime()
+        );
+
+        // ===============================
+        // 🔁 DEDUP (кроме realtime)
+        // ===============================
         if (shouldDedup(ev.getType())) {
 
             String dedupKey = buildKey(ev);
@@ -45,7 +80,10 @@ public class StrategyLiveWsBridge {
 
             Integer prev = lastEventHash.put(dedupKey, hash);
             if (prev != null && prev == hash) {
-                // 🔕 полностью идентичное событие
+                log.debug(
+                        "🔕 LIVE DEDUP SKIP type={} chatId={} strategy={} symbol={}",
+                        ev.getType(), ev.getChatId(), ev.getStrategyType(), ev.getSymbol()
+                );
                 return;
             }
         }
@@ -58,10 +96,11 @@ public class StrategyLiveWsBridge {
                       + "/"
                       + ev.getStrategyType().name();
 
+        log.info("📡 WS SEND → {}", dest);
         ws.convertAndSend(dest, ev);
 
         // ===============================
-        // 2️⃣ БД — НЕ БЛОКИРУЕТ WS
+        // 2️⃣ UI LAYER (НЕ БЛОКИРУЕТ WS)
         // ===============================
         try {
             persistUiLayer(ev);
@@ -80,9 +119,7 @@ public class StrategyLiveWsBridge {
 
         if (ev.getSymbol() == null) return;
 
-        Instant time = Instant.ofEpochMilli(
-                ev.getTime() > 0 ? ev.getTime() : StrategyLiveEvent.nowMillis()
-        );
+        Instant time = Instant.ofEpochMilli(ev.getTime());
 
         switch (ev.getType()) {
 
@@ -152,8 +189,7 @@ public class StrategyLiveWsBridge {
     // =====================================================
 
     /**
-     * ❗ КЛЮЧЕВОЕ МЕСТО:
-     * price и candle — ВСЕГДА realtime
+     * ❗ price и candle — ВСЕГДА realtime (НЕ дедуплицируются)
      */
     private boolean shouldDedup(String type) {
         return !"price".equals(type) && !"candle".equals(type);

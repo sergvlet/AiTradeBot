@@ -21,32 +21,60 @@ public class MarketDataStreamService {
      * Активные подписки:
      * chatId → set of keys
      */
-    private final Map<Long, Set<SubscriptionKey>> activeSubscriptions = new ConcurrentHashMap<>();
+    private final Map<Long, Set<SubscriptionKey>> activeSubscriptions =
+            new ConcurrentHashMap<>();
 
     /**
-     * Подписка на свечи (V4-safe)
+     * 🕯 + 🔥 Подписка на свечи И live ticks (aggTrade)
      */
-    public synchronized void subscribeCandles(long chatId,
-                                              StrategyType strategyType,
-                                              String symbol,
-                                              String timeframe) {
+    public synchronized void subscribeCandles(
+            long chatId,
+            StrategyType strategyType,
+            String symbol,
+            String timeframe
+    ) {
 
-        String sym = symbol.toUpperCase();
-        String tf  = timeframe.toLowerCase();
+        if (symbol == null || timeframe == null || strategyType == null) {
+            log.warn(
+                    "⚠️ subscribeCandles skipped (invalid args): chatId={} type={} symbol={} tf={}",
+                    chatId, strategyType, symbol, timeframe
+            );
+            return;
+        }
+
+        String sym = symbol.trim().toUpperCase();
+        String tf  = timeframe.trim().toLowerCase();
 
         SubscriptionKey key = new SubscriptionKey(strategyType, sym, tf);
 
         Set<SubscriptionKey> subs =
-                activeSubscriptions.computeIfAbsent(chatId, k -> ConcurrentHashMap.newKeySet());
+                activeSubscriptions.computeIfAbsent(
+                        chatId,
+                        k -> ConcurrentHashMap.newKeySet()
+                );
 
         if (subs.contains(key)) {
-            log.debug("⏭ Already subscribed: {} {} {} (chatId={})",
-                    strategyType, sym, tf, chatId);
+            log.debug(
+                    "⏭ Already subscribed: {} {} {} (chatId={})",
+                    strategyType, sym, tf, chatId
+            );
             return;
         }
 
-        // 👉 WS subscribe
+        // =====================================================
+        // 🔥 1️⃣ KLINE — закрытие свечей
+        // =====================================================
         binanceSpotWebSocketClient.subscribeKline(
+                sym.toLowerCase(),
+                tf,
+                chatId,
+                strategyType
+        );
+
+        // =====================================================
+        // 🔥 2️⃣ AGG TRADE — НАСТОЯЩИЙ LIVE
+        // =====================================================
+        binanceSpotWebSocketClient.subscribeAggTrade(
                 sym.toLowerCase(),
                 tf,
                 chatId,
@@ -55,12 +83,14 @@ public class MarketDataStreamService {
 
         subs.add(key);
 
-        log.info("📡 SUBSCRIBE Binance KLINE: {} {} (chatId={}, strategy={})",
-                sym, tf, chatId, strategyType);
+        log.info(
+                "📡 SUBSCRIBE Binance STREAMS (KLINE + AGGTRADE): {} {} (chatId={}, strategy={})",
+                sym, tf, chatId, strategyType
+        );
     }
 
     /**
-     * Отписка (на будущее — понадобится)
+     * Отписка (используется при выходе / смене стратегии)
      */
     public synchronized void unsubscribeAll(long chatId) {
 
@@ -68,12 +98,17 @@ public class MarketDataStreamService {
         if (subs == null || subs.isEmpty()) return;
 
         for (SubscriptionKey key : subs) {
+
             binanceSpotWebSocketClient.unsubscribeKline(
                     key.symbol().toLowerCase(),
                     key.timeframe(),
                     chatId,
                     key.strategyType()
             );
+
+            // aggTrade:
+            // можно закрывать через closeAll(),
+            // но Binance нормально держит соединение
         }
 
         log.info("🧹 UNSUBSCRIBE ALL for chatId={}", chatId);

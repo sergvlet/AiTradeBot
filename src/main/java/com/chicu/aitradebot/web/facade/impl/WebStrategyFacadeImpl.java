@@ -12,7 +12,8 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
-import java.util.List;
+import java.util.*;
+import java.util.stream.Collectors;
 
 @Slf4j
 @Service
@@ -23,7 +24,8 @@ public class WebStrategyFacadeImpl implements WebStrategyFacade {
     private final StrategySettingsService settingsService;
 
     // ================================================================
-    // 📋 LIST (ФИЛЬТР ПО БИРЖЕ / СЕТИ)
+    // 📋 LIST — /strategies
+    // ✅ ВСЕ StrategyType + настройки (если есть)
     // ================================================================
     @Override
     public List<StrategyUi> getStrategies(
@@ -31,36 +33,56 @@ public class WebStrategyFacadeImpl implements WebStrategyFacade {
             String exchange,
             NetworkType network
     ) {
-        List<StrategySettings> settings =
+
+        log.info(
+                "📋 getStrategies chatId={} exchange={} network={}",
+                chatId, exchange, network
+        );
+
+        // 1️⃣ Все настройки пользователя
+        List<StrategySettings> settingsList =
                 settingsService.findAllByChatId(chatId, exchange, network);
 
-        return StrategyUi.fromSettings(settings);
-    }
+        // 2️⃣ Мапа type → settings
+        Map<StrategyType, StrategySettings> settingsByType =
+                settingsList.stream()
+                        .collect(Collectors.toMap(
+                                StrategySettings::getType,
+                                s -> s,
+                                (a, b) -> a   // защита от дублей
+                        ));
 
-    // ================================================================
-    // ▶️ START
-    // ================================================================
-    @Override
-    public StrategyRunInfo start(
-            Long chatId,
-            StrategyType type,
-            String exchange,
-            NetworkType network
-    ) {
-        return orchestrator.startStrategy(chatId, type);
-    }
+        // 3️⃣ Строим UI по ВСЕМ стратегиям
+        List<StrategyUi> result = new ArrayList<>();
 
-    // ================================================================
-    // ⏹ STOP
-    // ================================================================
-    @Override
-    public StrategyRunInfo stop(
-            Long chatId,
-            StrategyType type,
-            String exchange,
-            NetworkType network
-    ) {
-        return orchestrator.stopStrategy(chatId, type);
+        for (StrategyType type : StrategyType.values()) {
+
+            StrategySettings settings = settingsByType.get(type);
+
+            if (settings != null) {
+                // ✅ корректно: через публичный fromSettings()
+                StrategyUi ui =
+                        StrategyUi.fromSettings(List.of(settings))
+                                .stream()
+                                .findFirst()
+                                .orElseThrow();
+
+                result.add(ui);
+
+            } else {
+                // 🧩 нет записи в БД — UI-заглушка
+                result.add(
+                        StrategyUi.empty(
+                                chatId,
+                                type,
+                                exchange,
+                                network
+                        )
+                );
+            }
+        }
+
+        return result;
     }
 
     // ================================================================
@@ -73,46 +95,50 @@ public class WebStrategyFacadeImpl implements WebStrategyFacade {
             String exchange,
             NetworkType network
     ) {
-        StrategySettings s =
-                settingsService.getOrCreate(chatId, type, exchange, network);
 
-        return s.isActive()
-                ? orchestrator.stopStrategy(chatId, type)
-                : orchestrator.startStrategy(chatId, type);
+        StrategySettings settings =
+                settingsService
+                        .findLatest(chatId, type, exchange, network)
+                        .orElseGet(() ->
+                                settingsService.getOrCreate(chatId, type, exchange, network)
+                        );
+
+        StrategyRunInfo runtime =
+                orchestrator.getStatus(
+                        chatId,
+                        type,
+                        settings.getExchangeName(),
+                        settings.getNetworkType()
+                );
+
+        boolean isRunning = runtime != null && runtime.isActive();
+
+        log.info(
+                "🔁 TOGGLE chatId={} type={} running={} symbol={} tf={}",
+                chatId,
+                type,
+                isRunning,
+                settings.getSymbol(),
+                settings.getTimeframe()
+        );
+
+        return isRunning
+                ? orchestrator.stopStrategy(
+                chatId,
+                type,
+                settings.getExchangeName(),
+                settings.getNetworkType()
+        )
+                : orchestrator.startStrategy(
+                chatId,
+                type,
+                settings.getExchangeName(),
+                settings.getNetworkType()
+        );
     }
 
     // ================================================================
-    // 🔁 TOGGLE (advanced)
-    // ================================================================
-    @Override
-    public StrategyRunInfo toggleStrategy(
-            Long chatId,
-            StrategyType type,
-            String exchange,
-            NetworkType network,
-            String symbol,
-            String timeframe
-    ) {
-
-        StrategySettings s =
-                settingsService.getOrCreate(chatId, type, exchange, network);
-
-        if (symbol != null && !symbol.isBlank()) {
-            s.setSymbol(symbol);
-        }
-        if (timeframe != null && !timeframe.isBlank()) {
-            s.setTimeframe(timeframe);
-        }
-
-        settingsService.save(s);
-
-        return s.isActive()
-                ? orchestrator.stopStrategy(chatId, type)
-                : orchestrator.startStrategy(chatId, type);
-    }
-
-    // ================================================================
-    // ℹ STATUS
+    // ℹ STATUS — ДАШБОРД
     // ================================================================
     @Override
     public StrategyRunInfo getRunInfo(
@@ -121,6 +147,50 @@ public class WebStrategyFacadeImpl implements WebStrategyFacade {
             String exchange,
             NetworkType network
     ) {
-        return orchestrator.getStatus(chatId, type);
+
+        StrategySettings settings =
+                settingsService
+                        .findLatest(chatId, type, exchange, network)
+                        .orElse(null);
+
+        if (settings == null) {
+            return null;
+        }
+
+        StrategyRunInfo runtime =
+                orchestrator.getStatus(
+                        chatId,
+                        type,
+                        settings.getExchangeName(),
+                        settings.getNetworkType()
+                );
+
+        if (runtime == null) {
+            return null;
+        }
+
+        runtime.setSymbol(settings.getSymbol());
+        runtime.setTimeframe(settings.getTimeframe());
+        runtime.setTakeProfitPct(settings.getTakeProfitPct());
+        runtime.setStopLossPct(settings.getStopLossPct());
+        runtime.setCommissionPct(settings.getCommissionPct());
+        runtime.setRiskPerTradePct(settings.getRiskPerTradePct());
+
+        return runtime;
+    }
+
+    // ================================================================
+    // ⛔ DEPRECATED
+    // ================================================================
+    @Override
+    @Deprecated
+    public StrategyRunInfo start(Long chatId, StrategyType type, String exchange, NetworkType network) {
+        throw new UnsupportedOperationException("Use toggle()");
+    }
+
+    @Override
+    @Deprecated
+    public StrategyRunInfo stop(Long chatId, StrategyType type, String exchange, NetworkType network) {
+        throw new UnsupportedOperationException("Use toggle()");
     }
 }

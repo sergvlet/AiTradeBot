@@ -6,13 +6,13 @@ import org.springframework.stereotype.Component;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
 
 @Slf4j
 @Component
 public class MarketStreamManager {
 
     /**
-     * Хранилище:
      * SYMBOL → TIMEFRAME → DEQUE<CANDLE>
      */
     private final Map<String, Map<String, Deque<Candle>>> cache = new ConcurrentHashMap<>();
@@ -42,6 +42,12 @@ public class MarketStreamManager {
         if (tf.startsWith("kline_")) {
             tf = tf.substring(6);
         }
+
+        // 🔥 защита от мусора
+        if (tf.endsWith("_")) {
+            tf = tf.substring(0, tf.length() - 1);
+        }
+
         return tf;
     }
 
@@ -56,8 +62,11 @@ public class MarketStreamManager {
         String sym = normSymbol(symbol);
         String tf  = normTf(timeframe);
 
-        var tfMap = cache.computeIfAbsent(sym, k -> new ConcurrentHashMap<>());
-        var deque = tfMap.computeIfAbsent(tf, k -> new ArrayDeque<>());
+        Map<String, Deque<Candle>> tfMap =
+                cache.computeIfAbsent(sym, k -> new ConcurrentHashMap<>());
+
+        Deque<Candle> deque =
+                tfMap.computeIfAbsent(tf, k -> new ConcurrentLinkedDeque<>());
 
         synchronized (deque) {
 
@@ -69,7 +78,7 @@ public class MarketStreamManager {
                 return;
             }
 
-            // обновление текущей свечи
+            // обновление текущей
             if (last.getTime() == candle.getTime()) {
                 deque.pollLast();
                 deque.addLast(candle);
@@ -85,7 +94,6 @@ public class MarketStreamManager {
             // новая свеча
             deque.addLast(candle);
 
-            // ограничение размера
             while (deque.size() > maxCandles) {
                 deque.pollFirst();
             }
@@ -101,11 +109,17 @@ public class MarketStreamManager {
         String sym = normSymbol(symbol);
         String tf  = normTf(timeframe);
 
-        var tfMap = cache.get(sym);
-        if (tfMap == null) return List.of();
+        Map<String, Deque<Candle>> tfMap = cache.get(sym);
+        if (tfMap == null) {
+            log.debug("📭 No candles: symbol={} (tfMap=null)", sym);
+            return List.of();
+        }
 
-        var deque = tfMap.get(tf);
-        if (deque == null || deque.isEmpty()) return List.of();
+        Deque<Candle> deque = tfMap.get(tf);
+        if (deque == null || deque.isEmpty()) {
+            log.debug("📭 No candles: symbol={} tf={}", sym, tf);
+            return List.of();
+        }
 
         synchronized (deque) {
 
@@ -126,19 +140,18 @@ public class MarketStreamManager {
     }
 
     // ============================
-    // EXTRA UTILS
+    // EXTRA
     // ============================
 
-    /** Последняя свеча */
     public Candle getLast(String symbol, String timeframe) {
 
         String sym = normSymbol(symbol);
         String tf  = normTf(timeframe);
 
-        var tfMap = cache.get(sym);
+        Map<String, Deque<Candle>> tfMap = cache.get(sym);
         if (tfMap == null) return null;
 
-        var deque = tfMap.get(tf);
+        Deque<Candle> deque = tfMap.get(tf);
         if (deque == null) return null;
 
         synchronized (deque) {
@@ -146,18 +159,15 @@ public class MarketStreamManager {
         }
     }
 
-    /** Очистка по символу */
     public void clear(String symbol) {
         cache.remove(normSymbol(symbol));
     }
 
-    /** Глобальный лимит */
     public void setMaxCandles(int max) {
         if (max < 200) max = 200;
         this.maxCandles = max;
     }
 
-    /** Debug статистика */
     public Map<String, Integer> stats() {
         Map<String, Integer> m = new HashMap<>();
         for (var e : cache.entrySet()) {
