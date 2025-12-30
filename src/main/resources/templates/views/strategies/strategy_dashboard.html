@@ -108,22 +108,133 @@
     </div>
 
     <!-- График -->
-    <div class="card card-theme p-3 mb-4">
+    <div class="card card-theme p-3 mb-4" id="chart-card">
         <div class="d-flex justify-content-between align-items-center mb-2">
             <h5 class="mb-0">
                 <i class="bi bi-bar-chart-line me-2"></i>График цены
             </h5>
 
-            <div class="small">
-                <span class="text-secondary">WS:</span>
-                <span id="chart-ws-status" class="fw-bold text-danger">OFFLINE</span>
+            <div class="d-flex align-items-center gap-2">
+                <div class="small">
+                    <span class="text-secondary">WS:</span>
+                    <span id="chart-ws-status" class="fw-bold text-danger">OFFLINE</span>
+                </div>
+
+                <!-- ✅ КНОПКИ -->
+                <button class="btn btn-sm btn-outline-secondary"
+                        id="btn-fullscreen"
+                        title="На весь экран">
+                    ⛶
+                </button>
+
+                <button class="btn btn-sm btn-outline-success"
+                        id="btn-save-chart"
+                        title="Сохранить изображение">
+                    💾
+                </button>
             </div>
         </div>
 
-        <div id="strategy-chart-container" style="height: 400px;">
+        <!-- Управление -->
+        <div class="chart-controls d-flex flex-wrap gap-2 mb-3">
+            <div class="btn-group btn-group-sm">
+                <button class="btn btn-outline-secondary" onclick="window.chartCtrl?.setTimeframe('1m')">1m</button>
+                <button class="btn btn-outline-secondary" onclick="window.chartCtrl?.setTimeframe('5m')">5m</button>
+                <button class="btn btn-outline-secondary" onclick="window.chartCtrl?.setTimeframe('15m')">15m</button>
+                <button class="btn btn-outline-secondary" onclick="window.chartCtrl?.setTimeframe('1h')">1h</button>
+            </div>
+
+            <div class="btn-group btn-group-sm">
+                <button class="btn btn-outline-warning" onclick="window.chartCtrl?.addSMA?.(14)">SMA</button>
+                <button class="btn btn-outline-info" onclick="window.chartCtrl?.addEMA?.(14)">EMA</button>
+                <button class="btn btn-outline-success" onclick="window.chartCtrl?.addVolumeSeries?.()">VOL</button>
+            </div>
+        </div>
+
+        <!-- Tooltip -->
+        <div id="tooltip-date"
+             style="position:absolute;top:8px;right:12px;
+                background:rgba(0,0,0,.75);
+                color:#fff;
+                font-size:12px;
+                padding:4px 8px;
+                border-radius:4px;
+                pointer-events:none;
+                z-index:100;">
+            —
+        </div>
+
+        <div id="strategy-chart-container" style="height:400px; position:relative;">
             <div id="strategy-chart" style="width:100%; height:100%;"></div>
         </div>
     </div>
+    <script>
+        (function () {
+
+            // ===============================
+            // FULLSCREEN
+            // ===============================
+            const fsBtn = document.getElementById("btn-fullscreen");
+            const card = document.getElementById("chart-card");
+
+            if (fsBtn && card) {
+                fsBtn.addEventListener("click", () => {
+                    if (!document.fullscreenElement) {
+                        card.requestFullscreen?.();
+                    } else {
+                        document.exitFullscreen?.();
+                    }
+                });
+            }
+
+            // ===============================
+            // SAVE IMAGE
+            // ===============================
+            const saveBtn = document.getElementById("btn-save-chart");
+
+            if (saveBtn) {
+                saveBtn.addEventListener("click", async () => {
+                    if (!window.chartCtrl?.chart) return;
+
+                    try {
+                        const canvas = document.querySelector("#strategy-chart canvas");
+                        if (!canvas) return alert("Canvas не найден");
+
+                        const link = document.createElement("a");
+                        link.download = `chart_${Date.now()}.png`;
+                        link.href = canvas.toDataURL("image/png");
+                        link.click();
+                    } catch (e) {
+                        console.error("Save chart failed:", e);
+                    }
+                });
+            }
+
+            // ===============================
+            // TOOLTIP (ISO DATE)
+            // ===============================
+            setTimeout(() => {
+                if (!window.chartCtrl?.chart) return;
+
+                window.chartCtrl.chart.subscribeCrosshairMove(param => {
+                    const el = document.getElementById("tooltip-date");
+                    if (!el) return;
+
+                    if (!param || !param.time) {
+                        el.textContent = "—";
+                        return;
+                    }
+
+                    const t = typeof param.time === "object"
+                        ? param.time.unix
+                        : param.time;
+
+                    el.textContent = new Date(t * 1000).toISOString();
+                });
+            }, 800);
+
+        })();
+    </script>
 
     <!-- Нижние блоки -->
     <div class="row g-4">
@@ -196,5 +307,9 @@
 
 </div>
 
+
+
+
 </body>
+
 </html>

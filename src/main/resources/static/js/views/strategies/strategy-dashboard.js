@@ -1,22 +1,5 @@
 "use strict";
 
-/**
- * StrategyDashboard
- * -----------------
- * ОРКЕСТРАТОР.
- *
- * Делает ТОЛЬКО:
- * - создаёт chart-controller
- * - создаёт layer-renderer
- * - создаёт strategy по type
- * - прокидывает ВСЕ события (REST + WS)
- *
- * НЕ:
- * - выбирает таймфрейм
- * - знает источник свечей
- * - содержит бизнес-логику
- */
-
 import { ChartController } from "../../chart/chart-controller.js";
 import { LayerRenderer }   from "../../chart/layer-renderer.js";
 
@@ -25,14 +8,11 @@ import { FibonacciStrategy }   from "../../strategies/fibonacci.strategy.js";
 import { SmartFusionStrategy } from "../../strategies/smartfusion.strategy.js";
 
 document.addEventListener("DOMContentLoaded", () => {
-    console.log("📊 Strategy Dashboard");
+    console.log("📊 Strategy Dashboard START");
 
-    // =====================================================
-    // CONTEXT (FROM HTML)
-    // =====================================================
     const root = document.querySelector("[data-chat-id][data-type][data-symbol]");
     if (!root) {
-        console.error("❌ Context root not found");
+        console.error("❌ Strategy Dashboard: context root not found");
         return;
     }
 
@@ -41,27 +21,21 @@ document.addEventListener("DOMContentLoaded", () => {
     const symbol = root.dataset.symbol;
 
     if (!chatId || !type || !symbol) {
-        console.error("❌ Invalid context:", { chatId, type, symbol });
+        console.error("❌ Strategy Dashboard: invalid context:", { chatId, type, symbol });
         return;
     }
 
     const container = document.getElementById("strategy-chart");
     if (!container) {
-        console.error("❌ #strategy-chart not found");
+        console.error("❌ Strategy Dashboard: #strategy-chart not found in DOM");
         return;
     }
 
     console.log("🧩 Context:", { chatId, type, symbol });
 
-    // =====================================================
-    // INIT CHART
-    // =====================================================
     const chartCtrl = new ChartController(container);
     const layers    = new LayerRenderer(chartCtrl.chart, chartCtrl.candles);
 
-    // =====================================================
-    // INIT STRATEGY
-    // =====================================================
     const ctx = { chatId, type, symbol };
 
     let strategy;
@@ -82,30 +56,32 @@ document.addEventListener("DOMContentLoaded", () => {
 
     console.log("🧠 Strategy initialized:", type);
 
-    // =====================================================
-    // NORMALIZERS (🔥 КРИТИЧНО)
-    // =====================================================
+    // ————————————————————————————————
+    // NORMALIZERS
+    // ————————————————————————————————
+
+    /**
+     * Unified normalizer for WS candle events
+     * @param {Object} ev
+     * @returns {Object|null}
+     */
     function normalizeCandleEvent(ev) {
-        if (!ev) return null;
+        if (!ev || typeof ev !== "object") return null;
 
-        let out = ev;
+        let out = { ...ev };
 
-        // unwrap kline (WS)
         if (ev.kline && typeof ev.kline === "object") {
             const k = ev.kline;
             out = {
-                ...ev,
                 open:   k.open,
                 high:   k.high,
                 low:    k.low,
                 close:  k.close,
                 volume: k.volume,
-                timeframe: k.timeframe,
-                time: ev.time
+                time:   ev.time
             };
         }
 
-        // ❗ ОБЯЗАТЕЛЬНО: millis → seconds
         if (out.time != null) {
             out.time = Math.floor(Number(out.time) / 1000);
         }
@@ -113,46 +89,58 @@ document.addEventListener("DOMContentLoaded", () => {
         return out;
     }
 
+    /**
+     * Normalizer for REST candles
+     * @param {Object} c
+     * @returns {Object|null}
+     */
     function normalizeRestCandle(c) {
-        if (!c) return null;
+        if (!c || typeof c !== "object") return null;
+        if (c.time == null) return null;
 
-        // REST почти всегда приходит в millis
-        if (c.time != null) {
-            return {
-                ...c,
-                time: Math.floor(Number(c.time) / 1000)
-            };
-        }
-        return c;
+        return {
+            ...c,
+            time: Math.floor(Number(c.time) / 1000)
+        };
     }
 
-    // =====================================================
-    // SNAPSHOT (REST)
-    // =====================================================
+    // ————————————————————————————————
+    // FETCH REST SNAPSHOT
+    // ————————————————————————————————
+
     const snapshotUrl =
         `/api/chart/strategy` +
         `?chatId=${encodeURIComponent(chatId)}` +
         `&type=${encodeURIComponent(type)}` +
         `&symbol=${encodeURIComponent(symbol)}`;
 
-    console.log("📦 REST snapshot:", snapshotUrl);
+    console.log("📦 Fetching REST snapshot:", snapshotUrl);
 
     fetch(snapshotUrl)
-        .then(r => (r.ok ? r.json() : null))
+        .then(r => (r.ok ? r.json() : Promise.reject(r)))
         .then(data => {
             if (!data) return;
 
-            // ===== CANDLES =====
             if (Array.isArray(data.candles) && data.candles.length > 0) {
                 const candles = data.candles
                     .map(normalizeRestCandle)
                     .filter(Boolean);
 
-                console.log(`🕯 REST candles: ${candles.length}`);
+                console.group("📦 [REST] Candles | Raw → Normalized");
+                console.table(candles.map(c => ({
+                    raw:    c.time,
+                    iso:    new Date(c.time * 1000).toISOString(),
+                    open:   c.open,
+                    high:   c.high,
+                    low:    c.low,
+                    close:  c.close,
+                    volume: c.volume
+                })));
+                console.groupEnd();
+
                 chartCtrl.setHistory(candles);
             }
 
-            // ===== STRATEGY LAYERS =====
             if (data.layers) {
                 if (Array.isArray(data.layers.levels)) {
                     strategy.onEvent({ type: "levels", levels: data.layers.levels });
@@ -165,13 +153,14 @@ document.addEventListener("DOMContentLoaded", () => {
                 }
             }
         })
-        .catch(e => console.error("❌ REST snapshot error", e));
+        .catch(err => console.error("❌ REST snapshot error", err));
 
-    // =====================================================
-    // WEBSOCKET (LIVE)
-    // =====================================================
+    // ————————————————————————————————
+    // WEBSOCKET (LIVE STREAM)
+    // ————————————————————————————————
+
     if (typeof SockJS === "undefined" || typeof Stomp === "undefined") {
-        console.error("❌ SockJS/Stomp not found");
+        console.error("❌ Strategy Dashboard: SockJS or Stomp not found");
         return;
     }
 
@@ -179,37 +168,38 @@ document.addEventListener("DOMContentLoaded", () => {
     const stomp  = Stomp.over(socket);
 
     const DEBUG_WS = true;
-    stomp.debug = DEBUG_WS ? (s) => console.log("🧵 STOMP:", s) : () => {};
+    stomp.debug = DEBUG_WS ? s => console.log("🧵 STOMP:", s) : () => {};
 
     stomp.connect({}, () => {
         const topic = `/topic/strategy/${chatId}/${type}`;
-        console.log("📡 SUBSCRIBE", topic);
+        console.log("📡 SUBSCRIBING to LIVE topic:", topic);
 
         stomp.subscribe(topic, msg => {
             let ev;
             try {
                 ev = JSON.parse(msg.body);
-            } catch {
+            } catch (parseError) {
+                console.warn("⚠️ WS parse error:", parseError);
                 return;
             }
 
-            if (!ev || !ev.type) return;
+            if (!ev || typeof ev !== "object" || !ev.type) return;
             if (ev.symbol && ev.symbol !== symbol) return;
 
-            // ===== MARKET EVENTS =====
+            // —— MARKET EVENTS ——
             if (ev.type === "candle") {
-                const norm = normalizeCandleEvent(ev);
-
-                if (!norm || norm.open == null) return;
+                const candle = normalizeCandleEvent(ev);
+                if (!candle || candle.open == null) return;
 
                 if (DEBUG_WS) {
-                    console.log("🕯 LIVE candle:", {
-                        time: new Date(norm.time * 1000).toLocaleString(),
-                        o: norm.open, h: norm.high, l: norm.low, c: norm.close
-                    });
+                    console.group("🕯 [WS] LIVE candle event");
+                    console.log("Raw:", ev);
+                    console.log("Normalized:", candle);
+                    console.log("Date:", new Date(candle.time * 1000).toISOString());
+                    console.groupEnd();
                 }
 
-                chartCtrl.onCandle(norm);
+                chartCtrl.onCandle(candle);
                 return;
             }
 
@@ -219,20 +209,26 @@ document.addEventListener("DOMContentLoaded", () => {
                 return;
             }
 
-            // ===== STRATEGY EVENTS =====
+            // —— STRATEGY EVENTS ——
             strategy.onEvent(ev);
         });
 
-        // 🔁 replay
+        // trigger replay
         fetch(`/api/strategy/${chatId}/${type}/replay`, { method: "POST" });
     });
 
-    // =====================================================
-    // RESIZE
-    // =====================================================
+    // ————————————————————————————————
+    // RESIZE + BAR SPACING
+    // ————————————————————————————————
+
     window.addEventListener("resize", () => {
-        chartCtrl.chart.applyOptions({
-            width: container.clientWidth
-        });
+        if (container) {
+            chartCtrl.chart.applyOptions({ width: container.clientWidth });
+            chartCtrl.adjustBarSpacing();
+        }
     });
+
+    chartCtrl.adjustBarSpacing();
+
+    console.log("📊 Strategy Dashboard INITIALIZED");
 });

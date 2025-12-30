@@ -45,6 +45,7 @@ public class LiveCandleAggregator {
         BigDecimal close;
         double volume;
         Instant start;
+        boolean closed; // ✅ ВАЖНО
     }
 
     private final Map<Key, Candle> candles = new ConcurrentHashMap<>();
@@ -82,25 +83,42 @@ public class LiveCandleAggregator {
         }
 
         // ========================================================
-        // CLOSE OLD CANDLES (catch-up)
+        // CLOSE CANDLES (CATCH-UP, БЕЗ ПРОПУСКОВ)
         // ========================================================
-        while (c.start.toEpochMilli() < bucketStartMs) {
-            closeAndPublish(chatId, strategy, symbol, timeframe, timeframeMillis, c);
-            c = newCandle(
+        while (!c.closed && c.start.toEpochMilli() < bucketStartMs) {
+
+            // закрываем текущую
+            closeAndPublish(
+                    chatId,
+                    strategy,
+                    symbol,
+                    timeframe,
+                    timeframeMillis,
+                    c
+            );
+            c.closed = true;
+
+            // создаём следующую свечу
+            Candle next = newCandle(
                     c.start.plusMillis(timeframeMillis),
                     c.close
             );
-            candles.put(key, c);
+
+            candles.put(key, next);
+            c = next;
         }
 
         // ========================================================
-        // UPDATE CURRENT
+        // UPDATE CURRENT (LIVE TICK)
         // ========================================================
-        c.high = c.high.max(price);
-        c.low  = c.low.min(price);
-        c.close = price;
-        c.volume += 1.0; // ⚠ approximate tick volume
+        if (!c.closed) {
+            c.high = c.high.max(price);
+            c.low  = c.low.min(price);
+            c.close = price;
+            c.volume += 1.0; // tick volume (ок)
+        }
     }
+
 
     // ============================================================
     // FLUSH
@@ -119,7 +137,7 @@ public class LiveCandleAggregator {
         );
 
         Candle c = candles.remove(key);
-        if (c != null) {
+        if (c != null && !c.closed) {
             closeAndPublish(chatId, strategy, symbol, timeframe, timeframeMillis, c);
         }
     }
@@ -135,6 +153,7 @@ public class LiveCandleAggregator {
         c.low = price;
         c.close = price;
         c.volume = 1.0;
+        c.closed = false;
         return c;
     }
 

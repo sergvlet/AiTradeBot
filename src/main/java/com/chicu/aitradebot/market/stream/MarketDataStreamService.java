@@ -2,20 +2,35 @@ package com.chicu.aitradebot.market.stream;
 
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.exchange.binance.ws.BinanceSpotWebSocketClient;
+import com.chicu.aitradebot.market.model.Candle;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class MarketDataStreamService {
 
+    private static final int MAX_CANDLES = 2_000;
+
     private final BinanceSpotWebSocketClient binanceSpotWebSocketClient;
+
+    /**
+     * 🧠 ХРАНИЛИЩЕ СВЕЧЕЙ
+     *
+     * chatId
+     *   → strategy
+     *     → symbol
+     *       → timeframe
+     *         → candles
+     */
+    private final Map<Long, Map<StrategyType, Map<String, Map<String, List<Candle>>>>>
+            candleStorage = new ConcurrentHashMap<>();
 
     /**
      * Активные подписки:
@@ -24,9 +39,9 @@ public class MarketDataStreamService {
     private final Map<Long, Set<SubscriptionKey>> activeSubscriptions =
             new ConcurrentHashMap<>();
 
-    /**
-     * 🕯 + 🔥 Подписка на свечи И live ticks (aggTrade)
-     */
+    // =====================================================================
+    // 🕯 + 🔥 Подписка на свечи и live ticks
+    // =====================================================================
     public synchronized void subscribeCandles(
             long chatId,
             StrategyType strategyType,
@@ -46,6 +61,15 @@ public class MarketDataStreamService {
         String tf  = timeframe.trim().toLowerCase();
 
         SubscriptionKey key = new SubscriptionKey(strategyType, sym, tf);
+
+        // =====================================================
+        // 🟢 0️⃣ ГАРАНТИРУЕМ ИНИЦИАЛИЗАЦИЮ CACHE
+        // =====================================================
+        candleStorage
+                .computeIfAbsent(chatId, __ -> new ConcurrentHashMap<>())
+                .computeIfAbsent(strategyType, __ -> new ConcurrentHashMap<>())
+                .computeIfAbsent(sym, __ -> new ConcurrentHashMap<>())
+                .computeIfAbsent(tf, __ -> new CopyOnWriteArrayList<>());
 
         Set<SubscriptionKey> subs =
                 activeSubscriptions.computeIfAbsent(
@@ -72,7 +96,7 @@ public class MarketDataStreamService {
         );
 
         // =====================================================
-        // 🔥 2️⃣ AGG TRADE — НАСТОЯЩИЙ LIVE
+        // 🔥 2️⃣ AGG TRADE — LIVE PRICE
         // =====================================================
         binanceSpotWebSocketClient.subscribeAggTrade(
                 sym.toLowerCase(),
@@ -89,27 +113,96 @@ public class MarketDataStreamService {
         );
     }
 
-    /**
-     * Отписка (используется при выходе / смене стратегии)
-     */
+    // =====================================================================
+    // 🕯 CALLBACK ДЛЯ LIVE СВЕЧЕЙ (вызывается из WS клиента)
+    // =====================================================================
+    public void onCandle(
+            long chatId,
+            StrategyType strategyType,
+            String symbol,
+            String timeframe,
+            Candle candle
+    ) {
+
+        List<Candle> candles = candleStorage
+                .computeIfAbsent(chatId, __ -> new ConcurrentHashMap<>())
+                .computeIfAbsent(strategyType, __ -> new ConcurrentHashMap<>())
+                .computeIfAbsent(symbol, __ -> new ConcurrentHashMap<>())
+                .computeIfAbsent(timeframe, __ -> new CopyOnWriteArrayList<>());
+
+        candles.add(candle);
+
+        if (candles.size() > MAX_CANDLES) {
+            candles.remove(0);
+        }
+
+        log.debug(
+                "🕯 CANDLE IN {} {} {} time={}",
+                strategyType, symbol, timeframe, candle.getOpen()
+        );
+    }
+
+    // =====================================================================
+    // 📊 SNAPSHOT ДЛЯ ГРАФИКА — НИКОГДА НЕ NULL
+    // =====================================================================
+    public List<Candle> getCandles(
+            long chatId,
+            StrategyType strategyType,
+            String symbol,
+            String timeframe
+    ) {
+
+        return candleStorage
+                .getOrDefault(chatId, Map.of())
+                .getOrDefault(strategyType, Map.of())
+                .getOrDefault(symbol, Map.of())
+                .getOrDefault(timeframe, List.of());
+    }
+
+    // =====================================================================
+    // 📦 PRELOAD (используется WebChartFacade)
+    // =====================================================================
+    public void putCandles(
+            long chatId,
+            StrategyType strategyType,
+            String symbol,
+            String timeframe,
+            List<Candle> candles
+    ) {
+
+        List<Candle> target = candleStorage
+                .computeIfAbsent(chatId, __ -> new ConcurrentHashMap<>())
+                .computeIfAbsent(strategyType, __ -> new ConcurrentHashMap<>())
+                .computeIfAbsent(symbol, __ -> new ConcurrentHashMap<>())
+                .computeIfAbsent(timeframe, __ -> new CopyOnWriteArrayList<>());
+
+        target.clear();
+        target.addAll(candles);
+
+        log.info(
+                "📦 Cache initialized {} candles for {} {} {}",
+                candles.size(), strategyType, symbol, timeframe
+        );
+    }
+
+    // =====================================================================
+    // 🧹 Отписка
+    // =====================================================================
     public synchronized void unsubscribeAll(long chatId) {
 
         Set<SubscriptionKey> subs = activeSubscriptions.remove(chatId);
         if (subs == null || subs.isEmpty()) return;
 
         for (SubscriptionKey key : subs) {
-
             binanceSpotWebSocketClient.unsubscribeKline(
                     key.symbol().toLowerCase(),
                     key.timeframe(),
                     chatId,
                     key.strategyType()
             );
-
-            // aggTrade:
-            // можно закрывать через closeAll(),
-            // но Binance нормально держит соединение
         }
+
+        candleStorage.remove(chatId);
 
         log.info("🧹 UNSUBSCRIBE ALL for chatId={}", chatId);
     }
