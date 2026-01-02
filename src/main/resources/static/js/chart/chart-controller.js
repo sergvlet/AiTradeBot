@@ -30,39 +30,59 @@ export class ChartController {
             }
         });
 
+        // ✅ Добавлен отступ справа (важно для читаемости)
+        this.chart.timeScale().applyOptions({ rightOffset: 20 });
+
         this.candles = this.chart.addCandlestickSeries({
             upColor: "#26a69a",
             downColor: "#ef5350",
             wickUpColor: "#26a69a",
             wickDownColor: "#ef5350",
             borderVisible: false,
+
+            // ❗ ВАЖНО: отключаем встроенную цену
             priceLineVisible: false,
             lastValueVisible: false
         });
 
+        // timeframe + data
         this.timeframeSec = 60;
         this.lastBar = null;
-        this.lastPrice = null;
-        this.priceLine = null;
-
-        this._plRaf = 0;
-        this._plQueuedPrice = null;
-
         this.candlesData = [];
 
-        // indicator series
-        this.lastSMA = null;
-        this.lastEMA = null;
-        this.volSeries = null;
+        // meta
+        this.symbol = null;
+        this.timeframe = null;
+
+        // === PRICE LINE (создаём 1 раз) ==================================
+        this.lastPrice = null;
+        this.priceLine = this.candles.createPriceLine({
+            price: 0,
+            color: "#888",
+            lineWidth: 1,
+            lineStyle: 2,
+            axisLabelVisible: true
+        });
 
         this.applyTheme("dark");
         this.adjustBarSpacing();
-
         window.addEventListener("resize", () => this.adjustBarSpacing());
+
+        console.log("✅ ChartController created", {
+            w: clientWidth,
+            h: clientHeight,
+            timeframeSec: this.timeframeSec
+        });
     }
 
+    /* ====================================================================== */
+    /* 🧠 TIME HELPERS                                                         */
+    /* ====================================================================== */
+
     setTimeframe(tf) {
+        this.timeframe = tf;
         this.timeframeSec = ChartController.parseTimeframeSec(tf);
+        console.log("⏱️ setTimeframe:", tf, "=>", this.timeframeSec, "sec");
     }
 
     static parseTimeframeSec(tf) {
@@ -70,9 +90,16 @@ export class ChartController {
         const m = s.match(/^(\d+)(s|m|h|d)$/);
         if (!m) return 60;
         const n = Number(m[1]);
-        const unit = m[2];
-        const mult = unit === "s" ? 1 : unit === "m" ? 60 : unit === "h" ? 3600 : 86400;
+        const mult = m[2] === "s" ? 1 : m[2] === "m" ? 60 : m[2] === "h" ? 3600 : 86400;
         return Math.max(1, n * mult);
+    }
+
+    normalizeLiveTime(raw) {
+        let t = Number(raw);
+        if (!Number.isFinite(t)) return null;
+        if (t > 1e12) t = Math.floor(t / 1000);
+        const step = this.timeframeSec || 60;
+        return Math.floor(t / step) * step;
     }
 
     normalizeTimeToBucket(rawTime, index = null, total = null) {
@@ -87,7 +114,7 @@ export class ChartController {
             return Math.floor(t / step) * step;
         }
 
-        if (Number.isFinite(t) && typeof index === "number" && typeof total === "number") {
+        if (typeof index === "number" && typeof total === "number") {
             const now = Math.floor(Date.now() / 1000);
             const step = this.timeframeSec || 60;
             const distance = total - index - 1;
@@ -97,6 +124,10 @@ export class ChartController {
 
         return null;
     }
+
+    /* ====================================================================== */
+    /* 📦 HISTORY                                                              */
+    /* ====================================================================== */
 
     setHistory(candles) {
         if (!Array.isArray(candles) || candles.length === 0) {
@@ -110,9 +141,10 @@ export class ChartController {
         for (let i = 0; i < total; i++) {
             const c = candles[i];
             const time = this.normalizeTimeToBucket(c?.time, i, total);
-            const open  = Number(c?.open);
-            const high  = Number(c?.high);
-            const low   = Number(c?.low);
+
+            const open = Number(c?.open);
+            const high = Number(c?.high);
+            const low  = Number(c?.low);
             const close = Number(c?.close);
             const volume = Number(c?.volume);
 
@@ -123,11 +155,12 @@ export class ChartController {
         }
 
         if (!safe.length) {
-            console.error("❌ All candles invalid");
+            console.error("❌ All candles invalid (history)");
             return;
         }
 
         safe.sort((a, b) => a.time - b.time);
+
         const map = new Map();
         for (const c of safe) map.set(c.time, c);
         const unique = [...map.values()].sort((a, b) => a.time - b.time);
@@ -136,8 +169,10 @@ export class ChartController {
         this.candlesData = unique;
 
         this.lastBar = unique.at(-1) || null;
-        this.updatePriceLine(this.lastBar?.close);
 
+        if (this.lastBar) this.updatePriceLine(this.lastBar.close);
+
+        console.log("📦 History loaded", unique.length);
         this.detectTimeframe(unique);
     }
 
@@ -151,15 +186,45 @@ export class ChartController {
         }
     }
 
-    onCandle(ev) {
-        const time = this.normalizeTimeToBucket(ev.time);
-        if (time == null) return;
+    /* ====================================================================== */
+    /* 🔥 WS MESSAGE (важно!)                                                  */
+    /* ====================================================================== */
 
-        const open  = Number(ev.open);
-        const high  = Number(ev.high);
-        const low   = Number(ev.low);
-        const close = Number(ev.close);
-        const volume = Number(ev.volume);
+    onWsMessage(msg) {
+        if (!msg || typeof msg !== "object") return;
+
+        // ✅ ИСПРАВЛЕНО: НЕ ПРЕОБРАЗУЕМ null → 0
+        if (msg.price !== null && msg.price !== undefined) {
+            const p = Number(msg.price);
+            if (Number.isFinite(p) && p > 0) {
+                this.updatePriceLine(p);
+            }
+        }
+
+        if (msg.type === "candle") {
+            this.onCandle(msg);
+        }
+    }
+
+    /* ====================================================================== */
+    /* 🔴 LIVE CANDLE                                                          */
+    /* ====================================================================== */
+
+    onCandle(ev) {
+        const k = (ev && ev.kline && typeof ev.kline === "object") ? ev.kline : ev;
+
+        const rawTime =
+            ev?.time ?? ev?.openTime ?? ev?.timestamp ?? ev?.t ??
+            k?.time ?? k?.openTime ?? k?.timestamp ?? k?.t;
+
+        const time = this.normalizeLiveTime(rawTime);
+        if (!Number.isFinite(time)) return;
+
+        const open   = Number(k?.open);
+        const high   = Number(k?.high);
+        const low    = Number(k?.low);
+        const close  = Number(k?.close);
+        const volume = Number(k?.volume);
 
         if (![open, high, low, close].every(Number.isFinite)) return;
 
@@ -173,49 +238,50 @@ export class ChartController {
         };
 
         const last = this.candlesData.at(-1);
+
         if (last && last.time === bar.time) {
             this.candles.update(bar);
-            this.candlesData[this.candlesData.length-1] = bar;
+            this.candlesData[this.candlesData.length - 1] = bar;
         } else if (!last || bar.time > last.time) {
             this.candles.update(bar);
-            this.chart.timeScale().scrollToRealTime();
             this.candlesData.push(bar);
+            this.chart.timeScale().scrollToRealTime();
+        } else {
+            return;
         }
 
         this.lastBar = bar;
+
+        // ✅ ЕДИНСТВЕННОЕ МЕСТО ОБНОВЛЕНИЯ ЦЕНЫ
         this.updatePriceLine(bar.close);
     }
 
+    /* ====================================================================== */
+    /* 💲 PRICE LINE                                                           */
+    /* ====================================================================== */
+
     updatePriceLine(price) {
-        if (!Number.isFinite(price)) return;
-        if (price === this.lastPrice) return;
+        const p = Number(price);
+        if (!Number.isFinite(p) || p <= 0) return;
 
-        this._plQueuedPrice = price;
-        if (this._plRaf) return;
+        const prev = this.lastPrice;
+        if (prev === p) return;
 
-        this._plRaf = requestAnimationFrame(() => {
-            this._plRaf = 0;
-            const p = this._plQueuedPrice;
-            this._plQueuedPrice = null;
+        this.lastPrice = p;
 
-            if (!Number.isFinite(p) || p === this.lastPrice) return;
+        let color = "#888";
+        if (prev != null) {
+            color = p > prev ? "#26a69a" : p < prev ? "#ef5350" : "#888";
+        }
 
-            if (this.priceLine) {
-                try { this.candles.removePriceLine(this.priceLine); }
-                catch {}
-                this.priceLine = null;
-            }
+        this.priceLine.applyOptions({ price: p, color });
 
-            this.priceLine = this.candles.createPriceLine({
-                price: p,
-                color: p >= this.lastPrice ? "#26a69a" : "#ef5350",
-                lineWidth: 1,
-                lineStyle: 2,
-                axisLabelVisible: true
-            });
-            this.lastPrice = p;
-        });
+        console.log("💲 PriceLine", prev, "→", p, color);
     }
+
+    /* ====================================================================== */
+    /* 🧩 UI                                                                    */
+    /* ====================================================================== */
 
     adjustBarSpacing() {
         const w = this.container.clientWidth;
@@ -224,7 +290,7 @@ export class ChartController {
         });
     }
 
-    applyTheme(kind="dark") {
+    applyTheme(kind = "dark") {
         const dark = kind === "dark";
         this.chart.applyOptions({
             layout: {
@@ -236,59 +302,5 @@ export class ChartController {
                 horzLines: { color: dark ? "#444" : "#ccc" }
             }
         });
-    }
-
-    addSMA(period=14, color="#ffeb3b") {
-        if (!this.candlesData.length) return;
-        const data = [];
-        const vals = this.candlesData.map(c => c.close);
-        for (let i = 0; i < vals.length; i++) {
-            if (i < period - 1) {
-                data.push(null);
-            } else {
-                const sum = vals.slice(i - period + 1, i + 1).reduce((a,b) => a+b, 0);
-                data.push(sum / period);
-            }
-        }
-        const seriesData = this.candlesData.map((c,i) => ({
-            time: c.time,
-            value: data[i]
-        })).filter(d => d.value != null);
-
-        if (!this.lastSMA) {
-            this.lastSMA = this.chart.addLineSeries({ color, lineWidth: 2 });
-        }
-        this.lastSMA.setData(seriesData);
-    }
-
-    addEMA(period=14, color="#03a9f4") {
-        if (!this.candlesData.length) return;
-        let k = 2/(period+1), prev;
-        const out = [];
-        this.candlesData.forEach((c,i) => {
-            prev = i===0 ? c.close : c.close*k + prev*(1-k);
-            out.push({ time: c.time, value: prev });
-        });
-
-        if (!this.lastEMA) {
-            this.lastEMA = this.chart.addLineSeries({ color, lineWidth: 2 });
-        }
-        this.lastEMA.setData(out);
-    }
-
-    addVolumeSeries() {
-        if (!this.candlesData.length) return;
-        if (!this.volSeries) {
-            this.volSeries = this.chart.addHistogramSeries({
-                priceFormat: { type: "volume" },
-                priceScaleId: "",
-                scaleMargins: { top: 0.75, bottom: 0 }
-            });
-        }
-        this.volSeries.setData(this.candlesData.map(c => ({
-            time: c.time,
-            value: c.volume,
-            color: c.close >= c.open ? "#26a69a" : "#ef5350"
-        })));
     }
 }

@@ -20,9 +20,7 @@ public class StrategyLiveWsBridge {
     private final UiStrategyLayerService uiLayers;
 
     /**
-     * 🔁 Дедупликация последних событий
      * key = chatId|strategy|type|symbol
-     * value = lastHash
      */
     private final Map<String, Integer> lastEventHash = new ConcurrentHashMap<>();
 
@@ -32,86 +30,83 @@ public class StrategyLiveWsBridge {
     public void publish(StrategyLiveEvent ev) {
 
         if (ev == null) {
-            log.warn("🚫 LIVE publish called with NULL event");
+            log.warn("LIVE publish called with NULL event");
             return;
         }
 
         if (ev.getChatId() == null || ev.getStrategyType() == null) {
             log.warn(
-                    "🚫 LIVE SKIP missing chatId/strategy type={} chatId={} strategy={}",
+                    "LIVE SKIP missing chatId/strategy type={} chatId={} strategy={}",
                     ev.getType(), ev.getChatId(), ev.getStrategyType()
             );
             return;
         }
 
-        // ===============================
-        // 🔧 NORMALIZE
-        // ===============================
         ev.normalize();
 
         String symbol = normalizeSymbol(ev.getSymbol());
         ev.setSymbol(symbol);
 
         // =================================================
-        // ⏱ ЕДИНСТВЕННО ПРАВИЛЬНАЯ ЛОГИКА ВРЕМЕНИ
+        // TIME NORMALIZATION
         // =================================================
         switch (ev.getType()) {
 
             case "price" -> {
-                // 🔥 price = всегда realtime
                 ev.setTime(StrategyLiveEvent.nowMillis());
             }
 
             case "candle" -> {
-                // 🕯 candle = ТОЛЬКО время свечи
-                // ❌ НЕ ЧИНИМ, ❌ НЕ fallback
                 if (ev.getTime() <= 0) {
-                    log.warn(
-                            "🚫 DROP candle without valid time chatId={} strategy={} symbol={}",
+                    log.debug(
+                            "DROP candle without time chatId={} strategy={} symbol={}",
                             ev.getChatId(), ev.getStrategyType(), ev.getSymbol()
                     );
-                    return; // ⛔ КЛЮЧЕВО
+                    return;
                 }
             }
 
             default -> {
-                // остальные события
                 if (ev.getTime() <= 0) {
                     ev.setTime(StrategyLiveEvent.nowMillis());
                 }
             }
         }
 
-        log.info(
-                "🔥 LIVE PUBLISH type={} chatId={} strategy={} symbol={} time={}",
-                ev.getType(),
-                ev.getChatId(),
-                ev.getStrategyType(),
-                ev.getSymbol(),
-                ev.getTime()
-        );
-
-        // ===============================
-        // 🔁 DEDUP (price / candle НЕ дедуплицируются)
-        // ===============================
+        // =================================================
+        // 🔕 DEDUP (кроме price / candle)
+        // =================================================
         if (shouldDedup(ev.getType())) {
-
-            String dedupKey = buildKey(ev);
+            String key = buildKey(ev);
             int hash = safeHash(ev);
 
-            Integer prev = lastEventHash.put(dedupKey, hash);
+            Integer prev = lastEventHash.put(key, hash);
             if (prev != null && prev == hash) {
-                log.debug(
-                        "🔕 LIVE DEDUP SKIP type={} chatId={} strategy={} symbol={}",
+                log.trace(
+                        "DEDUP SKIP type={} chatId={} strategy={} symbol={}",
                         ev.getType(), ev.getChatId(), ev.getStrategyType(), ev.getSymbol()
                 );
                 return;
             }
         }
 
-        // ===============================
-        // 1️⃣ WS — МГНОВЕННО
-        // ===============================
+        // =================================================
+        // 🔇 ЛОГИРОВАНИЕ (АККУРАТНО)
+        // =================================================
+
+        if (log.isDebugEnabled()) {
+            log.debug(
+                    "LIVE → type={} chatId={} strategy={} symbol={}",
+                    ev.getType(),
+                    ev.getChatId(),
+                    ev.getStrategyType(),
+                    ev.getSymbol()
+            );
+        }
+
+        // =================================================
+        // WS PUSH
+        // =================================================
         String dest = "/topic/strategy/"
                       + ev.getChatId()
                       + "/"
@@ -119,22 +114,21 @@ public class StrategyLiveWsBridge {
 
         ws.convertAndSend(dest, ev);
 
-        // ===============================
-        // 2️⃣ UI LAYER
-        // ===============================
+        // =================================================
+        // UI LAYER
+        // =================================================
         try {
             persistUiLayer(ev);
         } catch (Exception e) {
             log.warn(
-                    "⚠ UI layer persist failed: type={} chatId={} strategy={} symbol={}",
+                    "UI persist failed type={} chatId={} strategy={} symbol={}",
                     ev.getType(), ev.getChatId(), ev.getStrategyType(), symbol, e
             );
         }
     }
 
-
     // =====================================================
-    // UI LAYER PERSISTENCE
+    // UI PERSIST
     // =====================================================
     private void persistUiLayer(StrategyLiveEvent ev) {
 
@@ -200,7 +194,7 @@ public class StrategyLiveWsBridge {
             }
 
             default -> {
-                // остальные события не пишем
+                // intentionally ignored
             }
         }
     }
@@ -209,9 +203,6 @@ public class StrategyLiveWsBridge {
     // HELPERS
     // =====================================================
 
-    /**
-     * ❗ price и candle — НЕ дедуплицируются
-     */
     private boolean shouldDedup(String type) {
         return !"price".equals(type) && !"candle".equals(type);
     }
@@ -224,12 +215,9 @@ public class StrategyLiveWsBridge {
 
     private String buildKey(StrategyLiveEvent ev) {
         return ev.getChatId()
-               + "|"
-               + ev.getStrategyType()
-               + "|"
-               + ev.getType()
-               + "|"
-               + ev.getSymbol();
+               + "|" + ev.getStrategyType()
+               + "|" + ev.getType()
+               + "|" + ev.getSymbol();
     }
 
     private int safeHash(StrategyLiveEvent ev) {

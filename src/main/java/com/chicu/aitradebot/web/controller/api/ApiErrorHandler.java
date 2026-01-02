@@ -10,6 +10,7 @@ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchExcep
 import org.springframework.web.server.ResponseStatusException;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 import jakarta.servlet.http.HttpServletRequest;
 import java.util.HashMap;
@@ -19,27 +20,60 @@ import java.util.Map;
 @RestControllerAdvice
 public class ApiErrorHandler {
 
+    // =====================================================================
+    // 404 — STATIC / UNKNOWN RESOURCE (FIX)
+    // =====================================================================
+
+    @ExceptionHandler(NoResourceFoundException.class)
+    public ResponseEntity<Map<String, Object>> handleNoResource(
+            NoResourceFoundException e,
+            HttpServletRequest req
+    ) {
+        // Это нормальный 404 (Chrome devtools, .well-known и т.п.)
+        log.debug("404 Not Found at {}", safePath(req));
+        return build(404, e, req);
+    }
+
+    // =====================================================================
+    // 400 — BAD REQUEST
+    // =====================================================================
+
     @ExceptionHandler({
             MissingServletRequestParameterException.class,
             MethodArgumentTypeMismatchException.class,
             HttpMessageNotReadableException.class,
             MethodArgumentNotValidException.class
     })
-    public ResponseEntity<Map<String, Object>> handleBadRequest(Exception e, HttpServletRequest req) {
+    public ResponseEntity<Map<String, Object>> handleBadRequest(
+            Exception e,
+            HttpServletRequest req
+    ) {
         log.warn("400 Bad Request at {}: {}", safePath(req), e.toString());
         return build(400, e, req);
     }
 
+    // =====================================================================
+    // 405 — METHOD NOT ALLOWED
+    // =====================================================================
+
     @ExceptionHandler(HttpRequestMethodNotSupportedException.class)
-    public ResponseEntity<Map<String, Object>> handleMethodNotAllowed(HttpRequestMethodNotSupportedException e,
-                                                                      HttpServletRequest req) {
+    public ResponseEntity<Map<String, Object>> handleMethodNotAllowed(
+            HttpRequestMethodNotSupportedException e,
+            HttpServletRequest req
+    ) {
         log.warn("405 Method Not Allowed at {}: {}", safePath(req), e.getMethod());
         return build(405, e, req);
     }
 
+    // =====================================================================
+    // CUSTOM STATUS
+    // =====================================================================
+
     @ExceptionHandler(ResponseStatusException.class)
-    public ResponseEntity<Map<String, Object>> handleResponseStatus(ResponseStatusException e,
-                                                                    HttpServletRequest req) {
+    public ResponseEntity<Map<String, Object>> handleResponseStatus(
+            ResponseStatusException e,
+            HttpServletRequest req
+    ) {
         int code = e.getStatusCode().value();
         if (code >= 500) {
             log.error("{} at {}: {}", code, safePath(req), safeMsg(e), e);
@@ -49,16 +83,28 @@ public class ApiErrorHandler {
         return build(code, e, req);
     }
 
+    // =====================================================================
+    // 500 — UNEXPECTED ERROR
+    // =====================================================================
+
     @ExceptionHandler(Exception.class)
-    public ResponseEntity<Map<String, Object>> handle(Exception e, HttpServletRequest req) {
-        // общий неожиданный 500
+    public ResponseEntity<Map<String, Object>> handle(
+            Exception e,
+            HttpServletRequest req
+    ) {
         log.error("500 at {}: {}", safePath(req), safeMsg(e), e);
         return build(500, e, req);
     }
 
-    // ---------- helpers ----------
+    // =====================================================================
+    // HELPERS
+    // =====================================================================
 
-    private ResponseEntity<Map<String, Object>> build(int status, Exception e, HttpServletRequest req) {
+    private ResponseEntity<Map<String, Object>> build(
+            int status,
+            Exception e,
+            HttpServletRequest req
+    ) {
         Map<String, Object> body = new HashMap<>();
         body.put("status", "error");
         body.put("code", status);
@@ -71,7 +117,9 @@ public class ApiErrorHandler {
 
     private String safeMsg(Throwable e) {
         String m = (e != null ? e.getMessage() : null);
-        return (m != null && !m.isBlank()) ? m : (e != null ? e.getClass().getSimpleName() : "Error");
+        return (m != null && !m.isBlank())
+                ? m
+                : (e != null ? e.getClass().getSimpleName() : "Error");
     }
 
     private String safePath(HttpServletRequest req) {

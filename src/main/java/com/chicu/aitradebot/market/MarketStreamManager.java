@@ -109,15 +109,14 @@ public class MarketStreamManager {
         String sym = normSymbol(symbol);
         String tf  = normTf(timeframe);
 
-        Map<String, Deque<Candle>> tfMap = cache.get(sym);
-        if (tfMap == null) {
-            log.debug("📭 No candles: symbol={} (tfMap=null)", sym);
-            return List.of();
-        }
+        Map<String, Deque<Candle>> tfMap =
+                cache.computeIfAbsent(sym, k -> new ConcurrentHashMap<>());
 
-        Deque<Candle> deque = tfMap.get(tf);
-        if (deque == null || deque.isEmpty()) {
-            log.debug("📭 No candles: symbol={} tf={}", sym, tf);
+        Deque<Candle> deque =
+                tfMap.computeIfAbsent(tf, k -> new ConcurrentLinkedDeque<>());
+
+        if (deque.isEmpty()) {
+            log.debug("📭 No candles yet: symbol={} tf={}", sym, tf);
             return List.of();
         }
 

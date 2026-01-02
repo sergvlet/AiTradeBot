@@ -22,30 +22,15 @@ public class StrategyLivePublisher {
     // 🧩 HELPERS
     // =====================================================
 
-    /**
-     * epoch millis — UI V4 / LightweightCharts
-     */
     private static long nowMs(Instant ts) {
         return ts != null ? ts.toEpochMilli() : System.currentTimeMillis();
     }
 
-
-    /**
-     * null если пусто
-     */
     private static String sanitizeSymbol(String symbol) {
         if (symbol == null) return null;
-        String s = symbol.trim();
+        String s = symbol.trim().toUpperCase(); // ✅ КРИТИЧНО: единый формат символа
         return s.isEmpty() ? null : s;
     }
-
-    /**
-     * true = можно публиковать
-     */
-    private static boolean baseOk(Long chatId, StrategyType type, String symbol) {
-        return symbol != null && type != null;
-    }
-
 
     private static String sanitizeTf(String tf) {
         if (tf == null) return null;
@@ -54,7 +39,7 @@ public class StrategyLivePublisher {
     }
 
     /**
-     * ЕДИНАЯ защита + лог
+     * 🔒 ЕДИНАЯ защита
      */
     private boolean guard(Long chatId, StrategyType type, String symbol, String event) {
 
@@ -64,8 +49,8 @@ public class StrategyLivePublisher {
             return false;
         }
 
-        // chatId обязателен ТОЛЬКО для стратегии
-        if (chatId == null && !event.equals("candle") && !event.equals("price")) {
+        // 🔥 chatId ОБЯЗАТЕЛЕН для ВСЕХ событий
+        if (chatId == null) {
             log.warn("⚠️ LIVE SKIP [{}] missing chatId", event);
             return false;
         }
@@ -73,9 +58,19 @@ public class StrategyLivePublisher {
         return true;
     }
 
+    /**
+     * ✅ ЕДИНАЯ публикация с нормализацией (чтобы символ/таймфрейм/время всегда были валидны)
+     */
+    private void publish(StrategyLiveEvent ev) {
+        if (ev == null) return;
+        ev.normalize();               // ✅ ВОТ ЭТОГО ТЕБЕ НЕ ХВАТАЛО
+        bridge.publish(ev);
+    }
+
     // =====================================================
     // 🕯 CANDLE
     // =====================================================
+
     public void pushCandleOhlc(Long chatId,
                                StrategyType strategyType,
                                String symbol,
@@ -89,21 +84,24 @@ public class StrategyLivePublisher {
 
         symbol = sanitizeSymbol(symbol);
         timeframe = sanitizeTf(timeframe);
+
         if (!guard(chatId, strategyType, symbol, "candle")) return;
 
         if (open == null || high == null || low == null || close == null) {
-            log.warn("❌ CANDLE invalid OHLC chatId={} symbol={}", chatId, symbol);
+            log.warn("❌ LIVE CANDLE invalid OHLC chatId={} symbol={}", chatId, symbol);
             return;
         }
 
-        bridge.publish(
+        long timeMs = nowMs(ts);
+
+        StrategyLiveEvent ev =
                 StrategyLiveEvent.builder()
                         .type("candle")
                         .chatId(chatId)
                         .strategyType(strategyType)
                         .symbol(symbol)
-                        .timeframe(timeframe) // ✅ ОБЯЗАТЕЛЬНО
-                        .time(nowMs(ts))
+                        .timeframe(timeframe)
+                        .time(timeMs)
                         .kline(
                                 StrategyLiveEvent.CandlePayload.builder()
                                         .open(open)
@@ -111,20 +109,22 @@ public class StrategyLivePublisher {
                                         .low(low)
                                         .close(close)
                                         .volume(volume)
+                                        .timeframe(timeframe) // ✅ полезно для UI/диагностики
                                         .build()
                         )
-                        .build()
-        );
+                        .build();
+
+        publish(ev);
     }
 
-
     // =====================================================
-// 💲 PRICE
-// =====================================================
+    // 💲 PRICE
+    // =====================================================
+
     public void pushPriceTick(Long chatId,
                               StrategyType strategyType,
                               String symbol,
-                              String timeframe,   // ✅ ДОБАВЛЕНО
+                              String timeframe,
                               BigDecimal price,
                               Instant ts) {
 
@@ -133,13 +133,16 @@ public class StrategyLivePublisher {
         if (!guard(chatId, strategyType, symbol, "price")) return;
         if (price == null) return;
 
-        bridge.publish(
+        log.debug("📤 LIVE PUBLISH PRICE chatId={} {} {} tf={} price={}",
+                chatId, strategyType, symbol, timeframe, price);
+
+        publish(
                 StrategyLiveEvent.builder()
                         .type("price")
                         .chatId(chatId)
                         .strategyType(strategyType)
                         .symbol(symbol)
-                        .timeframe(timeframe) // ✅ ТЕПЕРЬ СУЩЕСТВУЕТ
+                        .timeframe(timeframe)
                         .price(price)
                         .time(nowMs(ts))
                         .build()
@@ -147,23 +150,21 @@ public class StrategyLivePublisher {
     }
 
     // =====================================================
-// 💲 PRICE (BACKWARD COMPATIBILITY)
-// =====================================================
+    // 💲 PRICE (BACKWARD COMPATIBILITY)
+    // =====================================================
+
     public void pushPriceTick(Long chatId,
                               StrategyType strategyType,
                               String symbol,
                               BigDecimal price,
                               Instant ts) {
-
-        // ⬅️ делегируем в новый метод без таймфрейма
         pushPriceTick(chatId, strategyType, symbol, null, price, ts);
     }
-
-
 
     // =====================================================
     // 🟣 LEVELS
     // =====================================================
+
     public void pushLevels(Long chatId,
                            StrategyType strategyType,
                            String symbol,
@@ -179,15 +180,14 @@ public class StrategyLivePublisher {
                         .map(p -> StrategyLiveEvent.LevelPayload.builder().price(p).build())
                         .toList();
 
-        bridge.publish(
+        publish(
                 StrategyLiveEvent.builder()
                         .type("levels")
                         .chatId(chatId)
                         .strategyType(strategyType)
                         .symbol(symbol)
                         .levels(payload)
-                        .time(nowMs(
-                                null))
+                        .time(nowMs(null))
                         .build()
         );
     }
@@ -199,6 +199,7 @@ public class StrategyLivePublisher {
     // =====================================================
     // 🟠 ZONE
     // =====================================================
+
     public void pushZone(Long chatId,
                          StrategyType strategyType,
                          String symbol,
@@ -208,7 +209,7 @@ public class StrategyLivePublisher {
         symbol = sanitizeSymbol(symbol);
         if (!guard(chatId, strategyType, symbol, "zone")) return;
 
-        bridge.publish(
+        publish(
                 StrategyLiveEvent.builder()
                         .type("zone")
                         .chatId(chatId)
@@ -222,8 +223,7 @@ public class StrategyLivePublisher {
                                                 .color("rgba(59,130,246,0.12)")
                                                 .build()
                         )
-                        .time(nowMs(
-                                null))
+                        .time(nowMs(null))
                         .build()
         );
     }
@@ -235,6 +235,7 @@ public class StrategyLivePublisher {
     // =====================================================
     // 🎯 ACTIVE LEVEL
     // =====================================================
+
     public void pushActiveLevel(Long chatId,
                                 StrategyType strategyType,
                                 String symbol,
@@ -244,7 +245,7 @@ public class StrategyLivePublisher {
         symbol = sanitizeSymbol(symbol);
         if (!guard(chatId, strategyType, symbol, "active_level")) return;
 
-        bridge.publish(
+        publish(
                 StrategyLiveEvent.builder()
                         .type("active_level")
                         .chatId(chatId)
@@ -257,8 +258,7 @@ public class StrategyLivePublisher {
                                                 .role(role)
                                                 .build()
                         )
-                        .time(nowMs(
-                                null))
+                        .time(nowMs(null))
                         .build()
         );
     }
@@ -270,6 +270,7 @@ public class StrategyLivePublisher {
     // =====================================================
     // 🔴 TRADE ZONE
     // =====================================================
+
     public void pushTradeZone(Long chatId,
                               StrategyType strategyType,
                               String symbol,
@@ -280,7 +281,7 @@ public class StrategyLivePublisher {
         symbol = sanitizeSymbol(symbol);
         if (!guard(chatId, strategyType, symbol, "trade_zone")) return;
 
-        bridge.publish(
+        publish(
                 StrategyLiveEvent.builder()
                         .type("trade_zone")
                         .chatId(chatId)
@@ -294,8 +295,7 @@ public class StrategyLivePublisher {
                                                 .bottom(bottom)
                                                 .build()
                         )
-                        .time(nowMs(
-                                null))
+                        .time(nowMs(null))
                         .build()
         );
     }
@@ -307,6 +307,7 @@ public class StrategyLivePublisher {
     // =====================================================
     // 🧾 ORDER
     // =====================================================
+
     public void pushOrder(Long chatId,
                           StrategyType strategyType,
                           String symbol,
@@ -319,7 +320,7 @@ public class StrategyLivePublisher {
         symbol = sanitizeSymbol(symbol);
         if (!guard(chatId, strategyType, symbol, "order")) return;
 
-        bridge.publish(
+        publish(
                 StrategyLiveEvent.builder()
                         .type("order")
                         .chatId(chatId)
@@ -334,8 +335,7 @@ public class StrategyLivePublisher {
                                         .status(status)
                                         .build()
                         )
-                        .time(nowMs(
-                                null))
+                        .time(nowMs(null))
                         .build()
         );
     }
@@ -343,6 +343,7 @@ public class StrategyLivePublisher {
     // =====================================================
     // 🟢 TP / SL
     // =====================================================
+
     public void pushTpSl(Long chatId,
                          StrategyType strategyType,
                          String symbol,
@@ -352,7 +353,7 @@ public class StrategyLivePublisher {
         symbol = sanitizeSymbol(symbol);
         if (!guard(chatId, strategyType, symbol, "tp_sl")) return;
 
-        bridge.publish(
+        publish(
                 StrategyLiveEvent.builder()
                         .type("tp_sl")
                         .chatId(chatId)
@@ -365,8 +366,7 @@ public class StrategyLivePublisher {
                                                 .sl(sl)
                                                 .build()
                         )
-                        .time(nowMs(
-                                null))
+                        .time(nowMs(null))
                         .build()
         );
     }
@@ -378,6 +378,7 @@ public class StrategyLivePublisher {
     // =====================================================
     // 📊 METRIC
     // =====================================================
+
     public void pushMetric(Long chatId,
                            StrategyType strategyType,
                            String symbol,
@@ -386,15 +387,14 @@ public class StrategyLivePublisher {
         symbol = sanitizeSymbol(symbol);
         if (!guard(chatId, strategyType, symbol, "metric")) return;
 
-        bridge.publish(
+        publish(
                 StrategyLiveEvent.builder()
                         .type("metric")
                         .chatId(chatId)
                         .strategyType(strategyType)
                         .symbol(symbol)
                         .metric(pnlPct)
-                        .time(nowMs(
-                                null))
+                        .time(nowMs(null))
                         .build()
         );
     }
@@ -402,6 +402,7 @@ public class StrategyLivePublisher {
     // =====================================================
     // ▶ STATE
     // =====================================================
+
     public void pushState(Long chatId,
                           StrategyType strategyType,
                           String symbol,
@@ -410,15 +411,14 @@ public class StrategyLivePublisher {
         symbol = sanitizeSymbol(symbol);
         if (!guard(chatId, strategyType, symbol, "state")) return;
 
-        bridge.publish(
+        publish(
                 StrategyLiveEvent.builder()
                         .type("state")
                         .chatId(chatId)
                         .strategyType(strategyType)
                         .symbol(symbol)
                         .state(running ? "running" : "stopped")
-                        .time(nowMs(
-                                null))
+                        .time(nowMs(null))
                         .build()
         );
     }
@@ -426,6 +426,7 @@ public class StrategyLivePublisher {
     // =====================================================
     // 🧲 MAGNET
     // =====================================================
+
     public void pushMagnet(Long chatId,
                            StrategyType strategyType,
                            String symbol,
@@ -435,7 +436,7 @@ public class StrategyLivePublisher {
         symbol = sanitizeSymbol(symbol);
         if (!guard(chatId, strategyType, symbol, "magnet")) return;
 
-        bridge.publish(
+        publish(
                 StrategyLiveEvent.builder()
                         .type("magnet")
                         .chatId(chatId)
@@ -448,8 +449,7 @@ public class StrategyLivePublisher {
                                                 .strength(strength)
                                                 .build()
                         )
-                        .time(nowMs(
-                                null))
+                        .time(nowMs(null))
                         .build()
         );
     }
@@ -457,6 +457,7 @@ public class StrategyLivePublisher {
     // =====================================================
     // 🚦 SIGNAL
     // =====================================================
+
     public void pushSignal(Long chatId,
                            StrategyType strategyType,
                            String symbol,
@@ -468,7 +469,7 @@ public class StrategyLivePublisher {
         if (!guard(chatId, strategyType, symbol, "signal")) return;
         if (signal == null) return;
 
-        bridge.publish(
+        publish(
                 StrategyLiveEvent.builder()
                         .type("signal")
                         .chatId(chatId)
@@ -482,8 +483,7 @@ public class StrategyLivePublisher {
                                         .timeframe(timeframe)
                                         .build()
                         )
-                        .time(nowMs(
-                                null))
+                        .time(nowMs(null))
                         .build()
         );
     }
@@ -491,6 +491,7 @@ public class StrategyLivePublisher {
     // =====================================================
     // 📈 TRADE
     // =====================================================
+
     public void pushTrade(Long chatId,
                           StrategyType strategyType,
                           String symbol,
@@ -502,7 +503,7 @@ public class StrategyLivePublisher {
         symbol = sanitizeSymbol(symbol);
         if (!guard(chatId, strategyType, symbol, "trade")) return;
 
-        bridge.publish(
+        publish(
                 StrategyLiveEvent.builder()
                         .type("trade")
                         .chatId(chatId)
@@ -515,8 +516,7 @@ public class StrategyLivePublisher {
                                         .qty(qty)
                                         .build()
                         )
-                        .time(nowMs(
-                                ts))
+                        .time(nowMs(ts))
                         .build()
         );
     }
@@ -524,6 +524,7 @@ public class StrategyLivePublisher {
     // =====================================================
     // 📍 PRICE LINE
     // =====================================================
+
     public void pushPriceLine(Long chatId,
                               StrategyType strategyType,
                               String symbol,
@@ -533,7 +534,7 @@ public class StrategyLivePublisher {
         symbol = sanitizeSymbol(symbol);
         if (!guard(chatId, strategyType, symbol, "price_line")) return;
 
-        bridge.publish(
+        publish(
                 StrategyLiveEvent.builder()
                         .type("price_line")
                         .chatId(chatId)
@@ -546,8 +547,7 @@ public class StrategyLivePublisher {
                                                 .price(price)
                                                 .build()
                         )
-                        .time(nowMs(
-                                null))
+                        .time(nowMs(null))
                         .build()
         );
     }
@@ -559,6 +559,7 @@ public class StrategyLivePublisher {
     // =====================================================
     // 🔲 WINDOW ZONE
     // =====================================================
+
     public void pushWindowZone(Long chatId,
                                StrategyType strategyType,
                                String symbol,
@@ -568,7 +569,7 @@ public class StrategyLivePublisher {
         symbol = sanitizeSymbol(symbol);
         if (!guard(chatId, strategyType, symbol, "window_zone")) return;
 
-        bridge.publish(
+        publish(
                 StrategyLiveEvent.builder()
                         .type("window_zone")
                         .chatId(chatId)
@@ -581,8 +582,7 @@ public class StrategyLivePublisher {
                                                 .low(low)
                                                 .build()
                         )
-                        .time(nowMs(
-                                null))
+                        .time(nowMs(null))
                         .build()
         );
     }
@@ -594,6 +594,7 @@ public class StrategyLivePublisher {
     // =====================================================
     // 📊 ATR
     // =====================================================
+
     public void pushAtr(Long chatId,
                         StrategyType strategyType,
                         String symbol,
@@ -603,7 +604,7 @@ public class StrategyLivePublisher {
         symbol = sanitizeSymbol(symbol);
         if (!guard(chatId, strategyType, symbol, "atr")) return;
 
-        bridge.publish(
+        publish(
                 StrategyLiveEvent.builder()
                         .type("atr")
                         .chatId(chatId)
@@ -615,8 +616,7 @@ public class StrategyLivePublisher {
                                         .volatilityPct(volatilityPct)
                                         .build()
                         )
-                        .time(nowMs(
-                                null))
+                        .time(nowMs(null))
                         .build()
         );
     }
@@ -624,6 +624,7 @@ public class StrategyLivePublisher {
     // =====================================================
     // ⏸ COOLDOWN
     // =====================================================
+
     public void pushCooldown(Long chatId,
                              StrategyType strategyType,
                              String symbol,
@@ -632,16 +633,36 @@ public class StrategyLivePublisher {
         symbol = sanitizeSymbol(symbol);
         if (!guard(chatId, strategyType, symbol, "cooldown")) return;
 
-        bridge.publish(
+        publish(
                 StrategyLiveEvent.builder()
                         .type("cooldown")
                         .chatId(chatId)
                         .strategyType(strategyType)
                         .symbol(symbol)
                         .metric(secondsLeft > 0 ? (double) secondsLeft : null)
-                        .time(nowMs(
-                                null))
+                        .time(nowMs(null))
                         .build()
         );
     }
+    private void logCandleClosed(Long chatId,
+                                 StrategyType strategyType,
+                                 String symbol,
+                                 String timeframe,
+                                 long time,
+                                 BigDecimal open,
+                                 BigDecimal high,
+                                 BigDecimal low,
+                                 BigDecimal close,
+                                 BigDecimal volume) {
+
+        log.info(
+                "🕯 CANDLE CLOSED [{}] {} {} tf={} O={} H={} L={} C={} V={}",
+                chatId,
+                strategyType,
+                symbol,
+                timeframe,
+                open, high, low, close, volume
+        );
+    }
+
 }

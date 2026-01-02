@@ -27,7 +27,6 @@ import java.util.concurrent.ConcurrentHashMap;
 public class MarketStreamService {
 
     private static final int INITIAL_HISTORY_LIMIT = 1000;
-    private static final long LIVE_CANDLE_THROTTLE_MS = 500;
 
     private final MarketStreamManager streamManager;
     private final StrategyLivePublisher live;
@@ -36,36 +35,59 @@ public class MarketStreamService {
     private final ObjectMapper objectMapper;
 
     /**
-     * key = chatId|strategy|symbol|tf → last push millis
+     * key = symbol|tf → last push millis
+     * (оставлено на будущее, сейчас не используется)
      */
     private final Map<String, Long> lastLiveCandlePushAt = new ConcurrentHashMap<>();
 
     // =====================================================================
-    // ❌ KLINE НЕ ОБНОВЛЯЕТ OHLC
+    // LIVE KLINE — CACHE + UI
     // =====================================================================
-    public void onKline(UnifiedKline kline) {
-        // намеренно ПУСТО
-        // kline используется ТОЛЬКО в closeCandle()
-    }
+    public void onKline(
+            long chatId,
+            StrategyType strategyType,
+            UnifiedKline kline
+    ) {
+        if (kline == null) return;
 
-    // =====================================================================
-    // STRATEGY PIPELINE
-    // =====================================================================
-    public void onKline(long chatId, StrategyType strategyType, UnifiedKline kline) {
+        String symbol = kline.getSymbol().toUpperCase(Locale.ROOT);
+        String timeframe = kline.getTimeframe().toLowerCase(Locale.ROOT);
 
-        preloadHistoryIfNeeded(
-                chatId,
-                kline.getSymbol().toUpperCase(),
-                kline.getTimeframe().toLowerCase()
+        Candle candle = new Candle(
+                kline.getOpenTime(),
+                kline.getOpen().doubleValue(),
+                kline.getHigh().doubleValue(),
+                kline.getLow().doubleValue(),
+                kline.getClose().doubleValue(),
+                kline.getVolume().doubleValue(),
+                kline.isClosed()
         );
 
-        // ❗ НИКАКИХ UI И OHLC ТУТ НЕТ
+        // 1️⃣ всегда обновляем кеш
+        streamManager.addCandle(symbol, timeframe, candle);
+
+        // 2️⃣ публикуем candle в UI (каждое обновление текущей свечи)
+        live.pushCandleOhlc(
+                chatId,
+                strategyType,
+                symbol,
+                timeframe,
+                kline.getOpen(),
+                kline.getHigh(),
+                kline.getLow(),
+                kline.getClose(),
+                kline.getVolume(),
+                Instant.ofEpochMilli(kline.getOpenTime())
+        );
+
+        // 3️⃣ в стратегию — ТОЛЬКО если свеча закрыта
+        if (!kline.isClosed()) return;
 
         TradingStrategy strategy = strategyRegistry.get(strategyType);
         if (strategy != null && strategy.isActive(chatId)) {
             strategy.onPriceUpdate(
                     chatId,
-                    kline.getSymbol().toUpperCase(),
+                    symbol,
                     kline.getClose(),
                     Instant.ofEpochMilli(kline.getCloseTime())
             );
@@ -73,44 +95,7 @@ public class MarketStreamService {
     }
 
     // =====================================================================
-    // PRELOAD HISTORY
-    // =====================================================================
-    private void preloadHistoryIfNeeded(long chatId, String symbol, String timeframe) {
-
-        if (!streamManager.getCandles(symbol, timeframe, 1).isEmpty()) {
-            return;
-        }
-
-        try {
-            ExchangeClient client = exchangeClientFactory.getByChat(chatId);
-            List<ExchangeClient.Kline> klines =
-                    client.getKlines(symbol, timeframe, INITIAL_HISTORY_LIMIT);
-
-            for (ExchangeClient.Kline k : klines) {
-                streamManager.addCandle(
-                        symbol,
-                        timeframe,
-                        new Candle(
-                                k.openTime(),
-                                k.open(),
-                                k.high(),
-                                k.low(),
-                                k.close(),
-                                k.volume(),
-                                true
-                        )
-                );
-            }
-
-            log.info("📥 Preloaded {} candles {} {}", klines.size(), symbol, timeframe);
-
-        } catch (Exception e) {
-            log.error("❌ Preload failed {} {}", symbol, timeframe, e);
-        }
-    }
-
-    // =====================================================================
-    // 🔥 AGG TRADE — ЕДИНСТВЕННЫЙ ИСТОЧНИК LIVE OHLC
+    // AGG TRADE — PRICE + CANDLE
     // =====================================================================
     public void onAggTrade(
             long chatId,
@@ -134,12 +119,10 @@ public class MarketStreamService {
             timeframe = timeframe.toLowerCase(Locale.ROOT);
 
             List<Candle> candles = streamManager.getCandles(symbol, timeframe, 1);
-
             if (candles.isEmpty()) return;
 
             Candle c = candles.get(0);
 
-            // 🕯 LIVE UPDATE
             c.setClose(price);
             c.setHigh(Math.max(c.getHigh(), price));
             c.setLow(Math.min(c.getLow(), price));
@@ -151,44 +134,38 @@ public class MarketStreamService {
                 }
             }
 
-            // ✅ UI: PRICE (каждый тик)
+            // 🔥 live price (тик)
             live.pushPriceTick(
                     chatId,
                     strategyType,
                     symbol,
+                    timeframe,
                     BigDecimal.valueOf(price),
                     tickTs
             );
 
-            // 🟡 UI: CANDLE (throttled, БЕЗ смены времени)
-            String key = chatId + "|" + strategyType + "|" + symbol + "|" + timeframe;
-            long now = System.currentTimeMillis();
-            Long prev = lastLiveCandlePushAt.get(key);
-
-            if (prev == null || now - prev >= LIVE_CANDLE_THROTTLE_MS) {
-                lastLiveCandlePushAt.put(key, now);
-
-                live.pushCandleOhlc(
-                        chatId,
-                        strategyType,
-                        symbol,
-                        timeframe,
-                        BigDecimal.valueOf(c.getOpen()),
-                        BigDecimal.valueOf(c.getHigh()),
-                        BigDecimal.valueOf(c.getLow()),
-                        BigDecimal.valueOf(c.getClose()),
-                        BigDecimal.valueOf(c.getVolume()),
-                        Instant.ofEpochMilli(c.getTime()) // ❗ время свечи
-                );
-            }
+            // 🔥 live candle (обновление текущей свечи)
+            live.pushCandleOhlc(
+                    chatId,
+                    strategyType,
+                    symbol,
+                    timeframe,
+                    BigDecimal.valueOf(c.getOpen()),
+                    BigDecimal.valueOf(c.getHigh()),
+                    BigDecimal.valueOf(c.getLow()),
+                    BigDecimal.valueOf(c.getClose()),
+                    BigDecimal.valueOf(c.getVolume()),
+                    Instant.ofEpochMilli(c.getTime())
+            );
 
         } catch (Exception e) {
-            log.debug("aggTrade skipped: {}", e.getMessage());
+            // ❗ реальная ошибка — логируем
+            log.warn("aggTrade processing failed: {}", e.getMessage());
         }
     }
 
     // =====================================================================
-    // 🔒 CLOSE CANDLE — ЕДИНСТВЕННОЕ МЕСТО ЗАКРЫТИЯ
+    // CLOSE CANDLE — РЕДКОЕ И ПОЛЕЗНОЕ СОБЫТИЕ
     // =====================================================================
     public void closeCandle(
             long chatId,
@@ -217,7 +194,30 @@ public class MarketStreamService {
 
         streamManager.addCandle(symbol, timeframe, next);
 
-        log.debug("🕯 CLOSED & OPENED {} {} @{}", symbol, timeframe, nextOpenTime);
+        // ✅ ЭТОТ ЛОГ ОСТАВЛЯЕМ
+        log.info("🕯 Candle closed {} {} @{}", symbol, timeframe, nextOpenTime);
+    }
+
+    // =====================================================================
+    // LEGACY ENTRY — ДЛЯ ADAPTER / HISTORY / REPLAY
+    // =====================================================================
+    public void onKline(UnifiedKline kline) {
+        if (kline == null) return;
+
+        String symbol = kline.getSymbol().toUpperCase(Locale.ROOT);
+        String timeframe = kline.getTimeframe().toLowerCase(Locale.ROOT);
+
+        Candle candle = new Candle(
+                kline.getOpenTime(),
+                kline.getOpen().doubleValue(),
+                kline.getHigh().doubleValue(),
+                kline.getLow().doubleValue(),
+                kline.getClose().doubleValue(),
+                kline.getVolume().doubleValue(),
+                kline.isClosed()
+        );
+
+        // ⚠️ только кеш, без UI и WS
+        streamManager.addCandle(symbol, timeframe, candle);
     }
 }
-

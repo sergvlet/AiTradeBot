@@ -40,29 +40,8 @@ public class StrategyService {
         );
     }
 
-    /**
-     * Запуск стратегии.
-     */
-    public void start(Long chatId, StrategyType type) {
-        webStrategyFacade.start(
-                chatId,
-                type,
-                DEFAULT_EXCHANGE,
-                DEFAULT_NETWORK
-        );
-    }
 
-    /**
-     * Остановка стратегии.
-     */
-    public void stop(Long chatId, StrategyType type) {
-        webStrategyFacade.stop(
-                chatId,
-                type,
-                DEFAULT_EXCHANGE,
-                DEFAULT_NETWORK
-        );
-    }
+
 
     /**
      * Переключение ON / OFF.

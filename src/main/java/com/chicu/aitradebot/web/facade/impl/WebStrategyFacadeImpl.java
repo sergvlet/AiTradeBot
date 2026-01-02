@@ -179,18 +179,5 @@ public class WebStrategyFacadeImpl implements WebStrategyFacade {
         return runtime;
     }
 
-    // ================================================================
-    // ⛔ DEPRECATED
-    // ================================================================
-    @Override
-    @Deprecated
-    public StrategyRunInfo start(Long chatId, StrategyType type, String exchange, NetworkType network) {
-        throw new UnsupportedOperationException("Use toggle()");
-    }
 
-    @Override
-    @Deprecated
-    public StrategyRunInfo stop(Long chatId, StrategyType type, String exchange, NetworkType network) {
-        throw new UnsupportedOperationException("Use toggle()");
-    }
 }

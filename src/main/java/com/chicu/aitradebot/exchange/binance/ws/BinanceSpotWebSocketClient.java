@@ -23,14 +23,13 @@ public class BinanceSpotWebSocketClient {
             "wss://stream.binance.com:9443/stream?streams=%s";
 
     private final OkHttpClient client;
-
-    /**
-     * 🔑 chatId:strategy:symbol:timeframe
-     */
-    private final Map<String, WebSocket> sockets = new ConcurrentHashMap<>();
-
     private final BinanceKlineParser parser;
     private final MarketStreamService marketStream;
+
+    /**
+     * key = chatId:strategy:symbol:timeframe[:aggTrade]
+     */
+    private final Map<String, WebSocket> sockets = new ConcurrentHashMap<>();
 
     // =====================================================================
     // SUBSCRIBE KLINE
@@ -45,17 +44,16 @@ public class BinanceSpotWebSocketClient {
         String key = buildKey(symbol, timeframe, chatId, strategyType);
 
         if (sockets.containsKey(key)) {
-            log.info("📡 [BINANCE-SPOT] Already subscribed {}", key);
+            log.debug("[BINANCE-SPOT] KLINE already subscribed {}", key);
             return;
         }
 
         String stream = (symbol + "@kline_" + timeframe).toLowerCase();
         String url = String.format(WS_URL_TEMPLATE, stream);
 
-        log.info("📡 [BINANCE-SPOT] CONNECT KLINE {} (key={})", url, key);
+        log.info("[BINANCE-SPOT] CONNECT KLINE {} (key={})", symbol, key);
 
         Request request = new Request.Builder().url(url).build();
-
         WebSocket ws = client.newWebSocket(
                 request,
                 new SpotKlineListener(key, chatId, strategyType)
@@ -65,7 +63,7 @@ public class BinanceSpotWebSocketClient {
     }
 
     // =====================================================================
-    // SUBSCRIBE AGG TRADE (НЕ ТРОГАЕМ)
+    // SUBSCRIBE AGG TRADE
     // =====================================================================
 
     public synchronized void subscribeAggTrade(
@@ -78,17 +76,16 @@ public class BinanceSpotWebSocketClient {
                      symbol.toUpperCase() + ":" + timeframe.toLowerCase() + ":aggTrade";
 
         if (sockets.containsKey(key)) {
-            log.info("📡 [BINANCE-SPOT] Already subscribed {}", key);
+            log.debug("[BINANCE-SPOT] AGGTRADE already subscribed {}", key);
             return;
         }
 
         String stream = (symbol + "@aggTrade").toLowerCase();
         String url = String.format(WS_URL_TEMPLATE, stream);
 
-        log.info("📡 [BINANCE-SPOT] CONNECT AGGTRADE {} (key={})", url, key);
+        log.info("[BINANCE-SPOT] CONNECT AGGTRADE {} (key={})", symbol, key);
 
         Request request = new Request.Builder().url(url).build();
-
         WebSocket ws = client.newWebSocket(
                 request,
                 new SpotAggTradeListener(
@@ -120,7 +117,7 @@ public class BinanceSpotWebSocketClient {
     }
 
     // =====================================================================
-    // ✅ KLINE LISTENER — МЯГКАЯ ЛОГИКА
+    // KLINE LISTENER
     // =====================================================================
 
     private class SpotKlineListener extends WebSocketListener {
@@ -137,26 +134,29 @@ public class BinanceSpotWebSocketClient {
 
         @Override
         public void onOpen(@NotNull WebSocket webSocket, @NotNull Response response) {
-            log.info("✅ [BINANCE-SPOT] KLINE WS OPEN {}", key);
+            log.info("[BINANCE-SPOT] KLINE WS OPEN {}", key);
         }
 
         @Override
         public void onMessage(@NotNull WebSocket webSocket, @NotNull String text) {
+
+            // 🔍 RAW сообщения — ТОЛЬКО для диагностики
+            if (log.isTraceEnabled()) {
+                log.trace("[BINANCE-SPOT] RAW KLINE {} => {}", key, text);
+            }
+
             try {
                 UnifiedKline kline = parser.parse(text);
                 if (kline == null) return;
 
-                // 🟡 ВСЕГДА обновляем текущую свечу (чтобы график жил)
-                marketStream.onKline(kline);
+                marketStream.onKline(chatId, strategyType, kline);
 
-                // 🔒 ТОЛЬКО если свеча закрыта — двигаем время
                 if (kline.isClosed()) {
-                    marketStream.onKline(chatId, strategyType, kline);
                     marketStream.closeCandle(chatId, strategyType, kline);
                 }
 
             } catch (Exception e) {
-                log.error("❌ [BINANCE-SPOT] kline parse error {}: {}", key, e.getMessage(), e);
+                log.error("[BINANCE-SPOT] KLINE parse error {}: {}", key, e.getMessage(), e);
             }
         }
 
@@ -167,7 +167,7 @@ public class BinanceSpotWebSocketClient {
     }
 
     // =====================================================================
-    // AGG TRADE LISTENER — БЕЗ ИЗМЕНЕНИЙ
+    // AGG TRADE LISTENER
     // =====================================================================
 
     private class SpotAggTradeListener extends WebSocketListener {
@@ -194,11 +194,16 @@ public class BinanceSpotWebSocketClient {
 
         @Override
         public void onOpen(@NotNull WebSocket webSocket, @NotNull Response response) {
-            log.info("✅ [BINANCE-SPOT] AGGTRADE WS OPEN {}", key);
+            log.info("[BINANCE-SPOT] AGGTRADE WS OPEN {}", key);
         }
 
         @Override
         public void onMessage(@NotNull WebSocket webSocket, @NotNull String text) {
+
+            if (log.isTraceEnabled()) {
+                log.trace("[BINANCE-SPOT] RAW AGGTRADE {} => {}", key, text);
+            }
+
             try {
                 marketStream.onAggTrade(
                         chatId,
@@ -208,7 +213,7 @@ public class BinanceSpotWebSocketClient {
                         text
                 );
             } catch (Exception e) {
-                log.error("❌ [BINANCE-SPOT] aggTrade error {}: {}", key, e.getMessage(), e);
+                log.error("[BINANCE-SPOT] AGGTRADE error {}: {}", key, e.getMessage(), e);
             }
         }
 
@@ -218,14 +223,15 @@ public class BinanceSpotWebSocketClient {
                 @NotNull Throwable t,
                 Response response
         ) {
-            log.error("❌ [BINANCE-SPOT] AGGTRADE WS failure {}: {}", key, t.getMessage());
+            log.error("[BINANCE-SPOT] AGGTRADE WS failure {}: {}", key, t.getMessage(), t);
             sockets.remove(key);
         }
     }
 
     // =====================================================================
-// UNSUBSCRIBE KLINE (FIX)
-// =====================================================================
+    // UNSUBSCRIBE
+    // =====================================================================
+
     public synchronized void unsubscribeKline(
             String symbol,
             String timeframe,
@@ -236,11 +242,8 @@ public class BinanceSpotWebSocketClient {
 
         WebSocket ws = sockets.remove(key);
         if (ws != null) {
-            log.info("🔌 [BINANCE-SPOT] KLINE UNSUBSCRIBE {}", key);
+            log.info("[BINANCE-SPOT] KLINE UNSUBSCRIBE {}", key);
             ws.close(1000, "client unsubscribe kline");
-        } else {
-            log.debug("ℹ️ [BINANCE-SPOT] No KLINE socket to unsubscribe {}", key);
         }
     }
-
 }
