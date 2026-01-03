@@ -10,7 +10,7 @@ import { FeatureWindowZone } from "../chart/features/feature-window-zone.js";
 import { FeatureAtr }        from "../chart/features/feature-atr.js";
 
 /**
- * ScalpingStrategy (ШАГ 10)
+ * ScalpingStrategy
  * ------------------------
  * Визуальная стратегия скальпинга.
  *
@@ -29,20 +29,38 @@ export class ScalpingStrategy extends BaseStrategy {
     constructor({ layers, ctx } = {}) {
         super({ ctx });
 
+        // ✅ Получаем настройки стратегии из ctx
+        const {
+            takeProfitPct = 1.0,
+            stopLossPct   = 1.0,
+            windowSize    = 20,
+            priceChangeThreshold = 0.3,
+            spreadThreshold       = 0.1
+        } = ctx?.info || {};
+
         // -------------------------
         // FEATURES
         // -------------------------
         const features = [
 
-            new FeatureWindowZone({ layers }),
+            new FeatureWindowZone({
+                layers,
+                windowSize,
+                priceChangeThreshold,
+                spreadThreshold
+            }),
 
             new FeatureTrades({ layers }),
 
-            new FeatureTpSl({ layers }),
+            new FeatureTpSl({
+                layers,
+                takeProfitPct,
+                stopLossPct
+            }),
 
             new FeatureAtr({ layers })
 
-            // ⚠ levels / zones / orders намеренно НЕ подключены
+            // ❌ levels / zones / orders НЕ подключаем
         ];
 
         this.registerFeatures(features);

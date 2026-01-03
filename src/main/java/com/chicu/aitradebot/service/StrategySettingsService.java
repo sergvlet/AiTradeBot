@@ -17,8 +17,6 @@ public interface StrategySettingsService {
 
     // =====================================================================
     // GET (может вернуть null, если настроек ещё нет)
-    // Используется в UI / Live / Runner
-    // =====================================================================
     StrategySettings getSettings(
             long chatId,
             StrategyType type,
@@ -28,7 +26,6 @@ public interface StrategySettingsService {
 
     // =====================================================================
     // GET OR CREATE (ГАРАНТИРОВАНО не null)
-    // =====================================================================
     StrategySettings getOrCreate(
             long chatId,
             StrategyType type,
@@ -39,16 +36,20 @@ public interface StrategySettingsService {
     // =====================================================================
     // UI: список стратегий для Dashboard / Settings
     // exchange / network могут быть null (фильтр)
-    // =====================================================================
     List<StrategySettings> findAllByChatId(
             long chatId,
             String exchange,
             NetworkType network
     );
 
+    // ✅ ✅ ✅ ДОБАВЛЕННЫЙ МЕТОД — БЕЗ NETWORK
+    List<StrategySettings> findAllByChatId(
+            long chatId,
+            String exchange
+    );
+
     // =====================================================================
     // ЧИСТЫЙ метод — для orchestrator / runner
-    // =====================================================================
     Optional<StrategySettings> findLatest(
             long chatId,
             StrategyType type,
@@ -58,7 +59,6 @@ public interface StrategySettingsService {
 
     // =====================================================================
     // RISK MANAGEMENT — UI
-    // =====================================================================
     void updateRiskFromUi(
             long chatId,
             StrategyType type,
@@ -69,8 +69,7 @@ public interface StrategySettingsService {
     );
 
     // =====================================================================
-    // RISK MANAGEMENT — AI (ограниченный контроль)
-    // =====================================================================
+    // RISK MANAGEMENT — AI
     void updateRiskFromAi(
             long chatId,
             StrategyType type,

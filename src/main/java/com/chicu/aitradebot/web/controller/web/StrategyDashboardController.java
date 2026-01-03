@@ -23,8 +23,6 @@ public class StrategyDashboardController {
 
     private final WebStrategyFacade webStrategyFacade;
     private final StrategySettingsService strategySettingsService;
-
-    // ✅ V4 market stream (ЕДИНСТВЕННЫЙ правильный вход)
     private final MarketDataStreamService marketDataStreamService;
 
     /**
@@ -44,11 +42,9 @@ public class StrategyDashboardController {
                 strategySettingsService
                         .findLatest(chatId, type, null, null)
                         .orElseThrow(() -> new IllegalStateException(
-                                "StrategySettings not found chatId=" + chatId +
-                                " type=" + type
+                                "StrategySettings not found chatId=" + chatId + " type=" + type
                         ));
 
-        // 🔒 нормализация
         String symbol = settings.getSymbol().toUpperCase();
         String timeframe = settings.getTimeframe().toLowerCase();
 
@@ -66,7 +62,7 @@ public class StrategyDashboardController {
         );
 
         // =====================================================
-        // 🔥 2️⃣ START MARKET STREAM (IDEMPOTENT)
+        // 2️⃣ START MARKET STREAM (IDEMPOTENT)
         // =====================================================
         try {
             marketDataStreamService.subscribeCandles(
@@ -106,6 +102,7 @@ public class StrategyDashboardController {
                         settings.getNetworkType()
                 );
 
+        // 🔥 CRITICAL FIX: fallback info для UI
         if (info == null) {
             log.warn(
                     "⚠️ StrategyRunInfo is null chatId={} type={} ex={} net={}",
@@ -114,6 +111,13 @@ public class StrategyDashboardController {
                     settings.getExchangeName(),
                     settings.getNetworkType()
             );
+
+            info = new StrategyRunInfo();
+            info.setActive(false);
+            info.setSymbol(symbol);
+            info.setTimeframe(timeframe);
+            info.setExchangeName(settings.getExchangeName());
+            info.setNetworkType(settings.getNetworkType());
         }
 
         // =====================================================

@@ -5,6 +5,8 @@ import com.chicu.aitradebot.exchange.client.ExchangeClient;
 import com.chicu.aitradebot.exchange.client.ExchangeClientFactory;
 import com.chicu.aitradebot.market.model.Candle;
 import com.chicu.aitradebot.market.stream.MarketDataStreamService;
+import com.chicu.aitradebot.strategy.scalping.ScalpingStrategySettings;
+import com.chicu.aitradebot.strategy.scalping.ScalpingStrategySettingsService;
 import com.chicu.aitradebot.web.dto.StrategyChartDto;
 import com.chicu.aitradebot.web.facade.WebChartFacade;
 import lombok.RequiredArgsConstructor;
@@ -24,6 +26,7 @@ public class WebChartFacadeImpl implements WebChartFacade {
 
     private final MarketDataStreamService streamService;
     private final ExchangeClientFactory exchangeClientFactory;
+    private final ScalpingStrategySettingsService scalpingSettingsService;
 
     @Override
     public StrategyChartDto buildChart(
@@ -34,10 +37,6 @@ public class WebChartFacadeImpl implements WebChartFacade {
             int limit
     ) {
 
-        // =====================================================
-        // 1️⃣ NORMALIZE INPUT
-        // =====================================================
-
         if (symbol == null || symbol.isBlank()) {
             return StrategyChartDto.builder()
                     .candles(List.of())
@@ -45,21 +44,10 @@ public class WebChartFacadeImpl implements WebChartFacade {
         }
 
         String finalSymbol = symbol.trim().toUpperCase(Locale.ROOT);
-
         String tf = (timeframe == null || timeframe.isBlank())
                 ? DEFAULT_TF
                 : timeframe.trim().toLowerCase(Locale.ROOT);
-
         int finalLimit = limit > 0 ? limit : DEFAULT_LIMIT;
-
-        log.debug(
-                "📊 Chart snapshot chatId={} type={} symbol={} tf={} limit={}",
-                chatId, strategyType, finalSymbol, tf, finalLimit
-        );
-
-        // =====================================================
-        // 2️⃣ 🔥 PRELOAD HISTORY IF CACHE EMPTY
-        // =====================================================
 
         List<Candle> cachedCandles =
                 streamService.getCandles(chatId, strategyType, finalSymbol, tf);
@@ -67,13 +55,12 @@ public class WebChartFacadeImpl implements WebChartFacade {
         if (cachedCandles.size() < finalLimit) {
             try {
                 ExchangeClient client = exchangeClientFactory.getByChat(chatId);
-
                 List<ExchangeClient.Kline> klines =
                         client.getKlines(finalSymbol, tf, finalLimit);
 
                 List<Candle> preload = klines.stream()
                         .map(k -> new Candle(
-                                k.openTime(), // ⏱ ms — OK, храним в cache в ms
+                                k.openTime(),
                                 k.open(),
                                 k.high(),
                                 k.low(),
@@ -83,43 +70,19 @@ public class WebChartFacadeImpl implements WebChartFacade {
                         ))
                         .toList();
 
-                streamService.putCandles(
-                        chatId,
-                        strategyType,
-                        finalSymbol,
-                        tf,
-                        preload
-                );
-
-                log.info(
-                        "📥 Chart preload {} candles for {} {} (chatId={}, strategy={})",
-                        preload.size(), finalSymbol, tf, chatId, strategyType
-                );
+                streamService.putCandles(chatId, strategyType, finalSymbol, tf, preload);
 
             } catch (Exception e) {
-                log.error(
-                        "❌ Chart preload failed {} {} chatId={}",
-                        finalSymbol, tf, chatId, e
-                );
+                log.error("❌ Chart preload failed", e);
             }
         }
-
-        // =====================================================
-        // 3️⃣ READ FROM CACHE (ЕДИНЫЙ ИСТОЧНИК)
-        // =====================================================
 
         List<Candle> candles =
                 streamService.getCandles(chatId, strategyType, finalSymbol, tf);
 
-        // =====================================================
-// 4️⃣ MAP → DTO (FIX TIME UNIT)
-// =====================================================
-
         List<StrategyChartDto.CandleDto> candleDtos = candles.stream()
                 .limit(finalLimit)
                 .map(c -> StrategyChartDto.CandleDto.builder()
-                        // ❗ БЫЛО: c.getTime()
-                        // ✅ СТАЛО: seconds
                         .time(c.getTime() / 1000)
                         .open(c.getOpen())
                         .high(c.getHigh())
@@ -129,12 +92,33 @@ public class WebChartFacadeImpl implements WebChartFacade {
                 )
                 .toList();
 
-        // =====================================================
-        // 5️⃣ RESULT
-        // =====================================================
+        StrategyChartDto.Layers layers = StrategyChartDto.Layers.empty();
+
+        if (strategyType == StrategyType.SCALPING && !candles.isEmpty()) {
+            ScalpingStrategySettings settings = scalpingSettingsService.getOrCreate(chatId);
+
+            double thresholdPct = settings.getPriceChangeThreshold();
+            double close = candles.get(candles.size() - 1).getClose();
+
+            double high = close * (1 + thresholdPct / 100.0);
+            double low  = close * (1 - thresholdPct / 100.0);
+
+            StrategyChartDto.Zone zone = StrategyChartDto.Zone.builder()
+                    .top(high)
+                    .bottom(low)
+                    .color("rgba(100,116,139,0.25)")
+                    .build();
+
+            layers = StrategyChartDto.Layers.builder()
+                    .zone(zone)
+                    .levels(List.of())
+                    .build();
+        }
 
         return StrategyChartDto.builder()
                 .candles(candleDtos)
+                .layers(layers)
                 .build();
     }
+
 }

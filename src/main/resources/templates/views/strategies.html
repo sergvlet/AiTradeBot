@@ -31,25 +31,48 @@
                     </span>
 
                     <!-- Основная инфа -->
-                    <div class="small">
+                    <div class="small text-start">
                         <div>
-                            PnL:
+                            <strong>Биржа:</strong>
+                            <span th:text="${s.exchangeName}">BINANCE</span>
+                        </div>
+                        <div>
+                            <strong>Сеть:</strong>
+                            <span th:text="${s.networkType}">MAINNET</span>
+                        </div>
+                        <div>
+                            <strong>Пара:</strong>
+                            <span th:text="${s.symbol}">BTCUSDT</span>
+                        </div>
+                        <div>
+                            <strong>Таймфрейм:</strong>
+                            <span th:text="${s.timeframe}">1m</span>
+                        </div>
+                        <div>
+                            <strong>Режим:</strong>
+                            <span th:text="${s.advancedControlMode}">MANUAL</span>
+                        </div>
+                        <div>
+                            <strong>PnL:</strong>
                             <span th:text="${s.totalProfitPct}"
-                                  th:classappend="${s.totalProfitPct >= 0} ? ' pnl-green' : ' pnl-red'">
-                                0
-                            </span>%
+                                  th:classappend="${s.totalProfitPct >= 0} ? ' pnl-green' : ' pnl-red'">0</span>%
                         </div>
                         <div>
-                            ML доверие:
-                            <strong th:text="${s.mlConfidence}">0</strong>
+                            <strong>ML доверие:</strong>
+                            <span th:text="${s.mlConfidence}">0</span>
                         </div>
                         <div>
-                            Пара:
-                            <strong th:text="${s.symbol}">BTCUSDT</strong>
+                            <strong>TP/SL:</strong>
+                            <span th:text="${s.takeProfitPct}">1</span> /
+                            <span th:text="${s.stopLossPct}">1</span>%
                         </div>
                         <div>
-                            Сеть:
-                            <strong th:text="${s.networkType}">MAINNET</strong>
+                            <strong>Риск/сделку:</strong>
+                            <span th:text="${s.riskPerTradePct}">1</span>%
+                        </div>
+                        <div>
+                            <strong>Комиссия:</strong>
+                            <span th:text="${s.commissionPct}">0.05</span>%
                         </div>
                     </div>
 
@@ -67,11 +90,8 @@
                             <button type="submit"
                                     class="btn"
                                     th:classappend="${s.active} ? ' btn-outline-danger' : ' btn-outline-success'">
-
                                 <i th:class="${s.active} ? 'bi bi-stop-fill' : 'bi bi-play-fill'"></i>
-                                <span th:text="${s.active} ? 'Остановить' : 'Запустить'">
-                                    Запустить
-                                </span>
+                                <span th:text="${s.active} ? 'Остановить' : 'Запустить'">Запустить</span>
                             </button>
                         </form>
 

@@ -12,6 +12,8 @@ import com.chicu.aitradebot.exchange.model.ApiKeyDiagnostics;
 import com.chicu.aitradebot.exchange.service.ExchangeSettingsService;
 import com.chicu.aitradebot.market.model.SymbolDescriptor;
 import com.chicu.aitradebot.market.service.MarketSymbolService;
+import com.chicu.aitradebot.orchestrator.AiStrategyOrchestrator;
+import com.chicu.aitradebot.orchestrator.dto.StrategyRunInfo;
 import com.chicu.aitradebot.service.StrategySettingsService;
 import com.chicu.aitradebot.strategy.core.cache.StrategySettingsCache;
 import com.chicu.aitradebot.strategy.rsie.RsiEmaStrategySettings;
@@ -44,6 +46,7 @@ public class StrategySettingsController {
     private final AccountBalanceService accountBalanceService;
     private final MarketSymbolService marketSymbolService;
     private final StrategyAdvancedRegistry strategyAdvancedRegistry;
+    private final AiStrategyOrchestrator orchestrator;
     private static final List<String> DEFAULT_TIMEFRAMES = List.of(
             "1s","5s","15s","1m","3m","5m","15m","30m","1h","4h","1d"
     );
@@ -87,6 +90,17 @@ public class StrategySettingsController {
                                         chatId, strategyType, exchange, network
                                 )
                         );
+
+        // 🔥 УСТАНОВКА АКТУАЛЬНОГО ACTIVE через orchestrator
+        try {
+            StrategyRunInfo runtime =
+                    orchestrator.getStatus(chatId, strategyType, exchange, network);
+            if (runtime != null) {
+                strategy.setActive(runtime.isActive());
+            }
+        } catch (Exception e) {
+            log.warn("⚠ Ошибка при получении статуса стратегии: {}", e.getMessage());
+        }
 
         pullRsiEmaIntoUnifiedIfEmpty(strategyType, chatId, strategy);
 
@@ -199,6 +213,7 @@ public class StrategySettingsController {
 
         return "layout/app";
     }
+
 
     // =====================================================
     // POST — СОХРАНЕНИЕ (FIXED)

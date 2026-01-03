@@ -3,6 +3,7 @@ package com.chicu.aitradebot.web.facade;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
+import com.chicu.aitradebot.domain.enums.AdvancedControlMode;
 
 import java.math.BigDecimal;
 import java.util.List;
@@ -16,7 +17,7 @@ public record StrategyUi(
         String exchangeName,
         NetworkType networkType,
 
-        // === СОСТОЯНИЕ ===
+        // === СОСТОЯНИЕ (runtime) ===
         boolean active,
 
         // === НАСТРОЙКИ ===
@@ -35,37 +36,22 @@ public record StrategyUi(
 
         // === СТАТИСТИКА ===
         BigDecimal totalProfitPct,
-        BigDecimal mlConfidence
+        BigDecimal mlConfidence,
+
+        // === РЕЖИМ УПРАВЛЕНИЯ ===
+        AdvancedControlMode advancedControlMode
 ) {
 
     // ================================================================
-    // 🔁 PUBLIC MAPPER (используется facade)
+    // 🔁 PUBLIC MAPPER
     // ================================================================
     public static List<StrategyUi> fromSettings(List<StrategySettings> settings) {
-        return settings.stream().map(StrategyUi::from).toList();
+        return settings.stream()
+                .map(StrategyUi::fromSettings)
+                .toList();
     }
 
-    // ================================================================
-    // 🔒 PRIVATE — только внутри UI
-    // ================================================================
-    private static StrategyUi from(StrategySettings s) {
-
-        BigDecimal profit        = nz(s.getTotalProfitPct());
-        BigDecimal mlConf        = nz(s.getMlConfidence());
-        BigDecimal tp            = nz(s.getTakeProfitPct());
-        BigDecimal sl            = nz(s.getStopLossPct());
-        BigDecimal commission    = nz(s.getCommissionPct());
-        BigDecimal riskPerTrade  = nz(s.getRiskPerTradePct());
-
-        NetworkType network =
-                s.getNetworkType() != null
-                        ? s.getNetworkType()
-                        : NetworkType.MAINNET;
-
-        String exchange =
-                s.getExchangeName() != null
-                        ? s.getExchangeName().toString()
-                        : "BINANCE";
+    public static StrategyUi fromSettings(StrategySettings s) {
 
         UiText ui = uiText(s.getType());
 
@@ -73,24 +59,59 @@ public record StrategyUi(
                 s.getId(),
                 s.getChatId(),
                 s.getType(),
-                exchange,
-                network,
-                s.isActive(), // ⚠ runtime подставляется facade позже
+                safe(s.getExchangeName(), "BINANCE"),
+                s.getNetworkType() != null ? s.getNetworkType() : NetworkType.MAINNET,
+
+                // ❗ active будет корректно переопределён facade'ом
+                false,
+
                 safe(s.getSymbol(), "—"),
                 safe(s.getTimeframe(), "—"),
-                tp,
-                sl,
-                commission,
-                riskPerTrade,
+
+                nz(s.getTakeProfitPct()),
+                nz(s.getStopLossPct()),
+                nz(s.getCommissionPct()),
+                nz(s.getRiskPerTradePct()),
+
                 ui.title,
                 ui.description,
-                profit,
-                mlConf
+
+                nz(s.getTotalProfitPct()),
+                nz(s.getMlConfidence()),
+
+                s.getAdvancedControlMode() != null
+                        ? s.getAdvancedControlMode()
+                        : AdvancedControlMode.MANUAL
         );
     }
 
     // ================================================================
-    // 🧩 EMPTY — когда нет записи в БД
+    // 🔁 RUNTIME UPDATE (ВАЖНО!)
+    // ================================================================
+    public StrategyUi withActive(boolean active) {
+        return new StrategyUi(
+                id,
+                chatId,
+                type,
+                exchangeName,
+                networkType,
+                active,
+                symbol,
+                timeframe,
+                takeProfitPct,
+                stopLossPct,
+                commissionPct,
+                riskPerTradePct,
+                title,
+                description,
+                totalProfitPct,
+                mlConfidence,
+                advancedControlMode
+        );
+    }
+
+    // ================================================================
+    // 🧩 EMPTY — если записи нет в БД
     // ================================================================
     public static StrategyUi empty(
             Long chatId,
@@ -105,8 +126,8 @@ public record StrategyUi(
                 null,
                 chatId,
                 type,
-                exchange,
-                network,
+                safe(exchange, "BINANCE"),
+                network != null ? network : NetworkType.MAINNET,
                 false,
                 "—",
                 "—",
@@ -117,7 +138,8 @@ public record StrategyUi(
                 ui.title,
                 "Стратегия ещё не настроена",
                 BigDecimal.ZERO,
-                BigDecimal.ZERO
+                BigDecimal.ZERO,
+                AdvancedControlMode.MANUAL
         );
     }
 

@@ -39,7 +39,7 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
     }
 
     // =====================================================================
-    // SAVE (БЕЗ ПОБОЧНЫХ ЭФФЕКТОВ)
+    // SAVE (очищает старый cache)
     // =====================================================================
     @Override
     public StrategySettings save(StrategySettings s) {
@@ -50,7 +50,12 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
 
         StrategySettings saved = repo.save(s);
 
-        // Кэшируем ТОЛЬКО при полном контексте
+        // ❗ сбрасываем все старые ключи этого chatId+type
+        cache.entrySet().removeIf(e ->
+                e.getKey().startsWith(saved.getChatId() + ":" + saved.getType().name() + ":")
+        );
+
+        // кладём актуальный
         if (saved.getExchangeName() != null && saved.getNetworkType() != null) {
             cache.put(
                     key(
@@ -67,7 +72,7 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
     }
 
     // =====================================================================
-    // FIND ALL (UI / DASHBOARD)
+    // FIND ALL (UI)
     // =====================================================================
     @Override
     public List<StrategySettings> findAllByChatId(
@@ -82,7 +87,7 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
     }
 
     // =====================================================================
-    // GET (⚠️ УСТАРЕВШАЯ СЕМАНТИКА, ТОЛЬКО ДЛЯ СОВМЕСТИМОСТИ)
+    // GET (legacy)
     // =====================================================================
     @Override
     @Deprecated
@@ -93,7 +98,6 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
             NetworkType network
     ) {
 
-        // Без полного контекста — просто последние по type
         if (exchange == null || network == null) {
             return repo
                     .findTopByChatIdAndTypeOrderByUpdatedAtDescIdDesc(chatId, type)
@@ -119,7 +123,7 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
     }
 
     // =====================================================================
-    // GET OR CREATE (ТОЛЬКО НАСТРОЙКИ, БЕЗ START/STOP)
+    // GET OR CREATE (🔥 ОСНОВНОЙ ФИКС)
     // =====================================================================
     @Override
     public StrategySettings getOrCreate(
@@ -128,14 +132,43 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
             String exchange,
             NetworkType network
     ) {
-
-        StrategySettings existing = getSettings(chatId, type, exchange, network);
-        if (existing != null) {
-            return existing;
+        // 1️⃣ Пытаемся найти точное совпадение
+        StrategySettings exact = getSettings(chatId, type, exchange, network);
+        if (exact != null) {
+            log.info("✅ Найдена существующая StrategySettings (id={}) с полным контекстом", exact.getId());
+            return exact;
         }
 
+        // 2️⃣ fallback — последняя стратегия этого типа (без учёта exchange/network)
+        Optional<StrategySettings> fallback =
+                repo.findTopByChatIdAndTypeOrderByUpdatedAtDescIdDesc(chatId, type);
+
+        if (fallback.isPresent()) {
+            StrategySettings s = fallback.get();
+            boolean changed = false;
+
+            if (s.getExchangeName() == null && exchange != null) {
+                s.setExchangeName(exchange);
+                changed = true;
+            }
+
+            if (s.getNetworkType() == null && network != null) {
+                s.setNetworkType(network);
+                changed = true;
+            }
+
+            if (changed) {
+                log.info("♻️ Повторное использование StrategySettings id={} с обновлением контекста", s.getId());
+                return save(s);
+            }
+
+            log.info("✅ Найдена StrategySettings id={} без изменений", s.getId());
+            return s;
+        }
+
+        // 3️⃣ Новый объект (если вообще ничего нет)
         log.warn(
-                "🆕 Создаём StrategySettings chatId={}, type={}, exchange={}, network={}",
+                "🆕 Создаётся новая StrategySettings chatId={}, type={}, exchange={}, network={}",
                 chatId, type, exchange, network
         );
 
@@ -155,14 +188,15 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
                 .exchangeName(exchange)
                 .networkType(network)
                 .advancedControlMode(AdvancedControlMode.MANUAL)
-                .active(false) // ⚠️ стартует ТОЛЬКО orchestrator
+                .active(false)
                 .build();
 
         return save(s);
     }
 
+
     // =====================================================================
-    // FIND LATEST (ЕДИНЫЙ ИСТОЧНИК ИСТИНЫ)
+    // FIND LATEST
     // =====================================================================
     @Override
     public Optional<StrategySettings> findLatest(
@@ -223,9 +257,8 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
         }
 
         BigDecimal incoming = validatePct(newRiskPerTradePct);
-        BigDecimal current  = s.getRiskPerTradePct();
+        BigDecimal current = s.getRiskPerTradePct();
 
-        // AI может только уменьшать риск
         if (current == null || incoming.compareTo(current) < 0) {
             s.setRiskPerTradePct(incoming);
             save(s);
@@ -248,4 +281,12 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
 
         return v.setScale(4, RoundingMode.HALF_UP);
     }
+
+    @Override
+    public List<StrategySettings> findAllByChatId(long chatId, String exchange) {
+        return repo.findByChatId(chatId).stream()
+                .filter(s -> exchange == null || exchange.equals(s.getExchangeName()))
+                .toList();
+    }
+
 }

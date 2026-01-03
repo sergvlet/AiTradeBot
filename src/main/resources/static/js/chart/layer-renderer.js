@@ -307,15 +307,17 @@ export class LayerRenderer {
         this.priceLines.clear();
     }
 
-    // =====================================================
-    // WINDOW ZONE
-    // =====================================================
+// =====================================================
+// WINDOW ZONE
+// =====================================================
     renderWindowZone(zone) {
         if (!zone) return;
+
         this.clearWindowZone();
 
         const high = Number(zone.high);
-        const low  = Number(zone.low);
+        const low = Number(zone.low);
+
         if (!Number.isFinite(high) || !Number.isFinite(low)) return;
 
         const hi = Math.max(high, low);
@@ -326,7 +328,7 @@ export class LayerRenderer {
         this.windowHighLine = this.candles.createPriceLine({
             price: hi,
             color,
-            lineWidth: 2,
+            lineWidth: 1,
             axisLabelVisible: true,
             title: "WINDOW HIGH"
         });
@@ -334,17 +336,70 @@ export class LayerRenderer {
         this.windowLowLine = this.candles.createPriceLine({
             price: lo,
             color,
-            lineWidth: 2,
+            lineWidth: 1,
             axisLabelVisible: true,
             title: "WINDOW LOW"
         });
+
+        const backgroundSeries = this.chart.addHistogramSeries({
+            color: "rgba(100, 116, 139, 0.15)",
+            priceLineVisible: false,
+            baseLineVisible: false,
+            lineWidth: 0,
+            overlay: true
+        });
+
+        const candles = Array.isArray(zone.candlesData) ? zone.candlesData : [];
+        if (!candles.length || !candles[0]?.time || !candles.at(-1)?.time) {
+            console.warn("⛔ zone.candlesData пустой или некорректный");
+            this.chart.removeSeries(backgroundSeries);
+            return;
+        }
+
+        const fromTime = Number(candles[0].time);
+        const toTime   = Number(candles.at(-1).time);
+
+        if (!Number.isFinite(fromTime) || !Number.isFinite(toTime)) {
+            console.warn("⛔ Временные метки невалидны", { fromTime, toTime });
+            this.chart.removeSeries(backgroundSeries);
+            return;
+        }
+
+        const step = 60;
+        const backgroundData = [];
+
+        for (let t = fromTime; t <= toTime; t += step) {
+            backgroundData.push({ time: t, value: hi });
+            backgroundData.push({ time: t, value: lo });
+        }
+
+        if (!backgroundData.length) {
+            this.chart.removeSeries(backgroundSeries);
+            return;
+        }
+
+        backgroundSeries.setData(backgroundData);
+        this.windowZoneBackground = backgroundSeries;
     }
+
+
+
+
+
+
 
     clearWindowZone() {
         this._safeRemovePriceLine(this.windowHighLine);
         this._safeRemovePriceLine(this.windowLowLine);
         this.windowHighLine = null;
         this.windowLowLine  = null;
+        if (this.windowZoneBackground) {
+            try {
+                this.chart.removeSeries(this.windowZoneBackground);
+            } catch {}
+            this.windowZoneBackground = null;
+        }
+
     }
 
     // =====================================================

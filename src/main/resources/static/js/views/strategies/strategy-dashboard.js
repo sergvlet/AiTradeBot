@@ -41,6 +41,7 @@ document.addEventListener("DOMContentLoaded", () => {
     chartCtrl.timeframe = "1m";
 
     const layers = new LayerRenderer(chartCtrl.chart, chartCtrl.candles);
+    layers.candlesData = chartCtrl.candlesData;
 
     // =========================================================================
     // STRATEGY
@@ -85,7 +86,16 @@ document.addEventListener("DOMContentLoaded", () => {
 
             if (data?.layers) {
                 strategy.onEvent?.({ type: "layers", layers: data.layers });
+
+                // ✅ SCALPING: отрисовка window zone
+                if (type === "SCALPING" && data.layers.windowZone) {
+                    strategy.onEvent?.({
+                        type: "window_zone",
+                        windowZone: data.layers.windowZone
+                    });
+                }
             }
+
         })
         .catch(err => console.error("❌ REST snapshot error", err));
 
