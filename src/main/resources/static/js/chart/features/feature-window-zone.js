@@ -26,7 +26,7 @@ export class FeatureWindowZone extends FeatureBase {
     onCandleHistory(candles) {
         if (!Array.isArray(candles) || candles.length < this.windowSize) return;
 
-        this.candlesData = candles;
+        this.candlesData = candles; // сохранить для передачи в render
 
         const slice = candles.slice(-this.windowSize);
 
@@ -38,18 +38,21 @@ export class FeatureWindowZone extends FeatureBase {
         const high = Math.max(...highs);
         const low  = Math.min(...lows);
 
-        if (!Number.isFinite(high) || !Number.isFinite(low) || low >= high) return;
+        const spread = high - low;
+        if (!Number.isFinite(high) || !Number.isFinite(low) || spread <= 0) return;
 
-        // 🔴 ВАЖНО: candlesData передаём сразу
-        this.callLayer("renderWindowZone", {
+        const zone = {
             high,
             low,
-            candlesData: this.candlesData
-        });
+            candlesData: candles // 👈 ОБЯЗАТЕЛЬНО передать сюда
+        };
 
+        this.callLayer("renderWindowZone", zone);
         this.active = true;
-        this.log("draw window zone (history)", { high, low });
+
+        this.log("draw window zone", zone);
     }
+
 
     // =====================================================
     // LIVE EVENTS
