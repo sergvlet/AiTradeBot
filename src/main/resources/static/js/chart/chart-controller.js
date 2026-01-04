@@ -30,7 +30,6 @@ export class ChartController {
             }
         });
 
-        // ✅ Добавлен отступ справа (важно для читаемости)
         this.chart.timeScale().applyOptions({ rightOffset: 20 });
 
         this.candles = this.chart.addCandlestickSeries({
@@ -39,11 +38,12 @@ export class ChartController {
             wickUpColor: "#26a69a",
             wickDownColor: "#ef5350",
             borderVisible: false,
-
-            // ❗ ВАЖНО: отключаем встроенную цену
             priceLineVisible: false,
             lastValueVisible: false
         });
+
+        // ✅ ДОБАВЛЕНО: ссылка на LayerRenderer
+        this.layerRenderer = null;
 
         // timeframe + data
         this.timeframeSec = 60;
@@ -73,6 +73,17 @@ export class ChartController {
             h: clientHeight,
             timeframeSec: this.timeframeSec
         });
+    }
+
+    // ✅ ДОБАВЛЕНО: привязка LayerRenderer к текущему chart/series
+    attachLayerRenderer(layerRenderer) {
+        this.layerRenderer = layerRenderer || null;
+
+        // если у LayerRenderer есть bind() (как я давал) — используем
+        if (this.layerRenderer?.bind) {
+            this.layerRenderer.bind(this.chart, this.candles);
+        }
+        // иначе просто держим ссылку
     }
 
     /* ====================================================================== */
@@ -140,12 +151,13 @@ export class ChartController {
 
         for (let i = 0; i < total; i++) {
             const c = candles[i];
+
             const time = this.normalizeTimeToBucket(c?.time, i, total);
 
-            const open = Number(c?.open);
-            const high = Number(c?.high);
-            const low  = Number(c?.low);
-            const close = Number(c?.close);
+            const open   = Number(c?.open);
+            const high   = Number(c?.high);
+            const low    = Number(c?.low);
+            const close  = Number(c?.close);
             const volume = Number(c?.volume);
 
             if (!Number.isFinite(time)) continue;
@@ -159,22 +171,32 @@ export class ChartController {
             return;
         }
 
+        // сортировка + дедуп по времени
         safe.sort((a, b) => a.time - b.time);
 
         const map = new Map();
         for (const c of safe) map.set(c.time, c);
         const unique = [...map.values()].sort((a, b) => a.time - b.time);
 
+        // 1) в график
         this.candles.setData(unique);
-        this.candlesData = unique;
 
-        this.lastBar = unique.at(-1) || null;
+        // 2) ✅ ВАЖНО: НЕ переassign this.candlesData (чтобы ссылки в layers/feature не ломались)
+        if (!Array.isArray(this.candlesData)) this.candlesData = [];
+        this.candlesData.length = 0;
+        this.candlesData.push(...unique);
+
+        // meta
+        this.lastBar = this.candlesData.at(-1) || null;
 
         if (this.lastBar) this.updatePriceLine(this.lastBar.close);
 
-        console.log("📦 History loaded", unique.length);
-        this.detectTimeframe(unique);
+        console.log("📦 History loaded", this.candlesData.length);
+
+        // детект таймфрейма — можно по unique или по this.candlesData (одно и то же)
+        this.detectTimeframe(this.candlesData);
     }
+
 
     detectTimeframe(unique) {
         if (unique.length > 1) {
@@ -193,7 +215,6 @@ export class ChartController {
     onWsMessage(msg) {
         if (!msg || typeof msg !== "object") return;
 
-        // ✅ ИСПРАВЛЕНО: НЕ ПРЕОБРАЗУЕМ null → 0
         if (msg.price !== null && msg.price !== undefined) {
             const p = Number(msg.price);
             if (Number.isFinite(p) && p > 0) {
@@ -251,8 +272,6 @@ export class ChartController {
         }
 
         this.lastBar = bar;
-
-        // ✅ ЕДИНСТВЕННОЕ МЕСТО ОБНОВЛЕНИЯ ЦЕНЫ
         this.updatePriceLine(bar.close);
     }
 

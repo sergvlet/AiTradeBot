@@ -13,7 +13,6 @@ document.addEventListener("DOMContentLoaded", () => {
     // =========================================================================
     // CONTEXT
     // =========================================================================
-
     const root = document.querySelector("[data-chat-id][data-type][data-symbol]");
     if (!root) {
         console.error("❌ Context root not found");
@@ -35,18 +34,21 @@ document.addEventListener("DOMContentLoaded", () => {
     // =========================================================================
     // CHART
     // =========================================================================
-
     const chartCtrl = new ChartController(container);
     chartCtrl.symbol    = symbol;
     chartCtrl.timeframe = "1m";
 
     const layers = new LayerRenderer(chartCtrl.chart, chartCtrl.candles);
+
+    // ✅ ВАЖНО: держим ссылку на один и тот же массив (setHistory у тебя уже фиксит это)
     layers.candlesData = chartCtrl.candlesData;
+
+    // если тебе нужно — можно связать обратно
+    chartCtrl.layerRenderer = layers;
 
     // =========================================================================
     // STRATEGY
     // =========================================================================
-
     const ctx = { chatId, type, symbol };
     let strategy;
 
@@ -70,7 +72,6 @@ document.addEventListener("DOMContentLoaded", () => {
     // =========================================================================
     // REST SNAPSHOT (HISTORY)
     // =========================================================================
-
     const snapshotUrl =
         `/api/chart/strategy` +
         `?chatId=${encodeURIComponent(chatId)}` +
@@ -80,14 +81,20 @@ document.addEventListener("DOMContentLoaded", () => {
     fetch(snapshotUrl)
         .then(r => r.json())
         .then(data => {
+            // 1) история → в график
             if (Array.isArray(data?.candles)) {
                 chartCtrl.setHistory(data.candles);
+
+                // ✅ КЛЮЧЕВОЕ: прогреваем фичи стратегией историей
+                // чтобы FeatureWindowZone сам посчитал hi/lo и нарисовал зону сразу после refresh
+                strategy.onCandleHistory?.(chartCtrl.candlesData);
             }
 
+            // 2) слои (если бек прислал)
             if (data?.layers) {
                 strategy.onEvent?.({ type: "layers", layers: data.layers });
 
-                // ✅ SCALPING: отрисовка window zone
+                // ✅ если бек хранит windowZone — рисуем (ПОСЛЕ history, чтобы candlesData уже были)
                 if (type === "SCALPING" && data.layers.windowZone) {
                     strategy.onEvent?.({
                         type: "window_zone",
@@ -95,14 +102,12 @@ document.addEventListener("DOMContentLoaded", () => {
                     });
                 }
             }
-
         })
         .catch(err => console.error("❌ REST snapshot error", err));
 
     // =========================================================================
     // WEBSOCKET (STOMP)
     // =========================================================================
-
     if (typeof SockJS === "undefined" || typeof Stomp === "undefined") {
         console.error("❌ SockJS / Stomp not loaded");
         return;
@@ -134,6 +139,14 @@ document.addEventListener("DOMContentLoaded", () => {
 
                 // стратегия получает ВСЁ
                 strategy.onEvent?.(ev);
+
+                // ✅ (опционально) если прилетела свеча и зона считается на закрытиях —
+                // можно периодически обновлять по последним данным
+                if (type === "SCALPING" && (ev.type === "candle" || ev.kline)) {
+                    // если в твоём FeatureWindowZone зона строится из history-window —
+                    // это поможет ей обновляться даже без window_zone событий от бэка
+                    strategy.onCandleHistory?.(chartCtrl.candlesData);
+                }
             });
 
             console.log("✅ SUBSCRIBED", dest);
@@ -146,7 +159,6 @@ document.addEventListener("DOMContentLoaded", () => {
     // =========================================================================
     // RESIZE
     // =========================================================================
-
     window.addEventListener("resize", () => {
         chartCtrl.chart.applyOptions({ width: container.clientWidth });
         chartCtrl.adjustBarSpacing();

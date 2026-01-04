@@ -13,17 +13,11 @@ import java.util.List;
 @AllArgsConstructor
 public class StrategyChartDto {
 
-    // =====================
-    // 📈 MARKET
-    // =====================
     @Builder.Default
     private List<CandleDto> candles = List.of();
 
     private Double lastPrice;
 
-    // =====================
-    // 🧠 STRATEGY LAYERS (КЛЮЧЕВО)
-    // =====================
     @Builder.Default
     private Layers layers = Layers.empty();
 
@@ -39,15 +33,20 @@ public class StrategyChartDto {
     public static class Layers {
 
         @Builder.Default
-        private List<Double> levels = List.of(); // Fibonacci / Grid
+        private List<Double> levels = List.of();
 
         @Builder.Default
         private Zone zone = null;
+
+        // ✅ ДОБАВЛЕНО: SCALPING window zone (high/low)
+        @Builder.Default
+        private WindowZone windowZone = null;
 
         public static Layers empty() {
             return Layers.builder()
                     .levels(List.of())
                     .zone(null)
+                    .windowZone(null)
                     .build();
         }
     }
@@ -60,11 +59,18 @@ public class StrategyChartDto {
     public static class Zone {
         private double top;
         private double bottom;
-
-        /**
-         * Любой CSS-совместимый цвет (например "#22c55e" или "rgba(34,197,94,0.2)")
-         */
         private String color;
+    }
+
+    // ✅ ДОБАВЛЕНО
+    @Getter
+    @Setter
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class WindowZone {
+        private double high;
+        private double low;
     }
 
     @Getter
@@ -74,10 +80,6 @@ public class StrategyChartDto {
     @AllArgsConstructor
     public static class CandleDto {
 
-        /**
-         * 🔒 ВАЖНО: time всегда в UNIX SECONDS (не millis).
-         * Это контракт для Lightweight Charts.
-         */
         @JsonProperty("time")
         private long time;
 
@@ -86,13 +88,8 @@ public class StrategyChartDto {
         private double low;
         private double close;
 
-        // -----------------------------
-        // Утилиты, чтобы не путать ms/sec
-        // -----------------------------
-
         @JsonIgnore
         public static long toSeconds(long epochMillisOrSeconds) {
-            // если случайно пришли millis — конвертируем
             return epochMillisOrSeconds > 3_000_000_000L
                     ? (epochMillisOrSeconds / 1000L)
                     : epochMillisOrSeconds;

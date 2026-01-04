@@ -13,7 +13,9 @@ export class FeatureWindowZone extends FeatureBase {
 
         this.active = false;
         this.chart = null;
+
         this.candlesData = [];
+        this.lastZone = null;       // ✅ запоминаем последнюю зону
     }
 
     bindChart(chart) {
@@ -26,7 +28,7 @@ export class FeatureWindowZone extends FeatureBase {
     onCandleHistory(candles) {
         if (!Array.isArray(candles) || candles.length < this.windowSize) return;
 
-        this.candlesData = candles; // сохранить для передачи в render
+        this.candlesData = candles;
 
         const slice = candles.slice(-this.windowSize);
 
@@ -38,21 +40,17 @@ export class FeatureWindowZone extends FeatureBase {
         const high = Math.max(...highs);
         const low  = Math.min(...lows);
 
-        const spread = high - low;
-        if (!Number.isFinite(high) || !Number.isFinite(low) || spread <= 0) return;
+        if (!Number.isFinite(high) || !Number.isFinite(low) || low >= high) return;
 
-        const zone = {
-            high,
-            low,
-            candlesData: candles // 👈 ОБЯЗАТЕЛЬНО передать сюда
-        };
+        // ✅ рисуем по истории (мгновенно после загрузки страницы)
+        const zone = { high, low, candlesData: candles };
+        this.lastZone = { high, low };
 
         this.callLayer("renderWindowZone", zone);
         this.active = true;
 
-        this.log("draw window zone", zone);
+        this.log("draw window zone (history)", zone);
     }
-
 
     // =====================================================
     // LIVE EVENTS
@@ -68,15 +66,20 @@ export class FeatureWindowZone extends FeatureBase {
             !Number.isFinite(zone.low) ||
             zone.low >= zone.high
         ) {
+            this.lastZone = null;
             this.clear();
             return;
         }
 
-        // 🔴 candlesData ОБЯЗАТЕЛЬНО
+        this.lastZone = { high: zone.high, low: zone.low };
+
+        // ✅ ВАЖНО: больше НЕ блокируем рендер из-за candlesData.
+        // Если history уже есть — передадим candlesData для фоновой зоны.
+        // Если history ещё нет — всё равно нарисуем хотя бы линии.
         this.callLayer("renderWindowZone", {
             high: zone.high,
             low: zone.low,
-            candlesData: this.candlesData
+            candlesData: (Array.isArray(this.candlesData) && this.candlesData.length) ? this.candlesData : null
         });
 
         this.active = true;

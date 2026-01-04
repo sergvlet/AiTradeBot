@@ -152,7 +152,7 @@ public class BinanceSpotWebSocketClient {
                 marketStream.onKline(chatId, strategyType, kline);
 
                 if (kline.isClosed()) {
-                    marketStream.closeCandle(chatId, strategyType, kline);
+                    marketStream.closeCandle(chatId, kline);
                 }
 
             } catch (Exception e) {

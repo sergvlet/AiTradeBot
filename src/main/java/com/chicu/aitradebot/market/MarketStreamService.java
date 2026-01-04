@@ -2,7 +2,6 @@ package com.chicu.aitradebot.market;
 
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.common.util.TimeframeUtils;
-import com.chicu.aitradebot.exchange.client.ExchangeClient;
 import com.chicu.aitradebot.exchange.client.ExchangeClientFactory;
 import com.chicu.aitradebot.market.model.Candle;
 import com.chicu.aitradebot.market.model.UnifiedKline;
@@ -10,6 +9,7 @@ import com.chicu.aitradebot.strategy.core.TradingStrategy;
 import com.chicu.aitradebot.strategy.live.StrategyLivePublisher;
 import com.chicu.aitradebot.strategy.registry.StrategyRegistry;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -26,11 +26,11 @@ import java.util.concurrent.ConcurrentHashMap;
 @RequiredArgsConstructor
 public class MarketStreamService {
 
-    private static final int INITIAL_HISTORY_LIMIT = 1000;
 
     private final MarketStreamManager streamManager;
     private final StrategyLivePublisher live;
     private final StrategyRegistry strategyRegistry;
+    @Getter
     private final ExchangeClientFactory exchangeClientFactory;
     private final ObjectMapper objectMapper;
 
@@ -38,6 +38,7 @@ public class MarketStreamService {
      * key = symbol|tf → last push millis
      * (оставлено на будущее, сейчас не используется)
      */
+    @Getter
     private final Map<String, Long> lastLiveCandlePushAt = new ConcurrentHashMap<>();
 
     // =====================================================================
@@ -121,7 +122,7 @@ public class MarketStreamService {
             List<Candle> candles = streamManager.getCandles(symbol, timeframe, 1);
             if (candles.isEmpty()) return;
 
-            Candle c = candles.get(0);
+            Candle c = candles.getFirst();
 
             c.setClose(price);
             c.setHigh(Math.max(c.getHigh(), price));
@@ -168,8 +169,7 @@ public class MarketStreamService {
     // CLOSE CANDLE — РЕДКОЕ И ПОЛЕЗНОЕ СОБЫТИЕ
     // =====================================================================
     public void closeCandle(
-            long chatId,
-            StrategyType strategyType,
+            long ignoredChatId,
             UnifiedKline kline
     ) {
         String symbol = kline.getSymbol().toUpperCase();
@@ -178,7 +178,7 @@ public class MarketStreamService {
         List<Candle> candles = streamManager.getCandles(symbol, timeframe, 1);
         if (candles.isEmpty()) return;
 
-        Candle last = candles.get(0);
+        Candle last = candles.getFirst();
         last.setClosed(true);
 
         long tfMs = TimeframeUtils.toMillis(timeframe);
@@ -220,4 +220,5 @@ public class MarketStreamService {
         // ⚠️ только кеш, без UI и WS
         streamManager.addCandle(symbol, timeframe, candle);
     }
+
 }

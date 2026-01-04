@@ -46,6 +46,19 @@ public interface ExchangeClient {
             int limit
     ) throws Exception;
 
+    // в ExchangeClient
+    default List<Kline> getKlines(
+            String symbol,
+            String interval,
+            long startTimeMs,
+            long endTimeMs,
+            int limit
+    ) throws Exception {
+        // fallback: старое поведение "последние limit"
+        return getKlines(symbol, interval, limit);
+    }
+
+
     /**
      * Последняя цена (REST).
      */

@@ -2,10 +2,16 @@ package com.chicu.aitradebot.strategy.scalping;
 
 import jakarta.persistence.*;
 import lombok.*;
+
 import java.time.Instant;
 
 @Entity
-@Table(name = "scalping_strategy_settings")
+@Table(
+        name = "scalping_strategy_settings",
+        indexes = {
+                @Index(name = "ix_scalping_settings_chat", columnList = "chat_id")
+        }
+)
 @Getter
 @Setter
 @NoArgsConstructor
@@ -36,7 +42,6 @@ public class ScalpingStrategySettings {
     @Column(nullable = false)
     private Double spreadThreshold = 0.1;
 
-
     // =========================
     // AUDIT
     // =========================
@@ -50,9 +55,11 @@ public class ScalpingStrategySettings {
 
     @PrePersist
     public void prePersist() {
-        if (createdAt == null) {
-            createdAt = Instant.now();
-        }
+        Instant now = Instant.now();
+        if (createdAt == null) createdAt = now;
+
+        // ✅ чтобы не было null на свежесозданной записи
+        if (updatedAt == null) updatedAt = createdAt;
     }
 
     @PreUpdate

@@ -7,6 +7,8 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.Locale;
+
 @Slf4j
 @RestController
 @RequiredArgsConstructor
@@ -15,62 +17,44 @@ public class StrategyChartApiController {
 
     private final WebChartFacade chartFacade;
 
-    /**
-     * 📈 SNAPSHOT стратегического графика
-
-     * ❗ Единственный источник данных для:
-     *  - UI графика
-     *  - replay
-     *  - backtest визуализации
-
-     * ❌ НЕ:
-     *  - стратегия
-     *  - ордера
-     *  - биржа
-     */
     @GetMapping("/strategy")
     public StrategyChartDto getStrategyChart(
             @RequestParam long chatId,
             @RequestParam StrategyType type,
             @RequestParam String symbol,
-            @RequestParam(defaultValue = "1m") String timeframe,
-            @RequestParam(defaultValue = "500") int limit
+            @RequestParam(required = false) String timeframe,
+            @RequestParam(required = false) Integer limit
     ) {
+        if (chatId <= 0) throw new IllegalArgumentException("chatId must be positive");
+        if (type == null) throw new IllegalArgumentException("type must be provided");
+        if (symbol == null || symbol.isBlank()) throw new IllegalArgumentException("symbol must be provided");
 
-        // ============================
-        // VALIDATION
-        // ============================
+        final String sym = symbol.trim().toUpperCase(Locale.ROOT);
 
-        if (chatId <= 0) {
-            throw new IllegalArgumentException("chatId must be positive");
-        }
+        // нормализуем "<default>" / "default" / пустоту -> null
+        final String tf = normalizeOptional(timeframe);
+        final int lim = normalizeLimit(limit);
 
-        if (symbol == null || symbol.isBlank()) {
-            throw new IllegalArgumentException("symbol must be provided");
-        }
-
-        if (limit < 10 || limit > 1500) {
-            throw new IllegalArgumentException("limit must be between 10 and 1500");
-        }
-
-        String tf = timeframe.trim().toLowerCase();
-        String sym = symbol.trim().toUpperCase();
-
-        log.info(
-                "📊 Chart SNAPSHOT → chatId={} type={} symbol={} tf={} limit={}",
-                chatId, type, sym, tf, limit
+        log.info("📊 Chart SNAPSHOT → chatId={} type={} symbol={} tf={} limit={}",
+                chatId, type, sym,
+                (tf == null ? "<from-settings>" : tf),
+                (lim == 0 ? "<from-settings>" : lim)
         );
 
-        // ============================
-        // DELEGATE (ЕДИНАЯ ТОЧКА)
-        // ============================
+        return chartFacade.buildChart(chatId, type, sym, tf, lim);
+    }
 
-        return chartFacade.buildChart(
-                chatId,
-                type,
-                sym,
-                tf,
-                limit
-        );
+    private static String normalizeOptional(String v) {
+        if (v == null) return null;
+        String s = v.trim().toLowerCase(Locale.ROOT);
+        if (s.isBlank()) return null;
+        if (s.equals("default") || s.equals("<default>")) return null;
+        return s;
+    }
+
+    private static int normalizeLimit(Integer v) {
+        if (v == null) return 0;          // 0 = возьми из настроек
+        if (v < 10 || v > 1500) return 0;  // тоже отдадим на резолв в settings
+        return v;
     }
 }

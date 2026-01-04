@@ -3,26 +3,6 @@
 /**
  * LayerRenderer
  * =============
- *
- * PUBLIC API (used by strategies):
- * ✔ renderLevels / clearLevels
- * ✔ renderZone / clearZone
- * ✔ renderTradeZone / clearTradeZone
- * ✔ renderTpSl / clearTpSl
- * ✔ renderPriceLine / clearPriceLines
- * ✔ renderOrder
- * ✔ renderTrade
- * ✔ renderWindowZone / clearWindowZone
- * ✔ renderAtr / clearAtr
- *
- * INTERNAL / LEGACY (not for new features):
- * ⚠ onActiveLevel
- * ⚠ onMagnet
- *
- * ❗ LayerRenderer:
- * - НЕ знает стратегию
- * - НЕ знает таймфрейм
- * - НЕ знает рынок
  */
 
 export class LayerRenderer {
@@ -51,6 +31,10 @@ export class LayerRenderer {
         // === WINDOW ZONE (SCALPING) ===
         this.windowHighLine = null;
         this.windowLowLine  = null;
+        this.windowZoneBackground = null;
+
+        // ✅ sticky state (чтобы после refresh восстановить)
+        this._lastWindowZone = null;
 
         // === ATR / VOLATILITY (INFO ONLY) ===
         this.lastAtr = null;
@@ -70,6 +54,23 @@ export class LayerRenderer {
     }
 
     // =====================================================
+    // BIND / REBIND (ВАЖНО для refresh)
+    // =====================================================
+    bind(chart, candleSeries) {
+        this.chart   = chart;
+        this.candles = candleSeries;
+
+        // после пересоздания series/graph — восстанавливаем зону
+        this.restoreWindowZone();
+    }
+
+    restoreWindowZone() {
+        if (!this._lastWindowZone) return;
+        // перерисует на текущих this.chart/this.candles
+        this.renderWindowZone(this._lastWindowZone);
+    }
+
+    // =====================================================
     // HELPERS
     // =====================================================
     _parsePrice(v) {
@@ -86,8 +87,30 @@ export class LayerRenderer {
     _safeRemovePriceLine(line) {
         if (!line) return;
         try {
-            this.candles.removePriceLine(line);
+            this.candles?.removePriceLine?.(line);
         } catch {}
+    }
+
+    _safeRemoveSeries(series) {
+        if (!series) return;
+        try {
+            this.chart?.removeSeries?.(series);
+        } catch {}
+    }
+
+    // ✅ приводим время к UTCTimestamp (секунды)
+    _normalizeTime(t) {
+        if (t == null) return NaN;
+
+        // LightweightCharts иногда может вернуть объект businessDay
+        if (typeof t === "object") return NaN;
+
+        const n = Number(t);
+        if (!Number.isFinite(n)) return NaN;
+
+        // если миллисекунды (типично 13 цифр)
+        if (n > 1e11) return Math.floor(n / 1000);
+        return Math.floor(n);
     }
 
     // =====================================================
@@ -307,24 +330,32 @@ export class LayerRenderer {
         this.priceLines.clear();
     }
 
-// =====================================================
-// WINDOW ZONE
-// =====================================================
+    // =====================================================
+    // WINDOW ZONE  ✅ FIXED
+    // =====================================================
     renderWindowZone(zone) {
         if (!zone) return;
 
-        this.clearWindowZone();
-
         const high = Number(zone.high);
-        const low = Number(zone.low);
-
+        const low  = Number(zone.low);
         if (!Number.isFinite(high) || !Number.isFinite(low)) return;
 
         const hi = Math.max(high, low);
         const lo = Math.min(high, low);
 
+        // ✅ сохраняем последнюю валидную зону (для restore после refresh)
+        this._lastWindowZone = {
+            high: hi,
+            low: lo,
+            candlesData: Array.isArray(zone.candlesData) ? zone.candlesData : null
+        };
+
+        // перерисовка
+        this.clearWindowZone();
+
         const color = "#64748b";
 
+        // ✅ Линии рисуем ВСЕГДА
         this.windowHighLine = this.candles.createPriceLine({
             price: hi,
             color,
@@ -341,65 +372,90 @@ export class LayerRenderer {
             title: "WINDOW LOW"
         });
 
-        const backgroundSeries = this.chart.addHistogramSeries({
-            color: "rgba(100, 116, 139, 0.15)",
+        // ---- ФОН (опционально) ----
+        if (typeof this.chart?.addBaselineSeries !== "function") return;
+
+        let fromTime = NaN;
+        let toTime   = NaN;
+
+        const candles = Array.isArray(zone.candlesData) ? zone.candlesData : null;
+
+        if (candles && candles.length) {
+            fromTime = this._normalizeTime(candles[0]?.time);
+            toTime   = this._normalizeTime(candles.at(-1)?.time);
+        }
+
+        // fallback: видимый диапазон (если candlesData нет/битый)
+        if (!Number.isFinite(fromTime) || !Number.isFinite(toTime)) {
+            const vr = this.chart?.timeScale?.().getVisibleRange?.();
+            if (vr && vr.from != null && vr.to != null) {
+                fromTime = this._normalizeTime(vr.from);
+                toTime   = this._normalizeTime(vr.to);
+            }
+        }
+
+        if (!Number.isFinite(fromTime) || !Number.isFinite(toTime)) return;
+
+        if (toTime < fromTime) {
+            const tmp = fromTime;
+            fromTime = toTime;
+            toTime = tmp;
+        }
+
+        // шаг по времени
+        let step = 60;
+        if (candles && candles.length >= 2) {
+            const t1 = this._normalizeTime(candles.at(-1)?.time);
+            const t0 = this._normalizeTime(candles.at(-2)?.time);
+            const dt = Math.abs(t1 - t0);
+            if (Number.isFinite(dt) && dt > 0) step = dt;
+        }
+
+        // ограничим размер массива
+        const maxPoints = 600;
+        const range = toTime - fromTime;
+        const approx = Math.floor(range / step);
+        if (approx > maxPoints) step = Math.max(1, Math.ceil(range / maxPoints));
+
+        const bg = this.chart.addBaselineSeries({
+            baseValue: { type: "price", price: lo },
+
+            topFillColor1: "rgba(100, 116, 139, 0.12)",
+            topFillColor2: "rgba(100, 116, 139, 0.12)",
+            bottomFillColor1: "rgba(100, 116, 139, 0.12)",
+            bottomFillColor2: "rgba(100, 116, 139, 0.12)",
+
+            lineVisible: false,
             priceLineVisible: false,
-            baseLineVisible: false,
-            lineWidth: 0,
-            overlay: true
+            lastValueVisible: false,
+
+            // ✅ чтобы фон НЕ влиял на autoscale свечей
+            autoscaleInfoProvider: () => null
         });
 
-        const candles = Array.isArray(zone.candlesData) ? zone.candlesData : [];
-        if (!candles.length || !candles[0]?.time || !candles.at(-1)?.time) {
-            console.warn("⛔ zone.candlesData пустой или некорректный");
-            this.chart.removeSeries(backgroundSeries);
-            return;
-        }
-
-        const fromTime = Number(candles[0].time);
-        const toTime   = Number(candles.at(-1).time);
-
-        if (!Number.isFinite(fromTime) || !Number.isFinite(toTime)) {
-            console.warn("⛔ Временные метки невалидны", { fromTime, toTime });
-            this.chart.removeSeries(backgroundSeries);
-            return;
-        }
-
-        const step = 60;
-        const backgroundData = [];
-
+        const data = [];
         for (let t = fromTime; t <= toTime; t += step) {
-            backgroundData.push({ time: t, value: hi });
-            backgroundData.push({ time: t, value: lo });
+            data.push({ time: t, value: hi });
         }
 
-        if (!backgroundData.length) {
-            this.chart.removeSeries(backgroundSeries);
+        if (!data.length) {
+            this._safeRemoveSeries(bg);
             return;
         }
 
-        backgroundSeries.setData(backgroundData);
-        this.windowZoneBackground = backgroundSeries;
+        bg.setData(data);
+        this.windowZoneBackground = bg;
     }
-
-
-
-
-
-
 
     clearWindowZone() {
         this._safeRemovePriceLine(this.windowHighLine);
         this._safeRemovePriceLine(this.windowLowLine);
-        this.windowHighLine = null;
-        this.windowLowLine  = null;
-        if (this.windowZoneBackground) {
-            try {
-                this.chart.removeSeries(this.windowZoneBackground);
-            } catch {}
-            this.windowZoneBackground = null;
-        }
 
+        this.windowHighLine = null;
+        this.windowLowLine = null;
+
+        this._safeRemoveSeries(this.windowZoneBackground);
+        this.windowZoneBackground = null;
     }
 
     // =====================================================
