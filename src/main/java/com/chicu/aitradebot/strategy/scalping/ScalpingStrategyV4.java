@@ -1,17 +1,14 @@
 package com.chicu.aitradebot.strategy.scalping;
 
-import com.chicu.aitradebot.account.AccountBalanceService;
-import com.chicu.aitradebot.account.AccountBalanceSnapshot;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
-import com.chicu.aitradebot.exchange.model.Order;
-import com.chicu.aitradebot.service.OrderService;
 import com.chicu.aitradebot.service.StrategySettingsService;
 import com.chicu.aitradebot.strategy.core.TradingStrategy;
 import com.chicu.aitradebot.strategy.core.signal.Signal;
 import com.chicu.aitradebot.strategy.live.StrategyLivePublisher;
 import com.chicu.aitradebot.strategy.registry.StrategyBinding;
+import com.chicu.aitradebot.trade.TradeExecutionService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -20,9 +17,13 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.ArrayDeque;
+import java.util.Comparator;
 import java.util.Deque;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 
 @StrategyBinding(StrategyType.SCALPING)
@@ -32,33 +33,36 @@ import java.util.concurrent.ConcurrentHashMap;
 public class ScalpingStrategyV4 implements TradingStrategy {
 
     private static final Duration SETTINGS_REFRESH_EVERY = Duration.ofSeconds(10);
+    private static final long LOG_EVERY_TICKS = 200;
+    private static final ZoneId ZONE = ZoneId.of("Europe/Warsaw");
 
     private final StrategyLivePublisher live;
     private final ScalpingStrategySettingsService scalpingSettingsService;
     private final StrategySettingsService strategySettingsService;
-    private final OrderService orderService;
-    private final AccountBalanceService accountBalanceService;
+    private final TradeExecutionService tradeExecutionService;
 
     private final Map<Long, LocalState> states = new ConcurrentHashMap<>();
 
-    // ✅ Snapshot для REST (/api/chart/strategy)
+    /**
+     * Важно: threshold в настройках хранится как ДОЛЯ (fraction):
+     * 0.005 = 0.5% (а не 0.005%)
+     */
     public record WindowZoneSnapshot(BigDecimal high, BigDecimal low) {}
 
     public WindowZoneSnapshot getLastWindowZone(long chatId) {
         LocalState st = states.get(chatId);
         if (st == null) return null;
-        BigDecimal hi = st.lastWindowHigh;
-        BigDecimal lo = st.lastWindowLow;
-        if (hi == null || lo == null) return null;
-        return new WindowZoneSnapshot(hi, lo);
+        if (st.lastWindowHigh == null || st.lastWindowLow == null) return null;
+        return new WindowZoneSnapshot(st.lastWindowHigh, st.lastWindowLow);
     }
 
-    // =====================================================
-    // LOCAL STATE
-    // =====================================================
     private static class LocalState {
         Instant startedAt;
         boolean active;
+
+        String lastSettingsFingerprint;
+        Instant lastSettingsUpdatedAt;   // StrategySettings.updatedAt (LocalDateTime -> Instant)
+        Instant lastScalpingUpdatedAt;   // ScalpingStrategySettings.updatedAt (Instant)
 
         StrategySettings strategySettings;
         ScalpingStrategySettings scalpingSettings;
@@ -86,6 +90,15 @@ public class ScalpingStrategyV4 implements TradingStrategy {
 
         BigDecimal lastWindowHigh;
         BigDecimal lastWindowLow;
+
+        long ticks;
+        long warmups;
+        long entries;
+        long exits;
+
+        // чтобы не спамить одинаковыми hold-сигналами
+        String lastHoldReason;
+        Instant lastHoldAt;
     }
 
     // =====================================================
@@ -100,20 +113,37 @@ public class ScalpingStrategyV4 implements TradingStrategy {
         LocalState st = new LocalState();
         st.active = true;
         st.startedAt = Instant.now();
+
         st.strategySettings = strategy;
         st.scalpingSettings = cfg;
-        st.symbol = strategy.getSymbol();
+
+        st.symbol = safeUpper(strategy.getSymbol());
         st.exchange = strategy.getExchangeName();
         st.network = strategy.getNetworkType();
+
         st.lastSettingsLoadAt = Instant.now();
 
         st.lastWindowHigh = null;
         st.lastWindowLow = null;
 
+        st.lastSettingsUpdatedAt = toInstant(strategy.getUpdatedAt());
+        st.lastScalpingUpdatedAt = (cfg != null) ? cfg.getUpdatedAt() : null;
+        st.lastSettingsFingerprint = buildSettingsFingerprint(strategy, cfg);
+
         states.put(chatId, st);
 
-        live.pushState(chatId, StrategyType.SCALPING, st.symbol, true);
-        live.pushSignal(chatId, StrategyType.SCALPING, st.symbol, null, Signal.hold("started"));
+        log.info("[SCALPING] ▶ START chatId={} symbol={} ex={} net={} windowSize={} thr={} cooldownSec={}",
+                chatId,
+                st.symbol,
+                st.exchange,
+                st.network,
+                cfg != null ? cfg.getWindowSize() : null,
+                cfg != null ? num(cfg.getPriceChangeThreshold()) : null,
+                strategy.getCooldownSeconds()
+        );
+
+        safeLive(() -> live.pushState(chatId, StrategyType.SCALPING, st.symbol, true));
+        safeLive(() -> live.pushSignal(chatId, StrategyType.SCALPING, st.symbol, null, Signal.hold("started")));
     }
 
     @Override
@@ -124,10 +154,15 @@ public class ScalpingStrategyV4 implements TradingStrategy {
 
         String symbol = st.symbol;
 
-        live.clearTpSl(chatId, StrategyType.SCALPING, symbol);
-        live.clearPriceLines(chatId, StrategyType.SCALPING, symbol);
-        live.clearWindowZone(chatId, StrategyType.SCALPING, symbol);
-        live.pushState(chatId, StrategyType.SCALPING, symbol, false);
+        if (symbol != null) {
+            safeLive(() -> live.clearTpSl(chatId, StrategyType.SCALPING, symbol));
+            safeLive(() -> live.clearPriceLines(chatId, StrategyType.SCALPING, symbol));
+            safeLive(() -> live.clearWindowZone(chatId, StrategyType.SCALPING, symbol));
+            safeLive(() -> live.pushState(chatId, StrategyType.SCALPING, symbol, false));
+        }
+
+        log.info("[SCALPING] ⏹ STOP chatId={} symbol={} ticks={} warmups={} entries={} exits={} inPos={}",
+                chatId, symbol, st.ticks, st.warmups, st.entries, st.exits, st.inPosition);
     }
 
     @Override
@@ -146,237 +181,407 @@ public class ScalpingStrategyV4 implements TradingStrategy {
     // PRICE UPDATE
     // =====================================================
     @Override
-    public void onPriceUpdate(Long chatId, String ignored, BigDecimal price, Instant ts) {
-        log.info("[SCALPING] ⏱ onPriceUpdate | chatId={}, price={}, ts={}", chatId, price, ts);
+    public void onPriceUpdate(Long chatId, String symbolFromTick, BigDecimal price, Instant ts) {
 
         LocalState st = states.get(chatId);
-        if (st == null || !st.active) {
-            log.warn("[SCALPING] ⛔ Strategy inactive or not found for chatId={}", chatId);
-            return;
-        }
+        if (st == null || !st.active) return;
+
+        st.ticks++;
+
         if (price == null || price.signum() <= 0) {
-            log.warn("[SCALPING] ⚠ Invalid price received: {}", price);
+            if (st.ticks % LOG_EVERY_TICKS == 0) {
+                log.warn("[SCALPING] ⚠ Invalid price chatId={} price={}", chatId, price);
+            }
             return;
         }
 
         Instant time = (ts != null) ? ts : Instant.now();
-        refreshSettingsIfNeeded(chatId, st, time);
 
-        StrategySettings strategy = st.strategySettings;
-        ScalpingStrategySettings cfg = st.scalpingSettings;
-        String symbol = st.symbol;
+        // 🔥 важный фикс: не мешаем цены разных символов
+        String tickSymbol = safeUpper(symbolFromTick);
+        String cfgSymbol = safeUpper(st.symbol);
 
-        live.pushPriceTick(chatId, StrategyType.SCALPING, symbol, price, time);
-
-        int windowSize = cfg.getWindowSize();
-        if (windowSize <= 1) {
-            live.pushSignal(chatId, StrategyType.SCALPING, symbol, null, Signal.hold("windowSize<=1"));
-            return;
+        if (cfgSymbol != null && tickSymbol != null && !cfgSymbol.equals(tickSymbol)) {
+            return; // игнорим чужие тики
+        }
+        if (cfgSymbol == null && tickSymbol != null) {
+            st.symbol = tickSymbol;
+            cfgSymbol = tickSymbol;
         }
 
-        st.window.addLast(price);
-        while (st.window.size() > windowSize) st.window.removeFirst();
+        // лайв тик (не ломаем торговлю если упадёт)
+        final String symbolForLive = safeUpper(st.symbol);
+        safeLive(() -> live.pushPriceTick(chatId, StrategyType.SCALPING, symbolForLive, price, time));
 
-        if (st.window.size() < windowSize) {
-            log.info("[SCALPING] 🔄 Warming up window: {}/{}", st.window.size(), windowSize);
-            live.pushSignal(chatId, StrategyType.SCALPING, symbol, null, Signal.hold("warming up"));
-            return;
-        }
+        synchronized (st) {
 
-        BigDecimal first = st.window.getFirst();
-        BigDecimal last = st.window.getLast();
+            refreshSettingsIfNeeded(chatId, st, time);
 
-        double diffPct = last.subtract(first)
-                                 .divide(first, 8, RoundingMode.HALF_UP)
-                                 .doubleValue() * 100.0;
+            StrategySettings strategy = st.strategySettings;
+            ScalpingStrategySettings cfg = st.scalpingSettings;
+            String symbol = safeUpper(st.symbol);
 
-        log.debug("[SCALPING] 📊 Price diffPct: {}", diffPct);
-
-        // =====================================================
-        // WINDOW ZONE (always keep last zone for snapshot)
-        // =====================================================
-        double thresholdPct = cfg.getPriceChangeThreshold();
-
-        // ✅ если порог стал 0 — чистим зону и snapshot, чтобы на refresh не показывать старую
-        if (thresholdPct <= 0) {
-            if (st.lastWindowHigh != null || st.lastWindowLow != null) {
-                st.lastWindowHigh = null;
-                st.lastWindowLow = null;
-                live.clearWindowZone(chatId, StrategyType.SCALPING, symbol);
+            if (cfg == null) {
+                pushHoldThrottled(chatId, symbol, st, "no_scalping_settings", time);
+                return;
             }
-        } else {
-            BigDecimal high = last.multiply(BigDecimal.valueOf(1 + thresholdPct / 100.0));
-            BigDecimal low  = last.multiply(BigDecimal.valueOf(1 - thresholdPct / 100.0));
 
-            st.lastWindowHigh = high;
-            st.lastWindowLow  = low;
+            int windowSize = cfg.getWindowSize() != null ? cfg.getWindowSize() : 0;
+            if (windowSize <= 1) {
+                pushHoldThrottled(chatId, symbol, st, "windowSize<=1", time);
+                return;
+            }
 
-            log.info("[SCALPING] 📐 pushWindowZone: high={}, low={}, threshold={}%", high, low, thresholdPct);
-            live.pushWindowZone(chatId, StrategyType.SCALPING, symbol, high, low);
-        }
+            st.window.addLast(price);
+            while (st.window.size() > windowSize) st.window.removeFirst();
 
-        // ENTRY
-        if (!st.inPosition && thresholdPct > 0 && Math.abs(diffPct) >= thresholdPct) {
+            if (st.window.size() < windowSize) {
+                st.warmups++;
+                if (st.ticks % LOG_EVERY_TICKS == 0) {
+                    log.info("[SCALPING] … warming chatId={} symbol={} window={}/{} inPos={}",
+                            chatId, symbol, st.window.size(), windowSize, st.inPosition);
+                }
+                pushHoldThrottled(chatId, symbol, st, "warming_up", time);
+                return;
+            }
 
-            Integer cooldown = strategy.getCooldownSeconds();
-            if (cooldown != null && cooldown > 0 && st.lastTradeClosedAt != null) {
-                long passed = Duration.between(st.lastTradeClosedAt, time).getSeconds();
-                if (passed < cooldown) {
-                    log.info("[SCALPING] 🕒 Cooldown active: {}s remaining", cooldown - passed);
-                    live.pushSignal(chatId, StrategyType.SCALPING, symbol, null, Signal.hold("cooldown"));
-                    return;
+            BigDecimal first = st.window.getFirst();
+            BigDecimal last = st.window.getLast();
+
+            if (first == null || first.signum() <= 0) {
+                pushHoldThrottled(chatId, symbol, st, "first_price_invalid", time);
+                return;
+            }
+
+            // diffFrac (доля): (last-first)/first
+            double diffFrac = last.subtract(first)
+                    .divide(first, 10, RoundingMode.HALF_UP)
+                    .doubleValue();
+
+            Double thresholdObj = cfg.getPriceChangeThreshold();
+            double thresholdFrac = (thresholdObj != null) ? thresholdObj : 0.0;
+
+            if (st.ticks % LOG_EVERY_TICKS == 0) {
+                log.info("[SCALPING] tick chatId={} symbol={} price={} diff={} thr={} windowSize={} inPos={}",
+                        chatId,
+                        symbol,
+                        price.stripTrailingZeros().toPlainString(),
+                        String.format("%.6f", diffFrac),
+                        String.format("%.6f", thresholdFrac),
+                        windowSize,
+                        st.inPosition
+                );
+            }
+
+            // =====================================================
+            // WINDOW ZONE (рисуем)
+            // thresholdFrac: 0.005 => +-0.5%
+            // =====================================================
+            if (thresholdFrac <= 0) {
+                if (st.lastWindowHigh != null || st.lastWindowLow != null) {
+                    st.lastWindowHigh = null;
+                    st.lastWindowLow = null;
+                    safeLive(() -> live.clearWindowZone(chatId, StrategyType.SCALPING, symbol));
+                }
+            } else {
+                BigDecimal high = last.multiply(BigDecimal.valueOf(1.0 + thresholdFrac));
+                BigDecimal low  = last.multiply(BigDecimal.valueOf(1.0 - thresholdFrac));
+
+                st.lastWindowHigh = high;
+                st.lastWindowLow = low;
+
+                safeLive(() -> live.pushWindowZone(chatId, StrategyType.SCALPING, symbol, high, low));
+            }
+
+            // =====================================================
+// ENTRY (SPOT: только LONG)
+// =====================================================
+            if (!st.inPosition && thresholdFrac > 0 && diffFrac >= thresholdFrac) { // ✅ только рост
+
+                Integer cooldown = strategy != null ? strategy.getCooldownSeconds() : null;
+                if (cooldown != null && cooldown > 0 && st.lastTradeClosedAt != null) {
+                    long passed = Duration.between(st.lastTradeClosedAt, time).getSeconds();
+                    if (passed < cooldown) {
+                        pushHoldThrottled(chatId, symbol, st, "cooldown", time);
+                        return;
+                    }
+                }
+
+                log.info("[SCALPING] ⚡ ENTRY try (SPOT LONG) chatId={} symbol={} price={} diff={} thr={}",
+                        chatId,
+                        symbol,
+                        price.stripTrailingZeros().toPlainString(),
+                        String.format("%.6f", diffFrac),
+                        String.format("%.6f", thresholdFrac)
+                );
+
+                try {
+                    var res = tradeExecutionService.executeEntry(
+                            chatId,
+                            StrategyType.SCALPING,
+                            symbol,
+                            price,
+                            BigDecimal.valueOf(diffFrac), // diffFrac >= thresholdFrac
+                            time,
+                            strategy
+                    );
+
+                    if (!res.executed()) {
+                        log.info("[SCALPING] ✋ ENTRY blocked chatId={} reason={}", chatId, res.reason());
+                        pushHoldThrottled(chatId, symbol, st, res.reason(), time);
+                        return;
+                    }
+
+                    st.entries++;
+                    st.inPosition = true;
+                    st.isLong = true;               // ✅ SPOT
+                    st.entryPrice = res.entryPrice();
+                    st.tp = res.tp();
+                    st.sl = res.sl();
+                    st.entryQty = res.qty();
+                    st.entrySide = "BUY";           // ✅ SPOT
+                    st.entryOrderId = res.orderId();
+
+                    log.info("[SCALPING] ✅ ENTRY OK (SPOT LONG) chatId={} qty={} entry={} tp={} sl={} orderId={}",
+                            chatId,
+                            st.entryQty != null ? st.entryQty.stripTrailingZeros().toPlainString() : "null",
+                            st.entryPrice != null ? st.entryPrice.stripTrailingZeros().toPlainString() : "null",
+                            st.tp != null ? st.tp.stripTrailingZeros().toPlainString() : "null",
+                            st.sl != null ? st.sl.stripTrailingZeros().toPlainString() : "null",
+                            st.entryOrderId
+                    );
+
+                    st.window.clear();
+                    st.lastHoldReason = null;
+
+                } catch (Exception e) {
+                    log.error("[SCALPING] ❌ ENTRY failed chatId={} err={}", chatId, e.getMessage(), e);
+                    pushHoldThrottled(chatId, symbol, st, "entry_failed", time);
                 }
             }
 
-            AccountBalanceSnapshot snapshot = accountBalanceService.getSnapshot(
-                    chatId, StrategyType.SCALPING, strategy.getExchangeName(), strategy.getNetworkType());
+            // =====================================================
+            // EXIT
+            // =====================================================
+            if (st.inPosition && st.entryQty != null && st.tp != null && st.sl != null) {
 
-            if (snapshot == null) {
-                log.warn("[SCALPING] ⚠ No account snapshot available for chatId={}", chatId);
-                return;
-            }
+                try {
+                    var ex = tradeExecutionService.executeExitIfHit(
+                            chatId,
+                            StrategyType.SCALPING,
+                            symbol,
+                            price,
+                            time,
+                            st.isLong,
+                            st.entryQty,
+                            st.tp,
+                            st.sl
+                    );
 
-            BigDecimal available = snapshot.getSelectedFreeBalance();
-            if (available == null || available.signum() <= 0) {
-                log.warn("[SCALPING] ⚠ No available balance");
-                return;
-            }
+                    if (ex.executed()) {
+                        st.exits++;
 
-            BigDecimal maxAllowed = resolveMaxExposureAmount(strategy, available);
-            BigDecimal tradeAmount = resolveTradeAmount(strategy, available, maxAllowed);
-            if (tradeAmount.signum() <= 0) {
-                log.warn("[SCALPING] ⚠ Trade amount resolved to zero");
-                return;
-            }
+                        log.info("[SCALPING] ✅ EXIT OK chatId={} price={} (tp={} sl={})",
+                                chatId,
+                                price.stripTrailingZeros().toPlainString(),
+                                st.tp.stripTrailingZeros().toPlainString(),
+                                st.sl.stripTrailingZeros().toPlainString()
+                        );
 
-            BigDecimal qty = tradeAmount.divide(price, 8, RoundingMode.DOWN);
-            if (qty.signum() <= 0) {
-                log.warn("[SCALPING] ⚠ Calculated qty <= 0");
-                return;
-            }
+                        st.inPosition = false;
+                        st.entryQty = null;
+                        st.entryOrderId = null;
+                        st.entryPrice = null;
+                        st.tp = null;
+                        st.sl = null;
 
-            st.inPosition = true;
-            st.isLong = diffPct > 0;
-            st.entryPrice = price;
+                        st.lastTradeClosedAt = time;
 
-            double tpPct = safePct(strategy.getTakeProfitPct());
-            double slPct = safePct(strategy.getStopLossPct());
+                        // очищаем линии на графике после закрытия
+                        safeLive(() -> live.clearTpSl(chatId, StrategyType.SCALPING, symbol));
+                        safeLive(() -> live.clearPriceLines(chatId, StrategyType.SCALPING, symbol));
+                    }
 
-            st.tp = st.isLong
-                    ? price.multiply(BigDecimal.valueOf(1 + tpPct))
-                    : price.multiply(BigDecimal.valueOf(1 - tpPct));
-
-            st.sl = st.isLong
-                    ? price.multiply(BigDecimal.valueOf(1 - slPct))
-                    : price.multiply(BigDecimal.valueOf(1 + slPct));
-
-            String entrySide = st.isLong ? "BUY" : "SELL";
-
-            Order entry = orderService.placeMarket(
-                    chatId, symbol, entrySide, qty, price, StrategyType.SCALPING.name());
-
-            st.entryQty = qty;
-            st.entrySide = entrySide;
-            st.entryOrderId = entry != null ? Long.valueOf(entry.getOrderId()) : null;
-
-            log.info("[SCALPING] ✅ ENTRY: chatId={}, side={}, price={}, qty={}", chatId, entrySide, price, qty);
-
-            live.pushPriceLine(chatId, StrategyType.SCALPING, symbol, "ENTRY", price);
-            live.pushTpSl(chatId, StrategyType.SCALPING, symbol, st.tp, st.sl);
-            live.pushTrade(chatId, StrategyType.SCALPING, symbol, entrySide, price, qty, time);
-
-            st.window.clear();
-        }
-
-        // EXIT
-        if (st.inPosition && st.entryQty != null && st.tp != null && st.sl != null) {
-            boolean hitTp = st.isLong ? price.compareTo(st.tp) >= 0 : price.compareTo(st.tp) <= 0;
-            boolean hitSl = st.isLong ? price.compareTo(st.sl) <= 0 : price.compareTo(st.sl) >= 0;
-
-            if (hitTp || hitSl) {
-                String exitSide = st.isLong ? "SELL" : "BUY";
-
-                orderService.placeMarket(chatId, symbol, exitSide, st.entryQty, price, StrategyType.SCALPING.name());
-
-                log.info("[SCALPING] ✅ EXIT: chatId={}, side={}, price={}, qty={}, reason={}",
-                        chatId, exitSide, price, st.entryQty, hitTp ? "TP" : "SL");
-
-                live.pushTrade(chatId, StrategyType.SCALPING, symbol, exitSide, price, st.entryQty, time);
-
-                st.inPosition = false;
-                st.entryQty = null;
-                st.entryOrderId = null;
-                st.lastTradeClosedAt = time;
-
-                live.clearTpSl(chatId, StrategyType.SCALPING, symbol);
-                live.clearPriceLines(chatId, StrategyType.SCALPING, symbol);
+                } catch (Exception e) {
+                    log.error("[SCALPING] ❌ EXIT failed chatId={} err={}", chatId, e.getMessage(), e);
+                }
             }
         }
     }
 
     // =====================================================
-    // HELPERS
+    // SETTINGS REFRESH
     // =====================================================
     private void refreshSettingsIfNeeded(Long chatId, LocalState st, Instant now) {
-        if (st.lastSettingsLoadAt == null ||
-            Duration.between(st.lastSettingsLoadAt, now).compareTo(SETTINGS_REFRESH_EVERY) >= 0) {
 
+        if (st.lastSettingsLoadAt != null &&
+            Duration.between(st.lastSettingsLoadAt, now).compareTo(SETTINGS_REFRESH_EVERY) < 0) {
+            return;
+        }
+
+        try {
             StrategySettings loaded = loadStrategySettings(chatId);
-            st.strategySettings = loaded;
-            st.scalpingSettings = scalpingSettingsService.getOrCreate(chatId);
+            ScalpingStrategySettings scalping = scalpingSettingsService.getOrCreate(chatId);
 
-            // ⚠️ символ/биржа/сеть менять на лету опасно, но оставляем как было у тебя
-            st.symbol = loaded.getSymbol();
-            st.exchange = loaded.getExchangeName();
-            st.network = loaded.getNetworkType();
+            Instant loadedUpd = (loaded != null) ? toInstant(loaded.getUpdatedAt()) : null;
+            Instant scalpingUpd = (scalping != null) ? scalping.getUpdatedAt() : null;
+
+            String fp = buildSettingsFingerprint(loaded, scalping);
+
+            boolean changed =
+                    st.lastSettingsFingerprint == null ||
+                    !st.lastSettingsFingerprint.equals(fp) ||
+                    !Objects.equals(st.lastSettingsUpdatedAt, loadedUpd) ||
+                    !Objects.equals(st.lastScalpingUpdatedAt, scalpingUpd);
+
+            String oldSymbol = safeUpper(st.symbol);
+
+            if (loaded != null) st.strategySettings = loaded;
+            if (scalping != null) st.scalpingSettings = scalping;
+
+            if (loaded != null) {
+                String loadedSymbol = safeUpper(loaded.getSymbol());
+                if (loadedSymbol != null) st.symbol = loadedSymbol;
+
+                if (loaded.getExchangeName() != null) st.exchange = loaded.getExchangeName();
+                if (loaded.getNetworkType() != null) st.network = loaded.getNetworkType();
+            }
 
             st.lastSettingsLoadAt = now;
+
+            if (changed) {
+                st.lastSettingsFingerprint = fp;
+                st.lastSettingsUpdatedAt = loadedUpd;
+                st.lastScalpingUpdatedAt = scalpingUpd;
+
+                log.info("[SCALPING] ⚙️ settings updated chatId={} symbol={} ex={} net={} windowSize={} thr={} spread={}",
+                        chatId,
+                        st.symbol,
+                        st.exchange,
+                        st.network,
+                        scalping != null ? scalping.getWindowSize() : null,
+                        scalping != null ? num(scalping.getPriceChangeThreshold()) : null,
+                        scalping != null ? num(scalping.getSpreadThreshold()) : null
+                );
+
+                String newSymbol = safeUpper(st.symbol);
+                if (oldSymbol != null && newSymbol != null && !oldSymbol.equals(newSymbol)) {
+                    st.window.clear();
+                    st.lastWindowHigh = null;
+                    st.lastWindowLow = null;
+
+                    // чистим зону и линии по СТАРОМУ символу, чтобы не оставался мусор
+                    safeLive(() -> live.clearWindowZone(chatId, StrategyType.SCALPING, oldSymbol));
+                    safeLive(() -> live.clearTpSl(chatId, StrategyType.SCALPING, oldSymbol));
+                    safeLive(() -> live.clearPriceLines(chatId, StrategyType.SCALPING, oldSymbol));
+
+                    st.lastHoldReason = null;
+                }
+            } else {
+                log.debug("[SCALPING] settings unchanged chatId={} (skip log)", chatId);
+            }
+
+        } catch (Exception e) {
+            st.lastSettingsLoadAt = now;
+            log.warn("[SCALPING] ⚠️ settings refresh failed chatId={} msg={}", chatId, e.toString());
         }
     }
 
+    // =====================================================
+    // FINGERPRINT
+    // =====================================================
+    private String buildSettingsFingerprint(StrategySettings ss, ScalpingStrategySettings sc) {
+        if (ss == null && sc == null) return "null";
+
+        String symbol = ss != null ? safeUpper(ss.getSymbol()) : "null";
+        String ex = ss != null ? String.valueOf(ss.getExchangeName()) : "null";
+        String net = ss != null ? String.valueOf(ss.getNetworkType()) : "null";
+        String tf = ss != null ? safe(ss.getTimeframe()) : "null";
+
+        String tp = ss != null ? bd(ss.getTakeProfitPct()) : "null";
+        String sl = ss != null ? bd(ss.getStopLossPct()) : "null";
+        String comm = ss != null ? bd(ss.getCommissionPct()) : "null";
+        String cooldown = ss != null && ss.getCooldownSeconds() != null ? String.valueOf(ss.getCooldownSeconds()) : "null";
+
+        String window = sc != null && sc.getWindowSize() != null ? String.valueOf(sc.getWindowSize()) : "null";
+        String thr = sc != null ? num(sc.getPriceChangeThreshold()) : "null";
+        String spread = sc != null ? num(sc.getSpreadThreshold()) : "null";
+
+        return symbol + "|" + ex + "|" + net + "|" + tf
+               + "|" + window + "|" + thr + "|" + spread
+               + "|" + tp + "|" + sl + "|" + comm + "|" + cooldown;
+    }
+
+    // =====================================================
+    // LOAD
+    // =====================================================
     private StrategySettings loadStrategySettings(Long chatId) {
         return strategySettingsService
                 .findAllByChatId(chatId, null, null)
                 .stream()
                 .filter(s -> s.getType() == StrategyType.SCALPING)
+                .sorted(
+                        Comparator
+                                .comparing(StrategySettings::getUpdatedAt, Comparator.nullsLast(Comparator.naturalOrder()))
+                                .reversed()
+                                .thenComparing(StrategySettings::getId, Comparator.nullsLast(Comparator.naturalOrder()))
+                                .reversed()
+                )
                 .findFirst()
-                .orElseThrow();
+                .orElseThrow(() -> new IllegalStateException(
+                        "StrategySettings для SCALPING не найдены (chatId=" + chatId + ")"
+                ));
     }
 
-    private double safePct(BigDecimal pct) {
-        return pct != null ? pct.doubleValue() / 100.0 : 0.0;
+    // =====================================================
+    // LIVE HELPERS (безопасно)
+    // =====================================================
+    private void safeLive(Runnable r) {
+        try { r.run(); } catch (Exception ignored) {}
     }
 
-    private BigDecimal resolveMaxExposureAmount(StrategySettings settings, BigDecimal available) {
-        if (settings.getMaxExposureUsd() != null) {
-            return settings.getMaxExposureUsd();
+    private void pushHoldThrottled(Long chatId, String symbol, LocalState st, String reason, Instant now) {
+        if (symbol == null) return;
+
+        // если причина та же и прошла меньше 2 секунд — не спамим
+        if (Objects.equals(st.lastHoldReason, reason) && st.lastHoldAt != null) {
+            long ms = Duration.between(st.lastHoldAt, now).toMillis();
+            if (ms < 2000) return;
         }
 
-        if (settings.getMaxExposurePct() != null) {
-            return available
-                    .multiply(BigDecimal.valueOf(settings.getMaxExposurePct()))
-                    .divide(BigDecimal.valueOf(100), 8, RoundingMode.DOWN);
-        }
-
-        return available;
+        st.lastHoldReason = reason;
+        st.lastHoldAt = now;
+        safeLive(() -> live.pushSignal(chatId, StrategyType.SCALPING, symbol, null, Signal.hold(reason)));
     }
 
-    private BigDecimal resolveTradeAmount(StrategySettings settings, BigDecimal available, BigDecimal maxAllowed) {
-        if (available == null || available.signum() <= 0) return BigDecimal.ZERO;
-        if (maxAllowed == null || maxAllowed.signum() <= 0) return BigDecimal.ZERO;
+    // =====================================================
+    // UTILS
+    // =====================================================
+    private static String safe(String s) {
+        return s == null ? "null" : s.trim();
+    }
 
-        if (settings.getCapitalUsd() != null && settings.getCapitalUsd().signum() > 0) {
-            return settings.getCapitalUsd().min(maxAllowed);
-        }
+    private static String safeUpper(String s) {
+        if (s == null) return null;
+        String t = s.trim();
+        return t.isEmpty() ? null : t.toUpperCase();
+    }
 
-        BigDecimal riskPct = settings.getRiskPerTradePct();
-        if (riskPct != null && riskPct.signum() > 0) {
-            BigDecimal byPct = available
-                    .multiply(riskPct)
-                    .divide(BigDecimal.valueOf(100), 8, RoundingMode.DOWN);
-            return byPct.min(maxAllowed);
-        }
+    private static Instant toInstant(LocalDateTime ldt) {
+        return ldt == null ? null : ldt.atZone(ZONE).toInstant();
+    }
 
-        return maxAllowed;
+    private static String bd(BigDecimal v) {
+        return v == null ? "null" : v.stripTrailingZeros().toPlainString();
+    }
+
+    private static String num(Object v) {
+        if (v == null) return "null";
+        if (v instanceof BigDecimal bd) return bd.stripTrailingZeros().toPlainString();
+        if (v instanceof Double d) return BigDecimal.valueOf(d).stripTrailingZeros().toPlainString();
+        if (v instanceof Float f) return BigDecimal.valueOf(f.doubleValue()).stripTrailingZeros().toPlainString();
+        if (v instanceof Integer i) return String.valueOf(i);
+        if (v instanceof Long l) return String.valueOf(l);
+        return String.valueOf(v);
     }
 }

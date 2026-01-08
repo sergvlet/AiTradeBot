@@ -1,5 +1,6 @@
 package com.chicu.aitradebot.ml.tuning;
 
+import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import lombok.Builder;
 
@@ -10,14 +11,22 @@ public record TuningRequest(
         Long chatId,
         StrategyType strategyType,
 
-        // опционально: если хотим запускать на конкретном символе/таймфрейме
+        // ✅ контекст биржи/сети (нужно для multi-exchange и testnet/mainnet)
+        String exchange,
+        NetworkType network,
+
+        // ✅ параметры датасета (берём из StrategySettings)
         String symbol,
         String timeframe,
+        Integer candlesLimit,
 
         // опционально: период обучения/оценки
         Instant startAt,
         Instant endAt,
 
-        // seed/версия/метки — позже (но запрос уже готов расширяться без ломки)
-        Long seed
+        // seed/версия/метки — позже
+        Long seed,
+
+        // ✅ зачем вызвали тюнинг (warmup/periodic/after-close)
+        String reason
 ) {}

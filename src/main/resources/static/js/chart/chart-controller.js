@@ -64,6 +64,16 @@ export class ChartController {
             axisLabelVisible: true
         });
 
+        // ✅ ДОБАВЛЕНО: управление автоскроллом (иначе историю “не видно”, т.к. live постоянно тащит вправо)
+        this.autoScroll = true;
+        this.historyLoaded = false;
+
+        // если пользователь взаимодействует с графиком — отключаем автоскролл
+        const stopAuto = () => { this.autoScroll = false; };
+        container.addEventListener("wheel", stopAuto, { passive: true });
+        container.addEventListener("mousedown", stopAuto);
+        container.addEventListener("touchstart", stopAuto, { passive: true });
+
         this.applyTheme("dark");
         this.adjustBarSpacing();
         window.addEventListener("resize", () => this.adjustBarSpacing());
@@ -141,7 +151,12 @@ export class ChartController {
     /* ====================================================================== */
 
     setHistory(candles) {
+        // ✅ если история уже была загружена — не даём “пустому ответу” стереть/сломать отображение
         if (!Array.isArray(candles) || candles.length === 0) {
+            if (this.historyLoaded) {
+                console.warn("⚠️ Empty history ignored (already loaded)");
+                return;
+            }
             console.warn("⚠️ Empty candles history");
             return;
         }
@@ -180,6 +195,12 @@ export class ChartController {
 
         // 1) в график
         this.candles.setData(unique);
+
+        // ✅ ПОСЛЕ setData показываем весь контент — иначе визуально виден только “хвост”
+        this.historyLoaded = true;
+        requestAnimationFrame(() => {
+            try { this.chart.timeScale().fitContent(); } catch (e) {}
+        });
 
         // 2) ✅ ВАЖНО: НЕ переassign this.candlesData (чтобы ссылки в layers/feature не ломались)
         if (!Array.isArray(this.candlesData)) this.candlesData = [];
@@ -232,6 +253,9 @@ export class ChartController {
     /* ====================================================================== */
 
     onCandle(ev) {
+        // ✅ чтобы не было “рисует только стартовые”, ждём историю (или хотя бы не автоскроллим до неё)
+        if (!this.historyLoaded) return;
+
         const k = (ev && ev.kline && typeof ev.kline === "object") ? ev.kline : ev;
 
         const rawTime =
@@ -266,7 +290,11 @@ export class ChartController {
         } else if (!last || bar.time > last.time) {
             this.candles.update(bar);
             this.candlesData.push(bar);
-            this.chart.timeScale().scrollToRealTime();
+
+            // ✅ автоскроллим только если включено
+            if (this.autoScroll) {
+                this.chart.timeScale().scrollToRealTime();
+            }
         } else {
             return;
         }
@@ -295,7 +323,6 @@ export class ChartController {
 
         this.priceLine.applyOptions({ price: p, color });
 
-        console.log("💲 PriceLine", prev, "→", p, color);
     }
 
     /* ====================================================================== */

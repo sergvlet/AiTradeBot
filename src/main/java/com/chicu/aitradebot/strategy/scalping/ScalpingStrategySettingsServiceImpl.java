@@ -1,11 +1,16 @@
 package com.chicu.aitradebot.strategy.scalping;
 
+import com.chicu.aitradebot.common.enums.StrategyType;
+import com.chicu.aitradebot.ml.override.AiOverrideService;
 import com.chicu.aitradebot.strategy.core.SettingsSnapshot;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.time.Instant;
+import java.util.Map;
 
 @Slf4j
 @Service
@@ -14,7 +19,8 @@ public class ScalpingStrategySettingsServiceImpl
         implements ScalpingStrategySettingsService {
 
     private final ScalpingStrategySettingsRepository repo;
-
+    private final AiOverrideService aiOverrideService;
+    private final ObjectMapper mapper;
     // =====================================================================
     // 1) Получение или создание
     // =====================================================================
@@ -85,5 +91,36 @@ public class ScalpingStrategySettingsServiceImpl
                 .put("priceChangeThreshold", s.getPriceChangeThreshold())
                 .put("spreadThreshold", s.getSpreadThreshold())
                 .build();
+    }
+
+    @Override
+    public ScalpingStrategySettings getEffective(Long chatId) {
+        ScalpingStrategySettings base = getOrCreate(chatId);
+
+        var patchOpt = aiOverrideService.getActivePatch(chatId, StrategyType.SCALPING, Instant.now());
+        if (patchOpt.isEmpty() || patchOpt.get().isEmpty()) {
+            return base;
+        }
+
+        Map<String, Object> patch = patchOpt.get();
+
+        // мета поля запрещаем патчить
+        patch.remove("id");
+        patch.remove("chatId");
+        patch.remove("createdAt");
+        patch.remove("updatedAt");
+        patch.remove("version");
+
+        // base -> map -> apply patch -> map -> settings
+        Map<String, Object> baseMap = mapper.convertValue(base, new com.fasterxml.jackson.core.type.TypeReference<>() {});
+        baseMap.putAll(patch);
+
+        ScalpingStrategySettings effective = mapper.convertValue(baseMap, ScalpingStrategySettings.class);
+
+        // гарантируем идентичность (чтобы нигде не “поплыло”)
+        effective.setId(base.getId());
+        effective.setChatId(base.getChatId());
+
+        return effective;
     }
 }

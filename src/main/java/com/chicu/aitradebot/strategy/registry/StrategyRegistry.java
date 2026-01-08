@@ -9,7 +9,11 @@ import org.springframework.beans.factory.config.BeanDefinition;
 import org.springframework.context.annotation.Role;
 import org.springframework.stereotype.Component;
 
-import java.util.*;
+import java.util.EnumMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Универсальный реестр стратегий (v4)
@@ -72,13 +76,17 @@ public class StrategyRegistry {
     // 2) JAVA-РЕЕСТР СТРАТЕГИЙ (ENGINE)
     // =====================================================================
 
-    private final Map<StrategyType, TradingStrategy> strategies =
-            new EnumMap<>(StrategyType.class);
+    /**
+     * Потокобезопасно + не зависит от того, когда/как регистрируются бины.
+     */
+    private final Map<StrategyType, TradingStrategy> strategies = new ConcurrentHashMap<>();
 
     /**
      * Вызывается StrategyBindingProcessor
      */
-    public synchronized void register(StrategyType type, TradingStrategy strategy) {
+    public void register(StrategyType type, TradingStrategy strategy) {
+        if (type == null) throw new IllegalArgumentException("StrategyType is null");
+        if (strategy == null) throw new IllegalArgumentException("TradingStrategy is null for type=" + type);
 
         TradingStrategy prev = strategies.put(type, strategy);
 
@@ -99,16 +107,31 @@ public class StrategyRegistry {
     }
 
     /**
-     * Основной метод
+     * Основной метод (nullable, как у тебя)
      */
     public TradingStrategy getStrategy(StrategyType type) {
+        if (type == null) return null;
+
         TradingStrategy strategy = strategies.get(type);
 
         if (strategy == null) {
-            log.error("❌ Strategy NOT FOUND for type={}", type);
+            log.error("❌ Strategy NOT FOUND for type={}. Registered={}", type, strategies.keySet());
         }
-
         return strategy;
+    }
+
+    /**
+     * Строгий вариант: если стратегии нет — кидаем понятную ошибку.
+     * Очень удобно, когда "должно быть всегда".
+     */
+    public TradingStrategy require(StrategyType type) {
+        TradingStrategy s = getStrategy(type);
+        if (s == null) {
+            throw new IllegalStateException(
+                    "Strategy NOT FOUND for type=" + type + ". Registered=" + strategies.keySet()
+            );
+        }
+        return s;
     }
 
     /**
@@ -116,5 +139,9 @@ public class StrategyRegistry {
      */
     public TradingStrategy get(StrategyType type) {
         return getStrategy(type);
+    }
+
+    public Set<StrategyType> getRegisteredTypes() {
+        return Set.copyOf(strategies.keySet());
     }
 }

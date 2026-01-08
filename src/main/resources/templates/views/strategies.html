@@ -86,7 +86,8 @@
                             <input type="hidden" name="type" th:value="${s.type}">
                             <input type="hidden" name="exchange" th:value="${s.exchangeName}">
                             <input type="hidden" name="network" th:value="${s.networkType}">
-
+                            <input type="hidden" name="symbol" th:value="${s.symbol}">
+                            <input type="hidden" name="timeframe" th:value="${s.timeframe}">
                             <button type="submit"
                                     class="btn"
                                     th:classappend="${s.active} ? ' btn-outline-danger' : ' btn-outline-success'">
@@ -97,13 +98,23 @@
 
                         <!-- 📊 Дашборд -->
                         <a class="btn btn-outline-primary"
-                           th:href="@{'/strategies/' + ${s.type} + '/dashboard'(chatId=${s.chatId})}">
+                           th:href="@{'/strategies/' + ${s.type} + '/dashboard'(
+                                chatId=${s.chatId},
+                                exchange=${s.exchangeName},
+                                network=${s.networkType},
+                                symbol=${s.symbol},
+                                timeframe=${s.timeframe}
+                           )}">
                             <i class="bi bi-graph-up"></i> Дашборд
                         </a>
 
                         <!-- ⚙️ Настройки -->
                         <a class="btn btn-outline-primary"
-                           th:href="@{'/strategies/' + ${s.type} + '/config'(chatId=${s.chatId})}">
+                           th:href="@{'/strategies/' + ${s.type} + '/config'(
+                                chatId=${s.chatId},
+                                exchange=${s.exchangeName},
+                                network=${s.networkType}
+                           )}">
                             <i class="bi bi-gear"></i> Настройки
                         </a>
 

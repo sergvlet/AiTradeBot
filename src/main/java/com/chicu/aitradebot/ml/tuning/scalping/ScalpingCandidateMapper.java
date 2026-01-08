@@ -22,7 +22,7 @@ public class ScalpingCandidateMapper {
         if (scalping != null) {
             m.put("windowSize", scalping.getWindowSize());
 
-            // Double -> BigDecimal (чтобы Guard/score работали стабильно)
+            // ✅ приводим к BigDecimal стабильно (и для BigDecimal, и для Double/Integer)
             m.put("priceChangeThreshold", toBd(scalping.getPriceChangeThreshold()));
             m.put("spreadThreshold", toBd(scalping.getSpreadThreshold()));
         }
@@ -40,7 +40,13 @@ public class ScalpingCandidateMapper {
         return m;
     }
 
-    private static BigDecimal toBd(Double v) {
-        return v == null ? null : BigDecimal.valueOf(v);
+    /**
+     * ✅ Универсальная конвертация Number -> BigDecimal
+     * (работает и если поле уже BigDecimal, и если оно Double)
+     */
+    private static BigDecimal toBd(Number v) {
+        if (v == null) return null;
+        if (v instanceof BigDecimal bd) return bd;
+        return BigDecimal.valueOf(v.doubleValue());
     }
 }

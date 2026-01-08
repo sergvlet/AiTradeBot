@@ -115,13 +115,26 @@ public class AiStrategyOrchestrator {
             String exchange,
             NetworkType network
     ) {
-
         StrategySettings s = loadSettingsStrict(chatId, type, exchange, network);
+
+        TradingStrategy strategy = strategyRegistry.get(type);
+
+        // ✅ реальный runtime-статус, а не флаг из БД
+        boolean runtimeActive = strategy != null && strategy.isActive(chatId);
+
+        // (опционально) самовосстановление рассинхрона после рестарта
+        if (s.isActive() != runtimeActive) {
+            s.setActive(runtimeActive);
+            if (!runtimeActive && s.getStoppedAt() == null) {
+                s.setStoppedAt(LocalDateTime.now());
+            }
+            settingsService.save(s);
+        }
 
         return buildRunInfo(
                 s,
-                s.isActive(),
-                s.isActive() ? "Стратегия запущена" : "Стратегия остановлена"
+                runtimeActive,
+                runtimeActive ? "Стратегия запущена" : "Стратегия остановлена"
         );
     }
 

@@ -56,6 +56,8 @@ public class StrategyLiveWsBridge {
                 ev.setTime(StrategyLiveEvent.nowMillis());
             }
 
+
+
             case "candle" -> {
                 if (ev.getTime() <= 0) {
                     log.debug(

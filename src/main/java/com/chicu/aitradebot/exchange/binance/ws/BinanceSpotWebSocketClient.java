@@ -4,6 +4,8 @@ import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.exchange.binance.parser.BinanceKlineParser;
 import com.chicu.aitradebot.market.MarketStreamService;
 import com.chicu.aitradebot.market.model.UnifiedKline;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import okhttp3.*;
@@ -11,8 +13,10 @@ import okio.ByteString;
 import org.jetbrains.annotations.NotNull;
 import org.springframework.stereotype.Component;
 
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 @Slf4j
 @Component
@@ -22,14 +26,23 @@ public class BinanceSpotWebSocketClient {
     private static final String WS_URL_TEMPLATE =
             "wss://stream.binance.com:9443/stream?streams=%s";
 
+    // ✅ логируем редко, чтобы не спамить
+    private static final long LOG_EVERY_N = 200;
+
     private final OkHttpClient client;
     private final BinanceKlineParser parser;
     private final MarketStreamService marketStream;
+    private final ObjectMapper objectMapper;
 
     /**
      * key = chatId:strategy:symbol:timeframe[:aggTrade]
      */
     private final Map<String, WebSocket> sockets = new ConcurrentHashMap<>();
+
+    /**
+     * Счётчики сообщений (ключ сокета -> счётчик)
+     */
+    private final Map<String, AtomicLong> counters = new ConcurrentHashMap<>();
 
     // =====================================================================
     // SUBSCRIBE KLINE
@@ -41,17 +54,20 @@ public class BinanceSpotWebSocketClient {
             long chatId,
             StrategyType strategyType
     ) {
-        String key = buildKey(symbol, timeframe, chatId, strategyType);
+        String sym = normSymbol(symbol);
+        String tf = normTf(timeframe);
+
+        String key = buildKey(sym, tf, chatId, strategyType);
 
         if (sockets.containsKey(key)) {
             log.debug("[BINANCE-SPOT] KLINE already subscribed {}", key);
             return;
         }
 
-        String stream = (symbol + "@kline_" + timeframe).toLowerCase();
+        String stream = (sym.toLowerCase(Locale.ROOT) + "@kline_" + tf).toLowerCase(Locale.ROOT);
         String url = String.format(WS_URL_TEMPLATE, stream);
 
-        log.info("[BINANCE-SPOT] CONNECT KLINE {} (key={})", symbol, key);
+        log.info("[BINANCE-SPOT] CONNECT KLINE {} (key={})", sym, key);
 
         Request request = new Request.Builder().url(url).build();
         WebSocket ws = client.newWebSocket(
@@ -60,6 +76,7 @@ public class BinanceSpotWebSocketClient {
         );
 
         sockets.put(key, ws);
+        counters.putIfAbsent(key, new AtomicLong(0));
     }
 
     // =====================================================================
@@ -72,18 +89,24 @@ public class BinanceSpotWebSocketClient {
             long chatId,
             StrategyType strategyType
     ) {
-        String key = chatId + ":" + strategyType.name() + ":" +
-                     symbol.toUpperCase() + ":" + timeframe.toLowerCase() + ":aggTrade";
+        String sym = normSymbol(symbol);
+        String tf = normTf(timeframe);
+
+        String key = buildAggKey(sym, tf, chatId, strategyType);
 
         if (sockets.containsKey(key)) {
             log.debug("[BINANCE-SPOT] AGGTRADE already subscribed {}", key);
             return;
         }
 
-        String stream = (symbol + "@aggTrade").toLowerCase();
+        // ✅ ВАЖНО:
+        // symbol должен быть lowercase, но "aggTrade" лучше оставить как есть (с T),
+        // иначе иногда получаешь "WS OPEN" без реальных данных.
+        String stream = sym.toLowerCase(Locale.ROOT) + "@aggTrade";
+
         String url = String.format(WS_URL_TEMPLATE, stream);
 
-        log.info("[BINANCE-SPOT] CONNECT AGGTRADE {} (key={})", symbol, key);
+        log.info("[BINANCE-SPOT] CONNECT AGGTRADE {} (key={}) stream={}", sym, key, stream);
 
         Request request = new Request.Builder().url(url).build();
         WebSocket ws = client.newWebSocket(
@@ -92,12 +115,13 @@ public class BinanceSpotWebSocketClient {
                         key,
                         chatId,
                         strategyType,
-                        symbol.toUpperCase(),
-                        timeframe.toLowerCase()
+                        sym,
+                        tf
                 )
         );
 
         sockets.put(key, ws);
+        counters.putIfAbsent(key, new AtomicLong(0));
     }
 
     // =====================================================================
@@ -112,8 +136,30 @@ public class BinanceSpotWebSocketClient {
     ) {
         return chatId + ":" +
                strategyType.name() + ":" +
-               symbol.toUpperCase() + ":" +
-               timeframe.toLowerCase();
+               symbol.toUpperCase(Locale.ROOT) + ":" +
+               timeframe.toLowerCase(Locale.ROOT);
+    }
+
+    private String buildAggKey(
+            String symbol,
+            String timeframe,
+            long chatId,
+            StrategyType strategyType
+    ) {
+        return chatId + ":" +
+               strategyType.name() + ":" +
+               symbol.toUpperCase(Locale.ROOT) + ":" +
+               timeframe.toLowerCase(Locale.ROOT) + ":aggTrade";
+    }
+
+    private static String normSymbol(String symbol) {
+        if (symbol == null) return "";
+        return symbol.trim().toUpperCase(Locale.ROOT);
+    }
+
+    private static String normTf(String timeframe) {
+        if (timeframe == null) return "";
+        return timeframe.trim().toLowerCase(Locale.ROOT);
     }
 
     // =====================================================================
@@ -140,7 +186,6 @@ public class BinanceSpotWebSocketClient {
         @Override
         public void onMessage(@NotNull WebSocket webSocket, @NotNull String text) {
 
-            // 🔍 RAW сообщения — ТОЛЬКО для диагностики
             if (log.isTraceEnabled()) {
                 log.trace("[BINANCE-SPOT] RAW KLINE {} => {}", key, text);
             }
@@ -163,6 +208,24 @@ public class BinanceSpotWebSocketClient {
         @Override
         public void onMessage(@NotNull WebSocket webSocket, @NotNull ByteString bytes) {
             onMessage(webSocket, bytes.utf8());
+        }
+
+        @Override
+        public void onFailure(
+                @NotNull WebSocket webSocket,
+                @NotNull Throwable t,
+                Response response
+        ) {
+            log.warn("[BINANCE-SPOT] KLINE WS failure {}: {}", key, t.getMessage(), t);
+            sockets.remove(key);
+            counters.remove(key);
+        }
+
+        @Override
+        public void onClosed(@NotNull WebSocket webSocket, int code, @NotNull String reason) {
+            log.warn("[BINANCE-SPOT] KLINE WS closed {} code={} reason={}", key, code, reason);
+            sockets.remove(key);
+            counters.remove(key);
         }
     }
 
@@ -204,17 +267,48 @@ public class BinanceSpotWebSocketClient {
                 log.trace("[BINANCE-SPOT] RAW AGGTRADE {} => {}", key, text);
             }
 
+            // ✅ редкий лог: докажем, что тики реально приходят
+            long n = counters.computeIfAbsent(key, k -> new AtomicLong(0)).incrementAndGet();
+            if (n % LOG_EVERY_N == 0) {
+                String p = "?";
+                String q = "?";
+                String T = "?";
+                String stream = "?";
+
+                try {
+                    JsonNode root = objectMapper.readTree(text);
+                    if (root.hasNonNull("stream")) stream = root.get("stream").asText();
+                    JsonNode data = root.has("data") ? root.get("data") : root;
+
+                    if (data != null) {
+                        if (data.hasNonNull("p")) p = data.get("p").asText();
+                        if (data.hasNonNull("q")) q = data.get("q").asText();
+                        if (data.hasNonNull("T")) T = data.get("T").asText();
+                    }
+                } catch (Exception ignore) {
+                }
+
+                log.info("📌 AGGTRADE_IN[{}] key={} sym={} tf={} stream={} p={} q={} T={}",
+                        n, key, symbol, timeframe, stream, p, q, T);
+            }
+
             try {
-                marketStream.onAggTrade(
-                        chatId,
-                        strategyType,
-                        symbol,
-                        timeframe,
-                        text
-                );
+                // ✅ форвардим в MarketStreamService (там pushPriceTick + обновление свечи)
+                marketStream.onAggTrade(chatId, strategyType, symbol, timeframe, text);
+
+                // ✅ факт форвардинга (тоже редко, чтобы не спамить)
+                if (n % LOG_EVERY_N == 0) {
+                    log.info("✅ AGGTRADE forwarded → onAggTrade (pushPriceTick should happen) key={}", key);
+                }
+
             } catch (Exception e) {
                 log.error("[BINANCE-SPOT] AGGTRADE error {}: {}", key, e.getMessage(), e);
             }
+        }
+
+        @Override
+        public void onMessage(@NotNull WebSocket webSocket, @NotNull ByteString bytes) {
+            onMessage(webSocket, bytes.utf8());
         }
 
         @Override
@@ -223,8 +317,16 @@ public class BinanceSpotWebSocketClient {
                 @NotNull Throwable t,
                 Response response
         ) {
-            log.error("[BINANCE-SPOT] AGGTRADE WS failure {}: {}", key, t.getMessage(), t);
+            log.warn("[BINANCE-SPOT] AGGTRADE WS failure {}: {}", key, t.getMessage(), t);
             sockets.remove(key);
+            counters.remove(key);
+        }
+
+        @Override
+        public void onClosed(@NotNull WebSocket webSocket, int code, @NotNull String reason) {
+            log.warn("[BINANCE-SPOT] AGGTRADE WS closed {} code={} reason={}", key, code, reason);
+            sockets.remove(key);
+            counters.remove(key);
         }
     }
 
@@ -238,12 +340,37 @@ public class BinanceSpotWebSocketClient {
             long chatId,
             StrategyType strategyType
     ) {
-        String key = buildKey(symbol, timeframe, chatId, strategyType);
+        String sym = normSymbol(symbol);
+        String tf = normTf(timeframe);
+
+        String key = buildKey(sym, tf, chatId, strategyType);
 
         WebSocket ws = sockets.remove(key);
+        counters.remove(key);
+
         if (ws != null) {
             log.info("[BINANCE-SPOT] KLINE UNSUBSCRIBE {}", key);
             ws.close(1000, "client unsubscribe kline");
+        }
+    }
+
+    public synchronized void unsubscribeAggTrade(
+            String symbol,
+            String timeframe,
+            long chatId,
+            StrategyType strategyType
+    ) {
+        String sym = normSymbol(symbol);
+        String tf = normTf(timeframe);
+
+        String key = buildAggKey(sym, tf, chatId, strategyType);
+
+        WebSocket ws = sockets.remove(key);
+        counters.remove(key);
+
+        if (ws != null) {
+            log.info("[BINANCE-SPOT] AGGTRADE UNSUBSCRIBE {}", key);
+            ws.close(1000, "client unsubscribe aggTrade");
         }
     }
 }

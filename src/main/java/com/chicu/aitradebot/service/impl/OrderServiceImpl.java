@@ -26,6 +26,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.LocalDateTime;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.stream.Collectors;
@@ -48,7 +49,7 @@ public class OrderServiceImpl implements OrderService {
     private final TradeJournalGateway tradeJournalGateway;
 
     // =====================================================
-    // ✅ НОВОЕ API (с OrderContext) — ЭТО БУДЕТ ЗВАТЬ SCALPING
+    // ✅ НОВОЕ API (с OrderContext)
     // =====================================================
 
     @Override
@@ -59,8 +60,11 @@ public class OrderServiceImpl implements OrderService {
                              BigDecimal executionPrice) {
 
         if (ctx == null) throw new IllegalArgumentException("OrderContext is null");
+
         Long chatId = ctx.chatId();
         String symbol = ctx.symbol();
+        if (chatId == null) throw new IllegalArgumentException("chatId is null");
+        if (symbol == null || symbol.isBlank()) throw new IllegalArgumentException("symbol is blank");
 
         String sideNorm = normalizeSide(side);
         StrategyType st = (ctx.strategyType() != null) ? ctx.strategyType() : StrategyType.values()[0];
@@ -74,32 +78,16 @@ public class OrderServiceImpl implements OrderService {
 
         SymbolDescriptor descriptor = resolveSymbolDescriptor(chatId, symbol);
 
+        // ✅ ВАЖНО: первым параметром AI-GUARD должен быть EXCHANGE, не SYMBOL
         GuardResult guard = aiGuard.validateAndAdjust(
-                symbol,
+                exchangeName,
                 descriptor,
                 quantity,
-                executionPrice,
+                executionPrice, // для MARKET можно передавать оценку/последний тик
                 true
         );
 
-        // correlationId: если стратегия уже создала intent — используем его, иначе создаём intent тут
-        String correlationId = (ctx.correlationId() != null && !ctx.correlationId().isBlank())
-                ? ctx.correlationId().trim()
-                : tradeJournalGateway.recordIntent(
-                        chatId,
-                        st,
-                        exchangeName,
-                        networkType,
-                        safeUpper(symbol),
-                        timeframe,
-                        "BUY".equals(sideNorm) ? TradeIntentEvent.Signal.BUY : TradeIntentEvent.Signal.SELL,
-                        guard.ok() ? TradeIntentEvent.Decision.ALLOW : TradeIntentEvent.Decision.REJECT,
-                        guard.ok() ? "OK" : "AI_GUARD_BLOCK",
-                        null, null, null,
-                        null,
-                        null,
-                        null
-                );
+        String correlationId = ensureCorrelationId(ctx, chatId, st, exchangeName, networkType, symbol, timeframe, sideNorm, guard);
 
         if (!guard.ok()) {
             throw new IllegalArgumentException("AI-GUARD BLOCKED MARKET ORDER: " + String.join("; ", guard.errors()));
@@ -113,12 +101,12 @@ public class OrderServiceImpl implements OrderService {
         tradeJournalGateway.linkClientOrder(chatId, st, exchangeName, networkType, safeUpper(symbol), timeframe, correlationId, clientOrderId, role);
 
         log.info("📥 [MARKET] chatId={}, ex={}, net={}, symbol={}, side={}, qty={}, price={}, st={}, cid={}, role={}",
-                chatId, exchangeName, networkType, symbol, sideNorm, finalQty, finalPrice, st, correlationId, role);
+                chatId, exchangeName, networkType, safeUpper(symbol), sideNorm, strip(finalQty), strip(finalPrice), st, correlationId, role);
 
         OrderEntity entity = new OrderEntity();
         entity.setChatId(chatId);
         entity.setUserId(chatId);
-        entity.setSymbol(symbol);
+        entity.setSymbol(safeUpper(symbol));
         entity.setSide(sideNorm);
         entity.setPrice(finalPrice);
         entity.setQuantity(finalQty);
@@ -147,8 +135,11 @@ public class OrderServiceImpl implements OrderService {
                             String timeInForce) {
 
         if (ctx == null) throw new IllegalArgumentException("OrderContext is null");
+
         Long chatId = ctx.chatId();
         String symbol = ctx.symbol();
+        if (chatId == null) throw new IllegalArgumentException("chatId is null");
+        if (symbol == null || symbol.isBlank()) throw new IllegalArgumentException("symbol is blank");
 
         String sideNorm = normalizeSide(side);
         StrategyType st = (ctx.strategyType() != null) ? ctx.strategyType() : StrategyType.values()[0];
@@ -163,30 +154,14 @@ public class OrderServiceImpl implements OrderService {
         SymbolDescriptor descriptor = resolveSymbolDescriptor(chatId, symbol);
 
         GuardResult guard = aiGuard.validateAndAdjust(
-                symbol,
+                exchangeName,
                 descriptor,
                 quantity,
                 limitPrice,
                 false
         );
 
-        String correlationId = (ctx.correlationId() != null && !ctx.correlationId().isBlank())
-                ? ctx.correlationId().trim()
-                : tradeJournalGateway.recordIntent(
-                        chatId,
-                        st,
-                        exchangeName,
-                        networkType,
-                        safeUpper(symbol),
-                        timeframe,
-                        "BUY".equals(sideNorm) ? TradeIntentEvent.Signal.BUY : TradeIntentEvent.Signal.SELL,
-                        guard.ok() ? TradeIntentEvent.Decision.ALLOW : TradeIntentEvent.Decision.REJECT,
-                        guard.ok() ? "OK" : "AI_GUARD_BLOCK",
-                        null, null, null,
-                        null,
-                        null,
-                        null
-                );
+        String correlationId = ensureCorrelationId(ctx, chatId, st, exchangeName, networkType, symbol, timeframe, sideNorm, guard);
 
         if (!guard.ok()) {
             throw new IllegalArgumentException("AI-GUARD BLOCKED LIMIT ORDER: " + String.join("; ", guard.errors()));
@@ -202,7 +177,7 @@ public class OrderServiceImpl implements OrderService {
         OrderEntity entity = new OrderEntity();
         entity.setChatId(chatId);
         entity.setUserId(chatId);
-        entity.setSymbol(symbol);
+        entity.setSymbol(safeUpper(symbol));
         entity.setSide(sideNorm);
         entity.setPrice(finalPrice);
         entity.setQuantity(finalQty);
@@ -229,8 +204,11 @@ public class OrderServiceImpl implements OrderService {
                           BigDecimal stopLimitPrice) {
 
         if (ctx == null) throw new IllegalArgumentException("OrderContext is null");
+
         Long chatId = ctx.chatId();
         String symbol = ctx.symbol();
+        if (chatId == null) throw new IllegalArgumentException("chatId is null");
+        if (symbol == null || symbol.isBlank()) throw new IllegalArgumentException("symbol is blank");
 
         StrategyType st = (ctx.strategyType() != null) ? ctx.strategyType() : StrategyType.values()[0];
 
@@ -241,23 +219,17 @@ public class OrderServiceImpl implements OrderService {
         String timeframe = (ctx.timeframe() == null || ctx.timeframe().isBlank()) ? "1m" : ctx.timeframe().trim();
         String role = (ctx.role() == null || ctx.role().isBlank()) ? "OCO" : ctx.role().trim().toUpperCase(Locale.ROOT);
 
-        String correlationId = (ctx.correlationId() != null && !ctx.correlationId().isBlank())
-                ? ctx.correlationId().trim()
-                : tradeJournalGateway.recordIntent(
-                        chatId,
-                        st,
-                        exchangeName,
-                        networkType,
-                        safeUpper(symbol),
-                        timeframe,
-                        TradeIntentEvent.Signal.SELL,
-                        TradeIntentEvent.Decision.ALLOW,
-                        "OK",
-                        null, null, null,
-                        null,
-                        null,
-                        null
-                );
+        // Для OCO обычно SELL-логика закрытия
+        GuardResult guard = GuardResult.builder()
+                .ok(true)
+                .adjusted(false)
+                .finalQty(quantity)
+                .finalPrice(takeProfitPrice) // просто референс
+                .warnings(List.of())
+                .errors(List.of())
+                .build();
+
+        String correlationId = ensureCorrelationId(ctx, chatId, st, exchangeName, networkType, symbol, timeframe, "SELL", guard);
 
         String clientOrderId = OrderCorrelation.clientOrderId(correlationId, chatId, st, symbol, role);
         tradeJournalGateway.attachClientOrderId(correlationId, clientOrderId);
@@ -266,7 +238,7 @@ public class OrderServiceImpl implements OrderService {
         OrderEntity entity = new OrderEntity();
         entity.setChatId(chatId);
         entity.setUserId(chatId);
-        entity.setSymbol(symbol);
+        entity.setSymbol(safeUpper(symbol));
         entity.setSide("SELL");
         entity.setQuantity(quantity);
         entity.setStrategyType(st.name());
@@ -289,7 +261,7 @@ public class OrderServiceImpl implements OrderService {
     }
 
     // =====================================================
-    // ⚠️ СТАРОЕ API (для совместимости) — ДЕЛЕГИРУЕМ В НОВОЕ
+    // ⚠️ СТАРОЕ API — делегируем в НОВОЕ
     // =====================================================
 
     @Override
@@ -364,7 +336,7 @@ public class OrderServiceImpl implements OrderService {
     }
 
     // =====================================================
-    // CANCEL
+    // CANCEL / OPEN / HISTORY / CREATE
     // =====================================================
 
     @Override
@@ -385,7 +357,6 @@ public class OrderServiceImpl implements OrderService {
     @Override
     @Transactional
     public int cancelAllOpen(Long chatId, String symbol) {
-
         List<String> openStatuses = List.of("NEW", "OPEN", "PARTIALLY_FILLED");
 
         List<OrderEntity> list =
@@ -401,10 +372,6 @@ public class OrderServiceImpl implements OrderService {
         return list.size();
     }
 
-    // =====================================================
-    // OPEN ORDERS
-    // =====================================================
-
     @Override
     @Transactional(readOnly = true)
     public List<Order> getOpenOrders(Long chatId, String symbol) {
@@ -418,10 +385,6 @@ public class OrderServiceImpl implements OrderService {
                 .map(this::mapToDto)
                 .collect(Collectors.toList());
     }
-
-    // =====================================================
-    // HISTORY
-    // =====================================================
 
     @Override
     @Transactional(readOnly = true)
@@ -439,14 +402,9 @@ public class OrderServiceImpl implements OrderService {
         return orderRepository.findByChatIdAndSymbolOrderByTimestampAsc(chatId, symbol);
     }
 
-    // =====================================================
-    // CREATE (generic)
-    // =====================================================
-
     @Override
     @Transactional
     public Order createOrder(Order order) {
-
         OrderEntity e = new OrderEntity();
         e.setChatId(order.getChatId());
         e.setUserId(order.getChatId());
@@ -475,16 +433,43 @@ public class OrderServiceImpl implements OrderService {
     // HELPERS
     // =====================================================
 
-    private SymbolDescriptor resolveSymbolDescriptor(Long chatId, String symbol) {
+    private String ensureCorrelationId(OrderContext ctx,
+                                       Long chatId,
+                                       StrategyType st,
+                                       String exchangeName,
+                                       NetworkType networkType,
+                                       String symbol,
+                                       String timeframe,
+                                       String sideNorm,
+                                       GuardResult guard) {
 
-        if (chatId == null || symbol == null) {
-            return null;
+        if (ctx.correlationId() != null && !ctx.correlationId().isBlank()) {
+            return ctx.correlationId().trim();
         }
+
+        return tradeJournalGateway.recordIntent(
+                chatId,
+                st,
+                exchangeName,
+                networkType,
+                safeUpper(symbol),
+                timeframe,
+                "BUY".equals(sideNorm) ? TradeIntentEvent.Signal.BUY : TradeIntentEvent.Signal.SELL,
+                guard.ok() ? TradeIntentEvent.Decision.ALLOW : TradeIntentEvent.Decision.REJECT,
+                guard.ok() ? "OK" : "AI_GUARD_BLOCK",
+                null, null, null,
+                null,
+                null,
+                null
+        );
+    }
+
+    private SymbolDescriptor resolveSymbolDescriptor(Long chatId, String symbol) {
+        if (chatId == null || symbol == null) return null;
 
         try {
             ExchangeClient client = exchangeClientFactory.getByChat(chatId);
             String exchange = client.getExchangeName();
-
             NetworkType network = resolveNetworkType(chatId, exchange);
 
             return marketSymbolService.getSymbolInfo(
@@ -493,7 +478,6 @@ public class OrderServiceImpl implements OrderService {
                     "USDT",
                     symbol
             );
-
         } catch (Exception e) {
             log.warn("⚠️ Cannot resolve SymbolDescriptor chatId={} symbol={}", chatId, symbol, e);
             return null;
@@ -502,12 +486,15 @@ public class OrderServiceImpl implements OrderService {
 
     private NetworkType resolveNetworkType(Long chatId, String exchangeName) {
         try {
+            Comparator<ExchangeSettings> byUpdated =
+                    Comparator.comparing(ExchangeSettings::getUpdatedAt, Comparator.nullsLast(Comparator.naturalOrder()));
+
             return exchangeSettingsService
                     .findAllByChatId(chatId)
                     .stream()
                     .filter(ExchangeSettings::isEnabled)
-                    .filter(s -> exchangeName.equalsIgnoreCase(s.getExchange()))
-                    .sorted((a, b) -> b.getUpdatedAt().compareTo(a.getUpdatedAt()))
+                    .filter(s -> exchangeName != null && exchangeName.equalsIgnoreCase(s.getExchange()))
+                    .sorted(byUpdated.reversed())
                     .map(ExchangeSettings::getNetwork)
                     .findFirst()
                     .orElse(NetworkType.MAINNET);
@@ -554,9 +541,7 @@ public class OrderServiceImpl implements OrderService {
     }
 
     private static StrategyType normalizeStrategy(String strategyType) {
-        if (strategyType == null || strategyType.isBlank()) {
-            return StrategyType.values()[0];
-        }
+        if (strategyType == null || strategyType.isBlank()) return StrategyType.values()[0];
         try {
             return StrategyType.valueOf(strategyType.trim().toUpperCase(Locale.ROOT));
         } catch (Exception e) {
@@ -566,5 +551,9 @@ public class OrderServiceImpl implements OrderService {
 
     private static String safeUpper(String s) {
         return (s == null) ? "" : s.trim().toUpperCase(Locale.ROOT);
+    }
+
+    private static String strip(BigDecimal v) {
+        return v == null ? "null" : v.stripTrailingZeros().toPlainString();
     }
 }

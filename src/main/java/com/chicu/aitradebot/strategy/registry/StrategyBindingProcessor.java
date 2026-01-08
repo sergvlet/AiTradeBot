@@ -2,9 +2,10 @@ package com.chicu.aitradebot.strategy.registry;
 
 import com.chicu.aitradebot.strategy.core.TradingStrategy;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.aop.support.AopUtils;
 import org.springframework.beans.BeansException;
 import org.springframework.beans.factory.config.BeanPostProcessor;
-import org.springframework.core.annotation.AnnotationUtils;
+import org.springframework.core.annotation.AnnotatedElementUtils;
 import org.springframework.stereotype.Component;
 
 @Slf4j
@@ -18,22 +19,34 @@ public class StrategyBindingProcessor implements BeanPostProcessor {
     }
 
     @Override
-    public Object postProcessAfterInitialization(Object bean, String beanName)
-            throws BeansException {
+    public Object postProcessAfterInitialization(Object bean, String beanName) throws BeansException {
 
+        // Прокси тоже обычно instanceof TradingStrategy, так что это ок.
         if (!(bean instanceof TradingStrategy strategy)) {
             return bean;
         }
 
-        // 🔑 КЛЮЧЕВО: корректно работаем с proxy
+        // ✅ КЛЮЧЕВО: берём реальный класс (а не proxy-class)
+        Class<?> targetClass = AopUtils.getTargetClass(bean);
+        if (targetClass == null) {
+            targetClass = strategy.getClass();
+        }
+
+        // ✅ Надёжный поиск аннотации (учитывает наследование/мета-аннотации)
         StrategyBinding binding =
-                AnnotationUtils.findAnnotation(strategy.getClass(), StrategyBinding.class);
+                AnnotatedElementUtils.findMergedAnnotation(targetClass, StrategyBinding.class);
 
         if (binding == null) {
+            // Можно оставить debug, чтобы не шуметь в логах
+            log.debug("Strategy bean has no @StrategyBinding: beanName={}, class={}",
+                    beanName, targetClass.getName());
             return bean;
         }
 
         registry.register(binding.value(), strategy);
+
+        log.info("✅ Strategy bound: {} -> {} (beanName={})",
+                binding.value(), targetClass.getSimpleName(), beanName);
 
         return bean;
     }

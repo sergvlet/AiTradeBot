@@ -112,27 +112,34 @@
 
 <!-- ====================== PAGE JS ====================== -->
 
-<!-- SETTINGS -->
+<!-- ✅ STRATEGIES LIST ( /strategies ) -->
+<th:block th:if="${page == 'strategies'}">
+    <script th:src="@{/js/views/strategies/strategies.js}" defer></script>
+</th:block>
+
+<!-- ✅ SETTINGS ( /strategies/{TYPE}/config и т.п. ) -->
 <th:block th:if="${page == 'strategies/settings' or page == 'settings'}">
-    <script th:src="@{/js/strategies/network.tab.js}"></script>
-    <script th:src="@{/js/views/strategies/symbol-picker.js}"></script>
-    <script th:src="@{/js/views/strategies/settings.js}"></script>
+    <script th:src="@{/js/strategies/network.tab.js}" defer></script>
+    <script th:src="@{/js/views/strategies/symbol-picker.js}" defer></script>
+    <script th:src="@{/js/views/strategies/settings.js}" defer></script>
 </th:block>
 
 <!-- ✅ STRATEGY DASHBOARD -->
 <th:block th:if="${page == 'strategy_dashboard' or page == 'strategies/strategy_dashboard'}">
-    <!-- ❗ module идёт ПОСЛЕ stomp -->
+    <!-- module идёт ПОСЛЕ stomp -->
     <script type="module" th:src="@{/js/views/strategies/strategy-dashboard.js}"></script>
 </th:block>
 
-<!-- OTHER PAGES -->
+<!-- ✅ OTHER PAGES -->
 <th:block th:if="${page != null
+                  and page != 'strategies'
                   and page != 'strategy_dashboard'
                   and page != 'strategies/strategy_dashboard'
                   and page != 'strategies/settings'
                   and page != 'settings'}">
-    <script th:src="@{'/js/views/' + ${page} + '.js'}"></script>
+    <script th:src="@{'/js/views/' + ${page} + '.js'}" defer></script>
 </th:block>
+
 
 </body>
 </html>

@@ -56,4 +56,7 @@ public interface ScalpingStrategySettingsService {
      * ❗ Используется ТОЛЬКО стратегией во время торговли
      */
     SettingsSnapshot getSnapshot(long chatId);
+
+    ScalpingStrategySettings getEffective(Long chatId);
+
 }

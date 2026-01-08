@@ -15,23 +15,36 @@ import java.util.List;
 public class ExchangeAIGuard {
 
     /**
-     * Валидация + авто-округление qty/price под биржевые фильтры.
-     *
-     * AI-aware логика:
-     * - SYMBOL   → ограничения пришли на уровне инструмента
-     * - ACCOUNT  → ограничения аккаунта (Bybit)
-     * - UNKNOWN  → данных нет, не блокируем жёстко
+     * По умолчанию: НЕ увеличиваем qty, только округляем вниз.
+     * Если хочешь автоподнятие qty до minNotional — используй overload ниже.
      */
     public GuardResult validateAndAdjust(
-            String exchange,          // "BINANCE" / "BYBIT"
-            SymbolDescriptor d,        // может быть null
+            String exchange,
+            SymbolDescriptor d,
             BigDecimal qty,
-            BigDecimal price,          // null для MARKET
+            BigDecimal price,          // null для MARKET (если нет оценки)
             boolean isMarketOrder
     ) {
+        return validateAndAdjust(exchange, d, qty, price, isMarketOrder, false);
+    }
 
-        final String ex =
-                exchange != null ? exchange.trim().toUpperCase() : "UNKNOWN";
+    /**
+     * allowIncreaseQtyToMinNotional=true:
+     * - если известна price
+     * - и известны minNotional + stepSize
+     * - и notional < minNotional
+     * тогда qty поднимается до минимально допустимого (вверх по stepSize)
+     */
+    public GuardResult validateAndAdjust(
+            String exchange,
+            SymbolDescriptor d,
+            BigDecimal qty,
+            BigDecimal price,
+            boolean isMarketOrder,
+            boolean allowIncreaseQtyToMinNotional
+    ) {
+
+        final String ex = exchange != null ? exchange.trim().toUpperCase() : "UNKNOWN";
 
         List<String> warnings = new ArrayList<>();
         List<String> errors   = new ArrayList<>();
@@ -40,20 +53,16 @@ public class ExchangeAIGuard {
         BigDecimal finalPrice = price;
 
         // =====================================================
-        // 1️⃣ DESCRIPTOR ОТСУТСТВУЕТ
+        // 1) DESCRIPTOR ОТСУТСТВУЕТ
         // =====================================================
         if (d == null) {
+            warnings.add("SymbolDescriptor отсутствует — проверка биржевых ограничений невозможна.");
 
-            warnings.add(
-                    "SymbolDescriptor отсутствует — проверка биржевых ограничений невозможна."
-            );
-
-            if (finalQty == null || finalQty.compareTo(BigDecimal.ZERO) <= 0) {
+            if (!isPositive(finalQty)) {
                 errors.add("Количество (qty) должно быть > 0.");
             }
 
-            if (!isMarketOrder &&
-                (finalPrice == null || finalPrice.compareTo(BigDecimal.ZERO) <= 0)) {
+            if (!isMarketOrder && !isPositive(finalPrice)) {
                 errors.add("Цена (price) должна быть > 0 для LIMIT ордера.");
             }
 
@@ -63,7 +72,7 @@ public class ExchangeAIGuard {
                     .finalQty(finalQty)
                     .finalPrice(finalPrice)
                     .minNotional(null)
-                    .computedNotional(null)
+                    .computedNotional(computeNotional(finalQty, finalPrice))
                     .minNotionalScope(ExchangeLimitScope.UNKNOWN)
                     .stepSizeScope(ExchangeLimitScope.UNKNOWN)
                     .tickSizeScope(ExchangeLimitScope.UNKNOWN)
@@ -72,17 +81,14 @@ public class ExchangeAIGuard {
                     .errors(errors)
                     .build();
 
-            if (!res.ok()) {
-                log.warn("🛡️ AI-GUARD BLOCK exchange={} errors={}", ex, res.errors());
-            } else {
-                log.info("🛡️ AI-GUARD PASS exchange={} warnings={}", ex, res.warnings());
-            }
+            if (!res.ok()) log.warn("🛡️ AI-GUARD BLOCK exchange={} errors={}", ex, res.errors());
+            else          log.info("🛡️ AI-GUARD PASS exchange={} warnings={}", ex, res.warnings());
 
             return res;
         }
 
         // =====================================================
-        // 2️⃣ SCOPES — ТОЛЬКО ИЗ SymbolDescriptor
+        // 2) SCOPES — ТОЛЬКО ИЗ SymbolDescriptor
         // =====================================================
         ExchangeLimitScope minNotionalScope = d.minNotionalScope();
         ExchangeLimitScope stepScope        = d.stepSizeScope();
@@ -90,109 +96,102 @@ public class ExchangeAIGuard {
         ExchangeLimitScope maxOrdersScope   = d.maxOrdersScope();
 
         // =====================================================
-        // 3️⃣ SANITY CHECKS
+        // 3) SANITY CHECKS
         // =====================================================
-        if (finalQty == null || finalQty.compareTo(BigDecimal.ZERO) <= 0) {
+        if (!isPositive(finalQty)) {
             errors.add("Количество (qty) должно быть > 0.");
-            return build(false, false, finalQty, finalPrice, d,
-                    warnings, errors,
+            return build(false, false, finalQty, finalPrice, d, warnings, errors,
                     minNotionalScope, stepScope, tickScope, maxOrdersScope);
         }
 
-        if (!isMarketOrder &&
-            (finalPrice == null || finalPrice.compareTo(BigDecimal.ZERO) <= 0)) {
-
+        if (!isMarketOrder && !isPositive(finalPrice)) {
             errors.add("Цена (price) должна быть > 0 для LIMIT ордера.");
-            return build(false, false, finalQty, finalPrice, d,
-                    warnings, errors,
+            return build(false, false, finalQty, finalPrice, d, warnings, errors,
                     minNotionalScope, stepScope, tickScope, maxOrdersScope);
         }
 
         boolean adjusted = false;
 
         // =====================================================
-        // 4️⃣ TICK SIZE (PRICE)
+        // 4) TICK SIZE (PRICE) — округляем ВНИЗ (только если не MARKET)
         // =====================================================
         if (!isMarketOrder) {
-            if (d.tickSize() != null && d.tickSize().compareTo(BigDecimal.ZERO) > 0) {
-                BigDecimal snapped =
-                        snapToStep(finalPrice, d.tickSize(), RoundingMode.DOWN);
-
-                if (snapped.compareTo(finalPrice) != 0) {
-                    warnings.add(
-                            "Цена округлена под tickSize: "
-                            + strip(finalPrice) + " → " + strip(snapped)
-                    );
+            if (isPositive(d.tickSize())) {
+                BigDecimal snapped = snapDownToStep(finalPrice, d.tickSize());
+                if (snapped != null && snapped.compareTo(finalPrice) != 0) {
+                    warnings.add("Цена округлена под tickSize: " + strip(finalPrice) + " → " + strip(snapped));
                     finalPrice = snapped;
                     adjusted = true;
                 }
+                if (!isPositive(finalPrice)) {
+                    errors.add("После округления под tickSize цена стала 0 — увеличь price.");
+                }
             } else {
-                warnings.add(
-                        "tickSize отсутствует (" + tickScope + ") — округление цены невозможно."
-                );
+                warnings.add("tickSize отсутствует (" + tickScope + ") — округление цены невозможно.");
             }
         }
 
-        // =====================================================
-        // 5️⃣ STEP SIZE (QTY)
-        // =====================================================
-        if (d.stepSize() != null && d.stepSize().compareTo(BigDecimal.ZERO) > 0) {
-            BigDecimal snapped =
-                    snapToStep(finalQty, d.stepSize(), RoundingMode.DOWN);
+        if (!errors.isEmpty()) {
+            return build(false, adjusted, finalQty, finalPrice, d, warnings, errors,
+                    minNotionalScope, stepScope, tickScope, maxOrdersScope);
+        }
 
-            if (snapped.compareTo(finalQty) != 0) {
-                warnings.add(
-                        "Количество округлено под stepSize: "
-                        + strip(finalQty) + " → " + strip(snapped)
-                );
+        // =====================================================
+        // 5) STEP SIZE (QTY) — округляем ВНИЗ
+        // =====================================================
+        if (isPositive(d.stepSize())) {
+            BigDecimal snapped = snapDownToStep(finalQty, d.stepSize());
+            if (snapped != null && snapped.compareTo(finalQty) != 0) {
+                warnings.add("Количество округлено под stepSize: " + strip(finalQty) + " → " + strip(snapped));
                 finalQty = snapped;
                 adjusted = true;
             }
-
-            if (finalQty.compareTo(BigDecimal.ZERO) <= 0) {
-                errors.add(
-                        "После округления под stepSize количество стало 0 — увеличь qty."
-                );
+            if (!isPositive(finalQty)) {
+                errors.add("После округления под stepSize количество стало 0 — увеличь qty.");
             }
         } else {
-            warnings.add(
-                    "stepSize отсутствует (" + stepScope + ") — округление qty невозможно."
-            );
+            warnings.add("stepSize отсутствует (" + stepScope + ") — округление qty невозможно.");
+        }
+
+        if (!errors.isEmpty()) {
+            return build(false, adjusted, finalQty, finalPrice, d, warnings, errors,
+                    minNotionalScope, stepScope, tickScope, maxOrdersScope);
         }
 
         // =====================================================
-        // 6️⃣ MIN NOTIONAL
+        // 6) MIN NOTIONAL
         // =====================================================
-        BigDecimal notional = null;
+        BigDecimal notional = computeNotional(finalQty, finalPrice);
 
-        if (finalPrice != null) {
-            notional = finalPrice.multiply(finalQty);
-        }
+        if (isPositive(d.minNotional())) {
+            if (notional == null) {
+                warnings.add("minNotional задан, но цена неизвестна — точная проверка невозможна.");
+            } else if (notional.compareTo(d.minNotional()) < 0) {
 
-        if (d.minNotional() != null && d.minNotional().compareTo(BigDecimal.ZERO) > 0) {
+                // Попытка авто-поднятия qty (опционально)
+                if (allowIncreaseQtyToMinNotional && isPositive(d.stepSize())) {
+                    BigDecimal requiredQty = computeRequiredQty(finalPrice, d.minNotional(), d.stepSize());
+                    if (requiredQty != null && requiredQty.compareTo(finalQty) > 0) {
+                        warnings.add("qty повышен для прохождения minNotional: "
+                                + strip(finalQty) + " → " + strip(requiredQty)
+                                + " (minNotional=" + strip(d.minNotional()) + ")");
+                        finalQty = requiredQty;
+                        adjusted = true;
+                        notional = computeNotional(finalQty, finalPrice);
+                    }
+                }
 
-            if (notional != null &&
-                notional.compareTo(d.minNotional()) < 0) {
-
-                errors.add(
-                        "Сумма сделки (qty*price=" + strip(notional) +
-                        ") меньше minNotional=" + strip(d.minNotional())
-                );
-
-            } else if (notional == null) {
-                warnings.add(
-                        "minNotional задан, но цена неизвестна — точная проверка невозможна."
-                );
+                if (notional != null && notional.compareTo(d.minNotional()) < 0) {
+                    errors.add("Сумма сделки (qty*price=" + strip(notional) +
+                            ") меньше minNotional=" + strip(d.minNotional()));
+                }
             }
-
         } else {
-            warnings.add(
-                    "minNotional отсутствует (" + minNotionalScope + ") — биржа может отклонить ордер."
-            );
+            warnings.add("minNotional отсутствует (" + minNotionalScope + ") — биржа может отклонить ордер.");
         }
 
         // =====================================================
-        // 7️⃣ RESULT
+        // 7) RESULT
         // =====================================================
         boolean ok = errors.isEmpty();
 
@@ -212,11 +211,12 @@ public class ExchangeAIGuard {
                 .build();
 
         if (!res.ok()) {
-            log.warn("🛡️ AI-GUARD BLOCK exchange={} symbol={} errors={}",
-                    ex, d.symbol(), res.errors());
+            log.warn("🛡️ AI-GUARD BLOCK exchange={} symbol={} errors={}", ex, d.symbol(), res.errors());
         } else if (res.adjusted()) {
             log.info("🛡️ AI-GUARD ADJUST exchange={} symbol={} qty={} price={}",
                     ex, d.symbol(), strip(finalQty), strip(finalPrice));
+        } else {
+            log.debug("🛡️ AI-GUARD PASS exchange={} symbol={}", ex, d.symbol());
         }
 
         return res;
@@ -245,7 +245,7 @@ public class ExchangeAIGuard {
                 .finalQty(qty)
                 .finalPrice(price)
                 .minNotional(d != null ? d.minNotional() : null)
-                .computedNotional(null)
+                .computedNotional(computeNotional(qty, price))
                 .minNotionalScope(minNotionalScope)
                 .stepSizeScope(stepScope)
                 .tickSizeScope(tickScope)
@@ -255,11 +255,48 @@ public class ExchangeAIGuard {
                 .build();
     }
 
-    private BigDecimal snapToStep(BigDecimal v, BigDecimal step, RoundingMode mode) {
-        if (v == null || step == null || step.compareTo(BigDecimal.ZERO) <= 0) {
-            return v;
-        }
-        return v.divide(step, 0, mode).multiply(step);
+    /**
+     * Округление ВНИЗ под шаг:
+     * floor(v / step) * step
+     * (так устойчивее, чем remainder() для биржевых шагов)
+     */
+    private BigDecimal snapDownToStep(BigDecimal v, BigDecimal step) {
+        if (v == null || step == null || step.compareTo(BigDecimal.ZERO) <= 0) return v;
+
+        BigDecimal steps = v.divide(step, 0, RoundingMode.DOWN);
+        BigDecimal snapped = steps.multiply(step);
+
+        if (snapped.compareTo(BigDecimal.ZERO) < 0) return BigDecimal.ZERO;
+
+        // Держим масштаб примерно как у шага (для красоты/совместимости)
+        int scale = Math.max(0, step.stripTrailingZeros().scale());
+        return snapped.setScale(scale, RoundingMode.DOWN);
+    }
+
+    /**
+     * Минимальный qty, чтобы price*qty >= minNotional, с округлением ВВЕРХ по stepSize.
+     */
+    private BigDecimal computeRequiredQty(BigDecimal price, BigDecimal minNotional, BigDecimal stepSize) {
+        if (!isPositive(price) || !isPositive(minNotional) || !isPositive(stepSize)) return null;
+
+        BigDecimal raw = minNotional.divide(price, 18, RoundingMode.UP);
+
+        BigDecimal steps = raw.divide(stepSize, 0, RoundingMode.UP);
+        BigDecimal required = steps.multiply(stepSize);
+
+        if (required.compareTo(BigDecimal.ZERO) <= 0) return null;
+
+        int scale = Math.max(0, stepSize.stripTrailingZeros().scale());
+        return required.setScale(scale, RoundingMode.UP);
+    }
+
+    private BigDecimal computeNotional(BigDecimal qty, BigDecimal price) {
+        if (qty == null || price == null) return null;
+        return price.multiply(qty);
+    }
+
+    private boolean isPositive(BigDecimal v) {
+        return v != null && v.compareTo(BigDecimal.ZERO) > 0;
     }
 
     private String strip(BigDecimal v) {
