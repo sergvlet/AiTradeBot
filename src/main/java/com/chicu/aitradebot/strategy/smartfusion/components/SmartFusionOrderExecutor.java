@@ -44,7 +44,7 @@ public class SmartFusionOrderExecutor {
         // 1) Берём активные настройки для этой биржи
         ExchangeSettings settings = exchangeSettingsService
                 .findAllByChatId(chatId).stream()
-                .filter(ExchangeSettings::isEnabled)
+
                 .filter(s -> "BINANCE".equalsIgnoreCase(s.getExchange()))
                 .findFirst()
                 .orElseThrow(() -> new IllegalStateException("Не найдены активные ключи BINANCE для chatId=" + chatId));
@@ -84,7 +84,7 @@ public class SmartFusionOrderExecutor {
     public Order placeLimit(long chatId, String symbol, String side, double qty, double price) throws Exception {
         ExchangeSettings settings = exchangeSettingsService
                 .findAllByChatId(chatId).stream()
-                .filter(ExchangeSettings::isEnabled)
+
                 .filter(s -> "BINANCE".equalsIgnoreCase(s.getExchange()))
                 .findFirst()
                 .orElseThrow(() -> new IllegalStateException("Не найдены активные ключи BINANCE для chatId=" + chatId));
@@ -121,7 +121,7 @@ public class SmartFusionOrderExecutor {
     public boolean cancel(long chatId, String symbol, String orderId) throws Exception {
         ExchangeSettings settings = exchangeSettingsService
                 .findAllByChatId(chatId).stream()
-                .filter(ExchangeSettings::isEnabled)
+
                 .filter(s -> "BINANCE".equalsIgnoreCase(s.getExchange()))
                 .findFirst()
                 .orElseThrow(() -> new IllegalStateException("Не найдены активные ключи BINANCE для chatId=" + chatId));

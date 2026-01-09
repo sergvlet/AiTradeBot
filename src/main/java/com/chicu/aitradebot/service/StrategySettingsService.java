@@ -77,4 +77,8 @@ public interface StrategySettingsService {
             NetworkType network,
             BigDecimal newRiskPerTradePct
     );
+
+
+    Optional<StrategySettings> findLatestAny(Long chatId, StrategyType type);
+
 }

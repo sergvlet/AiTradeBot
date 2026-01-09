@@ -31,12 +31,11 @@ import org.springframework.web.bind.annotation.*;
 import java.math.BigDecimal;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 
 @Slf4j
 @Controller
 @RequiredArgsConstructor
-@RequestMapping("/strategies/{type}/config")
+@RequestMapping("/strategies")
 public class StrategySettingsController {
 
     private final StrategySettingsService strategySettingsService;
@@ -47,37 +46,32 @@ public class StrategySettingsController {
     private final MarketSymbolService marketSymbolService;
     private final StrategyAdvancedRegistry strategyAdvancedRegistry;
     private final AiStrategyOrchestrator orchestrator;
+
     private static final List<String> DEFAULT_TIMEFRAMES = List.of(
-            "1s","5s","15s","1m","3m","5m","15m","30m","1h","4h","1d"
+            "1s", "5s", "15s", "1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d"
     );
 
     private static final List<String> AVAILABLE_EXCHANGES =
-            List.of("BINANCE","BYBIT","OKX");
-
+            List.of("BINANCE", "BYBIT", "OKX");
 
     // =====================================================
     // GET — ОТКРЫТЬ НАСТРОЙКИ
     // =====================================================
-    @GetMapping
+    @GetMapping("/{type}/config")
     public String openSettings(
-            @PathVariable("type") String type,
+            @PathVariable("type") String typeRaw,
             @RequestParam("chatId") long chatId,
             @RequestParam(value = "tab", required = false) String tab,
+            @RequestParam(value = "exchange", required = false) String exchangeParam,
+            @RequestParam(value = "network", required = false) String networkParam,
             HttpServletRequest request,
             Model model
     ) {
 
-        StrategyType strategyType = StrategyType.valueOf(type);
+        StrategyType strategyType = parseStrategyType(typeRaw);
 
-        // =====================================================
-        // exchange / network
-        // =====================================================
-        String exchange = Optional.ofNullable(request.getParameter("exchange"))
-                .orElse("BINANCE");
-
-        NetworkType network = Optional.ofNullable(request.getParameter("network"))
-                .map(NetworkType::valueOf)
-                .orElse(NetworkType.TESTNET);
+        String exchange = normalizeExchange(exchangeParam);
+        NetworkType network = parseNetworkOrDefault(networkParam, NetworkType.TESTNET);
 
         // =====================================================
         // StrategySettings (unified)
@@ -85,19 +79,12 @@ public class StrategySettingsController {
         StrategySettings strategy =
                 strategySettingsService
                         .findLatest(chatId, strategyType, exchange, network)
-                        .orElseGet(() ->
-                                strategySettingsService.getOrCreate(
-                                        chatId, strategyType, exchange, network
-                                )
-                        );
+                        .orElseGet(() -> strategySettingsService.getOrCreate(chatId, strategyType, exchange, network));
 
-        // 🔥 УСТАНОВКА АКТУАЛЬНОГО ACTIVE через orchestrator
+        // runtime status (active)
         try {
-            StrategyRunInfo runtime =
-                    orchestrator.getStatus(chatId, strategyType, exchange, network);
-            if (runtime != null) {
-                strategy.setActive(runtime.isActive());
-            }
+            StrategyRunInfo runtime = orchestrator.getStatus(chatId, strategyType, exchange, network);
+            if (runtime != null) strategy.setActive(runtime.isActive());
         } catch (Exception e) {
             log.warn("⚠ Ошибка при получении статуса стратегии: {}", e.getMessage());
         }
@@ -105,56 +92,46 @@ public class StrategySettingsController {
         pullRsiEmaIntoUnifiedIfEmpty(strategyType, chatId, strategy);
 
         // =====================================================
-        // BALANCE SNAPSHOT
+        // BALANCE
         // =====================================================
         AccountBalanceSnapshot balance =
-                accountBalanceService.getSnapshot(
-                        chatId, strategyType, exchange, network
-                );
+                accountBalanceService.getSnapshot(chatId, strategyType, exchange, network);
 
         // =====================================================
-        // Exchange + diagnostics
+        // Exchange settings (keys) + Diagnostics
         // =====================================================
-        ExchangeSettings exchangeSettings =
-                exchangeSettingsService.getOrCreate(chatId, exchange, network);
+        ExchangeSettings exchangeSettings = exchangeSettingsService.getOrCreate(chatId, exchange, network);
 
-        ApiKeyDiagnostics diagnostics =
-                exchangeSettings.hasKeys()
-                        ? exchangeSettingsService.testConnectionDetailed(exchangeSettings)
-                        : null;
+        boolean diagnosticsSupported = isDiagnosticsSupported(exchange);
 
-        // =====================================================
-        // SELECTED ASSET
-        // =====================================================
+        ApiKeyDiagnostics diagnostics = null;
+        if (diagnosticsSupported && exchangeSettings.hasBaseKeys()) {
+            diagnostics = exchangeSettingsService.testConnectionDetailed(exchangeSettings);
+        }
+
+        boolean connectionOk = diagnostics != null && diagnostics.isOk();
+
+        // selected asset
         String selectedAsset = strategy.getAccountAsset();
         if (selectedAsset == null || selectedAsset.isBlank()) {
             selectedAsset = balance.getSelectedAsset();
         }
 
-        // =====================================================
-        // SYMBOL INFO
-        // =====================================================
+        // symbol info
         SymbolDescriptor symbolInfo = null;
-
         if (strategy.getSymbol() != null && !strategy.getSymbol().isBlank()) {
             try {
                 symbolInfo = marketSymbolService.getSymbolInfo(
-                        exchange,
-                        network,
-                        selectedAsset,
-                        strategy.getSymbol()
+                        exchange, network, selectedAsset, strategy.getSymbol()
                 );
             } catch (Exception e) {
-                log.warn("⚠ Не удалось получить symbolInfo symbol={}: {}",
-                        strategy.getSymbol(), e.getMessage());
+                log.warn("⚠ Не удалось получить symbolInfo symbol={}: {}", strategy.getSymbol(), e.getMessage());
             }
         }
 
-        // =====================================================
-        // FEES
-        // =====================================================
+        // fees — только если ключи есть и диагностика успешна
         AccountFees accountFees = null;
-        if (exchangeSettings.hasKeys() && diagnostics != null && diagnostics.isOk()) {
+        if (diagnosticsSupported && exchangeSettings.hasBaseKeys() && connectionOk) {
             try {
                 accountFees = accountBalanceService.getAccountFees(chatId, exchange, network);
             } catch (Exception e) {
@@ -162,14 +139,9 @@ public class StrategySettingsController {
             }
         }
 
-        // =====================================================
-        // 🔥 STRATEGY ADVANCED (DYNAMIC HTML)
-        // =====================================================
+        // advanced html
         String strategyAdvancedHtml = null;
-
-        StrategyAdvancedRenderer advancedRenderer =
-                strategyAdvancedRegistry.get(strategyType);
-
+        StrategyAdvancedRenderer advancedRenderer = strategyAdvancedRegistry.get(strategyType);
         if (advancedRenderer != null) {
             strategyAdvancedHtml = advancedRenderer.render(
                     AdvancedRenderContext.builder()
@@ -183,7 +155,7 @@ public class StrategySettingsController {
         }
 
         // =====================================================
-        // MODEL
+        // model
         // =====================================================
         model.addAttribute("page", "strategies/settings");
         model.addAttribute("chatId", chatId);
@@ -196,9 +168,13 @@ public class StrategySettingsController {
 
         model.addAttribute("selectedExchange", exchange);
         model.addAttribute("selectedNetwork", network);
+
         model.addAttribute("exchangeSettings", exchangeSettings);
-        model.addAttribute("diagnostics", diagnostics);
-        model.addAttribute("connectionOk", diagnostics != null && diagnostics.isOk());
+
+        // ✅ важное: UI не должен показывать “старую диагностику”
+        model.addAttribute("diagnosticsSupported", diagnosticsSupported);
+        model.addAttribute("diagnostics", diagnosticsSupported ? diagnostics : null);
+        model.addAttribute("connectionOk", diagnosticsSupported && connectionOk);
 
         model.addAttribute("availableAssets", balance.getAvailableAssets());
         model.addAttribute("selectedAsset", selectedAsset);
@@ -208,178 +184,121 @@ public class StrategySettingsController {
         model.addAttribute("accountFees", accountFees);
         model.addAttribute("symbolInfo", symbolInfo);
 
-        // 🔥 ВАЖНОЕ
         model.addAttribute("strategyAdvancedHtml", strategyAdvancedHtml);
 
         return "layout/app";
     }
 
-
     // =====================================================
-    // POST — СОХРАНЕНИЕ (FIXED)
+    // POST — СОХРАНЕНИЕ
     // =====================================================
-    @PostMapping
+    @PostMapping("/{type}/config")
     public String saveSettings(
-            @PathVariable("type") String type,
+            @PathVariable("type") String typeRaw,
             @RequestParam("chatId") long chatId,
             @RequestParam("saveScope") String saveScope,
             @RequestParam Map<String, String> params,
             @ModelAttribute("strategy") StrategySettings form
     ) {
 
-        StrategyType strategyType = StrategyType.valueOf(type);
+        StrategyType strategyType = parseStrategyType(typeRaw);
 
-        String exchange = params.getOrDefault("exchange", "BINANCE");
-        NetworkType network =
-                NetworkType.valueOf(params.getOrDefault("network", "TESTNET"));
+        String exchange = normalizeExchange(params.get("exchange"));
+        NetworkType network = parseNetworkOrDefault(params.get("network"), NetworkType.TESTNET);
 
-        log.info(
-                "💾 SAVE SETTINGS START type={} chatId={} scope={} ex={} net={}",
-                strategyType, chatId, saveScope, exchange, network
-        );
-        log.debug("📥 RAW PARAMS: {}", params);
-
-        // =====================================================
-        // 🔥 POST гарантирует наличие записи
-        // =====================================================
         StrategySettings s =
                 strategySettingsService
                         .findLatest(chatId, strategyType, exchange, network)
-                        .orElseGet(() -> strategySettingsService.getOrCreate(
-                                chatId, strategyType, exchange, network
-                        ));
+                        .orElseGet(() -> strategySettingsService.getOrCreate(chatId, strategyType, exchange, network));
 
-        // =====================================================
-        // 🔐 GLOBAL: advancedControlMode (применяется сразу)
-        // =====================================================
+        // global
         if (params.containsKey("advancedControlMode")) {
             try {
-                s.setAdvancedControlMode(
-                        AdvancedControlMode.valueOf(params.get("advancedControlMode"))
-                );
+                s.setAdvancedControlMode(AdvancedControlMode.valueOf(params.get("advancedControlMode")));
             } catch (Exception e) {
                 log.warn("Invalid advancedControlMode: {}", params.get("advancedControlMode"));
             }
         }
 
-        // =====================================================
-        // 💰 accountAsset — единая точка
-        // =====================================================
         String accountAsset = params.get("accountAsset");
-        if (accountAsset != null && !accountAsset.isBlank()) {
-            s.setAccountAsset(accountAsset);
-        }
-
-        String redirect;
+        if (accountAsset != null && !accountAsset.isBlank()) s.setAccountAsset(accountAsset);
 
         switch (saveScope) {
 
-            case "network":
+            case "network" -> {
                 s.setExchangeName(exchange);
                 s.setNetworkType(network);
                 strategySettingsService.save(s);
-                exchangeSettingsService.saveNetwork(chatId, exchange, network);
-                break;
 
-            case "trade":
+                // запись под ключи должна существовать
+                exchangeSettingsService.getOrCreate(chatId, exchange, network);
+            }
+
+            case "keys" -> {
+                exchangeSettingsService.saveKeys(
+                        chatId,
+                        exchange,
+                        network,
+                        params.get("apiKey"),
+                        params.get("apiSecret"),
+                        params.get("passphrase"),
+                        params.get("subAccount")
+                );
+            }
+
+            case "trade" -> {
                 s.setSymbol(form.getSymbol());
                 s.setTimeframe(form.getTimeframe());
                 s.setCachedCandlesLimit(form.getCachedCandlesLimit());
 
-                // 🔥 EXECUTION POLICY
-                Integer maxOpenOrders   = parseIntOrNull(params.get("maxOpenOrders"));
+                Integer maxOpenOrders = parseIntOrNull(params.get("maxOpenOrders"));
                 Integer cooldownSeconds = parseIntOrNull(params.get("cooldownSeconds"));
 
-                // maxOpenOrders: null / <=0 → без ограничения
-                s.setMaxOpenOrders(
-                        (maxOpenOrders != null && maxOpenOrders > 0)
-                                ? maxOpenOrders
-                                : null
-                );
-
-                // cooldownSeconds: null / 0 / <0 → без паузы
-                s.setCooldownSeconds(
-                        (cooldownSeconds != null && cooldownSeconds > 0)
-                                ? cooldownSeconds
-                                : null
-                );
+                s.setMaxOpenOrders((maxOpenOrders != null && maxOpenOrders > 0) ? maxOpenOrders : null);
+                s.setCooldownSeconds((cooldownSeconds != null && cooldownSeconds > 0) ? cooldownSeconds : null);
 
                 strategySettingsService.save(s);
-                break;
+            }
 
-
-
-
-            case "risk":
-                // 🔐 Risk limits — ТОЛЬКО через policy
+            case "risk" -> {
                 strategySettingsService.updateRiskFromUi(
-                        chatId,
-                        strategyType,
-                        exchange,
-                        network,
+                        chatId, strategyType, exchange, network,
                         parseBigDecimalOrNull(params.get("dailyLossLimitPct")),
                         parseBigDecimalOrNull(params.get("riskPerTradePct"))
                 );
 
-                // 🔄 перезагружаем актуальное состояние
                 StrategySettings refreshed =
-                        strategySettingsService
-                                .findLatest(chatId, strategyType, exchange, network)
-                                .orElseThrow();
+                        strategySettingsService.findLatest(chatId, strategyType, exchange, network).orElseThrow();
 
-                // TP / SL — напрямую
-                BigDecimal stopLossPct  = parseBigDecimalOrNull(params.get("stopLossPct"));
+                BigDecimal stopLossPct = parseBigDecimalOrNull(params.get("stopLossPct"));
                 BigDecimal takeProfitPct = parseBigDecimalOrNull(params.get("takeProfitPct"));
 
                 boolean changed = false;
+                if (stopLossPct != null) { refreshed.setStopLossPct(stopLossPct); changed = true; }
+                if (takeProfitPct != null) { refreshed.setTakeProfitPct(takeProfitPct); changed = true; }
 
-                if (stopLossPct != null) {
-                    refreshed.setStopLossPct(stopLossPct);
-                    changed = true;
-                }
-                if (takeProfitPct != null) {
-                    refreshed.setTakeProfitPct(takeProfitPct);
-                    changed = true;
-                }
+                if (changed) strategySettingsService.save(refreshed);
+            }
 
-                if (changed) {
-                    strategySettingsService.save(refreshed);
-                }
-
-                break;
-
-            case "general":
+            case "general" -> {
                 s.setReinvestProfit(params.containsKey("reinvestProfit"));
 
-                BigDecimal maxExposureUsd =
-                        parseBigDecimalOrNull(params.get("maxExposureUsd"));
-                Integer maxExposurePct =
-                        parseIntOrNull(params.get("maxExposurePct"));
+                BigDecimal maxExposureUsd = parseBigDecimalOrNull(params.get("maxExposureUsd"));
+                Integer maxExposurePct = parseIntOrNull(params.get("maxExposurePct"));
 
-                if (maxExposureUsd != null && maxExposureUsd.signum() <= 0) {
-                    maxExposureUsd = null;
-                }
-                if (maxExposurePct != null &&
-                    (maxExposurePct <= 0 || maxExposurePct > 100)) {
-                    maxExposurePct = null;
-                }
+                if (maxExposureUsd != null && maxExposureUsd.signum() <= 0) maxExposureUsd = null;
+                if (maxExposurePct != null && (maxExposurePct <= 0 || maxExposurePct > 100)) maxExposurePct = null;
 
                 s.setMaxExposureUsd(maxExposureUsd);
                 s.setMaxExposurePct(maxExposurePct);
                 strategySettingsService.save(s);
-                break;
+            }
 
-            case "advanced": {
-
-                // 1️⃣ текущий режим ДО изменений
+            case "advanced" -> {
                 AdvancedControlMode currentMode = s.getAdvancedControlMode();
 
-                // 2️⃣ strategy-specific advanced
-                StrategyAdvancedRenderer renderer =
-                        strategyAdvancedRegistry.get(strategyType);
-
+                StrategyAdvancedRenderer renderer = strategyAdvancedRegistry.get(strategyType);
                 if (renderer != null && currentMode != AdvancedControlMode.AI) {
-
                     AdvancedRenderContext ctx =
                             AdvancedRenderContext.builder()
                                     .chatId(chatId)
@@ -389,107 +308,140 @@ public class StrategySettingsController {
                                     .controlMode(currentMode)
                                     .params(params)
                                     .build();
-
                     renderer.handleSubmit(ctx);
-
-                } else if (currentMode == AdvancedControlMode.AI) {
-                    log.info(
-                            "🔒 Advanced params ignored (AI mode) chatId={} strategy={}",
-                            chatId, strategyType
-                    );
                 }
 
-                // 3️⃣ смена режима (GLOBAL)
                 String modeRaw = params.get("advancedControlMode");
                 if (modeRaw != null) {
                     try {
-                        s.setAdvancedControlMode(
-                                AdvancedControlMode.valueOf(modeRaw)
-                        );
+                        s.setAdvancedControlMode(AdvancedControlMode.valueOf(modeRaw));
                     } catch (IllegalArgumentException e) {
                         log.warn("⚠️ Invalid advancedControlMode='{}'", modeRaw);
                     }
                 }
 
-                // 4️⃣ save
                 strategySettingsService.save(s);
-                break;
             }
 
-
-
-
-
-            default:
-                log.warn("⚠️ Unknown saveScope='{}'", saveScope);
+            default -> log.warn("⚠️ Unknown saveScope='{}'", saveScope);
         }
 
-        // =====================================================
-        // 🔄 POST SAVE
-        // =====================================================
         syncRsiEmaFromUnified(strategyType, chatId, s);
         settingsCache.invalidate(chatId, strategyType);
 
-        redirect = buildRedirect(type, chatId, exchange, network, saveScope);
-
-        log.info("✅ SAVE SETTINGS DONE id={} scope={}", s.getId(), saveScope);
-        return redirect;
+        String tab = params.getOrDefault("tab", "network");
+        return buildRedirect(strategyType, chatId, exchange, network, tab);
     }
 
-    private String buildRedirect(
-            String type,
-            long chatId,
-            String exchange,
-            NetworkType network,
-            String tab
+    // =====================================================
+    // POST — DIAGNOSE (правильный путь для страницы настроек)
+    // =====================================================
+    @PostMapping("/{type}/config/diagnose")
+    @ResponseBody
+    public ApiKeyDiagnostics diagnose(
+            @PathVariable("type") String typeRaw,
+            @RequestParam("chatId") long chatId,
+            @RequestParam("exchange") String exchange,
+            @RequestParam("network") String network
     ) {
-        return "redirect:/strategies/" + type +
+        parseStrategyType(typeRaw);
+
+        String ex = normalizeExchange(exchange);
+        NetworkType net = parseNetworkOrDefault(network, NetworkType.TESTNET);
+
+        if (!isDiagnosticsSupported(ex)) {
+            return ApiKeyDiagnostics.builder()
+                    .ok(false)
+                    .exchange(ex)
+                    .message("Диагностика не поддерживается для биржи: " + ex)
+                    .build();
+        }
+
+        ExchangeSettings s = exchangeSettingsService.getOrCreate(chatId, ex, net);
+
+        if (s == null || !s.hasBaseKeys()) {
+            return ApiKeyDiagnostics.notConfigured(ex, "Ключи не заданы");
+        }
+
+        return exchangeSettingsService.testConnectionDetailed(s);
+    }
+
+    // =====================================================
+    // POST — DIAGNOSE (совместимость со старым JS)
+    // =====================================================
+    @PostMapping("/network/diagnose")
+    @ResponseBody
+    public ApiKeyDiagnostics diagnoseLegacy(
+            @RequestParam("chatId") long chatId,
+            @RequestParam("exchange") String exchange,
+            @RequestParam("network") String network
+    ) {
+        String ex = normalizeExchange(exchange);
+        NetworkType net = parseNetworkOrDefault(network, NetworkType.TESTNET);
+
+        if (!isDiagnosticsSupported(ex)) {
+            return ApiKeyDiagnostics.builder()
+                    .ok(false)
+                    .exchange(ex)
+                    .message("Диагностика не поддерживается для биржи: " + ex)
+                    .build();
+        }
+
+        ExchangeSettings s = exchangeSettingsService.getOrCreate(chatId, ex, net);
+
+        if (s == null || !s.hasBaseKeys()) {
+            return ApiKeyDiagnostics.notConfigured(ex, "Ключи не заданы");
+        }
+
+        return exchangeSettingsService.testConnectionDetailed(s);
+    }
+
+    // =====================================================
+    // helpers
+    // =====================================================
+
+    private boolean isDiagnosticsSupported(String exchange) {
+        String ex = normalizeExchange(exchange);
+        return "BINANCE".equals(ex) || "BYBIT".equals(ex);
+    }
+
+    private String buildRedirect(StrategyType type, long chatId, String exchange, NetworkType network, String tab) {
+        return "redirect:/strategies/" + type.name() +
                "/config?chatId=" + chatId +
-               "&exchange=" + exchange +
+               "&exchange=" + normalizeExchange(exchange) +
                "&network=" + network.name() +
                "&tab=" + tab;
     }
 
-    // =====================================================
-    // AJAX — СМЕНА АКТИВА (FIXED)
-    // =====================================================
-    @PostMapping("/asset")
-    @ResponseBody
-    public AccountBalanceSnapshot changeAccountAsset(
-            @PathVariable("type") String type,
-            @RequestParam("chatId") long chatId,
-            @RequestParam("exchange") String exchange,
-            @RequestParam("network") NetworkType network,
-            @RequestParam("asset") String asset
-    ) {
-
-        StrategyType strategyType = StrategyType.valueOf(type);
-
-        // 🔥 FIX — тоже findLatest
-        StrategySettings settings =
-                strategySettingsService
-                        .findLatest(chatId, strategyType, exchange, network)
-                        .orElseThrow(() ->
-                                new IllegalStateException("StrategySettings not found for asset change"));
-
-        settings.setAccountAsset(asset);
-        strategySettingsService.save(settings);
-
-        settingsCache.invalidate(chatId, strategyType);
-
-        return accountBalanceService.getSnapshot(
-                chatId, strategyType, exchange, network
-        );
+    private StrategyType parseStrategyType(String raw) {
+        if (raw == null || raw.isBlank()) {
+            throw new IllegalArgumentException("Strategy type is blank");
+        }
+        try {
+            return StrategyType.valueOf(raw.trim().toUpperCase());
+        } catch (Exception e) {
+            log.error("❌ Invalid strategy type in path: '{}'", raw);
+            throw e;
+        }
     }
 
-    // =====================================================
+    private String normalizeExchange(String exchange) {
+        return (exchange == null || exchange.isBlank())
+                ? "BINANCE"
+                : exchange.trim().toUpperCase();
+    }
+
+    private NetworkType parseNetworkOrDefault(String raw, NetworkType def) {
+        if (raw == null || raw.isBlank()) return def;
+        try {
+            return NetworkType.valueOf(raw.trim().toUpperCase());
+        } catch (Exception e) {
+            return def;
+        }
+    }
+
     // RSI EMA legacy
-    // =====================================================
-    private void pullRsiEmaIntoUnifiedIfEmpty(
-            StrategyType type,
-            long chatId,
-            StrategySettings s
-    ) {
+    private void pullRsiEmaIntoUnifiedIfEmpty(StrategyType type, long chatId, StrategySettings s) {
         if (type != StrategyType.RSI_EMA) return;
         if (s.getSymbol() != null && s.getTimeframe() != null) return;
 
@@ -502,11 +454,7 @@ public class StrategySettingsController {
         strategySettingsService.save(s);
     }
 
-    private void syncRsiEmaFromUnified(
-            StrategyType type,
-            long chatId,
-            StrategySettings s
-    ) {
+    private void syncRsiEmaFromUnified(StrategyType type, long chatId, StrategySettings s) {
         if (type != StrategyType.RSI_EMA) return;
 
         RsiEmaStrategySettings t = rsiEmaSettingsService.getOrCreate(chatId);
@@ -518,18 +466,12 @@ public class StrategySettingsController {
     }
 
     private BigDecimal parseBigDecimalOrNull(String v) {
-        try {
-            return v == null ? null : new BigDecimal(v.trim());
-        } catch (Exception e) {
-            return null;
-        }
+        try { return v == null ? null : new BigDecimal(v.trim()); }
+        catch (Exception e) { return null; }
     }
 
     private Integer parseIntOrNull(String v) {
-        try {
-            return v == null ? null : Integer.parseInt(v.trim());
-        } catch (Exception e) {
-            return null;
-        }
+        try { return v == null ? null : Integer.parseInt(v.trim()); }
+        catch (Exception e) { return null; }
     }
 }

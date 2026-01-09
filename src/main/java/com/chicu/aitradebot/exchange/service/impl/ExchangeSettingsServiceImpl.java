@@ -17,10 +17,8 @@ import org.springframework.web.client.RestTemplate;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
-import java.time.Instant;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 
 @Slf4j
 @Service
@@ -28,160 +26,92 @@ import java.util.Optional;
 public class ExchangeSettingsServiceImpl implements ExchangeSettingsService {
 
     private final ExchangeSettingsRepository repository;
+
+    // Лучше бы инжектить как @Bean, но оставляю как у тебя (минимум изменений)
     private final RestTemplate restTemplate = new RestTemplate();
 
-    // ========================================================================
-    // GET OR CREATE (таб NETWORK)
-    // ========================================================================
     @Override
     @Transactional
     public ExchangeSettings getOrCreate(Long chatId, String exchange, NetworkType network) {
+        String ex = normalizeExchange(exchange);
 
-        return repository.findByChatIdAndExchangeAndNetwork(chatId, exchange, network)
+        return repository.findByChatIdAndExchangeAndNetwork(chatId, ex, network)
                 .orElseGet(() -> {
-                    ExchangeSettings s = new ExchangeSettings();
-                    s.setChatId(chatId);
-                    s.setExchange(exchange.toUpperCase());
-                    s.setNetwork(network);
+                    ExchangeSettings s = ExchangeSettings.builder()
+                            .chatId(chatId)
+                            .exchange(ex)
+                            .network(network)
+                            // ключи могут быть null (после миграции)
+                            .apiKey(null)
+                            .apiSecret(null)
+                            .passphrase(null)
+                            .subAccount(null)
+                            .build();
 
-                    // ❗ ключи ПУСТЫЕ, но НЕ null
-                    s.setApiKey("");
-                    s.setApiSecret("");
-                    s.setPassphrase("");
-                    s.setSubAccount("");
-                    s.setEnabled(false);
-
-                    s.setCreatedAt(Instant.now());
-                    s.setUpdatedAt(Instant.now());
-
-                    repository.save(s);
-
-                    log.info("🆕 Созданы ExchangeSettings {}@{} (chatId={})",
-                            exchange, network, chatId);
-
-                    return s;
+                    ExchangeSettings saved = repository.save(s);
+                    log.info("🆕 Созданы ExchangeSettings {}@{} (chatId={})", ex, network, chatId);
+                    return saved;
                 });
     }
 
-    // ========================================================================
-    // SAVE NETWORK (биржа + сеть) — ❗ НЕ ТРОГАЕТ КЛЮЧИ
-    // ========================================================================
+    @Override
     @Transactional
-    public ExchangeSettings saveNetwork(Long chatId, String exchange, NetworkType network) {
+    public ExchangeSettings saveKeys(Long chatId,
+                                     String exchange,
+                                     NetworkType network,
+                                     String apiKey,
+                                     String apiSecret,
+                                     String passphrase,
+                                     String subAccount) {
 
-        ExchangeSettings s = getOrCreate(chatId, exchange, network);
+        String ex = normalizeExchange(exchange);
 
-        // ничего кроме сети / биржи не меняем
-        s.setExchange(exchange.toUpperCase());
-        s.setNetwork(network);
-        s.setUpdatedAt(Instant.now());
+        // ✅ одна строка на (chatId, exchange, network) — дальше только UPDATE
+        ExchangeSettings s = getOrCreate(chatId, ex, network);
 
-        repository.save(s);
+        // ✅ ВАЖНО: пустая строка должна ОЧИЩАТЬ ключ (становится null)
+        s.setApiKey(normalizeNullable(apiKey));
+        s.setApiSecret(normalizeNullable(apiSecret));
+        s.setPassphrase(normalizeNullable(passphrase));
+        s.setSubAccount(normalizeNullable(subAccount));
 
-        log.info("🌐 Network updated {}@{} (chatId={})",
-                exchange, network, chatId);
+        ExchangeSettings saved = repository.save(s);
 
-        return s;
+        // лог без спама и без секретов
+        log.info("🔐 Keys saved {}@{} (chatId={}, hasBaseKeys={}, hasAnySecret={})",
+                ex, network, chatId, saved.hasBaseKeys(), saved.hasAnySecret());
+
+        return saved;
     }
 
-    // ========================================================================
-    // SAVE KEYS — ❗ НИКОГДА НЕ ЗАТИРАЕТ СУЩЕСТВУЮЩИЕ
-    // ========================================================================
-    @Transactional
-    public ExchangeSettings saveKeys(
-            Long chatId,
-            String exchange,
-            NetworkType network,
-            String apiKey,
-            String apiSecret,
-            String passphrase
-    ) {
-
-        ExchangeSettings s = getOrCreate(chatId, exchange, network);
-
-        // 🔐 ТОЛЬКО если пришли НЕ пустые
-        if (!isBlank(apiKey)) {
-            s.setApiKey(apiKey.trim());
-        }
-
-        if (!isBlank(apiSecret)) {
-            s.setApiSecret(apiSecret.trim());
-        }
-
-        if (!isBlank(passphrase)) {
-            s.setPassphrase(passphrase.trim());
-        }
-
-        s.setEnabled(true);
-        s.setUpdatedAt(Instant.now());
-
-        repository.save(s);
-
-        log.info("🔐 API keys updated {}@{} (chatId={})",
-                exchange, network, chatId);
-
-        return s;
-    }
-
-    // ========================================================================
-    // FIND
-    // ========================================================================
     @Override
     public List<ExchangeSettings> findAllByChatId(Long chatId) {
         return repository.findAllByChatId(chatId);
     }
 
-    // ========================================================================
-    // DELETE
-    // ========================================================================
     @Override
     @Transactional
     public void delete(Long chatId, String exchange, NetworkType network) {
-        repository.findByChatIdAndExchangeAndNetwork(chatId, exchange, network)
-                .ifPresent(repository::delete);
-
-        log.warn("🗑 Deleted ExchangeSettings {}@{} (chatId={})",
-                exchange, network, chatId);
+        repository.deleteByChatIdAndExchangeAndNetwork(chatId, normalizeExchange(exchange), network);
+        log.warn("🗑 Deleted ExchangeSettings {}@{} (chatId={})", exchange, network, chatId);
     }
 
-    @Override
-    @Transactional
-    public ExchangeSettings save(ExchangeSettings settings) {
-        settings.setUpdatedAt(Instant.now());
-        return repository.save(settings);
-    }
-
-
-    // ========================================================================
-    // DIAGNOSE (AJAX)
-    // ========================================================================
     @Override
     public ApiKeyDiagnostics diagnose(Long chatId, String exchange, NetworkType network) {
-
-        ExchangeSettings s =
-                repository.findByChatIdAndExchangeAndNetwork(chatId, exchange, network)
-                        .orElse(null);
-
+        ExchangeSettings s = repository.findByChatIdAndExchangeAndNetwork(chatId, normalizeExchange(exchange), network)
+                .orElse(null);
         return testConnectionDetailed(s);
     }
 
-    // ========================================================================
-    // БЫСТРАЯ ПРОВЕРКА (true/false)
-    // ========================================================================
     @Override
     public boolean testConnection(ExchangeSettings s) {
+        if (s == null) return false;
+        if (isBlank(s.getExchange()) || s.getNetwork() == null) return false;
+        if (!s.hasBaseKeys()) return false;
 
-        if (s == null || isBlank(s.getExchange()) || s.getNetwork() == null) {
-            return false;
-        }
-
-        if (isBlank(s.getApiKey()) || isBlank(s.getApiSecret())) {
-            return false;
-        }
-
-        return switch (s.getExchange().toUpperCase()) {
+        return switch (normalizeExchange(s.getExchange())) {
             case "BINANCE" -> testBinanceConnectionQuick(s);
-            case "BYBIT"   -> testBybitConnectionQuick(s);
+            case "BYBIT" -> testBybitConnectionQuick(s);
             default -> false;
         };
     }
@@ -197,30 +127,28 @@ public class ExchangeSettingsServiceImpl implements ExchangeSettingsService {
                     .build();
         }
 
-        String exchange = s.getExchange().toUpperCase();
+        String exchange = normalizeExchange(s.getExchange());
 
-        if (isBlank(s.getApiKey()) || isBlank(s.getApiSecret())) {
-            return ApiKeyDiagnostics.notConfigured(
-                    exchange,
-                    "API key or secret is empty"
-            );
+        // ✅ если ключей нет — диагностику не делаем
+        if (!s.hasBaseKeys()) {
+            return ApiKeyDiagnostics.notConfigured(exchange, "Ключи не заданы (apiKey/apiSecret пустые)");
         }
 
         return switch (exchange) {
             case "BINANCE" -> diagnoseBinance(s);
-            case "BYBIT"   -> diagnoseBybit(s);
+            case "BYBIT" -> diagnoseBybit(s);
             default -> ApiKeyDiagnostics.builder()
                     .ok(false)
                     .exchange(exchange)
-                    .message("Unsupported exchange: " + exchange)
+                    .message("Диагностика не поддерживается для: " + exchange)
                     .build();
         };
     }
 
-
-    // ========================================================================
+    // =====================================================================
     // QUICK TESTS
-    // ========================================================================
+    // =====================================================================
+
     private boolean testBinanceConnectionQuick(ExchangeSettings s) {
         try {
             String base = (s.getNetwork() == NetworkType.TESTNET)
@@ -242,7 +170,6 @@ public class ExchangeSettingsServiceImpl implements ExchangeSettingsService {
             );
 
             return r.getStatusCode().is2xxSuccessful();
-
         } catch (Exception e) {
             return false;
         }
@@ -250,23 +177,15 @@ public class ExchangeSettingsServiceImpl implements ExchangeSettingsService {
 
     private boolean testBybitConnectionQuick(ExchangeSettings s) {
         try {
-            String base;
-
-            if (s.getNetwork() == NetworkType.TESTNET) {
-                // ⚠️ TESTNET для BYBIT = DEMO
-                base = "https://api-demo.bybit.com";
-            } else {
-                base = "https://api.bybit.com";
-            }
+            String base = (s.getNetwork() == NetworkType.TESTNET)
+                    ? "https://api-demo.bybit.com"
+                    : "https://api.bybit.com";
 
             long ts = System.currentTimeMillis();
             String recv = "5000";
             String query = "accountType=UNIFIED";
 
-            String sign = hmacSha256(
-                    ts + s.getApiKey() + recv + query,
-                    s.getApiSecret()
-            );
+            String sign = hmacSha256(ts + s.getApiKey() + recv + query, s.getApiSecret());
 
             HttpHeaders h = new HttpHeaders();
             h.set("X-BAPI-API-KEY", s.getApiKey());
@@ -282,34 +201,16 @@ public class ExchangeSettingsServiceImpl implements ExchangeSettingsService {
             );
 
             return r.getStatusCode().is2xxSuccessful();
-
         } catch (Exception e) {
-            log.warn("Bybit quick test failed", e);
+            log.warn("Bybit quick test failed: {}", e.getMessage());
             return false;
         }
     }
 
-    // ========================================================================
-    // helpers
-    // ========================================================================
-    private boolean isBlank(String s) {
-        return s == null || s.trim().isEmpty();
-    }
+    // =====================================================================
+    // DIAGNOSE
+    // =====================================================================
 
-    private String hmacSha256(String data, String secret) {
-        try {
-            Mac mac = Mac.getInstance("HmacSHA256");
-            mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
-            byte[] h = mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
-
-            StringBuilder sb = new StringBuilder();
-            for (byte b : h) sb.append(String.format("%02x", b));
-            return sb.toString();
-
-        } catch (Exception e) {
-            throw new RuntimeException("HMAC-SHA256 error", e);
-        }
-    }
     private ApiKeyDiagnostics diagnoseBinance(ExchangeSettings s) {
 
         String base = (s.getNetwork() == NetworkType.TESTNET)
@@ -342,18 +243,14 @@ public class ExchangeSettingsServiceImpl implements ExchangeSettingsService {
                     .signatureValid(true)
                     .accountReadable(true)
                     .tradingAllowed(true)
-                    .ipAllowed(true)      // запрос прошёл → IP разрешён
+                    .ipAllowed(true)
                     .networkOk(true)
-                    .extra(Map.of(
-                            "balances", json.optJSONArray("balances") != null
-                    ))
+                    .extra(Map.of("balancesPresent", json.optJSONArray("balances") != null))
                     .build();
 
         } catch (HttpClientErrorException e) {
 
             int status = e.getStatusCode().value();
-
-            // 401 / 403 — почти всегда IP whitelist или ключ
             boolean ipBlocked = status == 401 || status == 403;
 
             return ApiKeyDiagnostics.builder()
@@ -365,12 +262,11 @@ public class ExchangeSettingsServiceImpl implements ExchangeSettingsService {
                     .signatureValid(true)
                     .accountReadable(false)
                     .tradingAllowed(false)
-                    .ipAllowed(!ipBlocked)   // ❌ если 401/403 — IP не разрешён
+                    .ipAllowed(!ipBlocked)
                     .networkOk(true)
                     .build();
 
         } catch (Exception e) {
-
             return ApiKeyDiagnostics.builder()
                     .ok(false)
                     .exchange("BINANCE")
@@ -379,7 +275,6 @@ public class ExchangeSettingsServiceImpl implements ExchangeSettingsService {
                     .build();
         }
     }
-
 
     private ApiKeyDiagnostics diagnoseBybit(ExchangeSettings s) {
 
@@ -392,10 +287,7 @@ public class ExchangeSettingsServiceImpl implements ExchangeSettingsService {
             String recv = "5000";
             String query = "accountType=UNIFIED";
 
-            String sign = hmacSha256(
-                    ts + s.getApiKey() + recv + query,
-                    s.getApiSecret()
-            );
+            String sign = hmacSha256(ts + s.getApiKey() + recv + query, s.getApiSecret());
 
             HttpHeaders h = new HttpHeaders();
             h.set("X-BAPI-API-KEY", s.getApiKey());
@@ -412,7 +304,6 @@ public class ExchangeSettingsServiceImpl implements ExchangeSettingsService {
 
             JSONObject json = new JSONObject(r.getBody());
             int retCode = json.optInt("retCode", -1);
-
             boolean ok = retCode == 0;
 
             return ApiKeyDiagnostics.builder()
@@ -424,8 +315,7 @@ public class ExchangeSettingsServiceImpl implements ExchangeSettingsService {
                     .signatureValid(ok)
                     .accountReadable(ok)
                     .tradingAllowed(ok)
-                    // 🔥 ВАЖНО
-                    .ipAllowed(true)          // если запрос прошёл — IP разрешён
+                    .ipAllowed(true)
                     .networkOk(true)
                     .extra(Map.of(
                             "retCode", retCode,
@@ -435,26 +325,22 @@ public class ExchangeSettingsServiceImpl implements ExchangeSettingsService {
 
         } catch (HttpClientErrorException e) {
 
-            // 👇 Реальный признак IP whitelist
-            boolean ipBlocked =
-                    e.getStatusCode().value() == 401 ||
-                    e.getStatusCode().value() == 403;
+            boolean ipBlocked = e.getStatusCode().value() == 401 || e.getStatusCode().value() == 403;
 
             return ApiKeyDiagnostics.builder()
                     .ok(false)
                     .exchange("BYBIT")
-                    .message("Bybit API error: " + e.getStatusCode())
+                    .message("Bybit API error: " + e.getStatusCode().value())
                     .apiKeyValid(true)
                     .secretValid(true)
                     .signatureValid(true)
                     .accountReadable(false)
                     .tradingAllowed(false)
-                    .ipAllowed(!ipBlocked)   // ❌ если 401/403 — IP не разрешён
+                    .ipAllowed(!ipBlocked)
                     .networkOk(true)
                     .build();
 
         } catch (Exception e) {
-
             return ApiKeyDiagnostics.builder()
                     .ok(false)
                     .exchange("BYBIT")
@@ -464,20 +350,37 @@ public class ExchangeSettingsServiceImpl implements ExchangeSettingsService {
         }
     }
 
+    // =====================================================================
+    // HELPERS
+    // =====================================================================
 
-    public static ApiKeyDiagnostics notConfigured(String exchange, String message) {
-        return ApiKeyDiagnostics.builder()
-                .ok(false)
-                .exchange(exchange)
-                .message(message)
-                .apiKeyValid(false)
-                .secretValid(false)
-                .signatureValid(false)
-                .accountReadable(false)
-                .tradingAllowed(false)
-                .ipAllowed(false)
-                .networkOk(true)
-                .build();
+    private String normalizeExchange(String exchange) {
+        return (exchange == null || exchange.isBlank())
+                ? "BINANCE"
+                : exchange.trim().toUpperCase();
     }
 
+    private boolean isBlank(String s) {
+        return s == null || s.trim().isEmpty();
+    }
+
+    private String normalizeNullable(String s) {
+        if (s == null) return null;
+        String v = s.trim();
+        return v.isEmpty() ? null : v;
+    }
+
+    private String hmacSha256(String data, String secret) {
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+            byte[] h = mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
+
+            StringBuilder sb = new StringBuilder();
+            for (byte b : h) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (Exception e) {
+            throw new RuntimeException("HMAC-SHA256 error", e);
+        }
+    }
 }

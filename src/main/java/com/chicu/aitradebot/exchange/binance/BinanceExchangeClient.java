@@ -63,7 +63,7 @@ public class BinanceExchangeClient implements ExchangeClient {
     private ExchangeSettings resolve(Long chatId) {
         return settingsService.findAllByChatId(chatId)
                 .stream()
-                .filter(ExchangeSettings::isEnabled)
+
                 .findFirst()
                 .orElseGet(() -> settingsService.getOrCreate(chatId, "BINANCE", NetworkType.MAINNET));
     }

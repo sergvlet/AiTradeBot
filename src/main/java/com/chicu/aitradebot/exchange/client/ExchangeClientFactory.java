@@ -103,8 +103,7 @@ public class ExchangeClientFactory {
 
         // ✅ ENABLED + самая свежая
         ExchangeSettings settings = list.stream()
-                .filter(ExchangeSettings::isEnabled)
-                .sorted((a, b) -> b.getUpdatedAt().compareTo(a.getUpdatedAt()))
+
                 .findFirst()
                 .orElseThrow(() -> new IllegalStateException(
                         "❌ У пользователя нет включённых exchange settings: chatId=" + chatId

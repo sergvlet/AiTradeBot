@@ -9,16 +9,6 @@
 
     <meta name="viewport" content="width=device-width, initial-scale=1">
 
-    <!-- ===================================================== -->
-    <!-- THEME INIT — ДО ВСЕГО -->
-    <!-- ===================================================== -->
-    <script>
-        (function () {
-            const theme = localStorage.getItem("aitrade_theme") || "dark";
-            document.documentElement.setAttribute("data-theme", theme);
-        })();
-    </script>
-
     <!-- Bootstrap -->
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
 
@@ -47,18 +37,16 @@
             </th:block>
         </th:block>
     </th:block>
-
-    <!-- Lightweight Charts -->
-    <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 
 <body class="app-body" id="app-body">
 
+<!-- ✅ Тема один раз, сразу на body (чтобы не мигало) -->
 <script>
-    document.body.setAttribute(
-        "data-theme",
-        document.documentElement.getAttribute("data-theme")
-    );
+    (function () {
+        const theme = localStorage.getItem("aitrade_theme") || "dark";
+        document.body.setAttribute("data-theme", theme);
+    })();
 </script>
 
 <div class="page-wrapper">
@@ -87,46 +75,50 @@
 </div>
 
 <!-- ===================================================== -->
-<!-- JS — ПОРЯДОК КРИТИЧЕН -->
+<!-- JS — порядок важен -->
 <!-- ===================================================== -->
 
 <!-- Bootstrap -->
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 
 <!-- GLOBAL JS -->
-<script th:src="@{/js/app.js}"></script>
-
-<!-- ================== 🔥 SockJS + STOMP (ДО MODULE) ================== -->
-<script src="https://cdn.jsdelivr.net/npm/sockjs-client@1.6.1/dist/sockjs.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/stompjs@2.3.3/lib/stomp.min.js"></script>
-
-<script>
-    // 🔒 ЖЁСТКАЯ ПРОВЕРКА — если тут ошибка, дальше смысла нет
-    if (typeof SockJS === "undefined") {
-        console.error("❌ SockJS НЕ загружен");
-    }
-    if (typeof Stomp === "undefined") {
-        console.error("❌ Stomp НЕ загружен");
-    }
-</script>
-
-<!-- ====================== PAGE JS ====================== -->
+<script th:src="@{/js/app.js}" defer></script>
 
 <!-- ✅ STRATEGIES LIST ( /strategies ) -->
 <th:block th:if="${page == 'strategies'}">
     <script th:src="@{/js/views/strategies/strategies.js}" defer></script>
 </th:block>
 
-<!-- ✅ SETTINGS ( /strategies/{TYPE}/config и т.п. ) -->
+<!-- ✅ SETTINGS ( /strategies/{TYPE}/config ) -->
 <th:block th:if="${page == 'strategies/settings' or page == 'settings'}">
-    <script th:src="@{/js/strategies/network.tab.js}" defer></script>
-    <script th:src="@{/js/views/strategies/symbol-picker.js}" defer></script>
-    <script th:src="@{/js/views/strategies/settings.js}" defer></script>
+
+    <!-- base api -->
+    <script th:src="@{/js/views/strategies/settings/api.js}" defer></script>
+    <script th:src="@{/js/views/strategies/settings/form-change-tracker.js}" defer></script>
+
+    <!-- tabs (window.SettingsTab*) -->
+    <script th:src="@{/js/views/strategies/settings/tabs/network.js}" defer></script>
+    <script th:src="@{/js/views/strategies/settings/tabs/general.js}" defer></script>
+    <script th:src="@{/js/views/strategies/settings/tabs/risk.js}" defer></script>
+    <script th:src="@{/js/views/strategies/settings/tabs/market.js}" defer></script>
+    <script th:src="@{/js/views/strategies/settings/tabs/advanced.js}" defer></script>
+
+    <!-- main -->
+    <script th:src="@{/js/views/strategies/settings/page.js}" defer></script>
+
+    <!-- ❌ LEGACY удаляем (иначе будут двойные обработчики и гонки) -->
 </th:block>
 
 <!-- ✅ STRATEGY DASHBOARD -->
 <th:block th:if="${page == 'strategy_dashboard' or page == 'strategies/strategy_dashboard'}">
-    <!-- module идёт ПОСЛЕ stomp -->
+
+    <!-- Lightweight Charts нужен только тут -->
+    <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
+
+    <!-- SockJS + STOMP нужны только тут -->
+    <script src="https://cdn.jsdelivr.net/npm/sockjs-client@1.6.1/dist/sockjs.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/stompjs@2.3.3/lib/stomp.min.js"></script>
+
     <script type="module" th:src="@{/js/views/strategies/strategy-dashboard.js}"></script>
 </th:block>
 
@@ -139,7 +131,6 @@
                   and page != 'settings'}">
     <script th:src="@{'/js/views/' + ${page} + '.js'}" defer></script>
 </th:block>
-
 
 </body>
 </html>

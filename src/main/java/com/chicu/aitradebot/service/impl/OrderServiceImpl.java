@@ -486,15 +486,13 @@ public class OrderServiceImpl implements OrderService {
 
     private NetworkType resolveNetworkType(Long chatId, String exchangeName) {
         try {
-            Comparator<ExchangeSettings> byUpdated =
-                    Comparator.comparing(ExchangeSettings::getUpdatedAt, Comparator.nullsLast(Comparator.naturalOrder()));
 
             return exchangeSettingsService
                     .findAllByChatId(chatId)
                     .stream()
-                    .filter(ExchangeSettings::isEnabled)
+
                     .filter(s -> exchangeName != null && exchangeName.equalsIgnoreCase(s.getExchange()))
-                    .sorted(byUpdated.reversed())
+
                     .map(ExchangeSettings::getNetwork)
                     .findFirst()
                     .orElse(NetworkType.MAINNET);
