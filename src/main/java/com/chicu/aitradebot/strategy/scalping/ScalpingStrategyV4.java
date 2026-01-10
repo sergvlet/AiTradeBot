@@ -488,28 +488,36 @@ public class ScalpingStrategyV4 implements TradingStrategy {
     }
 
     // =====================================================
-    // FINGERPRINT
-    // =====================================================
+// FINGERPRINT
+// =====================================================
     private String buildSettingsFingerprint(StrategySettings ss, ScalpingStrategySettings sc) {
         if (ss == null && sc == null) return "null";
 
+        // StrategySettings (unified) — только существующие поля
         String symbol = ss != null ? safeUpper(ss.getSymbol()) : "null";
-        String ex = ss != null ? String.valueOf(ss.getExchangeName()) : "null";
-        String net = ss != null ? String.valueOf(ss.getNetworkType()) : "null";
-        String tf = ss != null ? safe(ss.getTimeframe()) : "null";
+        String ex     = ss != null ? String.valueOf(ss.getExchangeName()) : "null";
+        String net    = ss != null ? String.valueOf(ss.getNetworkType()) : "null";
+        String tf     = ss != null ? safe(ss.getTimeframe()) : "null";
 
-        String tp = ss != null ? bd(ss.getTakeProfitPct()) : "null";
-        String sl = ss != null ? bd(ss.getStopLossPct()) : "null";
-        String comm = ss != null ? bd(ss.getCommissionPct()) : "null";
-        String cooldown = ss != null && ss.getCooldownSeconds() != null ? String.valueOf(ss.getCooldownSeconds()) : "null";
+        String candles  = ss != null && ss.getCachedCandlesLimit() != null
+                ? String.valueOf(ss.getCachedCandlesLimit())
+                : "null";
 
-        String window = sc != null && sc.getWindowSize() != null ? String.valueOf(sc.getWindowSize()) : "null";
-        String thr = sc != null ? num(sc.getPriceChangeThreshold()) : "null";
+        String cooldown = ss != null && ss.getCooldownSeconds() != null
+                ? String.valueOf(ss.getCooldownSeconds())
+                : "null";
+
+        // ScalpingStrategySettings — локальные параметры
+        String window = sc != null && sc.getWindowSize() != null
+                ? String.valueOf(sc.getWindowSize())
+                : "null";
+
+        String thr    = sc != null ? num(sc.getPriceChangeThreshold()) : "null";
         String spread = sc != null ? num(sc.getSpreadThreshold()) : "null";
 
         return symbol + "|" + ex + "|" + net + "|" + tf
-               + "|" + window + "|" + thr + "|" + spread
-               + "|" + tp + "|" + sl + "|" + comm + "|" + cooldown;
+               + "|" + candles + "|" + cooldown
+               + "|" + window + "|" + thr + "|" + spread;
     }
 
     // =====================================================

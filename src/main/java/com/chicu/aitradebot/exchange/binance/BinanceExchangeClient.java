@@ -7,10 +7,8 @@ import com.chicu.aitradebot.exchange.client.ExchangeClient;
 import com.chicu.aitradebot.exchange.enums.OrderSide;
 import com.chicu.aitradebot.exchange.model.AccountFees;
 import com.chicu.aitradebot.exchange.model.AccountInfo;
-import com.chicu.aitradebot.exchange.model.ApiKeyDiagnostics;
 import com.chicu.aitradebot.exchange.model.Order;
 import com.chicu.aitradebot.exchange.service.ExchangeSettingsService;
-import com.chicu.aitradebot.market.model.ExchangeLimitScope;
 import com.chicu.aitradebot.market.model.SymbolDescriptor;
 import lombok.extern.slf4j.Slf4j;
 import org.json.JSONArray;
@@ -54,8 +52,6 @@ public class BinanceExchangeClient implements ExchangeClient {
         return "BINANCE";
     }
 
-
-
     private String baseUrl(NetworkType net) {
         return net == NetworkType.TESTNET ? TEST : MAIN;
     }
@@ -63,7 +59,6 @@ public class BinanceExchangeClient implements ExchangeClient {
     private ExchangeSettings resolve(Long chatId) {
         return settingsService.findAllByChatId(chatId)
                 .stream()
-
                 .findFirst()
                 .orElseGet(() -> settingsService.getOrCreate(chatId, "BINANCE", NetworkType.MAINNET));
     }
@@ -80,7 +75,7 @@ public class BinanceExchangeClient implements ExchangeClient {
     public List<Kline> getKlines(String symbol, String interval, int limit) throws Exception {
 
         String url = MAIN + "/api/v3/klines?symbol=" + symbol +
-                "&interval=" + interval + "&limit=" + limit;
+                     "&interval=" + interval + "&limit=" + limit;
 
         JSONArray arr = new JSONArray(rest.getForObject(url, String.class));
         List<Kline> out = new ArrayList<>();
@@ -131,7 +126,6 @@ public class BinanceExchangeClient implements ExchangeClient {
             throw new RuntimeException("Ошибка подписи Binance", e);
         }
     }
-
 
     private String signedRequest(
             ExchangeSettings s,
@@ -331,7 +325,7 @@ public class BinanceExchangeClient implements ExchangeClient {
             String sign = hmac(query, s.getApiSecret());
 
             String url = baseUrl(networkType) + "/api/v3/account"
-                    + "?" + query + "&signature=" + sign;
+                         + "?" + query + "&signature=" + sign;
 
             HttpHeaders h = new HttpHeaders();
             h.set("X-MBX-APIKEY", s.getApiKey());
@@ -350,7 +344,7 @@ public class BinanceExchangeClient implements ExchangeClient {
                     .anyMatch(o -> {
                         Map<?, ?> m = (Map<?, ?>) o;
                         return "BNB".equalsIgnoreCase((String) m.get("asset"))
-                                && Double.parseDouble((String) m.get("free")) > 0.0001;
+                               && Double.parseDouble((String) m.get("free")) > 0.0001;
                     });
 
             double makerDiscount = hasBNB ? maker * 0.75 : maker;
@@ -378,7 +372,6 @@ public class BinanceExchangeClient implements ExchangeClient {
                     .build();
         }
     }
-
 
     @Override
     public AccountFees getAccountFees(long chatId, NetworkType networkType) {
@@ -465,12 +458,13 @@ public class BinanceExchangeClient implements ExchangeClient {
             if (!spotAllowed) continue;
 
             // =====================================================
-            // 4) Разбор filters (ТОЛЬКО ЗНАЧЕНИЯ)
+            // 4) Разбор filters (значения)
+            //    ✅ ВАЖНО: Binance часто отдаёт NOTIONAL вместо MIN_NOTIONAL
             // =====================================================
             BigDecimal minNotional = null;
-            BigDecimal stepSize    = null;
-            BigDecimal tickSize    = null;
-            Integer maxOrders      = null;
+            BigDecimal stepSize = null;
+            BigDecimal tickSize = null;
+            Integer maxOrders = null;
 
             JSONArray filters = s.getJSONArray("filters");
             for (int f = 0; f < filters.length(); f++) {
@@ -479,14 +473,22 @@ public class BinanceExchangeClient implements ExchangeClient {
 
                 switch (type) {
 
-                    case "MIN_NOTIONAL" ->
-                            minNotional = bdOrNull(filter.optString("minNotional", null));
+                    // ✅ поддерживаем оба варианта
+                    case "MIN_NOTIONAL", "NOTIONAL" -> {
+                        BigDecimal v = bdOrNull(filter.optString("minNotional", null));
+                        if (v != null) minNotional = v;
+                    }
 
-                    case "LOT_SIZE" ->
-                            stepSize = bdOrNull(filter.optString("stepSize", null));
+                    // ✅ для market тоже бывает отдельный фильтр
+                    case "LOT_SIZE", "MARKET_LOT_SIZE" -> {
+                        BigDecimal v = bdOrNull(filter.optString("stepSize", null));
+                        if (v != null) stepSize = v;
+                    }
 
-                    case "PRICE_FILTER" ->
-                            tickSize = bdOrNull(filter.optString("tickSize", null));
+                    case "PRICE_FILTER" -> {
+                        BigDecimal v = bdOrNull(filter.optString("tickSize", null));
+                        if (v != null) tickSize = v;
+                    }
 
                     case "MAX_NUM_ORDERS" -> {
                         int v = filter.optInt("maxNumOrders", 0);
@@ -510,7 +512,7 @@ public class BinanceExchangeClient implements ExchangeClient {
                     t != null ? bdOrNull(t.optString("quoteVolume", null)) : null;
 
             // =====================================================
-            // 6) Итоговый SymbolDescriptor (ЕДИНЫЙ ИСТОЧНИК SCOPE)
+            // 6) Итоговый SymbolDescriptor
             // =====================================================
             out.add(SymbolDescriptor.of(
                     symbol,
@@ -531,11 +533,12 @@ public class BinanceExchangeClient implements ExchangeClient {
         return out;
     }
 
-
     private BigDecimal bdOrNull(String v) {
         if (v == null || v.isBlank() || "null".equalsIgnoreCase(v)) return null;
-        try { return new BigDecimal(v); } catch (Exception e) { return null; }
+        try {
+            return new BigDecimal(v);
+        } catch (Exception e) {
+            return null;
+        }
     }
-
-
 }

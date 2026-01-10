@@ -10,7 +10,17 @@ import java.math.BigDecimal;
 import java.time.LocalDateTime;
 
 @Entity
-@Table(name = "strategy_settings")
+@Table(
+        name = "strategy_settings",
+        uniqueConstraints = @UniqueConstraint(
+                name = "uk_strategy_settings_ctx",
+                columnNames = {"chat_id", "type", "exchange_name", "network_type"}
+        ),
+        indexes = {
+                @Index(name = "ix_strategy_settings_chat", columnList = "chat_id"),
+                @Index(name = "ix_strategy_settings_ctx", columnList = "chat_id,type,exchange_name,network_type")
+        }
+)
 @Getter
 @Setter
 @NoArgsConstructor
@@ -23,18 +33,25 @@ public class StrategySettings {
     private Long id;
 
     // =====================================================================
-    // ИДЕНТИФИКАЦИЯ
+    // ИДЕНТИФИКАЦИЯ / КОНТЕКСТ
     // =====================================================================
 
-    @Column(nullable = false)
+    @Column(name = "chat_id", nullable = false)
     private Long chatId;
 
     @Enumerated(EnumType.STRING)
     @Column(nullable = false, length = 32)
     private StrategyType type;
 
+    @Column(name = "exchange_name", nullable = false, length = 32)
+    private String exchangeName;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "network_type", nullable = false, length = 16)
+    private NetworkType networkType;
+
     // =====================================================================
-    // ИНСТРУМЕНТ
+    // ИНСТРУМЕНТ / ДАННЫЕ
     // =====================================================================
 
     @Column(nullable = false, length = 32)
@@ -44,104 +61,75 @@ public class StrategySettings {
     private String timeframe;
 
     @Builder.Default
-    @Column(name = "cached_candles_limit")
+    @Column(name = "cached_candles_limit", nullable = false)
     private Integer cachedCandlesLimit = 500;
 
     // =====================================================================
-    // КАПИТАЛ / РИСК (LEGACY — потом можно удалить)
+    // GENERAL: АКТИВ / БЮДЖЕТ / ДНЕВНОЙ ЛИМИТ / РЕИНВЕСТ
     // =====================================================================
 
-    /** ⚠️ Историческое поле. В перспективе капитал должен браться с биржи. */
-    @Column(precision = 18, scale = 6)
-    private BigDecimal capitalUsd;
-
-    /** Актив аккаунта (USDT, BTC, ETH и т.д.) */
     @Column(name = "account_asset", length = 16)
     private String accountAsset;
 
-    @Builder.Default
-    @Column(nullable = false, precision = 10, scale = 6)
-    private BigDecimal commissionPct = BigDecimal.valueOf(0.05);
+    /** Бюджет стратегии в USD (если задан — лимитирует максимальную аллокацию) */
+    @Column(name = "max_exposure_usd", precision = 18, scale = 6)
+    private BigDecimal maxExposureUsd;
 
-    @Column(precision = 10, scale = 4)
-    private BigDecimal riskPerTradePct;
+    /** Бюджет стратегии в % от доступного баланса (если задан) */
+    @Column(name = "max_exposure_pct", precision = 10, scale = 4)
+    private BigDecimal maxExposurePct;
 
-    @Column(precision = 10, scale = 4)
+    /** Максимальная потеря за день (%) */
+    @Column(name = "daily_loss_limit_pct", precision = 10, scale = 4)
     private BigDecimal dailyLossLimitPct;
 
     @Builder.Default
-    @Column(nullable = false)
+    @Column(name = "reinvest_profit", nullable = false)
     private boolean reinvestProfit = false;
 
-    /** ⚠️ Историческое поле */
+    // =====================================================================
+    // RISK: ЛИМИТЫ / АНТИТИЛЬТ / ПРЕДОХРАНИТЕЛИ
+    // =====================================================================
+
+    /** Риск на сделку (%) */
+    @Column(name = "risk_per_trade_pct", precision = 10, scale = 4)
+    private BigDecimal riskPerTradePct;
+
+    /** Мин. Risk/Reward */
+    @Column(name = "min_risk_reward", precision = 10, scale = 4)
+    private BigDecimal minRiskReward;
+
+    /** Плечо (для спота обычно 1; держим универсально) */
     @Builder.Default
+    @Column(nullable = false)
     private int leverage = 1;
 
-    // =====================================================================
-    // ЛИМИТЫ ИСПОЛЬЗОВАНИЯ СРЕДСТВ (LEGACY)
-    // =====================================================================
+    @Column(name = "allow_averaging")
+    private Boolean allowAveraging;
 
-    @Column(precision = 18, scale = 6)
-    private BigDecimal maxExposureUsd;
+    @Column(name = "cooldown_after_loss_seconds")
+    private Integer cooldownAfterLossSeconds;
 
-    @Column(precision = 5, scale = 2)
-    private Integer maxExposurePct;
+    @Column(name = "max_consecutive_losses")
+    private Integer maxConsecutiveLosses;
 
-    // =====================================================================
-    // TP / SL
-    // =====================================================================
+    @Column(name = "max_drawdown_pct", precision = 10, scale = 4)
+    private BigDecimal maxDrawdownPct;
 
-    @Builder.Default
-    @Column(nullable = false, precision = 10, scale = 6)
-    private BigDecimal takeProfitPct = BigDecimal.valueOf(1.0);
+    @Column(name = "max_drawdown_usd", precision = 18, scale = 6)
+    private BigDecimal maxDrawdownUsd;
 
-    @Builder.Default
-    @Column(nullable = false, precision = 10, scale = 6)
-    private BigDecimal stopLossPct = BigDecimal.valueOf(1.0);
+    @Column(name = "max_position_pct", precision = 10, scale = 4)
+    private BigDecimal maxPositionPct;
 
-    // =====================================================================
-    // AI / УПРАВЛЕНИЕ
-    // =====================================================================
+    @Column(name = "max_position_usd", precision = 18, scale = 6)
+    private BigDecimal maxPositionUsd;
 
-    @Enumerated(EnumType.STRING)
-    @Column(nullable = false, length = 16)
-    @Builder.Default
-    private AdvancedControlMode advancedControlMode = AdvancedControlMode.MANUAL;
-
-    @Builder.Default
-    @Column(precision = 10, scale = 6)
-    private BigDecimal mlConfidence = BigDecimal.ZERO;
+    @Column(name = "max_trades_per_day")
+    private Integer maxTradesPerDay;
 
     // =====================================================================
-    // PnL / СТАТИСТИКА
-    // =====================================================================
-
-    @Builder.Default
-    @Column(precision = 12, scale = 6)
-    private BigDecimal totalProfitPct = BigDecimal.ZERO;
-
-    // =====================================================================
-    // СОСТОЯНИЕ СТРАТЕГИИ
-    // =====================================================================
-
-    @Builder.Default
-    private boolean active = false;
-
-    @Builder.Default
-    private int version = 1;
-
-    // =====================================================================
-    // БИРЖА / СЕТЬ
-    // =====================================================================
-
-    @Column(length = 32)
-    private String exchangeName;
-
-    @Enumerated(EnumType.STRING)
-    private NetworkType networkType;
-
-    // =====================================================================
-    // ОГРАНИЧЕНИЯ СТРАТЕГИИ (LEGACY)
+    // TRADE: ОГРАНИЧЕНИЯ СТРАТЕГИИ
     // =====================================================================
 
     @Column(name = "max_open_orders")
@@ -151,65 +139,40 @@ public class StrategySettings {
     private Integer cooldownSeconds;
 
     // =====================================================================
-    // ✅ NEW (RISK V2) — добавлено, чтобы не падали Hibernate/Thymeleaf
-    // Потом ненужное можно удалить одним блоком
+    // ADVANCED: РЕЖИМ УПРАВЛЕНИЯ + AI метрики
     // =====================================================================
 
-    /** Разрешить усреднение позиции */
-    @Column(name = "allow_averaging")
-    private Boolean allowAveraging;
+    @Enumerated(EnumType.STRING)
+    @Column(name = "advanced_control_mode", nullable = false, length = 16)
+    @Builder.Default
+    private AdvancedControlMode advancedControlMode = AdvancedControlMode.MANUAL;
 
-    /** Пауза после убыточной сделки (в БД колонка так называется) */
-    @Column(name = "cooldown_after_loss_seconds")
-    private Integer cooldownAfterLossSeconds;
+    @Builder.Default
+    @Column(name = "ml_confidence", precision = 10, scale = 6, nullable = false)
+    private BigDecimal mlConfidence = BigDecimal.ZERO;
 
-    /** Макс. подряд убыточных сделок */
-    @Column(name = "max_consecutive_losses")
-    private Integer maxConsecutiveLosses;
-
-    /** Макс. просадка в процентах */
-    @Column(name = "max_drawdown_pct", precision = 10, scale = 4)
-    private BigDecimal maxDrawdownPct;
-
-    /** Макс. просадка в USD */
-    @Column(name = "max_drawdown_usd", precision = 18, scale = 6)
-    private BigDecimal maxDrawdownUsd;
-
-    /** Макс. размер позиции в % */
-    @Column(name = "max_position_pct", precision = 5, scale = 2)
-    private BigDecimal maxPositionPct;
-
-    /** Макс. размер позиции в USD */
-    @Column(name = "max_position_usd", precision = 18, scale = 6)
-    private BigDecimal maxPositionUsd;
-
-    /** Макс. сделок в день */
-    @Column(name = "max_trades_per_day")
-    private Integer maxTradesPerDay;
-
-    /** Мин. риск/прибыль (RR) */
-    @Column(name = "min_risk_reward", precision = 10, scale = 4)
-    private BigDecimal minRiskReward;
+    @Builder.Default
+    @Column(name = "total_profit_pct", precision = 12, scale = 6, nullable = false)
+    private BigDecimal totalProfitPct = BigDecimal.ZERO;
 
     // =====================================================================
-    // ВРЕМЯ ЖИЗНИ ЗАПИСИ
+    // СОСТОЯНИЕ / ВРЕМЯ
     // =====================================================================
+
+    @Builder.Default
+    @Column(nullable = false)
+    private boolean active = false;
+
+    private LocalDateTime startedAt;
+    private LocalDateTime stoppedAt;
 
     @Column(nullable = false, updatable = false)
     private LocalDateTime createdAt;
 
     private LocalDateTime updatedAt;
 
-    // =====================================================================
-    // ВРЕМЯ ЗАПУСКА / ОСТАНОВКИ СТРАТЕГИИ
-    // =====================================================================
-
-    private LocalDateTime startedAt;
-    private LocalDateTime stoppedAt;
-
-    // =====================================================================
-    // JPA HOOKS
-    // =====================================================================
+    @Version
+    private Integer version;
 
     @PrePersist
     protected void onCreate() {
@@ -221,34 +184,5 @@ public class StrategySettings {
     @PreUpdate
     protected void onUpdate() {
         this.updatedAt = LocalDateTime.now();
-    }
-
-    // =====================================================================
-    // ✅ ALIASES ДЛЯ СОВМЕСТИМОСТИ С THYMELEAF (чтобы не править шаблон сейчас)
-    // =====================================================================
-
-    @Transient
-    public Integer getPauseAfterLossSeconds() {
-        return this.cooldownAfterLossSeconds;
-    }
-
-    public void setPauseAfterLossSeconds(Integer v) {
-        this.cooldownAfterLossSeconds = v;
-    }
-
-    // =====================================================================
-    // СОВМЕСТИМОСТЬ / УТИЛИТЫ
-    // =====================================================================
-
-    @Transient
-    public StrategyType getStrategyType() {
-        return this.type;
-    }
-
-    @Transient
-    public String getStrategyName() {
-        return (this.type != null)
-                ? this.type.name().replace('_', ' ')
-                : "Unknown";
     }
 }

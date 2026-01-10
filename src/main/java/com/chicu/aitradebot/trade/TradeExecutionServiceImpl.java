@@ -37,6 +37,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                                     StrategySettings ss) {
 
         if (chatId == null) return EntryResult.fail("chatId=null");
+        if (strategyType == null) return EntryResult.fail("strategyType=null");
         if (ss == null) return EntryResult.fail("StrategySettings=null");
         if (symbol == null || symbol.isBlank()) return EntryResult.fail("symbol пустой");
         if (price == null || price.signum() <= 0) return EntryResult.fail("price invalid");
@@ -46,12 +47,18 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             return EntryResult.fail("SPOT: entry только BUY (diff<=0)");
         }
 
-        String side = "BUY";
+        // контекст обязателен (иначе баланс/лимиты не проверить корректно)
+        if (ss.getExchangeName() == null || ss.getExchangeName().isBlank()) {
+            return EntryResult.fail("exchangeName пустой в StrategySettings");
+        }
+        if (ss.getNetworkType() == null) {
+            return EntryResult.fail("networkType пустой в StrategySettings");
+        }
 
-        // сумма входа в QUOTE (например USDT)
+        // сумма входа в QUOTE (USDT/USDC/...)
         BigDecimal quoteAmount = resolveQuoteAmount(chatId, strategyType, ss);
         if (quoteAmount == null || quoteAmount.signum() <= 0) {
-            return EntryResult.fail("нет средств: проверь accountAsset/баланс или capitalUsd");
+            return EntryResult.fail("недостаточно средств/лимит бюджета/риск=0");
         }
 
         // qty BASE = quoteAmount / price
@@ -60,15 +67,13 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                 .stripTrailingZeros();
 
         if (qty.signum() <= 0) {
-            return EntryResult.fail("qty=0: мало средств или слишком высокая цена/малый риск");
+            return EntryResult.fail("qty=0: мало средств или слишком высокая цена");
         }
 
-        // TP/SL (%)
-        BigDecimal tpPct = nz(ss.getTakeProfitPct());
-        BigDecimal slPct = nz(ss.getStopLossPct());
-
-        BigDecimal tp = price.multiply(BigDecimal.ONE.add(tpPct.divide(BigDecimal.valueOf(100), 10, RoundingMode.HALF_UP)));
-        BigDecimal sl = price.multiply(BigDecimal.ONE.subtract(slPct.divide(BigDecimal.valueOf(100), 10, RoundingMode.HALF_UP)));
+        // ❗ TP/SL здесь НЕ вычисляем: они больше не в StrategySettings.
+        // Их должен отдавать слой стратегии/параметров (из таблицы конкретной стратегии).
+        BigDecimal tp = null;
+        BigDecimal sl = null;
 
         // сигнал в UI
         live.pushSignal(chatId, strategyType, symbol, null, Signal.buy(price.doubleValue(), "entry"));
@@ -76,7 +81,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         Order order = orderService.placeMarket(
                 chatId,
                 symbol,
-                side,
+                "BUY",
                 qty,
                 price,
                 strategyType.name()
@@ -84,10 +89,10 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
 
         Long orderId = order != null ? order.getId() : null;
 
-        log.info("[TRADE] ENTRY SPOT BUY {} qty={} price={} tp={} sl={} quoteAmount={} (chatId={})",
-                symbol, qty, price, tp, sl, quoteAmount, chatId);
+        log.info("[TRADE] ENTRY SPOT BUY {} qty={} price={} quoteAmount={} chatId={}",
+                symbol, qty, price, quoteAmount, chatId);
 
-        return EntryResult.ok(true, side, qty, price, tp, sl, orderId);
+        return EntryResult.ok(true, "BUY", qty, price, tp, sl, orderId);
     }
 
     @Override
@@ -101,80 +106,107 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                                        BigDecimal tp,
                                        BigDecimal sl) {
 
+        if (chatId == null) return ExitResult.fail("chatId=null");
+        if (strategyType == null) return ExitResult.fail("strategyType=null");
+        if (symbol == null || symbol.isBlank()) return ExitResult.fail("symbol пустой");
         if (price == null || price.signum() <= 0) return ExitResult.fail("price invalid");
         if (entryQty == null || entryQty.signum() <= 0) return ExitResult.fail("entryQty invalid");
         if (tp == null || sl == null) return ExitResult.fail("tp/sl null");
 
-        // ✅ SPOT: у нас всегда long, но на всякий случай
-        if (!isLong) {
-            return ExitResult.fail("SPOT: short запрещён");
-        }
+        // ✅ SPOT: у нас всегда long
+        if (!isLong) return ExitResult.fail("SPOT: short запрещён");
 
         boolean tpHit = price.compareTo(tp) >= 0;
         boolean slHit = price.compareTo(sl) <= 0;
 
         if (!tpHit && !slHit) return ExitResult.fail("not hit");
 
-        String exitSide = "SELL";
-
         orderService.placeMarket(
                 chatId,
                 symbol,
-                exitSide,
+                "SELL",
                 entryQty,
                 price,
                 strategyType.name()
         );
 
-        BigDecimal pnlPct = tpHit ? BigDecimal.valueOf(0.1) : BigDecimal.valueOf(-0.1);
-
+        // UI
         live.clearTpSl(chatId, strategyType, symbol);
         live.clearPriceLines(chatId, strategyType, symbol);
         live.pushSignal(chatId, strategyType, symbol, null,
                 Signal.sell(price.doubleValue(), tpHit ? "TP" : "SL"));
 
-        log.info("[TRADE] EXIT SPOT SELL {} qty={} price={} tpHit={} slHit={} pnl~{}% (chatId={})",
-                symbol, entryQty, price, tpHit, slHit, pnlPct, chatId);
+        log.info("[TRADE] EXIT SPOT SELL {} qty={} price={} tpHit={} slHit={} chatId={}",
+                symbol, entryQty, price, tpHit, slHit, chatId);
 
-        return ExitResult.ok(tpHit, slHit, price, pnlPct);
+        return ExitResult.ok(tpHit, slHit, price, BigDecimal.ZERO);
     }
 
     // =====================================================
-    // helpers (SPOT)
+    // helpers
     // =====================================================
 
     /**
-     * Возвращает сумму в QUOTE (USDT/USDC/...) на вход.
-     * Сейчас берём из выбранного баланса (accountAsset) или fallback на capitalUsd.
+     * Сумма входа в QUOTE.
+     * Источник денег:
+     * - если есть соединение с биржей -> используем free выбранного asset
+     * - если соединения нет -> используем maxExposureUsd как бюджет (из StrategySettings)
+     *
+     * Затем:
+     * - применяем ограничения maxExposureUsd / maxExposurePct
+     * - применяем риск riskPerTradePct
      */
     private BigDecimal resolveQuoteAmount(Long chatId, StrategyType strategyType, StrategySettings ss) {
 
-        BigDecimal riskPct = nz(ss.getRiskPerTradePct());
-        if (riskPct.signum() <= 0) riskPct = BigDecimal.ONE; // 1%
+        BigDecimal riskPct = ss.getRiskPerTradePct();
+        if (riskPct == null || riskPct.signum() <= 0) {
+            return BigDecimal.ZERO;
+        }
 
-        // 1) пробуем баланс выбранного accountAsset
+        BigDecimal available = null;
+
         AccountBalanceSnapshot snap = accountBalanceService.getSnapshot(
                 chatId, strategyType, ss.getExchangeName(), ss.getNetworkType()
         );
 
-        BigDecimal free = (snap != null) ? snap.getSelectedFreeBalance() : null;
-
-        // 2) fallback на capitalUsd
-        if (free == null || free.signum() <= 0) {
-            BigDecimal capitalUsd = ss.getCapitalUsd();
-            if (capitalUsd == null || capitalUsd.signum() <= 0) return BigDecimal.ZERO;
-
-            return capitalUsd
-                    .multiply(riskPct)
-                    .divide(BigDecimal.valueOf(100), 10, RoundingMode.HALF_UP);
+        if (snap != null && snap.isConnectionOk()) {
+            BigDecimal free = snap.getSelectedFreeBalance();
+            if (free != null && free.signum() > 0) {
+                available = free;
+            }
         }
 
-        return free
+        // offline/paper/ML: бюджета из maxExposureUsd
+        if (available == null || available.signum() <= 0) {
+            BigDecimal budget = ss.getMaxExposureUsd();
+            if (budget == null || budget.signum() <= 0) return BigDecimal.ZERO;
+            available = budget;
+        }
+
+        BigDecimal budget = applyMaxExposureLimits(available, ss);
+
+        return budget
                 .multiply(riskPct)
                 .divide(BigDecimal.valueOf(100), 10, RoundingMode.HALF_UP);
     }
 
-    private static BigDecimal nz(BigDecimal v) {
-        return v != null ? v : BigDecimal.ZERO;
+    private BigDecimal applyMaxExposureLimits(BigDecimal available, StrategySettings ss) {
+        if (available == null || available.signum() <= 0) return BigDecimal.ZERO;
+
+        BigDecimal maxUsd = ss.getMaxExposureUsd();
+        if (maxUsd != null && maxUsd.signum() > 0) {
+            return available.min(maxUsd);
+        }
+
+        // ✅ FIX: maxExposurePct теперь BigDecimal (а не Integer)
+        BigDecimal pct = ss.getMaxExposurePct();
+        if (pct != null && pct.signum() > 0 && pct.compareTo(BigDecimal.valueOf(100)) <= 0) {
+            BigDecimal byPct = available
+                    .multiply(pct)
+                    .divide(BigDecimal.valueOf(100), 10, RoundingMode.HALF_UP);
+            return available.min(byPct);
+        }
+
+        return available;
     }
 }

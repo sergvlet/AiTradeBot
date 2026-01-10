@@ -4,10 +4,10 @@
  * Универсальный контроллер:
  * - автосохранение (debounce)
  * - статус "Сохранено / Ошибка / Сохранено но не применено"
- * - кнопка "Применить в торговлю" + автоприменение
+ * - кнопка "Применить в торговлю" + автоприменение (если настроено)
  *
  * ВАЖНО:
- * Ты передаёшь buildPayload() и scope ("general"/"risk"/и т.д.)
+ * - endpoints.apply может отсутствовать (например, для вкладки Trade)
  */
 window.SettingsAutoSave = (function () {
 
@@ -17,9 +17,14 @@ window.SettingsAutoSave = (function () {
 
         const rootEl = options.rootEl;
         const scope = options.scope;
-        const endpoints = options.endpoints;
 
-        const elements = options.elements;
+        const endpoints = options.endpoints || {};
+        if (!endpoints.autosave) throw new Error("SettingsAutoSave: endpoints.autosave обязателен");
+
+        // apply может не существовать — это нормально
+        const hasApplyEndpoint = typeof endpoints.apply === "string" && endpoints.apply.trim().length > 0;
+
+        const elements = options.elements || {};
 
         let pendingLabels = new Set();
         let savingNow = false;
@@ -70,8 +75,9 @@ window.SettingsAutoSave = (function () {
         }
 
         function scheduleSave(delayMs) {
+            const ms = (typeof delayMs === "number" && delayMs >= 0) ? delayMs : 500;
             clearTimeout(debounceTimer);
-            debounceTimer = setTimeout(() => saveNow(), delayMs);
+            debounceTimer = setTimeout(() => saveNow(), ms);
         }
 
         async function saveNow() {
@@ -82,8 +88,7 @@ window.SettingsAutoSave = (function () {
             setMeta("");
 
             try {
-                const payload = options.buildPayload();
-
+                const payload = options.buildPayload ? options.buildPayload() : null;
                 await api.postJson(endpoints.autosave, payload);
 
                 if (isRunning()) {
@@ -95,7 +100,15 @@ window.SettingsAutoSave = (function () {
                 setMeta("· " + nowTime());
                 clearPending();
 
-                if (isRunning() && elements.autoApplyToggle && elements.autoApplyToggle.checked) {
+                // автоприменение: только если
+                // 1) стратегия запущена
+                // 2) есть toggle
+                // 3) он включён
+                // 4) есть endpoints.apply
+                if (isRunning()
+                    && hasApplyEndpoint
+                    && elements.autoApplyToggle
+                    && elements.autoApplyToggle.checked) {
                     await applyNow();
                 }
 
@@ -109,6 +122,8 @@ window.SettingsAutoSave = (function () {
         }
 
         async function applyNow() {
+            // ✅ если apply не поддерживается — просто выходим
+            if (!hasApplyEndpoint) return;
             if (!isRunning()) return;
 
             setBadge("info", "Применяю…");
@@ -116,10 +131,10 @@ window.SettingsAutoSave = (function () {
 
             try {
                 await api.postJson(endpoints.apply, {
-                    chatId: options.context.chatId,
-                    type: options.context.type,
-                    exchange: options.context.exchange,
-                    network: options.context.network,
+                    chatId: options.context?.chatId,
+                    type: options.context?.type,
+                    exchange: options.context?.exchange,
+                    network: options.context?.network,
                     scope: scope
                 });
 
@@ -135,6 +150,14 @@ window.SettingsAutoSave = (function () {
 
         function bindApplyButton() {
             if (!elements.applyBtn) return;
+
+            // если apply endpoint отсутствует — просто отключаем кнопку, чтобы UX был ясный
+            if (!hasApplyEndpoint) {
+                elements.applyBtn.disabled = true;
+                elements.applyBtn.title = "Применение не настроено (нет endpoints.apply)";
+                return;
+            }
+
             elements.applyBtn.addEventListener("click", () => applyNow());
         }
 

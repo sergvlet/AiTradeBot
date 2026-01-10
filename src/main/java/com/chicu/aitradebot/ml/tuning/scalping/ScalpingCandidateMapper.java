@@ -27,14 +27,17 @@ public class ScalpingCandidateMapper {
             m.put("spreadThreshold", toBd(scalping.getSpreadThreshold()));
         }
 
-        // --- COMMON (общие настройки стратегии)
+        // --- COMMON (unified StrategySettings)
+        // В unified больше нет TP/SL: они живут в таблице конкретной стратегии.
+        // Поэтому здесь держим только реальные общие лимиты/флаги.
         if (common != null) {
-            m.put("takeProfitPct", common.getTakeProfitPct());
-            m.put("stopLossPct", common.getStopLossPct());
-
-            // это не "orderVolume", а риск. Его можно позже тюнить отдельным параметром.
             m.put("riskPerTradePct", common.getRiskPerTradePct());
             m.put("dailyLossLimitPct", common.getDailyLossLimitPct());
+            m.put("reinvestProfit", common.isReinvestProfit());
+
+            // общий бюджет-лимит (если используешь в симуляторе/тюнинге)
+            m.put("maxExposureUsd", common.getMaxExposureUsd());
+            m.put("maxExposurePct", common.getMaxExposurePct());
         }
 
         return m;

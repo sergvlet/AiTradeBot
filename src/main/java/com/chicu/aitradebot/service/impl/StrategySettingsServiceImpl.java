@@ -41,39 +41,50 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
     }
 
     // =====================================================================
-    // SAVE (очищает старый cache)
+    // SAVE (очищает cache для chatId+type)
     // =====================================================================
     @Override
     public StrategySettings save(StrategySettings s) {
 
+        // defaults
         if (s.getAdvancedControlMode() == null) {
             s.setAdvancedControlMode(AdvancedControlMode.MANUAL);
         }
 
-        // нормализуем контекст, если есть
-        if (s.getExchangeName() != null) {
-            s.setExchangeName(normalizeExchange(s.getExchangeName()));
+        // контекст должен быть нормализован и не null (у тебя теперь NOT NULL в entity)
+        s.setExchangeName(normalizeExchange(s.getExchangeName()));
+        if (s.getNetworkType() == null) {
+            s.setNetworkType(NetworkType.TESTNET);
+        }
+
+        // минимальные дефолты, чтобы не словить NOT NULL
+        if (s.getSymbol() == null || s.getSymbol().isBlank()) {
+            s.setSymbol("BTCUSDT");
+        }
+        if (s.getTimeframe() == null || s.getTimeframe().isBlank()) {
+            s.setTimeframe("1m");
+        }
+        if (s.getCachedCandlesLimit() == null || s.getCachedCandlesLimit() < 50) {
+            s.setCachedCandlesLimit(500);
         }
 
         StrategySettings saved = repo.save(s);
 
-        // ❗ сбрасываем все старые ключи этого chatId+type
+        // ❗ сбрасываем все старые ключи этого chatId+type (потому что данные могли поменяться)
         cache.entrySet().removeIf(e ->
                 e.getKey().startsWith(saved.getChatId() + ":" + saved.getType().name() + ":")
         );
 
         // кладём актуальный
-        if (saved.getExchangeName() != null && saved.getNetworkType() != null) {
-            cache.put(
-                    key(
-                            saved.getChatId(),
-                            saved.getType(),
-                            saved.getExchangeName(),
-                            saved.getNetworkType()
-                    ),
-                    saved
-            );
-        }
+        cache.put(
+                key(
+                        saved.getChatId(),
+                        saved.getType(),
+                        saved.getExchangeName(),
+                        saved.getNetworkType()
+                ),
+                saved
+        );
 
         return saved;
     }
@@ -90,7 +101,7 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
         String ex = exchange == null ? null : normalizeExchange(exchange);
 
         return repo.findByChatId(chatId).stream()
-                .filter(s -> ex == null || (s.getExchangeName() != null && ex.equalsIgnoreCase(s.getExchangeName())))
+                .filter(s -> ex == null || ex.equalsIgnoreCase(s.getExchangeName()))
                 .filter(s -> network == null || network == s.getNetworkType())
                 .toList();
     }
@@ -100,7 +111,7 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
         String ex = exchange == null ? null : normalizeExchange(exchange);
 
         return repo.findByChatId(chatId).stream()
-                .filter(s -> ex == null || (s.getExchangeName() != null && ex.equalsIgnoreCase(s.getExchangeName())))
+                .filter(s -> ex == null || ex.equalsIgnoreCase(s.getExchangeName()))
                 .toList();
     }
 
@@ -116,6 +127,7 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
             NetworkType network
     ) {
 
+        // если нет полного контекста — fallback (но лучше UI всегда давать exchange+network)
         if (exchange == null || exchange.isBlank() || network == null) {
             return repo
                     .findTopByChatIdAndTypeOrderByUpdatedAtDescIdDesc(chatId, type)
@@ -142,10 +154,7 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
     }
 
     // =====================================================================
-    // GET OR CREATE (ВАЖНО)
-    // - если запись под (chatId,type,exchange,network) есть -> вернуть
-    // - иначе взять последнюю по (chatId,type) и ОБНОВИТЬ её exchange/network (UPDATE, без INSERT)
-    // - если вообще ничего нет -> создать одну запись
+    // GET OR CREATE (СТРОГО по контексту)
     // =====================================================================
     @Override
     public StrategySettings getOrCreate(
@@ -157,7 +166,12 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
         String ex = normalizeExchange(exchange);
         NetworkType net = (network != null ? network : NetworkType.TESTNET);
 
-        // 1) точное совпадение
+        // 1) cache
+        String k = key(chatId, type, ex, net);
+        StrategySettings cached = cache.get(k);
+        if (cached != null) return cached;
+
+        // 2) exact from DB
         Optional<StrategySettings> exactOpt =
                 repo.findTopByChatIdAndTypeAndExchangeNameAndNetworkTypeOrderByUpdatedAtDescIdDesc(
                         chatId, type, ex, net
@@ -165,64 +179,46 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
 
         if (exactOpt.isPresent()) {
             StrategySettings exact = exactOpt.get();
-            cache.put(key(chatId, type, ex, net), exact);
+            cache.put(k, exact);
             return exact;
         }
 
-        // 2) fallback — последняя по стратегии (без учёта exchange/network) -> ОБНОВЛЯЕМ КОНТЕКСТ (UPDATE)
-        Optional<StrategySettings> fallbackOpt =
-                repo.findTopByChatIdAndTypeOrderByUpdatedAtDescIdDesc(chatId, type);
-
-        if (fallbackOpt.isPresent()) {
-            StrategySettings s = fallbackOpt.get();
-
-            boolean changed = false;
-
-            String currentEx = (s.getExchangeName() == null ? null : normalizeExchange(s.getExchangeName()));
-            if (currentEx == null || !currentEx.equalsIgnoreCase(ex)) {
-                s.setExchangeName(ex);
-                changed = true;
-            }
-
-            NetworkType currentNet = s.getNetworkType();
-            if (currentNet == null || currentNet != net) {
-                s.setNetworkType(net);
-                changed = true;
-            }
-
-            if (changed) {
-                return save(s); // save очистит кэш chatId+type
-            }
-
-            return s;
-        }
-
-        // 3) вообще нет настроек стратегии — создаём ОДНУ запись
-        StrategySettings s = StrategySettings.builder()
+        // 3) create NEW record for this exact context
+        StrategySettings created = StrategySettings.builder()
                 .chatId(chatId)
                 .type(type)
+                .exchangeName(ex)
+                .networkType(net)
 
-                // NOT NULL поля
+                // instrument defaults
                 .symbol("BTCUSDT")
                 .timeframe("1m")
                 .cachedCandlesLimit(500)
 
-                .capitalUsd(BigDecimal.valueOf(100))
-                .commissionPct(BigDecimal.valueOf(0.05))
-                .riskPerTradePct(BigDecimal.valueOf(1))
-                .dailyLossLimitPct(BigDecimal.valueOf(20))
-                .takeProfitPct(BigDecimal.valueOf(1))
-                .stopLossPct(BigDecimal.valueOf(1))
+                // general defaults
+                .accountAsset("USDT")
+                .maxExposureUsd(BigDecimal.valueOf(100).setScale(6, RoundingMode.HALF_UP))
+                .maxExposurePct(null)
+                .dailyLossLimitPct(BigDecimal.valueOf(20).setScale(4, RoundingMode.HALF_UP))
                 .reinvestProfit(false)
 
-                .exchangeName(ex)
-                .networkType(net)
+                // risk defaults
+                .riskPerTradePct(BigDecimal.valueOf(1).setScale(4, RoundingMode.HALF_UP))
+                .minRiskReward(null)
+                .leverage(1)
 
+                // trade defaults
+                .maxOpenOrders(null)
+                .cooldownSeconds(null)
+
+                // advanced defaults
                 .advancedControlMode(AdvancedControlMode.MANUAL)
                 .active(false)
                 .build();
 
-        return save(s);
+        StrategySettings saved = save(created);
+        cache.put(k, saved);
+        return saved;
     }
 
     // =====================================================================
@@ -249,7 +245,6 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
     }
 
     // =====================================================================
-    // ✅ НУЖЕН ТЕБЕ ПО ОШИБКЕ КОМПИЛЯЦИИ
     // findLatestAny(chatId, type) — без exchange/network
     // =====================================================================
     public Optional<StrategySettings> findLatestAny(Long chatId, StrategyType type) {
@@ -299,6 +294,7 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
         BigDecimal incoming = validatePct(newRiskPerTradePct);
         BigDecimal current = s.getRiskPerTradePct();
 
+        // пример политики: AI может только снижать риск (не увеличивать)
         if (current == null || (incoming != null && incoming.compareTo(current) < 0)) {
             s.setRiskPerTradePct(incoming);
             save(s);
@@ -312,11 +308,11 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
         if (v == null) return null;
 
         if (v.compareTo(BigDecimal.ZERO) < 0) {
-            return BigDecimal.ZERO;
+            return BigDecimal.ZERO.setScale(4, RoundingMode.HALF_UP);
         }
 
         if (v.compareTo(BigDecimal.valueOf(100)) > 0) {
-            return BigDecimal.valueOf(100);
+            return BigDecimal.valueOf(100).setScale(4, RoundingMode.HALF_UP);
         }
 
         return v.setScale(4, RoundingMode.HALF_UP);

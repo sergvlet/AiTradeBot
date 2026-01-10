@@ -84,6 +84,6 @@ document.addEventListener("DOMContentLoaded", () => {
     window.SettingsTabNetwork?.init?.();
     window.SettingsTabGeneral?.init?.();
     window.SettingsTabRisk?.init?.();
-    window.SettingsTabMarket?.init?.();
+    window.SettingsTabTrade?.init?.();
     window.SettingsTabAdvanced?.init?.(); // пустышка под будущее
 });

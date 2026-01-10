@@ -15,6 +15,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
+import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.LocalDateTime;
@@ -122,7 +123,7 @@ public class AiStrategyOrchestrator {
         // ✅ реальный runtime-статус, а не флаг из БД
         boolean runtimeActive = strategy != null && strategy.isActive(chatId);
 
-        // (опционально) самовосстановление рассинхрона после рестарта
+        // самовосстановление рассинхрона после рестарта
         if (s.isActive() != runtimeActive) {
             s.setActive(runtimeActive);
             if (!runtimeActive && s.getStoppedAt() == null) {
@@ -162,7 +163,7 @@ public class AiStrategyOrchestrator {
     }
 
     // =====================================================================
-    // 🔑 STRICT LOAD (ЕДИНЫЙ ИСТОЧНИК ИСТИНЫ)
+    // 🔑 STRICT LOAD
     // =====================================================================
     private StrategySettings loadSettingsStrict(
             Long chatId,
@@ -187,6 +188,10 @@ public class AiStrategyOrchestrator {
     // =====================================================================
     private StrategyRunInfo buildRunInfo(StrategySettings s, boolean active, String msg) {
 
+        // ⚠️ В unified StrategySettings больше нет capital/commission/tp/sl/pnl/mlConfidence.
+        // Они берутся из таблиц конкретных стратегий/рантайма и будут подключены отдельно.
+        // Здесь отдаём только то, что реально принадлежит unified.
+
         return StrategyRunInfo.builder()
                 .chatId(s.getChatId())
                 .type(s.getType())
@@ -197,22 +202,12 @@ public class AiStrategyOrchestrator {
                 .exchangeName(s.getExchangeName())
                 .networkType(s.getNetworkType())
 
-                .capitalUsd(s.getCapitalUsd())
-                .totalProfitPct(s.getTotalProfitPct())
-                .commissionPct(s.getCommissionPct())
-                .takeProfitPct(s.getTakeProfitPct())
-                .stopLossPct(s.getStopLossPct())
                 .riskPerTradePct(s.getRiskPerTradePct())
-                .mlConfidence(s.getMlConfidence())
-
                 .reinvestProfit(s.isReinvestProfit())
                 .version(s.getVersion())
 
-                // ✅ честная конвертация времени
                 .startedAt(toInstant(s.getStartedAt()))
                 .stoppedAt(toInstant(s.getStoppedAt()))
-
-                // ✅ момент формирования DTO
                 .updatedAt(Instant.now())
 
                 .message(msg)
@@ -286,12 +281,79 @@ public class AiStrategyOrchestrator {
                             o.getPrice(),
                             o.getQuantity(),
                             o.isFilled(),
-                            o.getTimestamp()
+                            extractOrderTimestamp(o)
                     ))
                     .toList();
         } catch (Exception e) {
             log.error("❌ listOrders error", e);
             return List.of();
+        }
+    }
+
+    /**
+     * Никаких прямых вызовов deprecated getTimestamp().
+     * Достаём время максимально совместимо: timestampMs/timeMs/createdAt/updatedAt и т.д.
+     */
+    private Long extractOrderTimestamp(Order o) {
+        if (o == null) return null;
+
+        // 1) millis
+        Long ms = tryLong(o, "getTimestampMs")
+                .or(() -> tryLong(o, "getTimeMs"))
+                .or(() -> tryLong(o, "getTs"))
+                .or(() -> tryLong(o, "getTime"))
+                .orElse(null);
+        if (ms != null && ms > 0) return ms;
+
+        // 2) Instant / LocalDateTime
+        Instant inst = tryInstant(o, "getCreatedAt")
+                .or(() -> tryInstant(o, "getUpdatedAt"))
+                .or(() -> tryInstant(o, "getExecutedAt"))
+                .orElse(null);
+        if (inst != null) return inst.toEpochMilli();
+
+        LocalDateTime ldt = tryLocalDateTime(o, "getCreatedAt")
+                .or(() -> tryLocalDateTime(o, "getUpdatedAt"))
+                .orElse(null);
+        if (ldt != null) return ldt.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
+
+        return null;
+    }
+
+    private java.util.Optional<Long> tryLong(Object target, String method) {
+        try {
+            Method m = target.getClass().getMethod(method);
+            Object v = m.invoke(target);
+            if (v == null) return java.util.Optional.empty();
+            if (v instanceof Long l) return java.util.Optional.of(l);
+            if (v instanceof Integer i) return java.util.Optional.of(i.longValue());
+            if (v instanceof BigDecimal bd) return java.util.Optional.of(bd.longValue());
+            if (v instanceof String s) return java.util.Optional.of(Long.parseLong(s.trim()));
+            return java.util.Optional.empty();
+        } catch (Exception ignored) {
+            return java.util.Optional.empty();
+        }
+    }
+
+    private java.util.Optional<Instant> tryInstant(Object target, String method) {
+        try {
+            Method m = target.getClass().getMethod(method);
+            Object v = m.invoke(target);
+            if (v instanceof Instant inst) return java.util.Optional.of(inst);
+            return java.util.Optional.empty();
+        } catch (Exception ignored) {
+            return java.util.Optional.empty();
+        }
+    }
+
+    private java.util.Optional<LocalDateTime> tryLocalDateTime(Object target, String method) {
+        try {
+            Method m = target.getClass().getMethod(method);
+            Object v = m.invoke(target);
+            if (v instanceof LocalDateTime ldt) return java.util.Optional.of(ldt);
+            return java.util.Optional.empty();
+        } catch (Exception ignored) {
+            return java.util.Optional.empty();
         }
     }
 }

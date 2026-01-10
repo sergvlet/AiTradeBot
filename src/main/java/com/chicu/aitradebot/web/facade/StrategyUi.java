@@ -5,7 +5,6 @@ import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
 import com.chicu.aitradebot.domain.enums.AdvancedControlMode;
 
-import java.math.BigDecimal;
 import java.util.List;
 
 public record StrategyUi(
@@ -20,23 +19,13 @@ public record StrategyUi(
         // === СОСТОЯНИЕ (runtime) ===
         boolean active,
 
-        // === НАСТРОЙКИ ===
+        // === БАЗОВЫЕ НАСТРОЙКИ (из StrategySettings) ===
         String symbol,
         String timeframe,
-
-        // === РИСК / ПАРАМЕТРЫ ===
-        BigDecimal takeProfitPct,
-        BigDecimal stopLossPct,
-        BigDecimal commissionPct,
-        BigDecimal riskPerTradePct,
 
         // === UI ===
         String title,
         String description,
-
-        // === СТАТИСТИКА ===
-        BigDecimal totalProfitPct,
-        BigDecimal mlConfidence,
 
         // === РЕЖИМ УПРАВЛЕНИЯ ===
         AdvancedControlMode advancedControlMode
@@ -68,16 +57,8 @@ public record StrategyUi(
                 safe(s.getSymbol(), "—"),
                 safe(s.getTimeframe(), "—"),
 
-                nz(s.getTakeProfitPct()),
-                nz(s.getStopLossPct()),
-                nz(s.getCommissionPct()),
-                nz(s.getRiskPerTradePct()),
-
                 ui.title,
                 ui.description,
-
-                nz(s.getTotalProfitPct()),
-                nz(s.getMlConfidence()),
 
                 s.getAdvancedControlMode() != null
                         ? s.getAdvancedControlMode()
@@ -98,14 +79,8 @@ public record StrategyUi(
                 active,
                 symbol,
                 timeframe,
-                takeProfitPct,
-                stopLossPct,
-                commissionPct,
-                riskPerTradePct,
                 title,
                 description,
-                totalProfitPct,
-                mlConfidence,
                 advancedControlMode
         );
     }
@@ -131,14 +106,8 @@ public record StrategyUi(
                 false,
                 "—",
                 "—",
-                BigDecimal.ZERO,
-                BigDecimal.ZERO,
-                BigDecimal.ZERO,
-                BigDecimal.ZERO,
                 ui.title,
                 "Стратегия ещё не настроена",
-                BigDecimal.ZERO,
-                BigDecimal.ZERO,
                 AdvancedControlMode.MANUAL
         );
     }
@@ -178,10 +147,6 @@ public record StrategyUi(
     // ================================================================
     // 🧰 HELPERS
     // ================================================================
-    private static BigDecimal nz(BigDecimal v) {
-        return v != null ? v : BigDecimal.ZERO;
-    }
-
     private static String safe(String v, String def) {
         return (v != null && !v.isBlank()) ? v : def;
     }

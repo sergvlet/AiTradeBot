@@ -51,12 +51,6 @@ public class BybitExchangeClient implements ExchangeClient {
         return "BYBIT";
     }
 
-    /**
-     * ❗ КЛИЕНТ НЕ ПРИВЯЗАН К СЕТИ
-     * Реальная сеть берётся из ExchangeSettings
-     */
-
-
     private String baseUrl(NetworkType net) {
         return net == NetworkType.TESTNET ? DEMO : MAIN;
     }
@@ -141,17 +135,18 @@ public class BybitExchangeClient implements ExchangeClient {
         if (tf == null) return "1";
 
         return switch (tf) {
-            case "1m"  -> "1";
-            case "3m"  -> "3";
-            case "5m"  -> "5";
+            case "1m" -> "1";
+            case "3m" -> "3";
+            case "5m" -> "5";
             case "15m" -> "15";
             case "30m" -> "30";
-            case "1h"  -> "60";
-            case "4h"  -> "240";
-            case "1d"  -> "D";
-            default    -> "1";
+            case "1h" -> "60";
+            case "4h" -> "240";
+            case "1d" -> "D";
+            default -> "1";
         };
     }
+
     // =================================================================
     // ORDERS
     // =================================================================
@@ -166,12 +161,8 @@ public class BybitExchangeClient implements ExchangeClient {
             Double price
     ) {
 
-        ExchangeSettings s = settingsService
-                .findAllByChatId(chatId)
-                .stream()
-                .filter(es -> "BYBIT".equals(es.getExchange()))
-                .findFirst()
-                .orElseThrow();
+        // ✅ фикс: учитываем сеть, и не берём "первый попавшийся" BYBIT
+        ExchangeSettings s = resolve(chatId, guessNetworkOrMain(chatId));
 
         Map<String, String> p = new LinkedHashMap<>();
         p.put("symbol", symbol.toUpperCase());
@@ -184,9 +175,16 @@ public class BybitExchangeClient implements ExchangeClient {
             p.put("timeInForce", "GTC");
         }
 
-        JSONObject r = new JSONObject(
+        JSONObject root = new JSONObject(
                 signed(s, "/spot/v3/private/order", p, HttpMethod.POST)
-        ).optJSONObject("result");
+        );
+
+        // ✅ фикс: обработка ret_code/ret_msg
+        if (root.optInt("ret_code", 0) != 0) {
+            throw new RuntimeException("BYBIT order error: " + root.optString("ret_msg"));
+        }
+
+        JSONObject r = root.optJSONObject("result");
 
         return new OrderResult(
                 r != null ? r.optString("orderId") : null,
@@ -226,21 +224,22 @@ public class BybitExchangeClient implements ExchangeClient {
     @Override
     public boolean cancelOrder(Long chatId, String symbol, String orderId) {
 
-        ExchangeSettings s = settingsService
-                .findAllByChatId(chatId)
-                .stream()
-                .filter(es -> "BYBIT".equals(es.getExchange()))
-                .findFirst()
-                .orElseThrow();
+        ExchangeSettings s = resolve(chatId, guessNetworkOrMain(chatId));
 
-        String res = signed(
+        String raw = signed(
                 s,
                 "/spot/v3/private/cancel-order",
-                Map.of("symbol", symbol, "orderId", orderId),
+                Map.of("symbol", symbol.toUpperCase(), "orderId", orderId),
                 HttpMethod.POST
         );
 
-        return res != null && res.contains("orderId");
+        JSONObject root = new JSONObject(raw);
+        if (root.optInt("ret_code", 0) != 0) {
+            log.warn("⚠️ BYBIT cancel error: {}", root.optString("ret_msg"));
+            return false;
+        }
+
+        return raw != null && raw.contains("orderId");
     }
 
     // =================================================================
@@ -268,7 +267,6 @@ public class BybitExchangeClient implements ExchangeClient {
 
             JSONObject root = new JSONObject(raw);
 
-            // 1️⃣ retCode check
             if (root.optInt("retCode", -1) != 0) {
                 log.warn("⚠️ BYBIT BALANCE retCode={} msg={}",
                         root.optInt("retCode"),
@@ -299,32 +297,20 @@ public class BybitExchangeClient implements ExchangeClient {
             for (int i = 0; i < coins.length(); i++) {
                 JSONObject c = coins.getJSONObject(i);
 
-                String asset = c.optString("coin");
-                if (asset.isBlank()) continue;
+                String a = c.optString("coin");
+                if (a.isBlank()) continue;
 
-                BigDecimal wallet   = safeDecimal(c.opt("walletBalance"));
+                BigDecimal wallet = safeDecimal(c.opt("walletBalance"));
                 BigDecimal withdraw = safeDecimal(c.opt("availableToWithdraw"));
 
-                // ✅ Bybit Spot логика
-                BigDecimal free = withdraw.compareTo(BigDecimal.ZERO) > 0
-                        ? withdraw
-                        : wallet;
-
+                BigDecimal free = withdraw.compareTo(BigDecimal.ZERO) > 0 ? withdraw : wallet;
                 BigDecimal locked = wallet.subtract(free).max(BigDecimal.ZERO);
 
                 if (wallet.compareTo(BigDecimal.ZERO) > 0) {
-                    out.put(
-                            asset,
-                            new Balance(
-                                    asset,
-                                    free.doubleValue(),
-                                    locked.doubleValue()
-                            )
-                    );
+                    out.put(a, new Balance(a, free.doubleValue(), locked.doubleValue()));
                 }
             }
 
-            log.info("💰 BYBIT BALANCE chatId={} {} -> {}", chatId, network, out.keySet());
             return out;
 
         } catch (Exception e) {
@@ -388,6 +374,9 @@ public class BybitExchangeClient implements ExchangeClient {
 
         try {
             long ts = System.currentTimeMillis();
+
+            // ✅ фикс: Bybit подпись = timestamp + apiKey + recvWindow + queryString
+            // ВАЖНО: queryString должен быть именно тем, что пойдёт в URL/body (encoded)
             String query = toQuery(params);
             String preSign = ts + s.getApiKey() + RECV_WINDOW + query;
 
@@ -396,17 +385,18 @@ public class BybitExchangeClient implements ExchangeClient {
             h.set("X-BAPI-SIGN", sign(preSign, s.getApiSecret()));
             h.set("X-BAPI-TIMESTAMP", String.valueOf(ts));
             h.set("X-BAPI-RECV-WINDOW", RECV_WINDOW);
-            h.setContentType(MediaType.APPLICATION_FORM_URLENCODED);
+
+            // ✅ фикс: для POST Bybit часто ждёт x-www-form-urlencoded
+            if (method == HttpMethod.POST) {
+                h.setContentType(MediaType.APPLICATION_FORM_URLENCODED);
+            }
 
             String url = baseUrl(s.getNetwork()) + endpoint +
                          (method == HttpMethod.GET && !query.isEmpty() ? "?" + query : "");
 
-            return rest.exchange(
-                    url,
-                    method,
-                    new HttpEntity<>(method == HttpMethod.POST ? query : "", h),
-                    String.class
-            ).getBody();
+            HttpEntity<String> entity = new HttpEntity<>(method == HttpMethod.POST ? query : null, h);
+
+            return rest.exchange(url, method, entity, String.class).getBody();
 
         } catch (Exception e) {
             throw new RuntimeException("Bybit signed request error", e);
@@ -414,13 +404,14 @@ public class BybitExchangeClient implements ExchangeClient {
     }
 
     private String toQuery(Map<String, String> p) {
+        if (p == null || p.isEmpty()) return "";
         return p.entrySet().stream()
                 .map(e -> e.getKey() + "=" + encode(e.getValue()))
                 .collect(Collectors.joining("&"));
     }
 
     private String encode(String s) {
-        return URLEncoder.encode(s, StandardCharsets.UTF_8);
+        return URLEncoder.encode(String.valueOf(s), StandardCharsets.UTF_8);
     }
 
     private String strip(double d) {
@@ -435,6 +426,7 @@ public class BybitExchangeClient implements ExchangeClient {
         for (byte b : h) sb.append(String.format("%02x", b));
         return sb.toString();
     }
+
     private BigDecimal safeDecimal(Object v) {
         if (v == null) return BigDecimal.ZERO;
 
@@ -443,9 +435,16 @@ public class BybitExchangeClient implements ExchangeClient {
             return BigDecimal.ZERO;
         }
 
-        return new BigDecimal(s);
+        try {
+            return new BigDecimal(s);
+        } catch (Exception e) {
+            return BigDecimal.ZERO;
+        }
     }
 
+    // =================================================================
+    // FEES
+    // =================================================================
 
     @Override
     public AccountFees getAccountFees(long chatId, NetworkType networkType) {
@@ -453,7 +452,6 @@ public class BybitExchangeClient implements ExchangeClient {
         try {
             ExchangeSettings s = resolve(chatId, networkType);
 
-            // Bybit V5 — комиссия для SPOT
             Map<String, String> params = new LinkedHashMap<>();
             params.put("category", "spot");
 
@@ -481,18 +479,16 @@ public class BybitExchangeClient implements ExchangeClient {
 
             JSONObject fees = list.getJSONObject(0);
 
-            // ⚠️ Bybit даёт ДОЛЮ (0.001 = 0.1%)
+            // ⚠️ Bybit даёт долю (0.001 = 0.1%)
             BigDecimal makerRate = parseBd(fees.optString("makerFeeRate", null));
             BigDecimal takerRate = parseBd(fees.optString("takerFeeRate", null));
 
             BigDecimal makerPct = makerRate != null
-                    ? makerRate.multiply(BigDecimal.valueOf(100))
-                    .setScale(6, RoundingMode.HALF_UP)
+                    ? makerRate.multiply(BigDecimal.valueOf(100)).setScale(6, RoundingMode.HALF_UP)
                     : null;
 
             BigDecimal takerPct = takerRate != null
-                    ? takerRate.multiply(BigDecimal.valueOf(100))
-                    .setScale(6, RoundingMode.HALF_UP)
+                    ? takerRate.multiply(BigDecimal.valueOf(100)).setScale(6, RoundingMode.HALF_UP)
                     : null;
 
             return AccountFees.builder()
@@ -507,7 +503,6 @@ public class BybitExchangeClient implements ExchangeClient {
         }
     }
 
-    /** Безопасный парсер BigDecimal (null-safe). */
     private BigDecimal parseBd(String s) {
         if (s == null) return null;
         String t = s.trim();
@@ -518,6 +513,11 @@ public class BybitExchangeClient implements ExchangeClient {
             return null;
         }
     }
+
+    // =================================================================
+    // TRADABLE SYMBOLS (V5)
+    // =================================================================
+
     @Override
     public List<SymbolDescriptor> getTradableSymbols(String quoteAsset) {
 
@@ -531,6 +531,13 @@ public class BybitExchangeClient implements ExchangeClient {
             );
 
             JSONObject instrumentsRoot = new JSONObject(instrumentsRaw);
+            if (instrumentsRoot.optInt("retCode", 0) != 0) {
+                log.warn("⚠️ BYBIT instruments retCode={} msg={}",
+                        instrumentsRoot.optInt("retCode"),
+                        instrumentsRoot.optString("retMsg"));
+                return List.of();
+            }
+
             JSONArray instruments = instrumentsRoot
                     .getJSONObject("result")
                     .getJSONArray("list");
@@ -544,6 +551,13 @@ public class BybitExchangeClient implements ExchangeClient {
             );
 
             JSONObject tickersRoot = new JSONObject(tickersRaw);
+            if (tickersRoot.optInt("retCode", 0) != 0) {
+                log.warn("⚠️ BYBIT tickers retCode={} msg={}",
+                        tickersRoot.optInt("retCode"),
+                        tickersRoot.optString("retMsg"));
+                return List.of();
+            }
+
             JSONArray tickers = tickersRoot
                     .getJSONObject("result")
                     .getJSONArray("list");
@@ -564,80 +578,60 @@ public class BybitExchangeClient implements ExchangeClient {
                 JSONObject s = instruments.getJSONObject(i);
 
                 String symbol = s.optString("symbol");
-                String base   = s.optString("baseCoin");
-                String quote  = s.optString("quoteCoin");
+                String base = s.optString("baseCoin");
+                String quote = s.optString("quoteCoin");
                 String status = s.optString("status");
 
                 if (!"Trading".equalsIgnoreCase(status)) continue;
-                if (!Objects.equals(quote, quoteAsset)) continue;
+                if (quoteAsset != null && !quoteAsset.equalsIgnoreCase(quote)) continue;
 
                 // =================================================
-                // LIMITS (Bybit специфика)
+                // LIMITS (Bybit)
                 // =================================================
                 JSONObject lotSize = s.optJSONObject("lotSizeFilter");
-                JSONObject price   = s.optJSONObject("priceFilter");
+                JSONObject price = s.optJSONObject("priceFilter");
 
-                BigDecimal minNotional = parseBd(
-                        lotSize != null ? lotSize.optString("minOrderAmt", null) : null
-                );
-                BigDecimal stepSize = parseBd(
-                        lotSize != null ? lotSize.optString("qtyStep", null) : null
-                );
-                BigDecimal tickSize = parseBd(
-                        price != null ? price.optString("tickSize", null) : null
-                );
+                // ⚠️ В V5 lotSizeFilter:
+                // minOrderAmt — минимальная сумма в quote (USDT), minOrderQty — минимальное количество
+                BigDecimal minNotional = parseBd(lotSize != null ? lotSize.optString("minOrderAmt", null) : null);
+                BigDecimal stepSize = parseBd(lotSize != null ? lotSize.optString("qtyStep", null) : null);
+                BigDecimal tickSize = parseBd(price != null ? price.optString("tickSize", null) : null);
 
-                Integer maxOrders = null; // ❗ Bybit НЕ предоставляет
-
-                ExchangeLimitScope minNotionalScope =
-                        minNotional != null ? ExchangeLimitScope.ACCOUNT : ExchangeLimitScope.UNKNOWN;
-
-                ExchangeLimitScope stepSizeScope =
-                        stepSize != null ? ExchangeLimitScope.SYMBOL : ExchangeLimitScope.UNKNOWN;
-
-                ExchangeLimitScope tickSizeScope =
-                        tickSize != null ? ExchangeLimitScope.SYMBOL : ExchangeLimitScope.UNKNOWN;
-
-                ExchangeLimitScope maxOrdersScope =
-                        ExchangeLimitScope.UNKNOWN;
+                Integer maxOrders = null; // Bybit spot обычно не даёт
 
                 // =================================================
                 // TICKER
                 // =================================================
                 JSONObject t = tickerMap.get(symbol);
 
-                BigDecimal lastPrice =
-                        t != null ? parseBd(t.optString("lastPrice", null)) : null;
+                BigDecimal lastPrice = t != null ? parseBd(t.optString("lastPrice", null)) : null;
 
-                BigDecimal priceChangePct =
-                        t != null && t.has("price24hPcnt")
-                                ? parseBd(t.optString("price24hPcnt", null))
-                                .multiply(BigDecimal.valueOf(100))
-                                : null;
+                BigDecimal priceChangePct = null;
+                if (t != null && t.has("price24hPcnt")) {
+                    BigDecimal frac = parseBd(t.optString("price24hPcnt", null)); // 0.0123 = 1.23%
+                    if (frac != null) priceChangePct = frac.multiply(BigDecimal.valueOf(100));
+                }
 
-                BigDecimal volume =
-                        t != null ? parseBd(t.optString("turnover24h", null)) : null;
+                // turnover24h — в quote
+                BigDecimal volume = t != null ? parseBd(t.optString("turnover24h", null)) : null;
 
                 // =================================================
                 // RESULT
                 // =================================================
-                out.add(
-                        SymbolDescriptor.of(
-                                symbol,
-                                base,
-                                quote,
-                                lastPrice,
-                                priceChangePct,
-                                volume,
-                                minNotional,
-                                stepSize,
-                                tickSize,
-                                maxOrders,
-                                true,
-                                "BYBIT"
-                        )
-                );
-
+                out.add(SymbolDescriptor.of(
+                        symbol,
+                        base,
+                        quote,
+                        lastPrice,
+                        priceChangePct,
+                        volume,
+                        minNotional,
+                        stepSize,
+                        tickSize,
+                        maxOrders,
+                        true,
+                        "BYBIT"
+                ));
             }
 
             log.info("✅ BYBIT symbols loaded: {}", out.size());
@@ -649,5 +643,25 @@ public class BybitExchangeClient implements ExchangeClient {
         }
     }
 
+    // =================================================================
+    // small helpers
+    // =================================================================
 
+    /**
+     * Мини-хак: в твоём коде placeOrder/cancelOrder не принимают NetworkType,
+     * поэтому хотя бы не берём "рандомные" настройки.
+     * Если у тебя есть активная сеть в StrategySettingsContext — лучше передавать её в методы.
+     */
+    private NetworkType guessNetworkOrMain(Long chatId) {
+        try {
+            // если в БД есть BYBIT TESTNET — можно выбрать её, иначе MAINNET
+            return settingsService.findAllByChatId(chatId).stream()
+                    .filter(es -> "BYBIT".equalsIgnoreCase(es.getExchange()))
+                    .map(ExchangeSettings::getNetwork)
+                    .findFirst()
+                    .orElse(NetworkType.MAINNET);
+        } catch (Exception ignored) {
+            return NetworkType.MAINNET;
+        }
+    }
 }

@@ -33,10 +33,27 @@ public final class ScalpingBacktestSimulator {
             return BacktestMetrics.fail("StrategySettings is null");
         }
 
-        BigDecimal initialEquity = nz(settings.getCapitalUsd());
+        // =====================================================
+        // ✅ ВАЖНО:
+        // - capitalUsd/tp/sl/commission больше НЕ хранятся в StrategySettings
+        // - initialEquity берём из maxExposureUsd (бюджет стратегии) или из candidateParams.initialEquityUsd
+        // - tp/sl/commission должны приходить из candidateParams (их потом подставит вызывающий код из БД/биржи)
+        // =====================================================
+
+        BigDecimal initialEquity = resolveInitialEquity(settings, candidateParams);
         if (initialEquity.signum() <= 0) {
-            return BacktestMetrics.fail("capitalUsd is empty/zero in StrategySettings (required for backtest)");
+            return BacktestMetrics.fail(
+                    "Initial equity is missing. Provide settings.maxExposureUsd (budget) or candidateParams.initialEquityUsd"
+            );
         }
+
+        BigDecimal tpPct = bigParamRequired(candidateParams, "takeProfitPct");
+        BigDecimal slPct = bigParamRequired(candidateParams, "stopLossPct");
+        BigDecimal commissionPct = bigParamRequired(candidateParams, "commissionPct");
+
+        double tpFrac = pctToFrac(tpPct);
+        double slFrac = pctToFrac(slPct);
+        double commissionFrac = pctToFrac(commissionPct);
 
         int windowSize = intParam(candidateParams, "windowSize", 0);
         if (windowSize <= 0) {
@@ -47,10 +64,6 @@ public final class ScalpingBacktestSimulator {
         if (thresholdPct <= 0) {
             return BacktestMetrics.fail("candidate param priceChangeThreshold is missing/invalid");
         }
-
-        double tpFrac = pctToFrac(settings.getTakeProfitPct());
-        double slFrac = pctToFrac(settings.getStopLossPct());
-        double commissionFrac = pctToFrac(settings.getCommissionPct());
 
         Integer cooldown = settings.getCooldownSeconds();
         long cooldownSec = cooldown != null ? Math.max(0, cooldown) : 0;
@@ -226,10 +239,29 @@ public final class ScalpingBacktestSimulator {
                 .build();
     }
 
+    // =====================================================
+    // ✅ initial equity: budget from settings OR explicit param
+    // =====================================================
+
+    private static BigDecimal resolveInitialEquity(StrategySettings s, Map<String, Object> p) {
+        // 1) бюджет стратегии в USD — самое логичное для backtest симулятора
+        BigDecimal budgetUsd = nz(s.getMaxExposureUsd());
+        if (budgetUsd.signum() > 0) return budgetUsd;
+
+        // 2) если бюджет не задан — требуем, чтобы вызывающий код передал equity явно
+        BigDecimal equityUsd = bigParam(p, "initialEquityUsd", null);
+        if (equityUsd != null && equityUsd.signum() > 0) return equityUsd;
+
+        // 3) поддержка старого поля (если где-то ещё осталось в ветке) через reflection без зависимости компиляции
+        BigDecimal legacyCapital = tryBigDecimal(s, "getCapitalUsd");
+        if (legacyCapital != null && legacyCapital.signum() > 0) return legacyCapital;
+
+        return BigDecimal.ZERO;
+    }
+
     // ---------------- time extraction (адаптер под твой CandleBar) ----------------
 
     private static Instant extractTime(CandleBar bar, Instant startAt, int idx, String timeframe) {
-        // 1) пробуем популярные методы без знаний твоей модели
         Long ms = tryLong(bar, "timeMs")
                 .or(() -> tryLong(bar, "timestamp"))
                 .or(() -> tryLong(bar, "ts"))
@@ -239,7 +271,6 @@ public final class ScalpingBacktestSimulator {
 
         if (ms != null && ms > 0) return Instant.ofEpochMilli(ms);
 
-        // 2) если есть Instant-метод
         Instant inst = tryInstant(bar, "time")
                 .or(() -> tryInstant(bar, "timestamp"))
                 .or(() -> tryInstant(bar, "openAt"))
@@ -248,7 +279,6 @@ public final class ScalpingBacktestSimulator {
 
         if (inst != null) return inst;
 
-        // 3) fallback: синтетика от startAt + idx * timeframe
         long stepSec = timeframeToSec(timeframe);
         return startAt != null
                 ? startAt.plusSeconds(stepSec * (long) idx)
@@ -326,14 +356,33 @@ public final class ScalpingBacktestSimulator {
         try { return Double.parseDouble(String.valueOf(v)); } catch (Exception e) { return def; }
     }
 
+    private static BigDecimal bigParamRequired(Map<String, Object> p, String key) {
+        BigDecimal v = bigParam(p, key, null);
+        if (v == null) {
+            throw new IllegalArgumentException("Missing required param: " + key);
+        }
+        return v;
+    }
+
+    private static BigDecimal bigParam(Map<String, Object> p, String key, BigDecimal def) {
+        if (p == null) return def;
+        Object v = p.get(key);
+        if (v == null) return def;
+        if (v instanceof BigDecimal bd) return bd;
+        if (v instanceof Integer i) return BigDecimal.valueOf(i.longValue());
+        if (v instanceof Long l) return BigDecimal.valueOf(l);
+        if (v instanceof Double d) return BigDecimal.valueOf(d);
+        if (v instanceof Float f) return BigDecimal.valueOf(f.doubleValue());
+        if (v instanceof String s) {
+            try { return new BigDecimal(s.trim()); } catch (Exception ignored) {}
+        }
+        return def;
+    }
+
     private static BigDecimal resolveTradeAmount(StrategySettings s, BigDecimal equity) {
         BigDecimal maxAllowed = resolveMaxExposureAmount(s, equity);
 
-        BigDecimal capital = s.getCapitalUsd();
-        if (capital != null && capital.signum() > 0) {
-            return capital.min(maxAllowed);
-        }
-
+        // riskPerTradePct — трактуем как верхнюю границу аллокации от equity (если задано)
         BigDecimal riskPct = s.getRiskPerTradePct();
         if (riskPct != null && riskPct.signum() > 0) {
             BigDecimal byPct = equity.multiply(riskPct)
@@ -350,7 +399,6 @@ public final class ScalpingBacktestSimulator {
             return maxUsd.min(equity);
         }
 
-        // ВАЖНО: maxExposurePct у тебя может быть Integer/Long/Double/BigDecimal — обрабатываем всё
         BigDecimal pct = asBigDecimal(s.getMaxExposurePct());
         if (pct != null && pct.signum() > 0) {
             BigDecimal byPct = equity.multiply(pct)
@@ -372,5 +420,16 @@ public final class ScalpingBacktestSimulator {
             try { return new BigDecimal(s.trim()); } catch (Exception ignored) {}
         }
         return null;
+    }
+
+    private static BigDecimal tryBigDecimal(Object target, String getterName) {
+        try {
+            Method m = target.getClass().getMethod(getterName);
+            Object v = m.invoke(target);
+            if (v instanceof BigDecimal bd) return bd;
+            return null;
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 }

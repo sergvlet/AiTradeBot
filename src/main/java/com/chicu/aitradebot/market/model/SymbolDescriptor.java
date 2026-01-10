@@ -54,10 +54,13 @@ public record SymbolDescriptor(
             String exchange
     ) {
 
+        final String ex = normalizeUpper(exchange);
+        final String sym = normalizeUpper(symbol);
+
         return new SymbolDescriptor(
-                symbol,
-                baseAsset,
-                quoteAsset,
+                sym,
+                normalizeUpper(baseAsset),
+                normalizeUpper(quoteAsset),
                 lastPrice,
                 priceChangePct24h,
                 volume24h,
@@ -67,20 +70,33 @@ public record SymbolDescriptor(
                 tickSize,
                 maxOrders,
 
-                scopeOf(exchange, minNotional),
-                scopeOf(exchange, stepSize),
-                scopeOf(exchange, tickSize),
-                maxOrders != null
-                        ? ExchangeLimitScope.SYMBOL
-                        : ExchangeLimitScope.UNKNOWN,
+                scopeOf(ex, minNotional),
+                scopeOf(ex, stepSize),
+                scopeOf(ex, tickSize),
+                scopeOf(ex, maxOrders),
 
                 tradable
         );
     }
 
+    private static String normalizeUpper(String s) {
+        return s == null ? null : s.trim().toUpperCase();
+    }
+
+    /**
+     * В UI "UNKNOWN" только путает.
+     * Для BINANCE/OKX/etc лимиты обычно символ-специфичны (exchangeInfo filters),
+     * даже если конкретное значение не пришло (null) — показываем SYMBOL, а не UNKNOWN.
+     * Для BYBIT часто лимиты/правила зависят от аккаунта → ACCOUNT.
+     */
     private static ExchangeLimitScope scopeOf(String exchange, Object value) {
         if (value != null) return ExchangeLimitScope.SYMBOL;
+
+        if (exchange == null || exchange.isBlank()) return ExchangeLimitScope.UNKNOWN;
+
         if ("BYBIT".equalsIgnoreCase(exchange)) return ExchangeLimitScope.ACCOUNT;
-        return ExchangeLimitScope.UNKNOWN;
+
+        // BINANCE / OKX / др.: лучше показать SYMBOL (а значение может быть "—")
+        return ExchangeLimitScope.SYMBOL;
     }
 }

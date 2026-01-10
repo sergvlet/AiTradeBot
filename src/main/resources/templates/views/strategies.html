@@ -25,10 +25,13 @@
                     <!-- Статус -->
                     <span class="badge px-3 py-2 mb-2"
                           th:classappend="${s.active} ? ' bg-success' : ' bg-secondary'">
-                        <span th:text="${s.active} ? '🟢 Активна' : '⚫ Остановлена'">
-                            ⚫ Остановлена
-                        </span>
+                        <span th:text="${s.active} ? '🟢 Активна' : '⚫ Остановлена'">⚫ Остановлена</span>
                     </span>
+
+                    <!-- Описание -->
+                    <div class="small text-secondary mb-3" th:text="${s.description}">
+                        Описание стратегии
+                    </div>
 
                     <!-- Основная инфа -->
                     <div class="small text-start">
@@ -52,28 +55,6 @@
                             <strong>Режим:</strong>
                             <span th:text="${s.advancedControlMode}">MANUAL</span>
                         </div>
-                        <div>
-                            <strong>PnL:</strong>
-                            <span th:text="${s.totalProfitPct}"
-                                  th:classappend="${s.totalProfitPct >= 0} ? ' pnl-green' : ' pnl-red'">0</span>%
-                        </div>
-                        <div>
-                            <strong>ML доверие:</strong>
-                            <span th:text="${s.mlConfidence}">0</span>
-                        </div>
-                        <div>
-                            <strong>TP/SL:</strong>
-                            <span th:text="${s.takeProfitPct}">1</span> /
-                            <span th:text="${s.stopLossPct}">1</span>%
-                        </div>
-                        <div>
-                            <strong>Риск/сделку:</strong>
-                            <span th:text="${s.riskPerTradePct}">1</span>%
-                        </div>
-                        <div>
-                            <strong>Комиссия:</strong>
-                            <span th:text="${s.commissionPct}">0.05</span>%
-                        </div>
                     </div>
 
                     <!-- КНОПКИ -->
@@ -81,13 +62,11 @@
 
                         <!-- 🔁 TOGGLE (FORM, НЕ JS) -->
                         <form method="post" th:action="@{/strategies/toggle}">
-
-                            <input type="hidden" name="chatId" th:value="${s.chatId}">
-                            <input type="hidden" name="type" th:value="${s.type}">
+                            <input type="hidden" name="chatId"   th:value="${s.chatId}">
+                            <input type="hidden" name="type"     th:value="${s.type}">
                             <input type="hidden" name="exchange" th:value="${s.exchangeName}">
-                            <input type="hidden" name="network" th:value="${s.networkType}">
-                            <input type="hidden" name="symbol" th:value="${s.symbol}">
-                            <input type="hidden" name="timeframe" th:value="${s.timeframe}">
+                            <input type="hidden" name="network"  th:value="${s.networkType}">
+
                             <button type="submit"
                                     class="btn"
                                     th:classappend="${s.active} ? ' btn-outline-danger' : ' btn-outline-success'">

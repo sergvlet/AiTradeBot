@@ -29,6 +29,7 @@ import org.springframework.ui.Model;
 import org.springframework.web.bind.annotation.*;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.util.List;
 import java.util.Map;
 
@@ -74,7 +75,7 @@ public class StrategySettingsController {
         NetworkType network = parseNetworkOrDefault(networkParam, NetworkType.TESTNET);
 
         // =====================================================
-        // StrategySettings (unified)
+        // StrategySettings (unified) — строго под контекст
         // =====================================================
         StrategySettings strategy =
                 strategySettingsService
@@ -171,7 +172,6 @@ public class StrategySettingsController {
 
         model.addAttribute("exchangeSettings", exchangeSettings);
 
-        // ✅ важное: UI не должен показывать “старую диагностику”
         model.addAttribute("diagnosticsSupported", diagnosticsSupported);
         model.addAttribute("diagnostics", diagnosticsSupported ? diagnostics : null);
         model.addAttribute("connectionOk", diagnosticsSupported && connectionOk);
@@ -221,7 +221,9 @@ public class StrategySettingsController {
         }
 
         String accountAsset = params.get("accountAsset");
-        if (accountAsset != null && !accountAsset.isBlank()) s.setAccountAsset(accountAsset);
+        if (accountAsset != null && !accountAsset.isBlank()) {
+            s.setAccountAsset(accountAsset);
+        }
 
         switch (saveScope) {
 
@@ -261,36 +263,53 @@ public class StrategySettingsController {
             }
 
             case "risk" -> {
-                strategySettingsService.updateRiskFromUi(
-                        chatId, strategyType, exchange, network,
-                        parseBigDecimalOrNull(params.get("dailyLossLimitPct")),
-                        parseBigDecimalOrNull(params.get("riskPerTradePct"))
-                );
+                // ✅ В unified больше нет TP/SL и комиссий — они живут в таблицах конкретных стратегий.
+                // Здесь сохраняем только то, что реально относится к StrategySettings.
 
-                StrategySettings refreshed =
-                        strategySettingsService.findLatest(chatId, strategyType, exchange, network).orElseThrow();
+                s.setRiskPerTradePct(validatePct(parseBigDecimalOrNull(params.get("riskPerTradePct"))));
+                s.setMinRiskReward(validatePositiveOrNull(parseBigDecimalOrNull(params.get("minRiskReward"))));
 
-                BigDecimal stopLossPct = parseBigDecimalOrNull(params.get("stopLossPct"));
-                BigDecimal takeProfitPct = parseBigDecimalOrNull(params.get("takeProfitPct"));
+                Integer leverage = parseIntOrNull(params.get("leverage"));
+                if (leverage != null && leverage >= 1) s.setLeverage(leverage);
 
-                boolean changed = false;
-                if (stopLossPct != null) { refreshed.setStopLossPct(stopLossPct); changed = true; }
-                if (takeProfitPct != null) { refreshed.setTakeProfitPct(takeProfitPct); changed = true; }
+                s.setMaxDrawdownPct(validatePct(parseBigDecimalOrNull(params.get("maxDrawdownPct"))));
+                s.setMaxDrawdownUsd(validateMoneyOrNull(parseBigDecimalOrNull(params.get("maxDrawdownUsd"))));
 
-                if (changed) strategySettingsService.save(refreshed);
+                s.setMaxPositionPct(validatePct(parseBigDecimalOrNull(params.get("maxPositionPct"))));
+                s.setMaxPositionUsd(validateMoneyOrNull(parseBigDecimalOrNull(params.get("maxPositionUsd"))));
+
+                Integer maxTradesPerDay = parseIntOrNull(params.get("maxTradesPerDay"));
+                s.setMaxTradesPerDay((maxTradesPerDay != null && maxTradesPerDay > 0) ? maxTradesPerDay : null);
+
+                Integer maxConsecutiveLosses = parseIntOrNull(params.get("maxConsecutiveLosses"));
+                s.setMaxConsecutiveLosses((maxConsecutiveLosses != null && maxConsecutiveLosses > 0) ? maxConsecutiveLosses : null);
+
+                Integer cooldownAfterLossSeconds = parseIntOrNull(params.get("cooldownAfterLossSeconds"));
+                s.setCooldownAfterLossSeconds((cooldownAfterLossSeconds != null && cooldownAfterLossSeconds > 0) ? cooldownAfterLossSeconds : null);
+
+                // checkbox
+                s.setAllowAveraging(params.containsKey("allowAveraging"));
+
+                strategySettingsService.save(s);
             }
 
             case "general" -> {
                 s.setReinvestProfit(params.containsKey("reinvestProfit"));
 
-                BigDecimal maxExposureUsd = parseBigDecimalOrNull(params.get("maxExposureUsd"));
-                Integer maxExposurePct = parseIntOrNull(params.get("maxExposurePct"));
+                // дневной лимит потерь живёт в "Общие"
+                s.setDailyLossLimitPct(validatePct(parseBigDecimalOrNull(params.get("dailyLossLimitPct"))));
 
+                BigDecimal maxExposureUsd = validateMoneyOrNull(parseBigDecimalOrNull(params.get("maxExposureUsd")));
                 if (maxExposureUsd != null && maxExposureUsd.signum() <= 0) maxExposureUsd = null;
-                if (maxExposurePct != null && (maxExposurePct <= 0 || maxExposurePct > 100)) maxExposurePct = null;
+
+                // ⚠️ ВАЖНО: тип maxExposurePct должен совпадать с твоей сущностью.
+                // Ошибка компиляции у тебя была "Integer -> BigDecimal", значит поле стало BigDecimal.
+                BigDecimal maxExposurePct = validatePct(parseBigDecimalOrNull(params.get("maxExposurePct")));
+                if (maxExposurePct != null && maxExposurePct.signum() <= 0) maxExposurePct = null;
 
                 s.setMaxExposureUsd(maxExposureUsd);
                 s.setMaxExposurePct(maxExposurePct);
+
                 strategySettingsService.save(s);
             }
 
@@ -334,7 +353,7 @@ public class StrategySettingsController {
     }
 
     // =====================================================
-    // POST — DIAGNOSE (правильный путь для страницы настроек)
+    // POST — DIAGNOSE
     // =====================================================
     @PostMapping("/{type}/config/diagnose")
     @ResponseBody
@@ -367,7 +386,7 @@ public class StrategySettingsController {
     }
 
     // =====================================================
-    // POST — DIAGNOSE (совместимость со старым JS)
+    // POST — DIAGNOSE (legacy)
     // =====================================================
     @PostMapping("/network/diagnose")
     @ResponseBody
@@ -440,16 +459,21 @@ public class StrategySettingsController {
         }
     }
 
-    // RSI EMA legacy
+    // RSI EMA legacy (временно)
     private void pullRsiEmaIntoUnifiedIfEmpty(StrategyType type, long chatId, StrategySettings s) {
         if (type != StrategyType.RSI_EMA) return;
-        if (s.getSymbol() != null && s.getTimeframe() != null) return;
+
+        boolean symbolEmpty = (s.getSymbol() == null || s.getSymbol().isBlank());
+        boolean tfEmpty = (s.getTimeframe() == null || s.getTimeframe().isBlank());
+        if (!symbolEmpty && !tfEmpty) return;
 
         RsiEmaStrategySettings t = rsiEmaSettingsService.getOrCreate(chatId);
-        s.setSymbol(t.getSymbol());
-        s.setTimeframe(t.getTimeframe());
-        s.setCachedCandlesLimit(t.getCachedCandlesLimit());
-        s.setNetworkType(t.getNetworkType());
+
+        if (symbolEmpty) s.setSymbol(t.getSymbol());
+        if (tfEmpty) s.setTimeframe(t.getTimeframe());
+
+        if (s.getCachedCandlesLimit() == null) s.setCachedCandlesLimit(t.getCachedCandlesLimit());
+        if (s.getNetworkType() == null) s.setNetworkType(t.getNetworkType());
 
         strategySettingsService.save(s);
     }
@@ -473,5 +497,26 @@ public class StrategySettingsController {
     private Integer parseIntOrNull(String v) {
         try { return v == null ? null : Integer.parseInt(v.trim()); }
         catch (Exception e) { return null; }
+    }
+
+    private BigDecimal validatePct(BigDecimal v) {
+        if (v == null) return null;
+
+        if (v.compareTo(BigDecimal.ZERO) < 0) v = BigDecimal.ZERO;
+        if (v.compareTo(BigDecimal.valueOf(100)) > 0) v = BigDecimal.valueOf(100);
+
+        return v.setScale(4, RoundingMode.HALF_UP);
+    }
+
+    private BigDecimal validateMoneyOrNull(BigDecimal v) {
+        if (v == null) return null;
+        if (v.compareTo(BigDecimal.ZERO) <= 0) return null;
+        return v.setScale(6, RoundingMode.HALF_UP);
+    }
+
+    private BigDecimal validatePositiveOrNull(BigDecimal v) {
+        if (v == null) return null;
+        if (v.compareTo(BigDecimal.ZERO) <= 0) return null;
+        return v.setScale(6, RoundingMode.HALF_UP);
     }
 }

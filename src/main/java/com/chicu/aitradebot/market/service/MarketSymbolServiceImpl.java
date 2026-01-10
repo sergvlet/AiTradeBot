@@ -22,7 +22,7 @@ public class MarketSymbolServiceImpl implements MarketSymbolService {
     private final ExchangeClientFactory exchangeClientFactory;
 
     // ⏱ cache на 10 минут
-    private static final long CACHE_TTL_MS = 10 * 60_000;
+    private static final long CACHE_TTL_MS = 10 * 600_000;
 
     // 📦 exchange|network|asset -> symbols
     private final Map<String, CacheEntry> cache = new ConcurrentHashMap<>();
