@@ -2,6 +2,7 @@ package com.chicu.aitradebot.strategy.registry;
 
 import com.chicu.aitradebot.strategy.core.TradingStrategy;
 import lombok.extern.slf4j.Slf4j;
+import org.jetbrains.annotations.NotNull;
 import org.springframework.aop.support.AopUtils;
 import org.springframework.beans.BeansException;
 import org.springframework.beans.factory.config.BeanPostProcessor;
@@ -19,7 +20,7 @@ public class StrategyBindingProcessor implements BeanPostProcessor {
     }
 
     @Override
-    public Object postProcessAfterInitialization(Object bean, String beanName) throws BeansException {
+    public Object postProcessAfterInitialization(@NotNull Object bean, @NotNull String beanName) throws BeansException {
 
         // Прокси тоже обычно instanceof TradingStrategy, так что это ок.
         if (!(bean instanceof TradingStrategy strategy)) {
@@ -28,9 +29,6 @@ public class StrategyBindingProcessor implements BeanPostProcessor {
 
         // ✅ КЛЮЧЕВО: берём реальный класс (а не proxy-class)
         Class<?> targetClass = AopUtils.getTargetClass(bean);
-        if (targetClass == null) {
-            targetClass = strategy.getClass();
-        }
 
         // ✅ Надёжный поиск аннотации (учитывает наследование/мета-аннотации)
         StrategyBinding binding =

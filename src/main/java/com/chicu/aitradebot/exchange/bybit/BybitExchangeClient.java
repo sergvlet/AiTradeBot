@@ -8,11 +8,11 @@ import com.chicu.aitradebot.exchange.model.AccountFees;
 import com.chicu.aitradebot.exchange.model.AccountInfo;
 import com.chicu.aitradebot.exchange.model.Order;
 import com.chicu.aitradebot.exchange.service.ExchangeSettingsService;
-import com.chicu.aitradebot.market.model.ExchangeLimitScope;
 import com.chicu.aitradebot.market.model.SymbolDescriptor;
 import lombok.extern.slf4j.Slf4j;
 import org.json.JSONArray;
 import org.json.JSONObject;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.http.*;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestTemplate;
@@ -34,11 +34,15 @@ public class BybitExchangeClient implements ExchangeClient {
     private static final String DEMO = "https://api-demo.bybit.com";
     private static final String RECV_WINDOW = "5000";
 
-    private final RestTemplate rest = new RestTemplate();
+    private final RestTemplate rest;
     private final ExchangeSettingsService settingsService;
 
-    public BybitExchangeClient(ExchangeSettingsService settingsService) {
+    public BybitExchangeClient(
+            ExchangeSettingsService settingsService,
+            @Qualifier("marketRestTemplate") RestTemplate rest
+    ) {
         this.settingsService = settingsService;
+        this.rest = rest;
         log.info("⚠️ BYBIT: TESTNET работает как DEMO (api-demo.bybit.com)");
     }
 
@@ -521,125 +525,182 @@ public class BybitExchangeClient implements ExchangeClient {
     @Override
     public List<SymbolDescriptor> getTradableSymbols(String quoteAsset) {
 
+        final String baseUrl = MAIN;
+
+        String qa = (quoteAsset == null || quoteAsset.isBlank())
+                ? "USDT"
+                : quoteAsset.trim().toUpperCase();
+
+        // =====================================================
+        // 1) INSTRUMENTS (SPOT, V5) — критично
+        // =====================================================
+        JSONArray instruments;
         try {
-            // =====================================================
-            // 1) INSTRUMENTS (SPOT, V5)
-            // =====================================================
-            String instrumentsRaw = rest.getForObject(
-                    MAIN + "/v5/market/instruments-info?category=spot",
-                    String.class
+            String instrumentsRaw = getForStringWithRetry(
+                    baseUrl + "/v5/market/instruments-info?category=spot",
+                    "bybit instruments"
             );
+
+            if (instrumentsRaw == null || instrumentsRaw.isBlank()) return List.of();
 
             JSONObject instrumentsRoot = new JSONObject(instrumentsRaw);
-            if (instrumentsRoot.optInt("retCode", 0) != 0) {
+            int retCode = instrumentsRoot.optInt("retCode", 0);
+            if (retCode != 0) {
                 log.warn("⚠️ BYBIT instruments retCode={} msg={}",
-                        instrumentsRoot.optInt("retCode"),
-                        instrumentsRoot.optString("retMsg"));
+                        retCode, instrumentsRoot.optString("retMsg"));
                 return List.of();
             }
 
-            JSONArray instruments = instrumentsRoot
-                    .getJSONObject("result")
-                    .getJSONArray("list");
+            JSONObject result = instrumentsRoot.optJSONObject("result");
+            instruments = result != null ? result.optJSONArray("list") : null;
 
-            // =====================================================
-            // 2) TICKERS 24H (V5)
-            // =====================================================
-            String tickersRaw = rest.getForObject(
-                    MAIN + "/v5/market/tickers?category=spot",
-                    String.class
-            );
-
-            JSONObject tickersRoot = new JSONObject(tickersRaw);
-            if (tickersRoot.optInt("retCode", 0) != 0) {
-                log.warn("⚠️ BYBIT tickers retCode={} msg={}",
-                        tickersRoot.optInt("retCode"),
-                        tickersRoot.optString("retMsg"));
-                return List.of();
-            }
-
-            JSONArray tickers = tickersRoot
-                    .getJSONObject("result")
-                    .getJSONArray("list");
-
-            Map<String, JSONObject> tickerMap = new HashMap<>();
-            for (int i = 0; i < tickers.length(); i++) {
-                JSONObject t = tickers.getJSONObject(i);
-                tickerMap.put(t.optString("symbol"), t);
-            }
-
-            List<SymbolDescriptor> out = new ArrayList<>();
-
-            // =====================================================
-            // 3) MAIN LOOP
-            // =====================================================
-            for (int i = 0; i < instruments.length(); i++) {
-
-                JSONObject s = instruments.getJSONObject(i);
-
-                String symbol = s.optString("symbol");
-                String base = s.optString("baseCoin");
-                String quote = s.optString("quoteCoin");
-                String status = s.optString("status");
-
-                if (!"Trading".equalsIgnoreCase(status)) continue;
-                if (quoteAsset != null && !quoteAsset.equalsIgnoreCase(quote)) continue;
-
-                // =================================================
-                // LIMITS (Bybit)
-                // =================================================
-                JSONObject lotSize = s.optJSONObject("lotSizeFilter");
-                JSONObject price = s.optJSONObject("priceFilter");
-
-                // ⚠️ В V5 lotSizeFilter:
-                // minOrderAmt — минимальная сумма в quote (USDT), minOrderQty — минимальное количество
-                BigDecimal minNotional = parseBd(lotSize != null ? lotSize.optString("minOrderAmt", null) : null);
-                BigDecimal stepSize = parseBd(lotSize != null ? lotSize.optString("qtyStep", null) : null);
-                BigDecimal tickSize = parseBd(price != null ? price.optString("tickSize", null) : null);
-
-                Integer maxOrders = null; // Bybit spot обычно не даёт
-
-                // =================================================
-                // TICKER
-                // =================================================
-                JSONObject t = tickerMap.get(symbol);
-
-                BigDecimal lastPrice = t != null ? parseBd(t.optString("lastPrice", null)) : null;
-
-                BigDecimal priceChangePct = null;
-                if (t != null && t.has("price24hPcnt")) {
-                    BigDecimal frac = parseBd(t.optString("price24hPcnt", null)); // 0.0123 = 1.23%
-                    if (frac != null) priceChangePct = frac.multiply(BigDecimal.valueOf(100));
-                }
-
-                // turnover24h — в quote
-                BigDecimal volume = t != null ? parseBd(t.optString("turnover24h", null)) : null;
-
-                // =================================================
-                // RESULT
-                // =================================================
-                out.add(SymbolDescriptor.of(
-                        symbol,
-                        base,
-                        quote,
-                        lastPrice,
-                        priceChangePct,
-                        volume,
-                        minNotional,
-                        stepSize,
-                        tickSize,
-                        maxOrders,
-                        true,
-                        "BYBIT"
-                ));
-            }
-
-            log.info("✅ BYBIT symbols loaded: {}", out.size());
-            return out;
+            if (instruments == null || instruments.isEmpty()) return List.of();
 
         } catch (Exception e) {
-            log.error("❌ Bybit getTradableSymbols failed", e);
+            log.warn("⚠️ BYBIT instruments failed: asset={} err={}", qa, e.toString());
             return List.of();
+        }
+
+        // =====================================================
+        // 2) TICKERS 24H (V5) — не критично (может падать)
+        // =====================================================
+        Map<String, JSONObject> tickerMap = Map.of();
+        try {
+            String tickersRaw = getForStringWithRetry(
+                    baseUrl + "/v5/market/tickers?category=spot",
+                    "bybit tickers"
+            );
+
+            if (tickersRaw != null && !tickersRaw.isBlank()) {
+                JSONObject tickersRoot = new JSONObject(tickersRaw);
+                int retCode = tickersRoot.optInt("retCode", 0);
+                if (retCode == 0) {
+                    JSONObject result = tickersRoot.optJSONObject("result");
+                    JSONArray tickers = result != null ? result.optJSONArray("list") : null;
+
+                    if (tickers != null && !tickers.isEmpty()) {
+                        Map<String, JSONObject> tmp = new HashMap<>();
+                        for (int i = 0; i < tickers.length(); i++) {
+                            JSONObject t = tickers.optJSONObject(i);
+                            if (t == null) continue;
+                            String sym = t.optString("symbol", null);
+                            if (sym != null && !sym.isBlank()) tmp.put(sym, t);
+                        }
+                        tickerMap = tmp;
+                    }
+                } else {
+                    log.warn("⚠️ BYBIT tickers retCode={} msg={}",
+                            retCode, tickersRoot.optString("retMsg"));
+                }
+            }
+        } catch (Exception e) {
+            // ⚠️ не валим метод — просто работаем без тикеров
+            log.warn("⚠️ BYBIT tickers failed: asset={} err={}", qa, e.toString());
+            tickerMap = Map.of();
+        }
+
+        List<SymbolDescriptor> out = new ArrayList<>(Math.min(instruments.length(), 2000));
+
+        // =====================================================
+        // 3) MAIN LOOP
+        // =====================================================
+        for (int i = 0; i < instruments.length(); i++) {
+
+            JSONObject s = instruments.optJSONObject(i);
+            if (s == null) continue;
+
+            String symbol = s.optString("symbol", null);
+            if (symbol == null || symbol.isBlank()) continue;
+
+            String base = s.optString("baseCoin", null);
+            String quote = s.optString("quoteCoin", null);
+            String status = s.optString("status", "");
+
+            // статус: Trading
+            if (!"Trading".equalsIgnoreCase(status)) continue;
+
+            // фильтрация по quote
+            if (quote == null || !qa.equalsIgnoreCase(quote)) continue;
+
+            // =================================================
+            // LIMITS (Bybit V5)
+            // =================================================
+            JSONObject lotSize = s.optJSONObject("lotSizeFilter");
+            JSONObject price = s.optJSONObject("priceFilter");
+
+            // Bybit: minOrderAmt (минимальная сумма в quote), qtyStep (шаг количества)
+            BigDecimal minNotional = bdOrNull(lotSize != null ? lotSize.optString("minOrderAmt", null) : null);
+            BigDecimal stepSize    = bdOrNull(lotSize != null ? lotSize.optString("qtyStep", null) : null);
+            BigDecimal tickSize    = bdOrNull(price != null ? price.optString("tickSize", null) : null);
+
+            Integer maxOrders = null; // spot Bybit обычно не отдаёт лимит
+
+            // =================================================
+            // TICKER (может отсутствовать)
+            // =================================================
+            JSONObject t = tickerMap.get(symbol);
+
+            BigDecimal lastPrice = (t != null) ? bdOrNull(t.optString("lastPrice", null)) : null;
+
+            BigDecimal priceChangePct = null;
+            if (t != null) {
+                // price24hPcnt: "0.0123" => 1.23%
+                BigDecimal frac = bdOrNull(t.optString("price24hPcnt", null));
+                if (frac != null) {
+                    priceChangePct = frac.multiply(BigDecimal.valueOf(100));
+                }
+            }
+
+            // turnover24h — оборот в quote (USDT)
+            BigDecimal volume = (t != null) ? bdOrNull(t.optString("turnover24h", null)) : null;
+
+            out.add(SymbolDescriptor.of(
+                    symbol,
+                    base,
+                    quote,
+                    lastPrice,
+                    priceChangePct,
+                    volume,
+                    minNotional,
+                    stepSize,
+                    tickSize,
+                    maxOrders,
+                    true,
+                    "BYBIT"
+            ));
+        }
+
+        log.info("✅ BYBIT symbols loaded: asset={} total={}", qa, out.size());
+        return out;
+    }
+
+    /**
+     * 1 повтор при сетевой проблеме/таймауте.
+     */
+    private String getForStringWithRetry(String url, String label) {
+        try {
+            return rest.getForObject(url, String.class);
+        } catch (Exception e1) {
+            try {
+                log.warn("⚠️ {} failed, retrying once… err={}", label, e1.toString());
+                return rest.getForObject(url, String.class);
+            } catch (Exception e2) {
+                throw e2;
+            }
+        }
+    }
+
+    /**
+     * Безопасный BigDecimal парсер.
+     */
+    private static BigDecimal bdOrNull(String s) {
+        if (s == null) return null;
+        String v = s.trim();
+        if (v.isEmpty()) return null;
+        try {
+            return new BigDecimal(v);
+        } catch (Exception ignored) {
+            return null;
         }
     }
 

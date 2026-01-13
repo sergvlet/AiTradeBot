@@ -13,8 +13,8 @@ import com.chicu.aitradebot.market.model.SymbolDescriptor;
 import lombok.extern.slf4j.Slf4j;
 import org.json.JSONArray;
 import org.json.JSONObject;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.http.*;
-import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestTemplate;
@@ -37,14 +37,12 @@ public class BinanceExchangeClient implements ExchangeClient {
     private final ExchangeSettingsService settingsService;
     private final RestTemplate rest;
 
-    public BinanceExchangeClient(ExchangeSettingsService settingsService) {
+    public BinanceExchangeClient(
+            ExchangeSettingsService settingsService,
+            @Qualifier("marketRestTemplate") RestTemplate rest
+    ) {
         this.settingsService = settingsService;
-
-        SimpleClientHttpRequestFactory f = new SimpleClientHttpRequestFactory();
-        f.setReadTimeout(7000);
-        f.setConnectTimeout(7000);
-
-        this.rest = new RestTemplate(f);
+        this.rest = rest;
     }
 
     @Override
@@ -414,102 +412,143 @@ public class BinanceExchangeClient implements ExchangeClient {
     @Override
     public List<SymbolDescriptor> getTradableSymbols(String quoteAsset) {
 
-        // ⚠️ Для списка символов Binance ВСЕГДА используем MAINNET
-        String baseUrl = MAIN;
+        // ⚠️ Для списка символов Binance ВСЕГДА используем MAINNET (публичные ручки)
+        final String baseUrl = MAIN;
+
+        String qa = (quoteAsset == null || quoteAsset.isBlank())
+                ? "USDT"
+                : quoteAsset.trim().toUpperCase();
 
         // =========================================================
         // 1) exchangeInfo — символы + фильтры
         // =========================================================
-        String infoBody = rest.getForObject(baseUrl + "/api/v3/exchangeInfo", String.class);
-        JSONObject info = new JSONObject(infoBody);
-        JSONArray symbols = info.getJSONArray("symbols");
-
-        // =========================================================
-        // 2) ticker 24h — цена / объём / изменение
-        // =========================================================
-        String tickerBody = rest.getForObject(baseUrl + "/api/v3/ticker/24hr", String.class);
-        JSONArray tickers = new JSONArray(tickerBody);
-
-        Map<String, JSONObject> tickerMap = new HashMap<>();
-        for (int i = 0; i < tickers.length(); i++) {
-            JSONObject t = tickers.getJSONObject(i);
-            tickerMap.put(t.getString("symbol"), t);
+        JSONObject info;
+        try {
+            String infoBody = getForStringWithRetry(baseUrl + "/api/v3/exchangeInfo", "exchangeInfo");
+            if (infoBody == null || infoBody.isBlank()) return List.of();
+            info = new JSONObject(infoBody);
+        } catch (Exception e) {
+            log.warn("⚠️ BINANCE exchangeInfo failed: asset={} err={}", qa, e.toString());
+            return List.of(); // без exchangeInfo вообще нечего строить
         }
 
-        List<SymbolDescriptor> out = new ArrayList<>();
+        JSONArray symbols = info.optJSONArray("symbols");
+        if (symbols == null || symbols.isEmpty()) return List.of();
+
+        // =========================================================
+        // 2) ticker 24h — цена / объём / изменение (может упасть)
+        // =========================================================
+        Map<String, JSONObject> tickerMap = new HashMap<>();
+        try {
+            String tickerBody = getForStringWithRetry(baseUrl + "/api/v3/ticker/24hr", "ticker24h");
+            if (tickerBody != null && !tickerBody.isBlank()) {
+                JSONArray tickers = new JSONArray(tickerBody);
+                for (int i = 0; i < tickers.length(); i++) {
+                    JSONObject t = tickers.optJSONObject(i);
+                    if (t == null) continue;
+                    String sym = t.optString("symbol", null);
+                    if (sym != null && !sym.isBlank()) {
+                        tickerMap.put(sym, t);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // ⚠️ важно: не ломаем UI — просто работаем без тикера
+            log.warn("⚠️ BINANCE ticker/24hr failed: asset={} err={}", qa, e.toString());
+            tickerMap = Map.of();
+        }
+
+        List<SymbolDescriptor> out = new ArrayList<>(Math.min(symbols.length(), 2000));
 
         // =========================================================
         // 3) Основной проход по символам
         // =========================================================
         for (int i = 0; i < symbols.length(); i++) {
 
-            JSONObject s = symbols.getJSONObject(i);
+            JSONObject s = symbols.optJSONObject(i);
+            if (s == null) continue;
 
-            String symbol = s.getString("symbol");
-            String status = s.optString("status");
-            boolean spotAllowed = s.optBoolean("isSpotTradingAllowed", true);
+            String symbol = s.optString("symbol", null);
+            if (symbol == null || symbol.isBlank()) continue;
 
-            String base = s.getString("baseAsset");
-            String quote = s.getString("quoteAsset");
+            String status = s.optString("status", "");
+            String base = s.optString("baseAsset", null);
+            String quote = s.optString("quoteAsset", null);
 
-            // --- фильтрация ---
-            if (!quoteAsset.equalsIgnoreCase(quote)) continue;
+            // --- фильтрация по котируемому активу ---
+            if (quote == null || !qa.equalsIgnoreCase(quote)) continue;
+
+            // --- только TRADING ---
             if (!"TRADING".equalsIgnoreCase(status)) continue;
-            if (!spotAllowed) continue;
+
+            // --- SPOT allowed: надёжно ---
+            if (!isSpotAllowed(s)) continue;
 
             // =====================================================
-            // 4) Разбор filters (значения)
-            //    ✅ ВАЖНО: Binance часто отдаёт NOTIONAL вместо MIN_NOTIONAL
+            // 4) Разбор filters
             // =====================================================
             BigDecimal minNotional = null;
             BigDecimal stepSize = null;
             BigDecimal tickSize = null;
             Integer maxOrders = null;
 
-            JSONArray filters = s.getJSONArray("filters");
-            for (int f = 0; f < filters.length(); f++) {
-                JSONObject filter = filters.getJSONObject(f);
-                String type = filter.getString("filterType");
+            JSONArray filters = s.optJSONArray("filters");
+            if (filters != null) {
+                for (int f = 0; f < filters.length(); f++) {
+                    JSONObject filter = filters.optJSONObject(f);
+                    if (filter == null) continue;
 
-                switch (type) {
+                    String type = filter.optString("filterType", "");
+                    if (type.isBlank()) continue;
 
-                    // ✅ поддерживаем оба варианта
-                    case "MIN_NOTIONAL", "NOTIONAL" -> {
-                        BigDecimal v = bdOrNull(filter.optString("minNotional", null));
-                        if (v != null) minNotional = v;
-                    }
+                    switch (type) {
 
-                    // ✅ для market тоже бывает отдельный фильтр
-                    case "LOT_SIZE", "MARKET_LOT_SIZE" -> {
-                        BigDecimal v = bdOrNull(filter.optString("stepSize", null));
-                        if (v != null) stepSize = v;
-                    }
+                        // ✅ поддерживаем оба варианта
+                        case "MIN_NOTIONAL", "NOTIONAL" -> {
+                            // У Binance в обоих обычно поле minNotional
+                            BigDecimal v = bdOrNull(filter.optString("minNotional", null));
+                            if (v != null) minNotional = v;
+                        }
 
-                    case "PRICE_FILTER" -> {
-                        BigDecimal v = bdOrNull(filter.optString("tickSize", null));
-                        if (v != null) tickSize = v;
-                    }
+                        // LOT_SIZE для лимитных, MARKET_LOT_SIZE для маркетов — берём любой, но LOT_SIZE предпочтительнее
+                        case "LOT_SIZE" -> {
+                            BigDecimal v = bdOrNull(filter.optString("stepSize", null));
+                            if (v != null) stepSize = v;
+                        }
 
-                    case "MAX_NUM_ORDERS" -> {
-                        int v = filter.optInt("maxNumOrders", 0);
-                        maxOrders = v > 0 ? v : null;
+                        case "MARKET_LOT_SIZE" -> {
+                            if (stepSize == null) { // не затираем LOT_SIZE
+                                BigDecimal v = bdOrNull(filter.optString("stepSize", null));
+                                if (v != null) stepSize = v;
+                            }
+                        }
+
+                        case "PRICE_FILTER" -> {
+                            BigDecimal v = bdOrNull(filter.optString("tickSize", null));
+                            if (v != null) tickSize = v;
+                        }
+
+                        case "MAX_NUM_ORDERS" -> {
+                            int v = filter.optInt("maxNumOrders", 0);
+                            maxOrders = v > 0 ? v : null;
+                        }
                     }
                 }
             }
 
             // =====================================================
-            // 5) Тикер
+            // 5) Тикер (может отсутствовать)
             // =====================================================
             JSONObject t = tickerMap.get(symbol);
 
             BigDecimal lastPrice =
-                    t != null ? bdOrNull(t.optString("lastPrice", null)) : null;
+                    (t != null) ? bdOrNull(t.optString("lastPrice", null)) : null;
 
             BigDecimal priceChangePct =
-                    t != null ? bdOrNull(t.optString("priceChangePercent", null)) : null;
+                    (t != null) ? bdOrNull(t.optString("priceChangePercent", null)) : null;
 
             BigDecimal volume =
-                    t != null ? bdOrNull(t.optString("quoteVolume", null)) : null;
+                    (t != null) ? bdOrNull(t.optString("quoteVolume", null)) : null;
 
             // =====================================================
             // 6) Итоговый SymbolDescriptor
@@ -533,12 +572,61 @@ public class BinanceExchangeClient implements ExchangeClient {
         return out;
     }
 
-    private BigDecimal bdOrNull(String v) {
-        if (v == null || v.isBlank() || "null".equalsIgnoreCase(v)) return null;
+    /**
+     * Надёжная проверка SPOT.
+     * Binance отдаёт либо isSpotTradingAllowed, либо permissions=["SPOT",...]
+     */
+    private boolean isSpotAllowed(JSONObject symbolJson) {
+
+        // 1) permissions
+        JSONArray perms = symbolJson.optJSONArray("permissions");
+        if (perms != null && !perms.isEmpty()) {
+            boolean hasSpot = false;
+            for (int i = 0; i < perms.length(); i++) {
+                String p = perms.optString(i, "");
+                if ("SPOT".equalsIgnoreCase(p)) {
+                    hasSpot = true;
+                    break;
+                }
+            }
+            if (!hasSpot) return false;
+        }
+
+        // 2) флаг spotAllowed (если нет — считаем true, но permissions уже отфильтровали)
+        // Важно: не ставим default=true бездумно, но пусть будет true для старых ответов.
+        boolean spotAllowed = symbolJson.optBoolean("isSpotTradingAllowed", true);
+        return spotAllowed;
+    }
+
+    /**
+     * 1 повтор при сетевой проблеме/таймауте.
+     */
+    private String getForStringWithRetry(String url, String label) {
+        try {
+            return rest.getForObject(url, String.class);
+        } catch (Exception e1) {
+            // один повтор
+            try {
+                log.warn("⚠️ BINANCE {} failed, retrying once… err={}", label, e1.toString());
+                return rest.getForObject(url, String.class);
+            } catch (Exception e2) {
+                throw e2;
+            }
+        }
+    }
+
+    /**
+     * Безопасный BigDecimal парсер.
+     */
+    private static BigDecimal bdOrNull(String s) {
+        if (s == null) return null;
+        String v = s.trim();
+        if (v.isEmpty()) return null;
         try {
             return new BigDecimal(v);
-        } catch (Exception e) {
+        } catch (Exception ignored) {
             return null;
         }
     }
+
 }

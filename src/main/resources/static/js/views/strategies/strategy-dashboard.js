@@ -3,9 +3,23 @@
 import { ChartController } from "../../chart/chart-controller.js";
 import { LayerRenderer }   from "../../chart/layer-renderer.js";
 
+// ✅ Стратегии-оверлеи (те, что реально существуют у тебя)
 import { ScalpingStrategy }    from "../../strategies/scalping.strategy.js";
 import { FibonacciStrategy }   from "../../strategies/fibonacci.strategy.js";
 import { SmartFusionStrategy } from "../../strategies/smartfusion.strategy.js";
+
+/**
+ * ✅ Пустая стратегия-заглушка для всех остальных типов:
+ * график работает, WS работает, но специфичных слоёв нет.
+ */
+class GenericStrategy {
+    constructor({ layers, ctx }) {
+        this.layers = layers;
+        this.ctx = ctx;
+    }
+    onEvent(_) {}
+    onCandleHistory(_) {}
+}
 
 document.addEventListener("DOMContentLoaded", () => {
     console.log("📊 Strategy Dashboard START");
@@ -20,7 +34,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     const chatId = root.dataset.chatId;
-    const type   = root.dataset.type;
+    const type   = (root.dataset.type || "").trim();            // например "MOMENTUM"
     const symbol = (root.dataset.symbol || "").trim().toUpperCase();
 
     console.log("🧩 Context:", { chatId, type, symbol });
@@ -36,38 +50,98 @@ document.addEventListener("DOMContentLoaded", () => {
     // =========================================================================
     const chartCtrl = new ChartController(container);
     chartCtrl.symbol    = symbol;
-    chartCtrl.timeframe = "1m";
+    chartCtrl.timeframe = "1m"; // если бек отдает иной — он всё равно обновит через snapshot/WS
 
     const layers = new LayerRenderer(chartCtrl.chart, chartCtrl.candles);
 
-    // ✅ ВАЖНО: держим ссылку на один и тот же массив (setHistory у тебя уже фиксит это)
+    // ✅ ВАЖНО: держим ссылку на один и тот же массив
     layers.candlesData = chartCtrl.candlesData;
 
-    // если тебе нужно — можно связать обратно
+    // если нужно
     chartCtrl.layerRenderer = layers;
 
     // =========================================================================
-    // STRATEGY
+    // STRATEGY (все типы StrategyType)
     // =========================================================================
     const ctx = { chatId, type, symbol };
     let strategy;
 
     switch (type) {
+
+        // ===================== III) SCALPING =====================
         case "SCALPING":
+        case "WINDOW_SCALPING":
             strategy = new ScalpingStrategy({ layers, ctx });
             break;
-        case "FIBONACCI":
+
+        // ===================== VI) GRIDS =====================
+        case "FIBONACCI_GRID":
+        case "FIBONACCI_RETRACE": // если твой FibonacciStrategy умеет и retrace — ок, если нет, останется generic
             strategy = new FibonacciStrategy({ layers, ctx });
             break;
+
+        case "GRID":
+            // пока нет отдельного grid.strategy.js — график будет работать, слоёв нет
+            strategy = new GenericStrategy({ layers, ctx });
+            break;
+
+        // ===================== VIII) AI =====================
         case "SMART_FUSION":
+        case "HYBRID":            // если нет отдельного hybrid.strategy.js — оставляем generic или можно SmartFusion
             strategy = new SmartFusionStrategy({ layers, ctx });
             break;
+
+        case "RL_AGENT":
+        case "ML_CLASSIFICATION":
+            strategy = new GenericStrategy({ layers, ctx });
+            break;
+
+        // ===================== I) MOMENTUM / TREND =====================
+        case "MOMENTUM":
+        case "TREND":
+        case "TREND_FOLLOWING":
+        case "EMA_CROSSOVER":
+            strategy = new GenericStrategy({ layers, ctx });
+            break;
+
+        // ===================== II) MEAN REVERSION / RSI =====================
+        case "MEAN_REVERSION":
+        case "RSI_OBOS":
+            strategy = new GenericStrategy({ layers, ctx });
+            break;
+
+        // ===================== IV) BREAKOUT =====================
+        case "BREAKOUT":
+        case "VOLATILITY_BREAKOUT":
+            strategy = new GenericStrategy({ layers, ctx });
+            break;
+
+        // ===================== V) LEVELS / STRUCTURE =====================
+        case "SUPPORT_RESISTANCE":
+        case "PRICE_ACTION":
+            strategy = new GenericStrategy({ layers, ctx });
+            break;
+
+        // ===================== VII) VOLUME =====================
+        case "VOLUME_PROFILE":
+        case "VWAP":
+        case "ORDER_FLOW":
+            strategy = new GenericStrategy({ layers, ctx });
+            break;
+
+        // ===================== DCA / GLOBAL =====================
+        case "DCA":
+        case "GLOBAL":
+            strategy = new GenericStrategy({ layers, ctx });
+            break;
+
         default:
-            console.error("❌ Unknown strategy type:", type);
-            return;
+            console.warn("⚠ Unknown strategy type, fallback to Generic:", type);
+            strategy = new GenericStrategy({ layers, ctx });
+            break;
     }
 
-    console.log("🧠 Strategy initialized:", type);
+    console.log("🧠 Strategy initialized:", type, strategy?.constructor?.name);
 
     // =========================================================================
     // REST SNAPSHOT (HISTORY)
@@ -85,8 +159,7 @@ document.addEventListener("DOMContentLoaded", () => {
             if (Array.isArray(data?.candles)) {
                 chartCtrl.setHistory(data.candles);
 
-                // ✅ КЛЮЧЕВОЕ: прогреваем фичи стратегией историей
-                // чтобы FeatureWindowZone сам посчитал hi/lo и нарисовал зону сразу после refresh
+                // прогреваем фичи стратегии историей
                 strategy.onCandleHistory?.(chartCtrl.candlesData);
             }
 
@@ -94,13 +167,18 @@ document.addEventListener("DOMContentLoaded", () => {
             if (data?.layers) {
                 strategy.onEvent?.({ type: "layers", layers: data.layers });
 
-                // ✅ если бек хранит windowZone — рисуем (ПОСЛЕ history, чтобы candlesData уже были)
-                if (type === "SCALPING" && data.layers.windowZone) {
+                // если бек хранит windowZone — рисуем
+                if ((type === "SCALPING" || type === "WINDOW_SCALPING") && data.layers.windowZone) {
                     strategy.onEvent?.({
                         type: "window_zone",
                         windowZone: data.layers.windowZone
                     });
                 }
+            }
+
+            // 3) если бек вернул timeframe — можно применить (опционально)
+            if (data?.timeframe) {
+                chartCtrl.timeframe = String(data.timeframe).toLowerCase();
             }
         })
         .catch(err => console.error("❌ REST snapshot error", err));
@@ -140,11 +218,8 @@ document.addEventListener("DOMContentLoaded", () => {
                 // стратегия получает ВСЁ
                 strategy.onEvent?.(ev);
 
-                // ✅ (опционально) если прилетела свеча и зона считается на закрытиях —
-                // можно периодически обновлять по последним данным
-                if (type === "SCALPING" && (ev.type === "candle" || ev.kline)) {
-                    // если в твоём FeatureWindowZone зона строится из history-window —
-                    // это поможет ей обновляться даже без window_zone событий от бэка
+                // обновление зон по свечам (если нужно)
+                if ((type === "SCALPING" || type === "WINDOW_SCALPING") && (ev.type === "candle" || ev.kline)) {
                     strategy.onCandleHistory?.(chartCtrl.candlesData);
                 }
             });

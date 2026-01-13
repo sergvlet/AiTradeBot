@@ -22,10 +22,16 @@ public class MarketSymbolServiceImpl implements MarketSymbolService {
     private final ExchangeClientFactory exchangeClientFactory;
 
     // ⏱ cache на 10 минут
-    private static final long CACHE_TTL_MS = 10 * 600_000;
+    private static final long CACHE_TTL_MS = 10L * 60L * 1000L;
 
-    // 📦 exchange|network|asset -> symbols
+    // 🧯 чтобы не спамить WARN (на один key раз в 30 сек)
+    private static final long WARN_COOLDOWN_MS = 30_000L;
+
+    // 📦 key -> symbols (храним сырые данные, сортируем по mode)
     private final Map<String, CacheEntry> cache = new ConcurrentHashMap<>();
+
+    // 🧯 key -> lastWarnAt
+    private final Map<String, Long> warnCooldown = new ConcurrentHashMap<>();
 
     @Override
     public List<SymbolDescriptor> getSymbols(
@@ -35,33 +41,81 @@ public class MarketSymbolServiceImpl implements MarketSymbolService {
             SymbolListMode mode
     ) {
 
-        String key = exchange + "|" + network + "|" + accountAsset;
+        // ===== safe defaults =====
+        String safeExchange = (exchange == null || exchange.isBlank())
+                ? "BINANCE"
+                : exchange.trim().toUpperCase();
 
+        NetworkType safeNetwork = (network != null ? network : NetworkType.MAINNET);
+
+        SymbolListMode safeMode = (mode != null ? mode : SymbolListMode.POPULAR);
+
+        String safeAsset = (accountAsset == null || accountAsset.isBlank())
+                ? "USDT"
+                : accountAsset.trim().toUpperCase();
+
+        String key = safeExchange + "|" + safeNetwork + "|" + safeAsset;
+
+        // 1) свежий кэш
         CacheEntry cached = cache.get(key);
         if (cached != null && !cached.isExpired()) {
-            return applyMode(cached.data(), mode);
+            return applyMode(cached.data(), safeMode);
         }
 
-        ExchangeClient client = exchangeClientFactory.get(exchange, network);
-        List<SymbolDescriptor> list = client.getTradableSymbols(accountAsset);
+        // 2) пробуем обновить с биржи
+        try {
+            ExchangeClient client = exchangeClientFactory.get(safeExchange, safeNetwork);
 
-        cache.put(key, new CacheEntry(list));
+            List<SymbolDescriptor> list = client.getTradableSymbols(safeAsset);
 
-        return applyMode(list, mode);
+            // ✅ не кешируем null
+            if (list != null) {
+
+                // ✅ если биржа вернула пусто — НЕ затираем старый кэш (если он был)
+                // чтобы UI не схлопывался из-за временного сбоя.
+                if (!list.isEmpty()) {
+                    cache.put(key, new CacheEntry(list));
+                    return applyMode(list, safeMode);
+                }
+
+                if (cached != null && cached.data() != null && !cached.data().isEmpty()) {
+                    warnOnce(key, "⚠️ symbols пустые (fallback на старый кеш): exchange={} network={} asset={}",
+                            safeExchange, safeNetwork, safeAsset);
+                    return applyMode(cached.data(), safeMode);
+                }
+
+                // пусто и кэша нет — отдаём пусто
+                warnOnce(key, "⚠️ symbols пустые (кэша нет): exchange={} network={} asset={}",
+                        safeExchange, safeNetwork, safeAsset);
+                cache.put(key, new CacheEntry(List.of())); // можно кешировать пусто, но это не критично
+                return List.of();
+            }
+
+            // null — странно, fallback
+            warnOnce(key, "⚠️ getTradableSymbols вернул null: exchange={} network={} asset={}",
+                    safeExchange, safeNetwork, safeAsset);
+
+        } catch (Exception e) {
+            // ✅ не ломаем UI
+            warnOnce(key, "⚠️ Не удалось получить symbols: exchange={} network={} asset={} mode={} err={}",
+                    safeExchange, safeNetwork, safeAsset, safeMode, e.toString());
+        }
+
+        // 3) fallback: старый кэш даже если TTL истёк
+        if (cached != null && cached.data() != null && !cached.data().isEmpty()) {
+            return applyMode(cached.data(), safeMode);
+        }
+
+        return List.of();
     }
 
     // =====================================================================
     // 🔀 MODE SORTING
     // =====================================================================
-    private List<SymbolDescriptor> applyMode(
-            List<SymbolDescriptor> list,
-            SymbolListMode mode
-    ) {
+    private List<SymbolDescriptor> applyMode(List<SymbolDescriptor> list, SymbolListMode mode) {
+        if (list == null || list.isEmpty()) return List.of();
 
-        SymbolListMode safeMode =
-                mode != null ? mode : SymbolListMode.POPULAR;
-
-        return switch (safeMode) {
+        return switch (mode) {
 
             case GAINERS -> list.stream()
                     .sorted(Comparator.comparing(
@@ -91,10 +145,7 @@ public class MarketSymbolServiceImpl implements MarketSymbolService {
     // =====================================================================
     // 📦 CACHE ENTRY
     // =====================================================================
-    private record CacheEntry(
-            List<SymbolDescriptor> data,
-            long createdAt
-    ) {
+    private record CacheEntry(List<SymbolDescriptor> data, long createdAt) {
         CacheEntry(List<SymbolDescriptor> data) {
             this(data, System.currentTimeMillis());
         }
@@ -102,6 +153,19 @@ public class MarketSymbolServiceImpl implements MarketSymbolService {
         boolean isExpired() {
             return System.currentTimeMillis() - createdAt > CACHE_TTL_MS;
         }
+    }
+
+    // =====================================================================
+    // 🧯 WARN COOLDOWN
+    // =====================================================================
+    private void warnOnce(String key, String pattern, Object... args) {
+        long now = System.currentTimeMillis();
+        Long last = warnCooldown.get(key);
+        if (last != null && now - last < WARN_COOLDOWN_MS) {
+            return;
+        }
+        warnCooldown.put(key, now);
+        log.warn(pattern, args);
     }
 
     @Override
@@ -113,11 +177,11 @@ public class MarketSymbolServiceImpl implements MarketSymbolService {
     ) {
         if (symbol == null || symbol.isBlank()) return null;
 
-        List<SymbolDescriptor> list =
-                getSymbols(exchange, network, accountAsset, SymbolListMode.POPULAR);
+        List<SymbolDescriptor> list = getSymbols(exchange, network, accountAsset, SymbolListMode.ALL);
 
+        String s = symbol.trim();
         return list.stream()
-                .filter(s -> symbol.equalsIgnoreCase(s.symbol()))
+                .filter(it -> it != null && it.symbol() != null && it.symbol().equalsIgnoreCase(s))
                 .findFirst()
                 .orElse(null);
     }

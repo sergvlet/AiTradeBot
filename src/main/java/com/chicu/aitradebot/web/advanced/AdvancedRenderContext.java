@@ -25,10 +25,13 @@ public class AdvancedRenderContext {
      */
     Map<String, String> params;
 
-    /**
-     * true если поля должны быть заблокированы (AI)
-     */
-    public boolean isReadOnly() {
-        return controlMode == AdvancedControlMode.AI;
-    }
+    public boolean isAi()     { return controlMode == AdvancedControlMode.AI; }
+    public boolean isHybrid() { return controlMode == AdvancedControlMode.HYBRID; }
+    public boolean isManual() { return controlMode == AdvancedControlMode.MANUAL; }
+
+    /** true если ручные поля запрещены */
+    public boolean isReadOnly() { return isAi(); }
+
+    /** true если можно сохранять ручные параметры стратегии */
+    public boolean canSubmit() { return !isAi(); }
 }

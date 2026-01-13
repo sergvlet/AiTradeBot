@@ -16,8 +16,6 @@ import com.chicu.aitradebot.orchestrator.AiStrategyOrchestrator;
 import com.chicu.aitradebot.orchestrator.dto.StrategyRunInfo;
 import com.chicu.aitradebot.service.StrategySettingsService;
 import com.chicu.aitradebot.strategy.core.cache.StrategySettingsCache;
-import com.chicu.aitradebot.strategy.rsie.RsiEmaStrategySettings;
-import com.chicu.aitradebot.strategy.rsie.RsiEmaStrategySettingsService;
 import com.chicu.aitradebot.web.advanced.AdvancedRenderContext;
 import com.chicu.aitradebot.web.advanced.StrategyAdvancedRegistry;
 import com.chicu.aitradebot.web.advanced.StrategyAdvancedRenderer;
@@ -41,7 +39,6 @@ public class StrategySettingsController {
 
     private final StrategySettingsService strategySettingsService;
     private final ExchangeSettingsService exchangeSettingsService;
-    private final RsiEmaStrategySettingsService rsiEmaSettingsService;
     private final StrategySettingsCache settingsCache;
     private final AccountBalanceService accountBalanceService;
     private final MarketSymbolService marketSymbolService;
@@ -89,8 +86,6 @@ public class StrategySettingsController {
         } catch (Exception e) {
             log.warn("⚠ Ошибка при получении статуса стратегии: {}", e.getMessage());
         }
-
-        pullRsiEmaIntoUnifiedIfEmpty(strategyType, chatId, strategy);
 
         // =====================================================
         // BALANCE
@@ -263,9 +258,6 @@ public class StrategySettingsController {
             }
 
             case "risk" -> {
-                // ✅ В unified больше нет TP/SL и комиссий — они живут в таблицах конкретных стратегий.
-                // Здесь сохраняем только то, что реально относится к StrategySettings.
-
                 s.setRiskPerTradePct(validatePct(parseBigDecimalOrNull(params.get("riskPerTradePct"))));
                 s.setMinRiskReward(validatePositiveOrNull(parseBigDecimalOrNull(params.get("minRiskReward"))));
 
@@ -296,14 +288,11 @@ public class StrategySettingsController {
             case "general" -> {
                 s.setReinvestProfit(params.containsKey("reinvestProfit"));
 
-                // дневной лимит потерь живёт в "Общие"
                 s.setDailyLossLimitPct(validatePct(parseBigDecimalOrNull(params.get("dailyLossLimitPct"))));
 
                 BigDecimal maxExposureUsd = validateMoneyOrNull(parseBigDecimalOrNull(params.get("maxExposureUsd")));
                 if (maxExposureUsd != null && maxExposureUsd.signum() <= 0) maxExposureUsd = null;
 
-                // ⚠️ ВАЖНО: тип maxExposurePct должен совпадать с твоей сущностью.
-                // Ошибка компиляции у тебя была "Integer -> BigDecimal", значит поле стало BigDecimal.
                 BigDecimal maxExposurePct = validatePct(parseBigDecimalOrNull(params.get("maxExposurePct")));
                 if (maxExposurePct != null && maxExposurePct.signum() <= 0) maxExposurePct = null;
 
@@ -345,7 +334,6 @@ public class StrategySettingsController {
             default -> log.warn("⚠️ Unknown saveScope='{}'", saveScope);
         }
 
-        syncRsiEmaFromUnified(strategyType, chatId, s);
         settingsCache.invalidate(chatId, strategyType);
 
         String tab = params.getOrDefault("tab", "network");
@@ -457,36 +445,6 @@ public class StrategySettingsController {
         } catch (Exception e) {
             return def;
         }
-    }
-
-    // RSI EMA legacy (временно)
-    private void pullRsiEmaIntoUnifiedIfEmpty(StrategyType type, long chatId, StrategySettings s) {
-        if (type != StrategyType.RSI_EMA) return;
-
-        boolean symbolEmpty = (s.getSymbol() == null || s.getSymbol().isBlank());
-        boolean tfEmpty = (s.getTimeframe() == null || s.getTimeframe().isBlank());
-        if (!symbolEmpty && !tfEmpty) return;
-
-        RsiEmaStrategySettings t = rsiEmaSettingsService.getOrCreate(chatId);
-
-        if (symbolEmpty) s.setSymbol(t.getSymbol());
-        if (tfEmpty) s.setTimeframe(t.getTimeframe());
-
-        if (s.getCachedCandlesLimit() == null) s.setCachedCandlesLimit(t.getCachedCandlesLimit());
-        if (s.getNetworkType() == null) s.setNetworkType(t.getNetworkType());
-
-        strategySettingsService.save(s);
-    }
-
-    private void syncRsiEmaFromUnified(StrategyType type, long chatId, StrategySettings s) {
-        if (type != StrategyType.RSI_EMA) return;
-
-        RsiEmaStrategySettings t = rsiEmaSettingsService.getOrCreate(chatId);
-        t.setSymbol(s.getSymbol());
-        t.setTimeframe(s.getTimeframe());
-        t.setCachedCandlesLimit(s.getCachedCandlesLimit());
-        t.setNetworkType(s.getNetworkType());
-        rsiEmaSettingsService.save(t);
     }
 
     private BigDecimal parseBigDecimalOrNull(String v) {

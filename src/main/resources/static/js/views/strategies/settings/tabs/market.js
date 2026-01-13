@@ -2,7 +2,12 @@
 
 window.SettingsTabTrade = (function () {
 
+    let _inited = false;
+
     function init() {
+        if (_inited) return;
+        _inited = true;
+
         const ctx = window.StrategySettingsContext;
         if (!ctx) return;
 
@@ -97,6 +102,10 @@ window.SettingsTabTrade = (function () {
         // =====================================================
         // helpers
         // =====================================================
+        function isAbortError(err) {
+            return err && (err.name === "AbortError" || String(err).includes("AbortError"));
+        }
+
         function modeNow() {
             const v = (controlModeSelect?.value || "").trim();
             return v || "MANUAL";
@@ -230,16 +239,20 @@ window.SettingsTabTrade = (function () {
         }
 
         // =====================================================
-        // symbols api
+        // symbols api (Abort-safe + race-safe)
         // =====================================================
         let activeMode = "POPULAR";
-        let symbolsAbort = null;
         let lastMap = new Map(); // SYMBOL -> descriptor
+
+        const SymbolsRequest = {
+            controller: null,
+            seq: 0
+        };
 
         async function fetchSymbols(mode) {
             const exchange = String(ctx.exchange || "BINANCE").trim() || "BINANCE";
             const network  = String(ctx.network  || "TESTNET").trim() || "TESTNET";
-            const asset = getAssetForRequest();
+            const asset    = getAssetForRequest();
 
             const url =
                 `${SYMBOLS_ENDPOINT}` +
@@ -248,17 +261,32 @@ window.SettingsTabTrade = (function () {
                 `&accountAsset=${encodeURIComponent(asset)}` +
                 `&mode=${encodeURIComponent(mode || "POPULAR")}`;
 
-            if (symbolsAbort) symbolsAbort.abort();
-            symbolsAbort = new AbortController();
+            // abort previous
+            if (SymbolsRequest.controller) {
+                try { SymbolsRequest.controller.abort("new symbols request"); }
+                catch (_) { SymbolsRequest.controller.abort(); }
+            }
+
+            const controller = new AbortController();
+            SymbolsRequest.controller = controller;
+            const mySeq = ++SymbolsRequest.seq;
 
             const res = await fetch(url, {
                 method: "GET",
                 headers: { "Accept": "application/json" },
-                signal: symbolsAbort.signal
+                signal: controller.signal
             });
 
+            // устаревший запрос — игнор
+            if (mySeq !== SymbolsRequest.seq) return null;
+
             if (!res.ok) throw new Error(`symbols http ${res.status}`);
-            return await res.json();
+            const data = await res.json();
+
+            // и тут тоже защита от гонок
+            if (mySeq !== SymbolsRequest.seq) return null;
+
+            return data;
         }
 
         function rebuildMap(items) {
@@ -330,6 +358,10 @@ window.SettingsTabTrade = (function () {
         async function reloadSymbols() {
             try {
                 const items = await fetchSymbols(activeMode);
+
+                // null = устаревший ответ (или запрос отменён другим) — тихо выходим
+                if (items == null) return;
+
                 rebuildMap(items);
                 renderSymbolList(items);
 
@@ -338,6 +370,9 @@ window.SettingsTabTrade = (function () {
                 else setLimitsUiEmpty();
 
             } catch (e) {
+                // AbortError — это ожидаемо, не ошибка
+                if (isAbortError(e)) return;
+
                 console.error("reloadSymbols failed", e);
                 rebuildMap([]);
                 renderSymbolList([]);
@@ -364,33 +399,46 @@ window.SettingsTabTrade = (function () {
         }
 
         // =====================================================
-        // ✅ СИНХРОНИЗАЦИЯ АКТИВА (чтобы Trade видел изменения из General)
+        // ✅ СИНХРОНИЗАЦИЯ АКТИВА (без двойного reload и без циклов)
         // =====================================================
+        let _lastAsset = "";
 
-        function notifyAssetChanged(asset) {
+        function notifyAssetChanged(asset, opts) {
             const a = (asset || "").trim().toUpperCase();
             if (!a) return;
 
-            // обновляем ctx как кэш (не обязателен, но полезен)
+            // если не изменился — ничего не делаем
+            if (a === _lastAsset) return;
+            _lastAsset = a;
+
+            // обновляем ctx как кэш
             ctx.accountAsset = a;
 
-            // внешнее событие для других вкладок/виджетов
+            // silent = только обновить кэш без оповещения
+            if (opts?.silent) return;
+
             window.dispatchEvent(new CustomEvent("strategy:asset-changed", { detail: { asset: a } }));
         }
 
         // 1) если актив меняется через select
         if (accountAssetSelect) {
-            accountAssetSelect.addEventListener("change", async () => {
+            accountAssetSelect.addEventListener("change", () => {
                 const a = (accountAssetSelect.value || "").trim();
+                // ✅ НЕ вызываем reloadSymbols тут — оно будет по событию один раз
                 notifyAssetChanged(a);
-                await reloadSymbols();
             });
         }
 
-        // 2) если актив меняется иначе (например, General обновляет текст selectedAssetView)
+        // 2) если актив меняется иначе (General/другие вкладки)
         window.addEventListener("strategy:asset-changed", async (e) => {
             const a = e?.detail?.asset;
             if (!a) return;
+
+            // если событие пришло с тем же активом — выходим
+            const next = String(a).trim().toUpperCase();
+            if (!next || next === _lastAsset) return;
+
+            notifyAssetChanged(next, { silent: true });
             await reloadSymbols();
         });
 
@@ -446,9 +494,10 @@ window.SettingsTabTrade = (function () {
         setSymbolUi(symbolHidden?.value || symbolLabel?.textContent || "");
         setLimitsUiEmpty();
 
-        // ✅ при старте: если General уже выставил актив — подхватим и закрепим
-        notifyAssetChanged(getAssetForRequest());
+        // ✅ при старте: только обновляем ctx, без события (чтобы не словить лишний reload)
+        notifyAssetChanged(getAssetForRequest(), { silent: true });
 
+        // и один нормальный загрузочный запрос
         reloadSymbols().catch(() => {});
     }
 

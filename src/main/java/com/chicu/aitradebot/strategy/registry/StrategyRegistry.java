@@ -61,11 +61,7 @@ public class StrategyRegistry {
                 new FieldMeta("stopLossPct", "SL (%)", "number")
         ));
 
-        fields.put(StrategyType.ML_INVEST, List.of(
-                new FieldMeta("confidenceThreshold", "Порог уверенности ML", "number"),
-                new FieldMeta("lookback", "Lookback", "number"),
-                new FieldMeta("modelName", "Название модели", "text")
-        ));
+
     }
 
     public List<FieldMeta> getFields(StrategyType type) {
