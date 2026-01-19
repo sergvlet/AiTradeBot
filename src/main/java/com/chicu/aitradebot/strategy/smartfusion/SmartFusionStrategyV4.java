@@ -34,7 +34,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * - RL  : action + confidence -> rlScore [0..1] только при BUY
 
  * Итог:
- * score = wTech*tech + wMl*ml + wRl*rl
+ * score = wTech*tech + wMl*ai + wRl*rl
  * BUY если score >= threshold и не в позиции.
  * SELL сигналим (не выходим по рынку) — выход по TP/SL.
  */
@@ -324,7 +324,7 @@ public class SmartFusionStrategyV4 implements TradingStrategy {
 
                     String reason = "fused=" + round2(fused) +
                             " tech=" + round2(techScore) +
-                            " ml=" + round2(mlScore) +
+                            " ai=" + round2(mlScore) +
                             " rl=" + round2(rlScore);
 
                     safeLive(() -> live.pushSignal(chatId, StrategyType.SMART_FUSION, symFinal, null, Signal.buy(scoreFinal, reason)));

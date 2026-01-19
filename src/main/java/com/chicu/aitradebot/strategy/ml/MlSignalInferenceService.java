@@ -1,4 +1,4 @@
-// src/main/java/com/chicu/aitradebot/strategy/ml/MlSignalInferenceService.java
+// src/main/java/com/chicu/aitradebot/strategy/ai/MlSignalInferenceService.java
 package com.chicu.aitradebot.strategy.ml;
 
 import java.math.BigDecimal;

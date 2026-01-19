@@ -2,6 +2,9 @@ package com.chicu.aitradebot.web.controller.web;
 
 import com.chicu.aitradebot.account.AccountBalanceService;
 import com.chicu.aitradebot.account.AccountBalanceSnapshot;
+import com.chicu.aitradebot.ai.tuning.AutoTunerOrchestrator;
+import com.chicu.aitradebot.ai.tuning.TuningRequest;
+import com.chicu.aitradebot.ai.tuning.TuningResult;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.ExchangeSettings;
@@ -20,8 +23,10 @@ import com.chicu.aitradebot.web.advanced.AdvancedRenderContext;
 import com.chicu.aitradebot.web.advanced.StrategyAdvancedRegistry;
 import com.chicu.aitradebot.web.advanced.StrategyAdvancedRenderer;
 import jakarta.servlet.http.HttpServletRequest;
+import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Controller;
 import org.springframework.ui.Model;
 import org.springframework.web.bind.annotation.*;
@@ -29,6 +34,7 @@ import org.springframework.web.bind.annotation.*;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 @Slf4j
@@ -44,6 +50,7 @@ public class StrategySettingsController {
     private final MarketSymbolService marketSymbolService;
     private final StrategyAdvancedRegistry strategyAdvancedRegistry;
     private final AiStrategyOrchestrator orchestrator;
+    private final AutoTunerOrchestrator autoTuner;
 
     private static final List<String> DEFAULT_TIMEFRAMES = List.of(
             "1s", "5s", "15s", "1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d"
@@ -65,19 +72,14 @@ public class StrategySettingsController {
             HttpServletRequest request,
             Model model
     ) {
-
         StrategyType strategyType = parseStrategyType(typeRaw);
 
         String exchange = normalizeExchange(exchangeParam);
         NetworkType network = parseNetworkOrDefault(networkParam, NetworkType.TESTNET);
 
-        // =====================================================
-        // StrategySettings (unified) — строго под контекст
-        // =====================================================
+        // ✅ В ПРОДЕ: НЕ используем "latest", всегда работаем строго по контексту
         StrategySettings strategy =
-                strategySettingsService
-                        .findLatest(chatId, strategyType, exchange, network)
-                        .orElseGet(() -> strategySettingsService.getOrCreate(chatId, strategyType, exchange, network));
+                strategySettingsService.getOrCreate(chatId, strategyType, exchange, network);
 
         // runtime status (active)
         try {
@@ -195,39 +197,44 @@ public class StrategySettingsController {
             @RequestParam Map<String, String> params,
             @ModelAttribute("strategy") StrategySettings form
     ) {
-
         StrategyType strategyType = parseStrategyType(typeRaw);
 
         String exchange = normalizeExchange(params.get("exchange"));
         NetworkType network = parseNetworkOrDefault(params.get("network"), NetworkType.TESTNET);
 
-        StrategySettings s =
-                strategySettingsService
-                        .findLatest(chatId, strategyType, exchange, network)
-                        .orElseGet(() -> strategySettingsService.getOrCreate(chatId, strategyType, exchange, network));
+        // ✅ В ПРОДЕ: НЕ ищем latest — строго по ключу
+        StrategySettings s = strategySettingsService.getOrCreate(chatId, strategyType, exchange, network);
 
-        // global
+        // global: режим можно менять из любой вкладки — сохраняем всегда
         if (params.containsKey("advancedControlMode")) {
             try {
-                s.setAdvancedControlMode(AdvancedControlMode.valueOf(params.get("advancedControlMode")));
+                s.setAdvancedControlMode(AdvancedControlMode.valueOf(params.get("advancedControlMode").trim().toUpperCase(Locale.ROOT)));
             } catch (Exception e) {
                 log.warn("Invalid advancedControlMode: {}", params.get("advancedControlMode"));
             }
         }
 
+        // asset (если прислали)
         String accountAsset = params.get("accountAsset");
         if (accountAsset != null && !accountAsset.isBlank()) {
-            s.setAccountAsset(accountAsset);
+            s.setAccountAsset(accountAsset.trim().toUpperCase(Locale.ROOT));
         }
 
         switch (saveScope) {
 
+            /**
+             * ✅ ВАЖНО:
+             * вкладка "Сеть" — это выбор КОНТЕКСТА (exchange/network),
+             * а не “переписать ключ” существующей строки StrategySettings.
+             *
+             * Поэтому НЕ делаем:
+             *   s.setExchangeName(exchange);
+             *   s.setNetworkType(network);
+             *
+             * Мы просто гарантируем наличие строк под новый контекст и редиректим.
+             */
             case "network" -> {
-                s.setExchangeName(exchange);
-                s.setNetworkType(network);
-                strategySettingsService.save(s);
-
-                // запись под ключи должна существовать
+                strategySettingsService.getOrCreate(chatId, strategyType, exchange, network);
                 exchangeSettingsService.getOrCreate(chatId, exchange, network);
             }
 
@@ -282,6 +289,12 @@ public class StrategySettingsController {
                 // checkbox
                 s.setAllowAveraging(params.containsKey("allowAveraging"));
 
+                Integer cooldownSeconds = parseIntOrNull(params.get("cooldownSeconds"));
+                s.setCooldownSeconds((cooldownSeconds != null && cooldownSeconds > 0) ? cooldownSeconds : null);
+
+                Integer maxOpenOrders = parseIntOrNull(params.get("maxOpenOrders"));
+                s.setMaxOpenOrders((maxOpenOrders != null && maxOpenOrders > 0) ? maxOpenOrders : null);
+
                 strategySettingsService.save(s);
             }
 
@@ -291,10 +304,7 @@ public class StrategySettingsController {
                 s.setDailyLossLimitPct(validatePct(parseBigDecimalOrNull(params.get("dailyLossLimitPct"))));
 
                 BigDecimal maxExposureUsd = validateMoneyOrNull(parseBigDecimalOrNull(params.get("maxExposureUsd")));
-                if (maxExposureUsd != null && maxExposureUsd.signum() <= 0) maxExposureUsd = null;
-
                 BigDecimal maxExposurePct = validatePct(parseBigDecimalOrNull(params.get("maxExposurePct")));
-                if (maxExposurePct != null && maxExposurePct.signum() <= 0) maxExposurePct = null;
 
                 s.setMaxExposureUsd(maxExposureUsd);
                 s.setMaxExposurePct(maxExposurePct);
@@ -304,6 +314,7 @@ public class StrategySettingsController {
 
             case "advanced" -> {
                 AdvancedControlMode currentMode = s.getAdvancedControlMode();
+                if (currentMode == null) currentMode = AdvancedControlMode.MANUAL;
 
                 StrategyAdvancedRenderer renderer = strategyAdvancedRegistry.get(strategyType);
                 if (renderer != null && currentMode != AdvancedControlMode.AI) {
@@ -322,7 +333,7 @@ public class StrategySettingsController {
                 String modeRaw = params.get("advancedControlMode");
                 if (modeRaw != null) {
                     try {
-                        s.setAdvancedControlMode(AdvancedControlMode.valueOf(modeRaw));
+                        s.setAdvancedControlMode(AdvancedControlMode.valueOf(modeRaw.trim().toUpperCase(Locale.ROOT)));
                     } catch (IllegalArgumentException e) {
                         log.warn("⚠️ Invalid advancedControlMode='{}'", modeRaw);
                     }
@@ -338,6 +349,106 @@ public class StrategySettingsController {
 
         String tab = params.getOrDefault("tab", "network");
         return buildRedirect(strategyType, chatId, exchange, network, tab);
+    }
+
+    // =========================================================
+    // ✅ 4) POST /apply — применить HYBRID/AI (тюнинг) сразу
+    // =========================================================
+    @PostMapping("/apply")
+    public ResponseEntity<ApplyResponse> apply(@RequestBody ApplyRequest req) {
+
+        String ex = normalizeExchange(req.getExchange());
+        NetworkType net = (req.getNetwork() != null) ? req.getNetwork() : NetworkType.TESTNET;
+
+        StrategySettings s = strategySettingsService.getOrCreate(
+                req.getChatId(),
+                req.getType(),
+                ex,
+                net
+        );
+
+        // если режим пришёл с фронта — применим сразу
+        if (req.getAdvancedControlMode() != null) {
+            try {
+                s.setAdvancedControlMode(AdvancedControlMode.valueOf(req.getAdvancedControlMode().trim().toUpperCase(Locale.ROOT)));
+                strategySettingsService.save(s);
+            } catch (Exception ignored) {}
+        }
+
+        AdvancedControlMode mode = s.getAdvancedControlMode();
+        if (mode == null) mode = AdvancedControlMode.MANUAL;
+
+        // MANUAL — просто подтверждаем, без AI
+        if (mode == AdvancedControlMode.MANUAL) {
+            return ResponseEntity.ok(
+                    ApplyResponse.builder()
+                            .ok(true)
+                            .mode(mode)
+                            .applied(false)
+                            .reason("MANUAL: apply не требуется")
+                            .build()
+            );
+        }
+
+        // HYBRID/AI — запускаем тюнер
+        TuningResult result;
+        try {
+            TuningRequest tr = TuningRequest.builder()
+                    .chatId(req.getChatId())
+                    .strategyType(req.getType())
+                    .exchange(ex)
+                    .network(net)
+                    .symbol(s.getSymbol())
+                    .timeframe(s.getTimeframe())
+                    .candlesLimit(s.getCachedCandlesLimit())
+                    .reason((req.getReason() == null || req.getReason().isBlank()) ? "ui_control_mode_change" : req.getReason())
+                    .build();
+
+            result = autoTuner.tune(tr);
+        } catch (Exception e) {
+            log.error("apply failed chatId={} type={} ex={} net={}: {}",
+                    req.getChatId(), req.getType(), ex, net, e.getMessage(), e);
+
+            return ResponseEntity.ok(
+                    ApplyResponse.builder()
+                            .ok(false)
+                            .mode(mode)
+                            .applied(false)
+                            .reason("apply failed: " + e.getMessage())
+                            .build()
+            );
+        }
+
+        boolean applied = result != null && result.applied();
+        String reason = result != null ? result.reason() : "null";
+
+        return ResponseEntity.ok(
+                ApplyResponse.builder()
+                        .ok(true)
+                        .mode(mode)
+                        .applied(applied)
+                        .reason(reason)
+                        .build()
+        );
+    }
+
+    @Data
+    public static class ApplyRequest {
+        private Long chatId;
+        private StrategyType type;
+        private String exchange;
+        private NetworkType network;
+        private String advancedControlMode;
+        private String reason;
+    }
+
+    @Data
+    @lombok.Builder
+    public static class ApplyResponse {
+        private boolean ok;
+        private AdvancedControlMode mode;
+        private boolean applied;
+        private String reason;
     }
 
     // =====================================================
@@ -425,7 +536,7 @@ public class StrategySettingsController {
             throw new IllegalArgumentException("Strategy type is blank");
         }
         try {
-            return StrategyType.valueOf(raw.trim().toUpperCase());
+            return StrategyType.valueOf(raw.trim().toUpperCase(Locale.ROOT));
         } catch (Exception e) {
             log.error("❌ Invalid strategy type in path: '{}'", raw);
             throw e;
@@ -435,21 +546,27 @@ public class StrategySettingsController {
     private String normalizeExchange(String exchange) {
         return (exchange == null || exchange.isBlank())
                 ? "BINANCE"
-                : exchange.trim().toUpperCase();
+                : exchange.trim().toUpperCase(Locale.ROOT);
     }
 
     private NetworkType parseNetworkOrDefault(String raw, NetworkType def) {
         if (raw == null || raw.isBlank()) return def;
         try {
-            return NetworkType.valueOf(raw.trim().toUpperCase());
+            return NetworkType.valueOf(raw.trim().toUpperCase(Locale.ROOT));
         } catch (Exception e) {
             return def;
         }
     }
 
     private BigDecimal parseBigDecimalOrNull(String v) {
-        try { return v == null ? null : new BigDecimal(v.trim()); }
-        catch (Exception e) { return null; }
+        try {
+            if (v == null) return null;
+            String s = v.trim().replace(",", ".");
+            if (s.isEmpty()) return null;
+            return new BigDecimal(s);
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private Integer parseIntOrNull(String v) {

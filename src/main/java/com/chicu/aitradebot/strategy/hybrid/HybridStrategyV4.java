@@ -307,7 +307,7 @@ public class HybridStrategyV4 implements TradingStrategy {
 
                 if (!consensusOk) {
                     String reason = "no_consensus"
-                            + " ml=" + round2(pBuy)
+                            + " ai=" + round2(pBuy)
                             + " rl=" + action + ":" + round2(rlConf)
                             + " trendUp=" + trendUp
                             + " thr=" + round2(commonThr)
@@ -360,7 +360,7 @@ public class HybridStrategyV4 implements TradingStrategy {
                             StrategyType.HYBRID,
                             symFinal,
                             null,
-                            Signal.buy(scoreFinal, "consensus ml=" + round2(pBuyFinal) + " rl=" + round2(rlConfFinal))
+                            Signal.buy(scoreFinal, "consensus ai=" + round2(pBuyFinal) + " rl=" + round2(rlConfFinal))
                     ));
                     return;
 

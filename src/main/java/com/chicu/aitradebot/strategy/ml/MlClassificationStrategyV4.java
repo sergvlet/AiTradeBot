@@ -1,4 +1,4 @@
-// src/main/java/com/chicu/aitradebot/strategy/ml/MlClassificationStrategyV4.java
+// src/main/java/com/chicu/aitradebot/strategy/ai/MlClassificationStrategyV4.java
 package com.chicu.aitradebot.strategy.ml;
 
 import com.chicu.aitradebot.common.enums.NetworkType;

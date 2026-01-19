@@ -1,4 +1,4 @@
-// src/main/java/com/chicu/aitradebot/strategy/ml/MlClassificationSettingsServiceImpl.java
+// src/main/java/com/chicu/aitradebot/strategy/ai/MlClassificationSettingsServiceImpl.java
 package com.chicu.aitradebot.strategy.ml;
 
 import lombok.RequiredArgsConstructor;

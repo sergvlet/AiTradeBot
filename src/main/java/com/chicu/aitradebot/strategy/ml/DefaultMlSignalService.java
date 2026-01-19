@@ -1,4 +1,4 @@
-// src/main/java/com/chicu/aitradebot/strategy/ml/DefaultMlSignalService.java
+// src/main/java/com/chicu/aitradebot/strategy/ai/DefaultMlSignalService.java
 package com.chicu.aitradebot.strategy.ml;
 
 import lombok.extern.slf4j.Slf4j;

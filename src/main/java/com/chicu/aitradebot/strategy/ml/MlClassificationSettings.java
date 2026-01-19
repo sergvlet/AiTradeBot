@@ -1,4 +1,4 @@
-// src/main/java/com/chicu/aitradebot/strategy/ml/MlClassificationSettings.java
+// src/main/java/com/chicu/aitradebot/strategy/ai/MlClassificationSettings.java
 package com.chicu.aitradebot.strategy.ml;
 
 import jakarta.persistence.*;

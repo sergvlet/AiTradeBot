@@ -2,6 +2,9 @@ package com.chicu.aitradebot.web.controller.api;
 
 import com.chicu.aitradebot.account.AccountBalanceService;
 import com.chicu.aitradebot.account.AccountBalanceSnapshot;
+import com.chicu.aitradebot.ai.tuning.AutoTunerOrchestrator;
+import com.chicu.aitradebot.ai.tuning.TuningRequest;
+import com.chicu.aitradebot.ai.tuning.TuningResult;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
@@ -18,6 +21,7 @@ import java.math.RoundingMode;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.Locale;
+import java.util.Map;
 
 @Slf4j
 @RestController
@@ -27,9 +31,10 @@ public class StrategySettingsApiController {
 
     private final StrategySettingsService strategySettingsService;
     private final AccountBalanceService accountBalanceService;
+    private final AutoTunerOrchestrator autoTunerOrchestrator;
 
     // =========================================================
-    // ✅ 1) POST /asset — смена выбранного актива + возврат snapshot
+    // 1) POST /asset — смена выбранного актива + возврат snapshot
     // =========================================================
     @PostMapping("/asset")
     public AccountBalanceSnapshot changeAsset(
@@ -44,14 +49,14 @@ public class StrategySettingsApiController {
         StrategySettings s = strategySettingsService.getOrCreate(chatId, type, ex, network);
 
         String normalized = normalizeAssetOrNull(asset);
-        s.setAccountAsset(normalized); // null = очистить выбор (snapshot сам выберет)
+        s.setAccountAsset(normalized); // null = очистить выбор
         strategySettingsService.save(s);
 
         return accountBalanceService.getSnapshot(chatId, type, ex, network);
     }
 
     // =========================================================
-    // ✅ 2) GET /balance — вернуть актуальный snapshot
+    // 2) GET /balance — вернуть актуальный snapshot
     // =========================================================
     @GetMapping("/balance")
     public AccountBalanceSnapshot getBalance(
@@ -63,10 +68,10 @@ public class StrategySettingsApiController {
     ) {
         String ex = normalizeExchange(exchange);
 
-        String normalized = normalizeAssetOrNull(asset);
-        if (normalized != null) {
+        // если параметр asset присутствует (даже пустой) — сохраняем (включая очистку -> null)
+        if (asset != null) {
             StrategySettings s = strategySettingsService.getOrCreate(chatId, type, ex, network);
-            s.setAccountAsset(normalized);
+            s.setAccountAsset(normalizeAssetOrNull(asset));
             strategySettingsService.save(s);
         }
 
@@ -74,8 +79,8 @@ public class StrategySettingsApiController {
     }
 
     // =========================================================
-    // ✅ 3) POST /autosave — автосейв StrategySettings + snapshot
-    // scope: "general" | "risk" | "trade" | "" (пусто = применить всё, что пришло)
+    // 3) POST /autosave — автосейв StrategySettings + snapshot
+    // scope: "general" | "risk" | "trade" | "" (пусто = применить всё)
     // =========================================================
     @PostMapping("/autosave")
     public ResponseEntity<AutosaveResponse> autosave(@RequestBody AutosaveRequest req) {
@@ -89,6 +94,23 @@ public class StrategySettingsApiController {
                 req.getNetwork()
         );
 
+        // =========================================================
+        // ✅ РЕЖИМ — сохраняем ВСЕГДА, если пришёл валидный (не зависит от scope)
+        // =========================================================
+        AdvancedControlMode before = s.getAdvancedControlMode();
+        AdvancedControlMode parsed = parseEnumOrNull(AdvancedControlMode.class, req.getAdvancedControlMode());
+
+        if (req.getAdvancedControlMode() != null) {
+            // пришло с фронта (даже если пусто) — логируем
+            log.info("🧠 AUTOSAVE MODE incoming='{}' parsed={} before={} ctx: chatId={} type={} ex={} net={}",
+                    req.getAdvancedControlMode(), parsed, before,
+                    req.getChatId(), req.getType(), ex, req.getNetwork());
+        }
+
+        if (parsed != null && parsed != before) {
+            s.setAdvancedControlMode(parsed);
+        }
+
         String scope = normalizeScope(req.getScope());
         boolean applyAll     = scope.isEmpty();
         boolean applyGeneral = applyAll || scope.equals("general");
@@ -99,13 +121,9 @@ public class StrategySettingsApiController {
         // GENERAL
         // -------------------------
         if (applyGeneral) {
-            if (req.getAdvancedControlMode() != null) {
-                AdvancedControlMode mode = parseEnumOrNull(AdvancedControlMode.class, req.getAdvancedControlMode());
-                if (mode != null) s.setAdvancedControlMode(mode);
-            }
 
-            // если пришло null/"" — очищаем (без дефолта USDT)
             if (req.getAccountAsset() != null) {
+                // можно и очистить (пустая строка -> null)
                 s.setAccountAsset(normalizeAssetOrNull(req.getAccountAsset()));
             }
 
@@ -125,20 +143,15 @@ public class StrategySettingsApiController {
         }
 
         // -------------------------
-        // TRADE (под вкладку Trade)
-        // ВАЖНО: пустые строки НЕ должны очищать уже сохранённые значения
+        // TRADE
         // -------------------------
         if (applyTrade) {
 
             String sym = normalizeSymbolOrNull(req.getSymbol());
-            if (sym != null) {
-                s.setSymbol(sym);
-            }
+            if (sym != null) s.setSymbol(sym);
 
             String tf = normalizeTimeframeOrNull(req.getTimeframe());
-            if (tf != null) {
-                s.setTimeframe(tf);
-            }
+            if (tf != null) s.setTimeframe(tf);
 
             Integer candles = parseIntOrNull(req.getCachedCandlesLimit());
             if (candles != null) {
@@ -170,19 +183,16 @@ public class StrategySettingsApiController {
                 s.setAllowAveraging(req.getAllowAveraging());
             }
 
-            // 0/пусто = без паузы → null
             if (req.getCooldownSeconds() != null) {
                 Integer cd = parseIntOrNull(req.getCooldownSeconds());
                 s.setCooldownSeconds(toNullablePositive(cd));
             }
 
-            // 0/пусто = без лимита → null
             if (req.getMaxTradesPerDay() != null) {
                 Integer mtd = parseIntOrNull(req.getMaxTradesPerDay());
                 s.setMaxTradesPerDay(toNullablePositive(mtd));
             }
 
-            // 0/пусто = без лимита → null
             if (req.getMaxOpenOrders() != null) {
                 Integer moo = parseIntOrNull(req.getMaxOpenOrders());
                 s.setMaxOpenOrders(toNullablePositive(moo));
@@ -212,7 +222,6 @@ public class StrategySettingsApiController {
                 if (v != null) s.setMaxPositionPct(null);
             }
 
-            // после убытков (0/пусто = без ограничения → null)
             if (req.getCooldownAfterLossSeconds() != null) {
                 Integer v = parseIntOrNull(req.getCooldownAfterLossSeconds());
                 s.setCooldownAfterLossSeconds(toNullablePositive(v));
@@ -223,7 +232,14 @@ public class StrategySettingsApiController {
             }
         }
 
-        strategySettingsService.save(s);
+        // ✅ сохраняем ровно одну строку по ключу (это гарантирует getOrCreate + UNIQUE)
+        StrategySettings saved = strategySettingsService.save(s);
+
+        AdvancedControlMode after = saved.getAdvancedControlMode();
+        if (parsed != null) {
+            log.info("✅ AUTOSAVE MODE stored={} (before={}) id={} ctx: chatId={} type={} ex={} net={}",
+                    after, before, saved.getId(), req.getChatId(), req.getType(), ex, req.getNetwork());
+        }
 
         AccountBalanceSnapshot snap = accountBalanceService.getSnapshot(
                 req.getChatId(),
@@ -237,6 +253,79 @@ public class StrategySettingsApiController {
                         .ok(true)
                         .savedAt(nowHHmmss())
                         .snapshot(snap)
+
+                        // дополнительные поля (UI может синхронизировать вкладки)
+                        .advancedControlMode(after != null ? after.name() : null)
+                        .accountAsset(saved.getAccountAsset())
+                        .symbol(saved.getSymbol())
+                        .timeframe(saved.getTimeframe())
+                        .cachedCandlesLimit(saved.getCachedCandlesLimit())
+
+                        // ✅ очень полезно для отладки: в какую строку реально сохранили
+                        .id(saved.getId())
+                        .chatId(saved.getChatId())
+                        .type(saved.getType() != null ? saved.getType().name() : null)
+                        .exchange(saved.getExchangeName())
+                        .network(saved.getNetworkType() != null ? saved.getNetworkType().name() : null)
+
+                        .build()
+        );
+    }
+
+    // =========================================================
+    // 4) POST /apply — применить HYBRID/AI (тюнинг)
+    // =========================================================
+    @PostMapping("/apply")
+    public ResponseEntity<ApplyResponse> apply(@RequestBody ApplyRequest req) {
+        String ex = normalizeExchange(req.getExchange());
+
+        StrategySettings s = strategySettingsService.getOrCreate(
+                req.getChatId(),
+                req.getType(),
+                ex,
+                req.getNetwork()
+        );
+
+        AdvancedControlMode incoming = parseEnumOrNull(AdvancedControlMode.class, req.getAdvancedControlMode());
+        if (incoming != null && incoming != s.getAdvancedControlMode()) {
+            log.info("🧠 APPLY MODE change {} -> {} ctx: chatId={} type={} ex={} net={}",
+                    s.getAdvancedControlMode(), incoming, req.getChatId(), req.getType(), ex, req.getNetwork());
+            s.setAdvancedControlMode(incoming);
+            s = strategySettingsService.save(s);
+        }
+
+        AdvancedControlMode mode = s.getAdvancedControlMode();
+        if (mode == null || mode == AdvancedControlMode.MANUAL) {
+            return ResponseEntity.ok(
+                    ApplyResponse.builder()
+                            .applied(false)
+                            .reason("MANUAL: тюнинг не выполнялся")
+                            .build()
+            );
+        }
+
+        TuningResult tr = autoTunerOrchestrator.tune(
+                TuningRequest.builder()
+                        .chatId(req.getChatId())
+                        .strategyType(req.getType())
+                        .exchange(ex)
+                        .network(req.getNetwork())
+                        .symbol(s.getSymbol())
+                        .timeframe(s.getTimeframe())
+                        .candlesLimit(s.getCachedCandlesLimit())
+                        .reason(req.getReason())
+                        .build()
+        );
+
+        return ResponseEntity.ok(
+                ApplyResponse.builder()
+                        .applied(tr.applied())
+                        .reason(tr.reason())
+                        .modelVersion(tr.modelVersion())
+                        .scoreBefore(tr.scoreBefore())
+                        .scoreAfter(tr.scoreAfter())
+                        .oldParams(tr.oldParams())
+                        .newParams(tr.newParams())
                         .build()
         );
     }
@@ -244,6 +333,31 @@ public class StrategySettingsApiController {
     // =========================================================
     // DTO
     // =========================================================
+
+    @Data
+    public static class ApplyRequest {
+        private Long chatId;
+        private StrategyType type;
+        private String exchange;
+        private NetworkType network;
+        private String advancedControlMode;
+        private String reason;
+    }
+
+    @Data
+    @lombok.Builder
+    public static class ApplyResponse {
+        private boolean applied;
+        private String reason;
+
+        private String modelVersion;
+        private BigDecimal scoreBefore;
+        private BigDecimal scoreAfter;
+
+        private Map<String, Object> oldParams;
+        private Map<String, Object> newParams;
+    }
+
     @Data
     public static class AutosaveRequest {
         private Long chatId;
@@ -294,6 +408,19 @@ public class StrategySettingsApiController {
         private boolean ok;
         private String savedAt;
         private AccountBalanceSnapshot snapshot;
+
+        private String advancedControlMode;
+        private String accountAsset;
+        private String symbol;
+        private String timeframe;
+        private Integer cachedCandlesLimit;
+
+        // ✅ ДОБАВИЛ: отладочный контекст (не ломает старый UI)
+        private Long id;
+        private Long chatId;
+        private String type;
+        private String exchange;
+        private String network;
     }
 
     // =========================================================
@@ -306,7 +433,10 @@ public class StrategySettingsApiController {
 
     private static String normalizeScope(String scope) {
         if (scope == null) return "";
-        return scope.trim().toLowerCase(Locale.ROOT);
+        String s = scope.trim().toLowerCase(Locale.ROOT);
+        if (s.isEmpty()) return "";
+        if (!s.equals("general") && !s.equals("risk") && !s.equals("trade")) return "";
+        return s;
     }
 
     private static String normalizeExchange(String exchange) {
@@ -315,7 +445,6 @@ public class StrategySettingsApiController {
         return ex.isEmpty() ? "BINANCE" : ex;
     }
 
-    /** Возвращает NULL, если пусто. Без дефолта USDT. */
     private static String normalizeAssetOrNull(String asset) {
         if (asset == null) return null;
         String a = asset.trim().toUpperCase(Locale.ROOT);
@@ -332,7 +461,6 @@ public class StrategySettingsApiController {
         if (timeframe == null) return null;
         String s = timeframe.trim();
         if (s.isEmpty()) return null;
-        // таймфреймы у тебя в списке в нижнем регистре, поэтому приводим так
         return s.toLowerCase(Locale.ROOT);
     }
 

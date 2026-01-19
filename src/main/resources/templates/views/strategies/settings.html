@@ -320,7 +320,7 @@
                         </div>
                     </div>
 
-                    <div class="small text-secondary mt-2 d-none" id="generalChangedList"></div>
+                    <dscalping_strategy_settingsiv class="small text-secondary mt-2 d-none" id="generalChangedList"></dscalping_strategy_settingsiv>
                 </div>
 
                 <!-- ================== 1) РЕЖИМ УПРАВЛЕНИЯ ================== -->
@@ -330,30 +330,41 @@
                     <div class="col-md-4">
                         <label class="form-label" for="advancedControlMode">Кто управляет настройками</label>
 
+                        <!-- ✅ В HYBRID/AI применяем сразу, поэтому confirm убираем -->
                         <select class="form-select"
                                 id="advancedControlMode"
-                                th:field="*{advancedControlMode}"
-                                data-confirm="true"
-                                data-confirm-title="Подтверждение"
-                                data-confirm-text="Изменение режима управления может сильно повлиять на торговлю. Сохранить?">
+                                th:field="*{advancedControlMode}">
                             <option value="MANUAL">Ручной (только пользователь)</option>
-                            <option value="HYBRID">Гибрид (AI предлагает)</option>
-                            <option value="AI">Авто (AI управляет)</option>
+                            <option value="HYBRID">Гибрид (AI применяет, пользователь может править)</option>
+                            <option value="AI">Авто (AI применяет автоматически)</option>
                         </select>
 
-                        <div class="form-text">Определяет права редактирования на вкладках.</div>
+                        <div class="form-text">
+                            MANUAL — только вручную. HYBRID/AI — AI применяет параметры сразу после выбора режима.
+                        </div>
+
+                        <!-- ✅ Индикатор, если тюнинг/бэктест займёт время -->
+                        <div id="controlModeProgress"
+                             class="small text-secondary mt-2 d-none"
+                             aria-live="polite">
+            <span class="spinner-border spinner-border-sm me-2"
+                  role="status"
+                  aria-hidden="true"></span>
+                            Применяю режим… (тюнинг/бэктест/обучение)
+                        </div>
                     </div>
 
                     <div class="col-md-8">
                         <div class="alert alert-info small mb-0" id="controlModeHint">
                             <b>MANUAL:</b> всё меняет пользователь.
-                            <br><b>HYBRID:</b> AI предлагает, пользователь подтверждает/правит.
-                            <br><b>AI:</b> AI управляет стратегическими параметрами, пользователь — только финансами и базовыми ограничениями.
+                            <br><b>HYBRID:</b> AI применяет параметры автоматически, пользователь может править вручную.
+                            <br><b>AI:</b> AI управляет стратегическими параметрами автоматически.
                         </div>
                     </div>
                 </div>
 
                 <hr class="my-4"/>
+
 
                 <!-- ================== 2) БЮДЖЕТ + АКТИВ/БАЛАНС ================== -->
                 <div class="section-title">Бюджет и актив</div>
@@ -1064,6 +1075,7 @@
                         <div class="fw-bold">Продвинутое</div>
                         <div class="text-secondary small">
                             Статус, метрики и параметры конкретной стратегии (MANUAL/HYBRID/AI).
+                            <span class="ms-2 text-secondary">(автосохранение)</span>
                         </div>
                     </div>
 
@@ -1123,29 +1135,27 @@
                     <div>
                         <div class="fw-bold">Поля стратегии</div>
                         <div class="text-secondary small" id="advStrategyHint">
-                            Режим AI запрещает ручное редактирование.
+                            MANUAL / HYBRID: параметры применяются сразу (автосохранение).
                         </div>
                     </div>
-
-                    <button type="button" class="btn btn-primary btn-sm" id="advSaveBtn" disabled>
-                        <i class="bi bi-save me-1"></i>Сохранить
-                    </button>
+                    <!-- ✅ Кнопки нет: автосейв -->
                 </div>
 
-                <form id="advStrategyForm" class="mt-3">
+                <!-- ✅ ВАЖНО: отключаем браузерную валидацию, чтобы автосейв не блокировался -->
+                <form id="advStrategyForm" class="mt-3" novalidate>
                     <div id="advStrategyBlock">
                         <div class="text-secondary small">Загрузка…</div>
                     </div>
                 </form>
 
+                <!-- ✅ Оставляем один источник правды для read-only: рендерер внутри HTML.
+                     Этот блок держим, но по умолчанию скрыт; JS сам решит показывать/скрывать. -->
                 <div class="alert alert-info mt-3 mb-0 d-none" id="advReadonlyNote">
                     Режим AI: ручное редактирование отключено.
                 </div>
 
             </div>
         </div>
-
-
 
 
     </div> <!-- /tab-content -->

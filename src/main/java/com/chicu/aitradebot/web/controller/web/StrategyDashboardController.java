@@ -15,7 +15,8 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 
-import java.util.Optional;
+import java.util.Comparator;
+import java.util.List;
 
 @Slf4j
 @Controller
@@ -29,7 +30,7 @@ public class StrategyDashboardController {
 
     /**
      * 📊 Strategy dashboard
-
+     *
      * ВАЖНО:
      * - НЕ кидаем 500, если стратегия ещё не настроена
      * - Показываем страницу с понятным состоянием "не настроено"
@@ -49,19 +50,17 @@ public class StrategyDashboardController {
         model.addAttribute("type", type);
 
         // =====================================================
-        // 1) LOAD STRATEGY SETTINGS (SINGLE SOURCE OF TRUTH)
+        // 1) LOAD STRATEGY SETTINGS (baseline)
+        // (раньше: findLatest(chatId, type, null, null) — теперь этого нет)
         // =====================================================
-        Optional<StrategySettings> opt =
-                strategySettingsService.findLatest(chatId, type, null, null);
+        StrategySettings settings = resolveBaselineSettings(chatId, type);
 
         // ✅ НЕТ НАСТРОЕК — НЕ 500, а нормальная страница
-        if (opt.isEmpty()) {
+        if (settings == null) {
             log.warn("⚠️ DASHBOARD: StrategySettings not found (NOT CONFIGURED) chatId={} type={}", chatId, type);
 
-            // флаг для шаблона
             model.addAttribute("configured", false);
 
-            // минимум данных, чтобы шаблон не падал на null
             model.addAttribute("strategy", null);
             model.addAttribute("symbol", null);
             model.addAttribute("exchange", null);
@@ -76,14 +75,11 @@ public class StrategyDashboardController {
 
             model.addAttribute("info", info);
 
-            // можно ещё показать красивое сообщение
             model.addAttribute("notice",
                     "Стратегия ещё не настроена. Зайди в «Настройки», выбери символ и таймфрейм, затем открой дашборд.");
 
             return "layout/app";
         }
-
-        StrategySettings settings = opt.get();
 
         // =====================================================
         // 2) VALIDATE REQUIRED FIELDS (symbol/timeframe)
@@ -107,7 +103,7 @@ public class StrategyDashboardController {
             model.addAttribute("network", settings.getNetworkType() != null ? settings.getNetworkType().name() : null);
 
             StrategyRunInfo info = new StrategyRunInfo();
-            info.setActive(Boolean.TRUE.equals(settings.isActive()));
+            info.setActive(settings.isActive());
             info.setSymbol(rawSymbol);
             info.setTimeframe(rawTimeframe);
             info.setExchangeName(settings.getExchangeName());
@@ -147,7 +143,6 @@ public class StrategyDashboardController {
         // =====================================================
         try {
             marketDataStreamService.subscribeCandles(chatId, type, symbol, timeframe);
-
             log.info("📡 MARKET STREAM OK chatId={} type={} {} {}", chatId, type, symbol, timeframe);
 
         } catch (Exception e) {
@@ -189,5 +184,27 @@ public class StrategyDashboardController {
         model.addAttribute("info", info);
 
         return "layout/app";
+    }
+
+    /**
+     * baseline selection без exchange/network в запросе:
+     * - сначала active=true
+     * - иначе updatedAt desc, затем id desc
+     */
+    private StrategySettings resolveBaselineSettings(Long chatId, StrategyType type) {
+        if (chatId == null || chatId <= 0) return null;
+
+        List<StrategySettings> all = strategySettingsService.findAllByChatId(chatId, null);
+        if (all == null || all.isEmpty()) return null;
+
+        return all.stream()
+                .filter(s -> s != null && s.getType() == type)
+                .sorted(Comparator
+                        .comparing(StrategySettings::isActive).reversed()
+                        .thenComparing(StrategySettings::getUpdatedAt, Comparator.nullsLast(Comparator.naturalOrder())).reversed()
+                        .thenComparing(StrategySettings::getId, Comparator.nullsLast(Comparator.naturalOrder())).reversed()
+                )
+                .findFirst()
+                .orElse(null);
     }
 }

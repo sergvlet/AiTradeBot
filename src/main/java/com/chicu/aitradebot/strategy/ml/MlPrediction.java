@@ -1,4 +1,4 @@
-// src/main/java/com/chicu/aitradebot/strategy/ml/MlPrediction.java
+// src/main/java/com/chicu/aitradebot/strategy/ai/MlPrediction.java
 package com.chicu.aitradebot.strategy.ml;
 
 /**

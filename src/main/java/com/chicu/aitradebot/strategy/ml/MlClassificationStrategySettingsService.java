@@ -1,4 +1,4 @@
-// src/main/java/com/chicu/aitradebot/strategy/ml/MlClassificationStrategySettingsService.java
+// src/main/java/com/chicu/aitradebot/strategy/ai/MlClassificationStrategySettingsService.java
 package com.chicu.aitradebot.strategy.ml;
 
 public interface MlClassificationStrategySettingsService {

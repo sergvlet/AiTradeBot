@@ -35,10 +35,13 @@ public class WebStrategyFacadeImpl implements WebStrategyFacade {
 
         log.info("📋 getStrategies chatId={} exchange={} network={}", chatId, exchange, network);
 
-        // Берём всё по chatId + exchange, а сеть фильтруем тут (чтобы не ломать твой сервис/репо)
+        // ✅ Берём все настройки по chatId (+ exchange фильтр), сеть фильтруем тут
         List<StrategySettings> all = settingsService.findAllByChatId(chatId, exchange);
 
-        // Выбираем "самую свежую" настройку по каждому type (по id)
+        // ✅ В проде теперь UNIQUE, но список всё равно может быть:
+        // - разный network
+        // - разные стратегии
+        // Поэтому группируем по type и берём "последнюю" по id (на всякий случай).
         Map<StrategyType, StrategySettings> latestByType = new EnumMap<>(StrategyType.class);
 
         for (StrategySettings s : all) {
@@ -58,7 +61,6 @@ public class WebStrategyFacadeImpl implements WebStrategyFacade {
             Long curId = cur.getId();
             Long newId = s.getId();
 
-            // выбираем запись с максимальным id
             if (newId != null && (curId == null || newId > curId)) {
                 latestByType.put(type, s);
             }
@@ -82,7 +84,7 @@ public class WebStrategyFacadeImpl implements WebStrategyFacade {
                         chatId,
                         type,
                         exchange,
-                        settings.getNetworkType() // тут можно и network, но берём то что в записи
+                        settings.getNetworkType()
                 );
                 active = runtime != null && runtime.isActive();
             } catch (Exception e) {
@@ -103,10 +105,14 @@ public class WebStrategyFacadeImpl implements WebStrategyFacade {
     @Transactional
     public StrategyRunInfo toggle(Long chatId, StrategyType type, String exchange, NetworkType network) {
 
-        // ✅ гарантируем, что настройки существуют (НО НЕ ПИШЕМ ИХ при toggle)
-        StrategySettings settings = settingsService
-                .findLatest(chatId, type, exchange, network)
-                .orElseGet(() -> settingsService.getOrCreate(chatId, type, exchange, network));
+        // ✅ никаких findLatest(...) — только getSettings/getOrCreate
+        // toggle не должен плодить записи при каждом клике, поэтому:
+        // 1) пробуем прочитать
+        // 2) если нет — создаём (после твоего DROP это обязательно)
+        StrategySettings settings = settingsService.getSettings(chatId, type, exchange, network);
+        if (settings == null) {
+            settings = settingsService.getOrCreate(chatId, type, exchange, network);
+        }
 
         StrategyRunInfo runtime = orchestrator.getStatus(chatId, type, exchange, network);
         boolean isRunning = runtime != null && runtime.isActive();
@@ -114,7 +120,7 @@ public class WebStrategyFacadeImpl implements WebStrategyFacade {
         log.info("🔁 TOGGLE chatId={} type={} running={} symbol={} tf={} ex={} net={}",
                 chatId, type, isRunning, settings.getSymbol(), settings.getTimeframe(), exchange, network);
 
-        // ✅ старт/стоп — только runtime, без сохранения StrategySettings (иначе OptimisticLock)
+        // ✅ старт/стоп — только runtime (orchestrator сам сохранит active/startedAt/stoppedAt)
         return isRunning
                 ? orchestrator.stopStrategy(chatId, type, exchange, network)
                 : orchestrator.startStrategy(chatId, type, exchange, network);
@@ -127,7 +133,8 @@ public class WebStrategyFacadeImpl implements WebStrategyFacade {
     @Transactional(readOnly = true)
     public StrategyRunInfo getRunInfo(Long chatId, StrategyType type, String exchange, NetworkType network) {
 
-        StrategySettings s = settingsService.findLatest(chatId, type, exchange, network).orElse(null);
+        // ✅ вместо findLatest(...)
+        StrategySettings s = settingsService.getSettings(chatId, type, exchange, network);
         if (s == null) return null;
 
         StrategyRunInfo runtime = orchestrator.getStatus(chatId, type, exchange, network);

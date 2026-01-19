@@ -2,266 +2,345 @@
 
 window.SettingsTabAdvanced = (function () {
 
+    let _inited = false;
+
     function init() {
-        const ctx = window.StrategySettingsContext;
-        if (!ctx) return;
+        if (_inited) return;
+        _inited = true;
 
-        // badges / state
-        const loadState    = document.getElementById("advLoadState");
-        const modeBadge    = document.getElementById("advModeBadge");
-        const activeBadge  = document.getElementById("advActiveBadge");
+        const ENDPOINT = "/api/strategy/settings/advanced";
+        const SUBMIT_ENDPOINT = "/api/strategy/settings/advanced/submit";
 
-        // metrics
-        const mlConfidence = document.getElementById("advMlConfidence");
-        const totalProfit  = document.getElementById("advTotalProfitPct");
-        const updatedAt    = document.getElementById("advUpdatedAt");
-        const startedAt    = document.getElementById("advStartedAt");
-        const stoppedAt    = document.getElementById("advStoppedAt");
-        const contextEl    = document.getElementById("advContext");
+        const pageRoot =
+            document.querySelector(".strategy-settings-page") ||
+            document.querySelector("[data-chat-id][data-type][data-exchange][data-network]");
 
-        // strategy block
-        const strategyBlock  = document.getElementById("advStrategyBlock");
-        const strategyForm   = document.getElementById("advStrategyForm");
-        const saveBtn        = document.getElementById("advSaveBtn");
-        const hintEl         = document.getElementById("advStrategyHint");
-        const readonlyNote   = document.getElementById("advReadonlyNote");
+        if (!pageRoot) return;
 
-        // source of truth (GENERAL)
-        const controlModeSelect = document.getElementById("advancedControlMode");
+        const globalCtx = window.StrategySettingsContext || null;
 
-        const ENDPOINT_LOAD   = "/api/strategy/settings/advanced";
-        const ENDPOINT_SUBMIT = "/api/strategy/settings/advanced/submit";
+        const ctx = {
+            chatId: Number(globalCtx?.chatId ?? pageRoot.dataset.chatId ?? 0),
+            type: String(globalCtx?.type ?? pageRoot.dataset.type ?? "").trim(),
+            exchange: String(globalCtx?.exchange ?? pageRoot.dataset.exchange ?? "BINANCE").trim(),
+            network: String(globalCtx?.network ?? pageRoot.dataset.network ?? "MAINNET").trim()
+        };
 
-        let lastServer = null; // последняя dto с сервера
+        const modeBadge = document.getElementById("advModeBadge");
+        const activeBadge = document.getElementById("advActiveBadge");
+        const loadState = document.getElementById("advLoadState");
 
-        function setState(text, cls) {
-            if (!loadState) return;
-            loadState.textContent = text || "—";
-            loadState.className = "badge " + (cls || "bg-secondary");
+        const mlConfEl = document.getElementById("advMlConfidence");
+        const profitEl = document.getElementById("advTotalProfitPct");
+        const updatedAtEl = document.getElementById("advUpdatedAt");
+
+        const startedAtEl = document.getElementById("advStartedAt");
+        const stoppedAtEl = document.getElementById("advStoppedAt");
+        const contextEl = document.getElementById("advContext");
+
+        const hintEl = document.getElementById("advStrategyHint");
+        const blockEl = document.getElementById("advStrategyBlock");
+        const formEl = document.getElementById("advStrategyForm");
+        const readonlyNote = document.getElementById("advReadonlyNote");
+
+        if (!blockEl || !formEl) return;
+
+        let lastServer = null;
+
+        let saveTimer = null;
+        function scheduleAutosave() {
+            if (!lastServer) return;
+            if (lastServer.readOnly) return;
+            if (lastServer.canSubmit === false) return;
+
+            if (saveTimer) clearTimeout(saveTimer);
+            saveTimer = setTimeout(() => submit(), 450);
         }
 
-        function fmt(v) {
-            if (v == null) return "—";
-            const s = String(v).trim();
-            return s ? s : "—";
+        let reloadTimer = null;
+        function scheduleReload(delayMs) {
+            clearTimeout(reloadTimer);
+            reloadTimer = setTimeout(() => load(), typeof delayMs === "number" ? delayMs : 200);
         }
 
-        function fmtDt(v) {
-            const s = fmt(v);
-            if (s === "—") return "—";
-            return s.replace("T", " ");
+        function isAdvancedTabActive() {
+            const pane = document.getElementById("tab-advanced");
+            return !!pane && pane.classList.contains("active") && pane.classList.contains("show");
         }
 
-        function modeNowUi() {
-            const v = (controlModeSelect?.value || "").trim();
-            return v || "MANUAL";
-        }
-
-        function applyModeBadge(mode, dirty) {
-            if (!modeBadge) return;
-
-            const m = (mode || "MANUAL").trim();
-
-            modeBadge.textContent = dirty ? `${m}*` : m;
-
-            modeBadge.classList.remove("bg-secondary", "bg-primary", "bg-warning", "bg-danger", "text-dark");
-            if (m === "AI") {
-                modeBadge.classList.add("bg-danger");
-            } else if (m === "HYBRID") {
-                modeBadge.classList.add("bg-warning", "text-dark");
-            } else {
-                modeBadge.classList.add("bg-primary");
-            }
-        }
-
-        function applyActiveBadge(active) {
-            if (!activeBadge) return;
-            activeBadge.textContent = active ? "🟢 ACTIVE" : "⚫ STOPPED";
-            activeBadge.className = "badge " + (active ? "bg-success" : "bg-secondary");
-        }
-
-        function setFormDisabled(disabled) {
-            if (!strategyForm) return;
-
-            const controls = strategyForm.querySelectorAll("input, select, textarea, button");
-            controls.forEach(el => {
-                // не трогаем скрытые, но это не критично
-                if (el.tagName === "BUTTON") return;
-                el.disabled = !!disabled;
-            });
-        }
-
-        function applyEditPolicy() {
-            const uiMode = modeNowUi();
-            const serverCanEdit = (lastServer?.strategyCanEdit === true);
-
-            // UI-логика: AI всегда readonly
-            const uiSaysReadonly = (uiMode === "AI");
-            const canEdit = serverCanEdit && !uiSaysReadonly;
-
-            if (saveBtn) saveBtn.disabled = !canEdit;
-            setFormDisabled(!canEdit);
-
-            if (readonlyNote) {
-                readonlyNote.classList.toggle("d-none", canEdit);
-            }
-
-            if (hintEl) {
-                if (uiMode === "AI") {
-                    hintEl.textContent = "Режим AI запрещает ручное редактирование.";
-                } else if (!serverCanEdit) {
-                    hintEl.textContent = "Редактирование отключено политикой сервера.";
-                } else if (uiMode === "HYBRID") {
-                    hintEl.textContent = "HYBRID: можно менять вручную, AI может рекомендовать.";
-                } else {
-                    hintEl.textContent = "MANUAL: все параметры редактируются вручную.";
-                }
-            }
-        }
-
-        function syncModeFromUi() {
-            // ✅ ключ: обновляем бейдж сразу по select, не ждём БД
-            const uiMode = modeNowUi();
-            const serverMode = String(lastServer?.advancedControlMode || "").trim();
-            const dirty = (serverMode && uiMode && serverMode !== uiMode);
-            applyModeBadge(uiMode, dirty);
-            applyEditPolicy();
-        }
-
+        // =========================================================
+        // LOAD
+        // =========================================================
         async function load() {
             try {
-                setState("Загрузка...", "bg-info text-dark");
+                setLoadState("Загрузка…", "secondary");
 
-                const ex   = (ctx.exchange || "BINANCE").trim();
-                const net  = (ctx.network  || "TESTNET").trim();
-                const type = (ctx.type || "").trim();
+                const url = new URL(ENDPOINT, window.location.origin);
+                url.searchParams.set("chatId", String(ctx.chatId));
+                url.searchParams.set("type", ctx.type);
+                url.searchParams.set("exchange", ctx.exchange);
+                url.searchParams.set("network", ctx.network);
 
-                const url =
-                    `${ENDPOINT_LOAD}` +
-                    `?chatId=${encodeURIComponent(ctx.chatId)}` +
-                    `&type=${encodeURIComponent(type)}` +
-                    `&exchange=${encodeURIComponent(ex)}` +
-                    `&network=${encodeURIComponent(net)}`;
+                const res = await fetch(url.toString(), { method: "GET" });
 
-                const res = await fetch(url, { headers: { "Accept": "application/json" } });
                 if (res.status === 404) {
-                    setState("Нет данных", "bg-warning text-dark");
+                    lastServer = null;
+                    blockEl.innerHTML = "<div class='text-secondary small'>Нет данных</div>";
+                    setLoadState("404", "danger");
                     return;
                 }
-                if (!res.ok) throw new Error(`http ${res.status}`);
 
-                lastServer = await res.json();
-
-                // server active (точно)
-                applyActiveBadge(!!lastServer.active);
-
-                // metrics
-                if (mlConfidence) mlConfidence.value = fmt(lastServer.mlConfidence);
-                if (totalProfit)  totalProfit.value  = fmt(lastServer.totalProfitPct);
-
-                if (updatedAt) updatedAt.value = fmtDt(lastServer.updatedAt);
-                if (startedAt) startedAt.value = fmtDt(lastServer.startedAt);
-                if (stoppedAt) stoppedAt.value = fmtDt(lastServer.stoppedAt);
-
-                if (contextEl) {
-                    const a  = fmt(lastServer.accountAsset);
-                    const s  = fmt(lastServer.symbol);
-                    const tf = fmt(lastServer.timeframe);
-                    contextEl.value = `${a} / ${s} / ${tf}`;
+                if (!res.ok) {
+                    lastServer = null;
+                    blockEl.innerHTML = "<div class='text-danger small'>Ошибка загрузки</div>";
+                    setLoadState("ERR", "danger");
+                    return;
                 }
 
-                // strategy block HTML
-                if (strategyBlock) {
-                    strategyBlock.innerHTML = lastServer.strategyAdvancedHtml || "";
-                }
+                const raw = await res.json();
+                const data = normalizeAdvancedDto(raw);
 
-                // ✅ режим сверху — по UI (а звёздочка покажет, что не сохранено)
-                syncModeFromUi();
+                lastServer = data;
 
-                setState("Готово", "bg-secondary");
+                publishControlModeIfNeeded(data.controlMode);
+
+                renderHeader(data);
+                renderMetrics(data);
+                renderStatus(data);
+                renderStrategyBlock(data);
+
+                setLoadState("Готово", "success");
             } catch (e) {
-                console.error("Advanced tab load failed", e);
-                setState("Ошибка", "bg-danger");
+                console.error("ADVANCED load error", e);
+                lastServer = null;
+                blockEl.innerHTML = "<div class='text-danger small'>Ошибка загрузки</div>";
+                setLoadState("ERR", "danger");
             }
         }
 
-        async function submit() {
+        function setLoadState(text, color) {
+            if (!loadState) return;
+            loadState.textContent = text;
+            loadState.className = "badge bg-" + (color || "secondary");
+        }
+
+        function normalizeAdvancedDto(d) {
+            const modeRaw = (d && (d.controlMode || d.advancedControlMode || d.mode)) || "MANUAL";
+            const mode = String(modeRaw).trim().toUpperCase() || "MANUAL";
+
+            const active = !!(d && d.active);
+
+            let canSubmit = true;
+            if (typeof d?.canSubmit === "boolean") canSubmit = d.canSubmit;
+            else if (typeof d?.strategyCanEdit === "boolean") canSubmit = d.strategyCanEdit;
+            else if (typeof d?.editable === "boolean") canSubmit = d.editable;
+
+            const readOnly = (mode === "AI") || (canSubmit === false);
+
+            const html = d?.strategyAdvancedHtml ?? d?.advancedHtml ?? d?.html ?? "";
+
+            const context =
+                d?.context ||
+                [d?.accountAsset || "—", d?.symbol || "—", d?.timeframe || "—"].join(" / ");
+
+            return {
+                controlMode: mode,
+                active,
+                readOnly,
+                canSubmit: canSubmit !== false,
+
+                mlConfidence: d?.mlConfidence,
+                totalProfitPct: d?.totalProfitPct,
+                updatedAt: d?.updatedAt,
+
+                startedAt: d?.startedAt,
+                stoppedAt: d?.stoppedAt,
+                context,
+
+                strategyAdvancedHtml: html
+            };
+        }
+
+        // =========================================================
+        // MODE SYNC
+        // =========================================================
+        function publishControlModeIfNeeded(mode) {
+            const m = String(mode || "").trim().toUpperCase();
+            if (!m) return;
+
+            // ✅ если режим уже такой — НИЧЕГО не делаем (важно, чтобы не плодить событий)
+            if (window.__StrategyControlMode === m) return;
+
+            window.__StrategyControlMode = m;
+
+            const controlModeSelect = document.getElementById("advancedControlMode");
+            if (controlModeSelect) {
+                const cur = String(controlModeSelect.value || "").trim().toUpperCase();
+                if (cur !== m) {
+                    controlModeSelect.value = m;
+                    controlModeSelect.dataset.prevValue = m;
+                }
+            }
+
+            window.dispatchEvent(new CustomEvent("strategy:controlModeChanged", { detail: { mode: m } }));
+        }
+
+        window.addEventListener("strategy:controlModeChanged", (e) => {
+            const m = String(e?.detail?.mode || "").trim().toUpperCase();
+            if (!m) return;
+
+            window.__StrategyControlMode = m;
+
+            if (lastServer) {
+                lastServer.controlMode = m;
+                lastServer.readOnly = (m === "AI") || (lastServer.canSubmit === false);
+                renderHeader(lastServer);
+                updateReadonlyUiOnly(lastServer);
+            }
+
+            if (isAdvancedTabActive()) {
+                scheduleReload(120);
+            }
+        });
+
+        // =========================================================
+        // RENDER
+        // =========================================================
+        function renderHeader(d) {
+            if (modeBadge) {
+                const m = (d.controlMode || "—").toUpperCase();
+                modeBadge.textContent = m;
+                modeBadge.className = "badge " + (m === "AI" ? "bg-info" : "bg-secondary");
+            }
+            if (activeBadge) {
+                const a = !!d.active;
+                activeBadge.textContent = a ? "ACTIVE" : "INACTIVE";
+                activeBadge.className = "badge " + (a ? "bg-success" : "bg-secondary");
+            }
+        }
+
+        function renderMetrics(d) {
+            if (mlConfEl) mlConfEl.value = renderMetric(d.mlConfidence);
+            if (profitEl) profitEl.value = renderMetric(d.totalProfitPct);
+            if (updatedAtEl) updatedAtEl.value = d.updatedAt || "—";
+        }
+
+        function renderStatus(d) {
+            if (startedAtEl) startedAtEl.value = d.startedAt || "—";
+            if (stoppedAtEl) stoppedAtEl.value = d.stoppedAt || "—";
+            if (contextEl) contextEl.value = d.context || "— / — / —";
+        }
+
+        function renderStrategyBlock(d) {
+            const html = d.strategyAdvancedHtml;
+
+            blockEl.innerHTML = (html && String(html).trim().length > 0)
+                ? html
+                : "<div class='text-secondary small'>Нет данных</div>";
+
+            if (readonlyNote) readonlyNote.classList.add("d-none");
+
+            updateReadonlyUiOnly(d);
+            bindAutosaveHandlers();
+        }
+
+        function updateReadonlyUiOnly(d) {
+            if (hintEl) {
+                hintEl.textContent = d.readOnly
+                    ? ""
+                    : "MANUAL / HYBRID: параметры применяются сразу (автосохранение).";
+            }
+            toggleBlockInputsDisabled(!!d.readOnly);
+        }
+
+        function toggleBlockInputsDisabled(disable) {
             try {
-                if (!lastServer) return;
-                syncModeFromUi();
-
-                // если UI в AI — просто не отправляем
-                if (modeNowUi() === "AI") {
-                    setState("AI: редактирование запрещено", "bg-warning text-dark");
-                    return;
-                }
-                if (saveBtn?.disabled) return;
-
-                setState("Сохранение...", "bg-info text-dark");
-
-                const ex   = (ctx.exchange || "BINANCE").trim();
-                const net  = (ctx.network  || "TESTNET").trim();
-                const type = (ctx.type || "").trim();
-
-                const params = new URLSearchParams();
-                params.set("chatId", String(ctx.chatId));
-                params.set("type", type);
-                params.set("exchange", ex);
-                params.set("network", net);
-
-                // все поля формы (strategy-specific)
-                if (strategyForm) {
-                    const fd = new FormData(strategyForm);
-                    for (const [k, v] of fd.entries()) {
-                        params.append(k, String(v));
+                const inputs = blockEl.querySelectorAll("input,select,textarea,button");
+                inputs.forEach(el => {
+                    if (el.matches("input,select,textarea")) {
+                        el.disabled = !!disable;
+                        if (disable) el.setAttribute("aria-readonly", "true");
+                        else el.removeAttribute("aria-readonly");
+                    } else if (el.matches("button[type='submit']")) {
+                        el.disabled = !!disable;
                     }
-                }
+                });
+            } catch (_) {}
+        }
 
-                const res = await fetch(ENDPOINT_SUBMIT, {
+        function bindAutosaveHandlers() {
+            formEl.removeEventListener("input", onFormChange, true);
+            formEl.removeEventListener("change", onFormChange, true);
+
+            formEl.addEventListener("input", onFormChange, true);
+            formEl.addEventListener("change", onFormChange, true);
+        }
+
+        function onFormChange(e) {
+            const t = e.target;
+            if (!t) return;
+            if (!blockEl.contains(t)) return;
+            if (!lastServer || lastServer.readOnly) return;
+
+            if (t.matches("input,select,textarea")) scheduleAutosave();
+        }
+
+        function renderMetric(v) {
+            if (v === null || typeof v === "undefined") return "0";
+            return String(v);
+        }
+
+        // =========================================================
+        // SUBMIT
+        // ✅ отправляем также advancedControlMode
+        // =========================================================
+        async function submit() {
+            if (!lastServer) return;
+            if (lastServer.readOnly) return;
+            if (lastServer.canSubmit === false) return;
+
+            try {
+                setLoadState("Сохранение…", "secondary");
+
+                const fd = new FormData(formEl);
+
+                fd.set("chatId", String(ctx.chatId));
+                fd.set("type", ctx.type);
+                fd.set("exchange", ctx.exchange);
+                fd.set("network", ctx.network);
+
+                // ✅ ВАЖНО: режим берём из селекта или глобала
+                const sel = document.getElementById("advancedControlMode");
+                const mode =
+                    (sel && sel.value ? String(sel.value) : null) ||
+                    (window.__StrategyControlMode ? String(window.__StrategyControlMode) : null) ||
+                    (lastServer?.controlMode ? String(lastServer.controlMode) : null);
+
+                if (mode) fd.set("advancedControlMode", String(mode).trim().toUpperCase());
+
+                const body = new URLSearchParams();
+                for (const [k, v] of fd.entries()) body.set(k, String(v));
+
+                const res = await fetch(SUBMIT_ENDPOINT, {
                     method: "POST",
-                    headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
-                    body: params.toString()
+                    headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
+                    body: body.toString()
                 });
 
-                if (!res.ok) throw new Error(`http ${res.status}`);
-                const out = await res.json();
-                if (!out?.ok) {
-                    setState(out?.message || "Ошибка", "bg-danger");
+                if (!res.ok) {
+                    setLoadState("ERR", "danger");
                     return;
                 }
 
-                setState("Сохранено", "bg-success");
+                scheduleReload(150);
 
-                // после submit перезагрузим блок (и подтянем актуальные значения/политику)
-                await load();
             } catch (e) {
-                console.error("Advanced submit failed", e);
-                setState("Ошибка", "bg-danger");
+                console.error("ADVANCED submit error", e);
+                setLoadState("ERR", "danger");
             }
         }
 
-        // первичная загрузка
         load();
-
-        // reload если меняют биржу/сеть
-        const exchangeSelect = document.getElementById("exchangeSelect");
-        const networkSelect  = document.getElementById("networkSelect");
-        exchangeSelect?.addEventListener("change", () => setTimeout(load, 250));
-        networkSelect?.addEventListener("change",  () => setTimeout(load, 250));
-
-        // ✅ ключ: при смене режима в GENERAL — обновляем бейдж сразу (без ожидания сервера)
-        controlModeSelect?.addEventListener("change", () => {
-            syncModeFromUi();
-            // потом чуть позже подтянем сервер (когда autosave general успеет сохранить)
-            setTimeout(load, 600);
-        });
-
-        // save
-        saveBtn?.addEventListener("click", () => submit());
-        strategyForm?.addEventListener("submit", (e) => {
-            e.preventDefault();
-            submit();
-        });
     }
 
     return { init };

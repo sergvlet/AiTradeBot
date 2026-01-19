@@ -1,14 +1,13 @@
 package com.chicu.aitradebot.strategy.scalping;
 
 import com.chicu.aitradebot.common.enums.StrategyType;
-import com.chicu.aitradebot.ml.override.AiOverrideService;
+import com.chicu.aitradebot.ai.override.AiOverrideService;
 import com.chicu.aitradebot.strategy.core.SettingsSnapshot;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
-import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.Map;
 

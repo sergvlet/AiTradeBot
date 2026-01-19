@@ -18,20 +18,18 @@ window.SettingsTabGeneral = (function () {
         const dirtyBadge  = document.getElementById("generalDirtyBadge");
         const applyBtn    = document.getElementById("generalApplyBtn");
 
-        // confirm modal
         const confirmModalEl = document.getElementById("generalConfirmModal");
         const confirmTitleEl = document.getElementById("generalConfirmTitle");
         const confirmTextEl  = document.getElementById("generalConfirmText");
         const confirmOkBtn   = document.getElementById("generalConfirmOk");
 
-        // inputs
-        const controlModeSelect = document.getElementById("advancedControlMode");
+        const controlModeSelect   = document.getElementById("advancedControlMode");
+        const controlModeProgress = document.getElementById("controlModeProgress");
 
         const accountAssetSelect   = document.getElementById("accountAssetSelect");
         const selectedAssetView    = document.getElementById("selectedAssetView");
         const availableBalanceView = document.getElementById("availableBalanceView");
 
-        // Budget
         const exposureMode          = document.getElementById("strategyBudgetMode");
         const exposureValue         = document.getElementById("strategyBudgetValue");
         const exposureValueReadonly = document.getElementById("strategyBudgetValueReadonly");
@@ -53,17 +51,14 @@ window.SettingsTabGeneral = (function () {
         const rootEl = document.getElementById("generalHeader") || form;
 
         const AUTOSAVE_ENDPOINT = "/api/strategy/settings/autosave";
-        const APPLY_ENDPOINT    = "/api/strategy/settings/apply";
         const BALANCE_ENDPOINT  = "/api/strategy/settings/balance";
+        const APPLY_ENDPOINT    = "/api/strategy/settings/apply";
 
         const autosave = window.SettingsAutoSave?.create?.({
             rootEl,
             scope: "general",
             context: ctx,
-            endpoints: {
-                autosave: AUTOSAVE_ENDPOINT,
-                apply: APPLY_ENDPOINT
-            },
+            endpoints: { autosave: AUTOSAVE_ENDPOINT },
             elements: { saveState, saveMeta, changedList, applyBtn },
             buildPayload: buildPayload
         });
@@ -81,7 +76,7 @@ window.SettingsTabGeneral = (function () {
         autosave?.initReadyState?.();
 
         // =====================================================
-        // HELPERS (без хардкода USDT/BTC)
+        // HELPERS
         // =====================================================
         function nowHHmm() {
             const d = new Date();
@@ -101,6 +96,47 @@ window.SettingsTabGeneral = (function () {
         function fmt(n, decimals = 8) {
             if (!Number.isFinite(n)) return "—";
             return n.toFixed(decimals).replace(/\.?0+$/, "");
+        }
+
+        function setSavedUiHint(extraMeta) {
+            if (dirtyBadge) dirtyBadge.classList.add("d-none");
+            if (saveState) {
+                saveState.classList.remove("bg-secondary");
+                saveState.classList.add("bg-success");
+                saveState.textContent = "Сохранено ✓";
+            }
+            if (saveMeta) saveMeta.textContent = extraMeta || nowHHmm();
+        }
+
+        function setSavingUiHint() {
+            if (saveState) {
+                saveState.classList.remove("bg-success");
+                saveState.classList.add("bg-secondary");
+                saveState.textContent = "Сохранение…";
+            }
+        }
+
+        function setErrorUiHint() {
+            if (saveState) {
+                saveState.classList.remove("bg-success");
+                saveState.classList.add("bg-secondary");
+                saveState.textContent = "Ошибка";
+            }
+            if (saveMeta) saveMeta.textContent = "проверь API";
+        }
+
+        function setApplyingUiHint() {
+            if (saveState) {
+                saveState.classList.remove("bg-success");
+                saveState.classList.add("bg-secondary");
+                saveState.textContent = "Применяю AI…";
+            }
+            if (saveMeta) saveMeta.textContent = nowHHmm();
+        }
+
+        function showProgress(on) {
+            if (!controlModeProgress) return;
+            controlModeProgress.classList.toggle("d-none", !on);
         }
 
         function getAssetForUi() {
@@ -128,31 +164,56 @@ window.SettingsTabGeneral = (function () {
             }
         }
 
-        function setSavedUiHint() {
-            if (dirtyBadge) dirtyBadge.classList.add("d-none");
-            if (saveState) {
-                saveState.classList.remove("bg-secondary");
-                saveState.classList.add("bg-success");
-                saveState.textContent = "Сохранено ✓";
-            }
-            if (saveMeta) saveMeta.textContent = nowHHmm();
+        // =====================================================
+        // ✅ ЖЁСТКИЙ AUTOSAVE: гарантирует payload из buildPayload
+        // (обходит кривую реализацию SettingsAutoSave.saveNow)
+        // =====================================================
+        async function postAutosaveDirect(payload) {
+            const res = await fetch(AUTOSAVE_ENDPOINT, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Accept": "application/json"
+                },
+                body: JSON.stringify(payload)
+            });
+
+            if (!res.ok) throw new Error(`autosave http ${res.status}`);
+
+            const text = await res.text();
+            try { return JSON.parse(text); } catch { return null; }
         }
 
-        function setSavingUiHint() {
-            if (saveState) {
-                saveState.classList.remove("bg-success");
-                saveState.classList.add("bg-secondary");
-                saveState.textContent = "Сохранение…";
-            }
+        // =====================================================
+        // ✅ FIX: синхронизация контекста (обязательно!)
+        // если режим сохранялся в другую строку — это покажет и починит
+        // =====================================================
+        function syncContextFromServer(resp) {
+            const ex = (resp?.exchange || resp?.exchangeName || "").toString().trim();
+            const net = (resp?.network || resp?.networkType || "").toString().trim();
+            const type = (resp?.type || "").toString().trim();
+
+            if (ex) ctx.exchange = ex;
+            if (net) ctx.network = net;
+            if (type) ctx.type = type;
         }
 
-        function setErrorUiHint() {
-            if (saveState) {
-                saveState.classList.remove("bg-success");
-                saveState.classList.add("bg-secondary");
-                saveState.textContent = "Ошибка";
+        function syncControlModeFromServer(resp) {
+            const mode = String(resp?.advancedControlMode || "").trim().toUpperCase();
+            if (!mode) return;
+
+            if (controlModeSelect) {
+                const cur = String(controlModeSelect.value || "").trim().toUpperCase();
+                if (cur !== mode) controlModeSelect.value = mode;
+                controlModeSelect.dataset.prevValue = mode;
             }
-            if (saveMeta) saveMeta.textContent = "проверь API";
+
+            ctx.advancedControlMode = mode;
+            window.__StrategyControlMode = mode;
+
+            try {
+                window.dispatchEvent(new CustomEvent("strategy:controlModeChanged", { detail: { mode } }));
+            } catch (_) {}
         }
 
         // =====================================================
@@ -168,19 +229,18 @@ window.SettingsTabGeneral = (function () {
                 network: ctx.network,
                 scope: "general",
 
-                advancedControlMode: (controlModeSelect?.value || "").trim() || null,
+                advancedControlMode: controlModeSelect ? ((controlModeSelect.value || "").trim() || null) : null,
 
                 accountAsset: asset,
                 maxExposureUsd: (maxExposureUsdHidden?.value || "").trim() || null,
                 maxExposurePct: (maxExposurePctHidden?.value || "").trim() || null,
-
                 dailyLossLimitPct: (dailyLossInput?.value || "").trim() || null,
-                reinvestProfit: !!reinvestCheckbox?.checked
+                reinvestProfit: reinvestCheckbox ? !!reinvestCheckbox.checked : null
             };
         }
 
         // =====================================================
-        // BALANCE API (AccountBalanceSnapshot)
+        // BALANCE API
         // =====================================================
         async function fetchBalanceSnapshot(asset) {
             const a = (asset || "").trim();
@@ -194,19 +254,11 @@ window.SettingsTabGeneral = (function () {
                 `&network=${encodeURIComponent(ctx.network)}` +
                 `&asset=${encodeURIComponent(a)}`;
 
-            const res = await fetch(url, {
-                method: "GET",
-                headers: { "Accept": "application/json" }
-            });
-
+            const res = await fetch(url, { method: "GET", headers: { "Accept": "application/json" } });
             if (!res.ok) throw new Error(`balance http ${res.status}`);
 
             const text = await res.text();
-            try {
-                return JSON.parse(text);
-            } catch {
-                throw new Error("balance not json");
-            }
+            try { return JSON.parse(text); } catch { throw new Error("balance not json"); }
         }
 
         async function refreshBalance(asset) {
@@ -224,20 +276,17 @@ window.SettingsTabGeneral = (function () {
                 const free = snap?.selectedFreeBalance ?? "—";
                 setBalanceUi(selAsset, free);
 
-                // пересчитать бюджет/preview под этот актив
                 setBudgetUi(false);
-
                 return snap;
             } catch (e) {
                 console.error("refreshBalance failed", e);
-                // не затираем текущее значение, но обновим подписи/preview под выбранный актив
                 setBudgetUi(false);
                 return null;
             }
         }
 
         // =====================================================
-        // CONFIRM MODAL
+        // CONFIRM
         // =====================================================
         function confirmText(el) {
             return {
@@ -291,31 +340,23 @@ window.SettingsTabGeneral = (function () {
             });
         }
 
-        // =====================================================
-        // CONFIRM POLICY (главное: НЕ мешаем вводить)
-        // =====================================================
         function shouldConfirmByPolicy(el, key, extra) {
             if (!el) return false;
-
-            // Если вообще нет data-confirm — не подтверждаем
             const flag = String(el.dataset.confirm || "").toLowerCase() === "true";
             if (!flag) return false;
 
-            // ✅ Никогда не подтверждаем ввод числа (иначе невозможно настроить)
             if (key === "budgetValue") return false;
 
-            // ✅ Режим бюджета подтверждаем ТОЛЬКО если включают "весь баланс"
             if (key === "budgetMode") {
                 const nextMode = (extra?.nextMode || "").trim();
                 return nextMode === "NONE";
             }
 
-            // Остальные поля — как раньше (если в HTML стоит confirm)
             return true;
         }
 
         // =====================================================
-        // DEBOUNCE (чтобы автосейв не дергался на каждую цифру)
+        // DEBOUNCE
         // =====================================================
         const Debounce = (function () {
             let t = null;
@@ -344,69 +385,70 @@ window.SettingsTabGeneral = (function () {
         })();
 
         // =====================================================
-        // SAVE NOW (с fallback если SettingsAutoSave не умеет saveNow)
+        // ✅ SAVE NOW: сначала пробуем autosave.saveNow, но режим — только через direct
         // =====================================================
-        async function fallbackSaveNow() {
+        async function autosaveNowStrict() {
             const payload = buildPayload();
+
             setSavingUiHint();
 
-            try {
-                const res = await fetch(AUTOSAVE_ENDPOINT, {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                        "Accept": "application/json"
-                    },
-                    body: JSON.stringify(payload)
+            // 1) прямой POST гарантирует что advancedControlMode реально уйдёт
+            const resp = await postAutosaveDirect(payload);
+
+            // 2) подтягиваем контекст и режим
+            syncContextFromServer(resp);
+            syncControlModeFromServer(resp);
+
+            // 3) баланс
+            const snap = resp?.snapshot || resp?.balanceSnapshot || null;
+            if (snap?.selectedAsset) {
+                setBalanceUi(snap.selectedAsset, snap.selectedFreeBalance);
+                setBudgetUi(false);
+            }
+
+            // 4) (не обязательно) диагностический лог
+            if (resp?.id) {
+                console.log("✅ AUTOSAVE OK", {
+                    id: resp.id, ex: resp.exchange, net: resp.network, mode: resp.advancedControlMode
                 });
-
-                if (!res.ok) throw new Error(`autosave http ${res.status}`);
-
-                const text = await res.text();
-                let data = null;
-                try { data = JSON.parse(text); } catch { data = null; }
-
-                const snap = data?.snapshot || data?.balanceSnapshot || null;
-                if (snap?.selectedAsset) {
-                    setBalanceUi(snap.selectedAsset, snap.selectedFreeBalance);
-                    setBudgetUi(false);
-                }
-
-                setSavedUiHint();
-                return data;
-            } catch (e) {
-                console.error("fallbackSaveNow failed", e);
-                setErrorUiHint();
-                return null;
-            }
-        }
-
-        async function autosaveNow() {
-            if (!autosave) return null;
-
-            if (typeof autosave.saveNow === "function") {
-                setSavingUiHint();
-                try {
-                    const resp = await autosave.saveNow();
-                    const snap = resp?.snapshot || resp?.balanceSnapshot || null;
-                    if (snap?.selectedAsset) {
-                        setBalanceUi(snap.selectedAsset, snap.selectedFreeBalance);
-                        setBudgetUi(false);
-                    }
-                    setSavedUiHint();
-                    return resp;
-                } catch (e) {
-                    console.error("autosave.saveNow failed", e);
-                    setErrorUiHint();
-                    return null;
-                }
             }
 
-            return await fallbackSaveNow();
+            setSavedUiHint();
+            return resp;
         }
 
         // =====================================================
-        // “CHANGE” ACTION WRAPPER (confirm -> action -> save)
+        // APPLY
+        // =====================================================
+        async function applyControlMode(reason) {
+            if (!controlModeSelect) return null;
+
+            const payload = {
+                chatId: ctx.chatId,
+                type: ctx.type,
+                exchange: ctx.exchange,
+                network: ctx.network,
+                advancedControlMode: (controlModeSelect.value || "").trim() || null,
+                reason: (reason || "").trim() || null
+            };
+
+            const res = await fetch(APPLY_ENDPOINT, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Accept": "application/json"
+                },
+                body: JSON.stringify(payload)
+            });
+
+            if (!res.ok) throw new Error(`apply http ${res.status}`);
+
+            const text = await res.text();
+            try { return JSON.parse(text); } catch { return null; }
+        }
+
+        // =====================================================
+        // “CHANGE” ACTION WRAPPER
         // =====================================================
         async function commitChange(el, key, action, confirmExtra, overrideConfirmText) {
             markChanged(key);
@@ -420,27 +462,31 @@ window.SettingsTabGeneral = (function () {
                 await action();
             }
 
-            await autosaveNow();
+            try {
+                await autosaveNowStrict();
+            } catch (e) {
+                console.error("autosaveNowStrict failed", e);
+                setErrorUiHint();
+                return false;
+            }
+
             scheduleSave(250);
             return true;
         }
 
         // =====================================================
-        // BUDGET UI (dynamic by asset + free)
+        // BUDGET UI
         // =====================================================
         function setBudgetTexts(mode, asset, valueRaw) {
-            const free = getFreeBalanceNumber(); // number|null
+            const free = getFreeBalanceNumber();
 
             if (mode === "NONE") {
                 if (exposureValueLabel) exposureValueLabel.textContent = "Значение";
                 if (exposureValueHint) exposureValueHint.textContent = "Будет использован весь доступный баланс.";
 
                 if (exposureValueReadonly) {
-                    if (asset && free != null) {
-                        exposureValueReadonly.value = `Весь доступный баланс: ${fmt(free)} ${asset}`;
-                    } else {
-                        exposureValueReadonly.value = "Весь доступный баланс";
-                    }
+                    if (asset && free != null) exposureValueReadonly.value = `Весь доступный баланс: ${fmt(free)} ${asset}`;
+                    else exposureValueReadonly.value = "Весь доступный баланс";
                 }
 
                 if (exposurePreview) {
@@ -494,7 +540,7 @@ window.SettingsTabGeneral = (function () {
         function setBudgetUi(triggerSave) {
             if (!exposureMode) return;
 
-            const mode = (exposureMode.value || "PCT").trim(); // безопасный дефолт
+            const mode = (exposureMode.value || "PCT").trim();
             const asset = getAssetForUi();
 
             if (mode === "NONE") {
@@ -522,7 +568,6 @@ window.SettingsTabGeneral = (function () {
                     exposureValue.min = "0";
                     exposureValue.step = "1";
                     exposureValue.placeholder = "Напр. 500";
-                    // max = free (если известно)
                     const free = getFreeBalanceNumber();
                     exposureValue.max = (free != null && free > 0) ? String(free) : "";
                 }
@@ -586,9 +631,6 @@ window.SettingsTabGeneral = (function () {
             }
         }
 
-        // =====================================================
-        // SAFE DEFAULT: НЕ ставим "весь баланс" первым/по умолчанию
-        // =====================================================
         function moveOptionToEnd(selectEl, value) {
             if (!selectEl) return;
             const opt = Array.from(selectEl.options).find(o => o.value === value);
@@ -598,13 +640,10 @@ window.SettingsTabGeneral = (function () {
         }
 
         function initBudgetFromBackendSafe() {
-            // "NONE" в конец
             moveOptionToEnd(exposureMode, "NONE");
 
-            // initial mode from backend
             let initial = (exposureInitialMode?.value || "").trim();
 
-            // если лимита нет — ставим безопасно PCT=10
             if (!initial || initial === "NONE") {
                 initial = "PCT";
                 if (exposureValue) exposureValue.value = "10";
@@ -625,25 +664,76 @@ window.SettingsTabGeneral = (function () {
         // FIELD HANDLERS
         // =====================================================
 
-        // --- controlMode: confirm (если стоит data-confirm), rollback
         if (controlModeSelect) {
             controlModeSelect.dataset.prevValue = controlModeSelect.value;
+            controlModeSelect.dataset.confirm = "false";
 
             controlModeSelect.addEventListener("change", async () => {
-                const prev = controlModeSelect.dataset.prevValue ?? "";
-                const next = controlModeSelect.value;
+                const prev = (controlModeSelect.dataset.prevValue ?? "").trim();
+                const next = (controlModeSelect.value || "").trim();
 
-                const ok = await commitChange(
-                    controlModeSelect,
-                    "advancedControlMode",
-                    async () => { controlModeSelect.dataset.prevValue = next; }
-                );
+                const nextUpper = String(next).toUpperCase();
+                const isAiMode = (nextUpper === "HYBRID" || nextUpper === "AI");
 
-                if (!ok) controlModeSelect.value = prev;
+                markChanged("advancedControlMode");
+
+                window.__StrategyControlMode = nextUpper;
+                try {
+                    window.dispatchEvent(new CustomEvent("strategy:controlModeChanged", { detail: { mode: nextUpper } }));
+                } catch (_) {}
+
+                if (isAiMode) {
+                    showProgress(true);
+                    setApplyingUiHint();
+                } else {
+                    setSavingUiHint();
+                }
+
+                try {
+                    // ✅ строгое сохранение (гарантирует advancedControlMode)
+                    const saved = await autosaveNowStrict();
+
+                    if (!saved) throw new Error("autosave returned null");
+
+                    // 2) для HYBRID/AI — apply
+                    if (isAiMode) {
+                        try {
+                            const applyResp = await applyControlMode(null);
+                            // applyResp может быть null — не критично
+                            setSavedUiHint(`${nowHHmm()} • apply ok`);
+                        } catch (e) {
+                            console.error("applyControlMode failed", e);
+                            setSavedUiHint(`${nowHHmm()} • apply error`);
+                        } finally {
+                            showProgress(false);
+                        }
+                    } else {
+                        showProgress(false);
+                        setSavedUiHint();
+                    }
+
+                    controlModeSelect.dataset.prevValue = String(controlModeSelect.value || "").trim();
+
+                } catch (e) {
+                    console.error("controlMode change failed", e);
+
+                    // откат UI
+                    controlModeSelect.value = prev;
+                    controlModeSelect.dataset.prevValue = prev;
+
+                    window.__StrategyControlMode = String(prev).trim().toUpperCase();
+                    try {
+                        window.dispatchEvent(new CustomEvent("strategy:controlModeChanged", { detail: { mode: window.__StrategyControlMode } }));
+                    } catch (_) {}
+
+                    showProgress(false);
+                    setErrorUiHint();
+                }
+
+                scheduleSave(250);
             });
         }
 
-        // --- accountAsset: любой токен, без хардкода
         if (accountAssetSelect) {
             accountAssetSelect.dataset.prevValue = (accountAssetSelect.value || "").trim();
 
@@ -651,7 +741,6 @@ window.SettingsTabGeneral = (function () {
                 const prev = accountAssetSelect.dataset.prevValue ?? "";
                 const next = (accountAssetSelect.value || "").trim();
 
-                // сразу обновим баланс/preview
                 await refreshBalance(next);
 
                 const ok = await commitChange(
@@ -667,15 +756,12 @@ window.SettingsTabGeneral = (function () {
             });
         }
 
-        // --- dailyLoss: не дергаем модалку на input, только на change
         if (dailyLossInput) {
             dailyLossInput.dataset.prevValue = dailyLossInput.value;
 
             dailyLossInput.addEventListener("input", () => {
                 markChanged("dailyLossLimitPct");
-                // можно сделать мягкий автосейв после паузы (без confirm), но оставим безопасно:
                 Debounce.schedule(async () => {
-                    // НЕ показываем confirm на ввод — просто сохраняем через паузу
                     await commitChange(dailyLossInput, "dailyLossLimitPct", async () => {});
                 }, 1200);
             });
@@ -696,14 +782,12 @@ window.SettingsTabGeneral = (function () {
             });
         }
 
-        // --- reinvestProfit: без confirm
         if (reinvestCheckbox) {
             reinvestCheckbox.addEventListener("change", async () => {
                 await commitChange(reinvestCheckbox, "reinvestProfit", async () => {});
             });
         }
 
-        // --- budget mode: confirm ТОЛЬКО на NONE (весь баланс), rollback
         if (exposureMode) {
             exposureMode.dataset.prevValue = exposureMode.value;
 
@@ -711,7 +795,6 @@ window.SettingsTabGeneral = (function () {
                 const prev = exposureMode.dataset.prevValue ?? "";
                 const next = (exposureMode.value || "PCT").trim();
 
-                // UI меняем сразу, но если cancel — откатим
                 setBudgetUi(false);
                 markChanged("budget");
 
@@ -724,10 +807,7 @@ window.SettingsTabGeneral = (function () {
                     },
                     { nextMode: next },
                     next === "NONE"
-                        ? {
-                            title: "Внимание",
-                            text: "Режим «Весь баланс» опасен. Стратегия сможет использовать весь доступный free. Включить?"
-                        }
+                        ? { title: "Внимание", text: "Режим «Весь баланс» опасен. Стратегия сможет использовать весь доступный free. Включить?" }
                         : null
                 );
 
@@ -739,37 +819,35 @@ window.SettingsTabGeneral = (function () {
             });
         }
 
-        // --- budget value: ГЛАВНОЕ — НИКАКОЙ модалки, чтобы ты успевал вводить
         if (exposureValue) {
             exposureValue.dataset.prevValue = exposureValue.value;
-
-            // Даже если в HTML стоит data-confirm=true — игнорируем для этого поля
             exposureValue.dataset.confirm = "false";
 
             exposureValue.addEventListener("input", () => {
                 syncBudgetHidden(false);
                 markChanged("budget");
 
-                // автосейв после паузы (без confirm)
                 Debounce.schedule(async () => {
                     const n = parseNumberLoose(exposureValue.value);
                     if (n == null) return;
 
-                    // clamp уже делается в syncBudgetHidden (если USD и free известен)
                     syncBudgetHidden(false);
 
                     exposureValue.dataset.prevValue = exposureValue.value;
-                    await autosaveNow();
+                    try {
+                        await autosaveNowStrict();
+                    } catch (e) {
+                        console.error("budget autosave failed", e);
+                        setErrorUiHint();
+                    }
                     scheduleSave(250);
                 }, 1200);
             });
 
-            // blur/change — сохранить сразу, без модалки
             const saveBudgetValueNow = async () => {
                 Debounce.flush(async () => {
                     const n = parseNumberLoose(exposureValue.value);
                     if (n == null) {
-                        // если мусор — откатим
                         exposureValue.value = exposureValue.dataset.prevValue ?? "";
                         syncBudgetHidden(false);
                         return;
@@ -778,7 +856,12 @@ window.SettingsTabGeneral = (function () {
                     syncBudgetHidden(false);
                     exposureValue.dataset.prevValue = exposureValue.value;
 
-                    await autosaveNow();
+                    try {
+                        await autosaveNowStrict();
+                    } catch (e) {
+                        console.error("budget autosave failed", e);
+                        setErrorUiHint();
+                    }
                     scheduleSave(250);
                 });
             };
@@ -797,6 +880,16 @@ window.SettingsTabGeneral = (function () {
         // =====================================================
         // FIRST LOAD
         // =====================================================
+        if (controlModeSelect) {
+            const m = String(controlModeSelect.value || "").trim().toUpperCase();
+            if (m) {
+                window.__StrategyControlMode = m;
+                try {
+                    window.dispatchEvent(new CustomEvent("strategy:controlModeChanged", { detail: { mode: m } }));
+                } catch (_) {}
+            }
+        }
+
         const initialAsset = getAssetForUi();
         if (initialAsset) {
             refreshBalance(initialAsset).catch(() => {});

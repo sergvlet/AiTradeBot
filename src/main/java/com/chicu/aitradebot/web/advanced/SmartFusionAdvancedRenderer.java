@@ -1,4 +1,3 @@
-// src/main/java/com/chicu/aitradebot/web/advanced/SmartFusionAdvancedRenderer.java
 package com.chicu.aitradebot.web.advanced;
 
 import com.chicu.aitradebot.common.enums.StrategyType;
@@ -33,8 +32,7 @@ public class SmartFusionAdvancedRenderer implements StrategyAdvancedRenderer {
         String dis = ro ? " disabled" : "";
         String roAttr = ro ? " readonly" : "";
 
-        return ""
-                + "<div class='card card-theme p-3 mb-3'>"
+        return "<div class='card card-theme p-3 mb-3'>"
                 + "  <div class='d-flex align-items-center justify-content-between mb-2'>"
                 + "    <div class='fw-bold'>SMART_FUSION — параметры стратегии</div>"
                 + badge(ro)
@@ -120,8 +118,7 @@ public class SmartFusionAdvancedRenderer implements StrategyAdvancedRenderer {
 
     private static String fieldText(String name, String label, String value, String dis, String roAttr, String help) {
         String v = value == null ? "" : HtmlUtils.htmlEscape(value);
-        return ""
-                + "<div class='col-md-4'>"
+        return "<div class='col-md-4'>"
                 + "  <label class='form-label'>" + HtmlUtils.htmlEscape(label) + "</label>"
                 + "  <input type='text' class='form-control' name='" + HtmlUtils.htmlEscape(name) + "' value='" + v + "'" + dis + roAttr + ">"
                 + "  <div class='form-text'>" + HtmlUtils.htmlEscape(help) + "</div>"
@@ -130,8 +127,7 @@ public class SmartFusionAdvancedRenderer implements StrategyAdvancedRenderer {
 
     private static String fieldNumber(String name, String label, String value, String extraAttrs, String dis, String roAttr, String help) {
         String v = value == null ? "" : HtmlUtils.htmlEscape(value);
-        return ""
-                + "<div class='col-md-3'>"
+        return "<div class='col-md-3'>"
                 + "  <label class='form-label'>" + HtmlUtils.htmlEscape(label) + "</label>"
                 + "  <input type='number' class='form-control' name='" + HtmlUtils.htmlEscape(name) + "' value='" + v + "' " + extraAttrs + dis + roAttr + ">"
                 + "  <div class='form-text'>" + HtmlUtils.htmlEscape(help) + "</div>"

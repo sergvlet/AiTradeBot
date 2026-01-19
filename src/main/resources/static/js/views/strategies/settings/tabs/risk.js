@@ -80,14 +80,14 @@ window.SettingsTabRisk = (function () {
             }
         }
 
-        function setSavedUi() {
+        function setSavedUi(metaText) {
             if (dirtyBadge) dirtyBadge.classList.add("d-none");
             if (saveState) {
                 saveState.classList.remove("bg-secondary");
                 saveState.classList.add("bg-success");
                 saveState.textContent = "Сохранено ✓";
             }
-            if (saveMeta) saveMeta.textContent = nowHHmm();
+            if (saveMeta) saveMeta.textContent = metaText || nowHHmm();
         }
 
         function setErrorUi() {
@@ -102,7 +102,6 @@ window.SettingsTabRisk = (function () {
         function markChanged(key) {
             if (dirtyBadge) dirtyBadge.classList.remove("d-none");
             if (changedList) {
-                // не спамим — покажем только последние 1–2
                 const t = (changedList.textContent || "").trim();
                 const next = key && !t.includes(key) ? (t ? (t + ", " + key) : key) : t;
                 changedList.textContent = next;
@@ -260,7 +259,6 @@ window.SettingsTabRisk = (function () {
                 }
             }
 
-            // AI = только чтение
             const disable = (mode === "AI");
             const allInputs = form.querySelectorAll("input, select, textarea");
             allInputs.forEach(el => {
@@ -335,7 +333,7 @@ window.SettingsTabRisk = (function () {
         }
 
         // =====================================================
-        // Payload (scope=risk)
+        // Payload (scope=risk) — НЕ затираем поля, если инпута нет
         // =====================================================
         function buildPayloadRisk() {
             return {
@@ -349,7 +347,7 @@ window.SettingsTabRisk = (function () {
                 minRiskReward: (minRiskRewardInput?.value || "").trim() || null,
                 leverage: (leverageInput?.value || "").trim() || null,
 
-                allowAveraging: !!allowAveragingInput?.checked,
+                allowAveraging: allowAveragingInput ? !!allowAveragingInput.checked : null,
                 cooldownSeconds: (cooldownSecondsInput?.value || "").trim() || null,
                 maxTradesPerDay: (maxTradesPerDayInput?.value || "").trim() || null,
 
@@ -382,7 +380,7 @@ window.SettingsTabRisk = (function () {
 
                 if (!res.ok) throw new Error(`autosave http ${res.status}`);
 
-                // ответ не обязателен, но если вернулся snapshot — ок
+                // если бек вернул JSON — ок, но нам не обязателен
                 await res.text().catch(() => "");
                 setSavedUi();
             } catch (e) {
@@ -405,11 +403,16 @@ window.SettingsTabRisk = (function () {
             el.dataset.prevValue = el.value || "";
 
             el.addEventListener("input", () => {
+                // ✅ AI: игнорируем (на всякий случай, если инпут не disabled)
+                if (getControlMode() === "AI") return;
+
                 markChanged(key);
                 if (typeof onInput === "function") onInput();
 
                 const prev = el.dataset.prevValue ?? "";
                 ConfirmGate.schedule(delay, async () => {
+                    if (getControlMode() === "AI") return;
+
                     if (typeof onBeforeSave === "function") onBeforeSave();
                     el.dataset.prevValue = el.value || "";
                     await saveNow();
@@ -421,12 +424,19 @@ window.SettingsTabRisk = (function () {
 
             el.addEventListener("change", async () => {
                 ConfirmGate.clear();
+
+                // ✅ AI: откатываем и выходим
+                if (getControlMode() === "AI") {
+                    el.value = el.dataset.prevValue ?? "";
+                    if (typeof confirmRollback === "function") confirmRollback();
+                    return;
+                }
+
                 markChanged(key);
 
                 const prev = el.dataset.prevValue ?? "";
                 const next = el.value || "";
 
-                // если мусор — откат
                 const n = parseNumberLoose(next);
                 if (next.trim() !== "" && n == null) {
                     el.value = prev;
@@ -451,6 +461,12 @@ window.SettingsTabRisk = (function () {
             el.dataset.prevChecked = el.checked ? "1" : "0";
 
             el.addEventListener("change", async () => {
+                // ✅ AI: откат
+                if (getControlMode() === "AI") {
+                    el.checked = (el.dataset.prevChecked === "1");
+                    return;
+                }
+
                 markChanged(key);
                 const prev = el.dataset.prevChecked === "1";
                 const next = !!el.checked;
@@ -535,11 +551,17 @@ window.SettingsTabRisk = (function () {
         bindNumberInput(maxOpenOrdersInput, "maxOpenOrders");
 
         // =====================================================
-        // Sync mode badge on change (чтобы риск не "зависал" на HYBRID)
+        // Sync mode badge on change + слушаем глобальный эвент из General
         // =====================================================
         function syncMode() {
             const mode = getControlMode();
             setModeUi(mode);
+
+            // ✅ если режим стал AI — сбросим in-flight confirm/debounce
+            if (mode === "AI") {
+                ConfirmGate.clear();
+                setSavedUi(nowHHmm());
+            }
         }
 
         if (controlModeSelect) {
@@ -547,6 +569,15 @@ window.SettingsTabRisk = (function () {
                 syncMode();
             });
         }
+
+        // ✅ общий сигнал от General (мы его диспатчим там)
+        window.addEventListener("strategy:controlModeChanged", (e) => {
+            const m = String(e?.detail?.mode || "").toUpperCase();
+            if (m) {
+                ctx.advancedControlMode = m;
+                syncMode();
+            }
+        });
 
         // =====================================================
         // First render

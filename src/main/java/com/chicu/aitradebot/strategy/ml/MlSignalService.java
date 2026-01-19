@@ -1,4 +1,4 @@
-// src/main/java/com/chicu/aitradebot/strategy/ml/MlSignalService.java
+// src/main/java/com/chicu/aitradebot/strategy/ai/MlSignalService.java
 package com.chicu.aitradebot.strategy.ml;
 
 public interface MlSignalService {

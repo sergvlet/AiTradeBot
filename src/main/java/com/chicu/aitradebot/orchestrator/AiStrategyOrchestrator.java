@@ -46,7 +46,6 @@ public class AiStrategyOrchestrator {
             String exchange,
             NetworkType network
     ) {
-
         StrategySettings s = loadSettingsStrict(chatId, type, exchange, network);
 
         if (s.getSymbol() == null || s.getSymbol().isBlank()) {
@@ -86,7 +85,6 @@ public class AiStrategyOrchestrator {
             String exchange,
             NetworkType network
     ) {
-
         StrategySettings s = loadSettingsStrict(chatId, type, exchange, network);
         TradingStrategy strategy = strategyRegistry.get(type);
 
@@ -151,15 +149,40 @@ public class AiStrategyOrchestrator {
     public GlobalState getGlobalState(Long chatId) {
         int active = 0;
 
+        // ✅ больше НЕ используем findLatest(...). У нас есть строгий ключ.
+        // Для глобального счётчика нам достаточно пройтись по сетям/биржам,
+        // которые реально используются в UI/проекте.
         for (StrategyType t : StrategyType.values()) {
-            if (settingsService.findLatest(chatId, t, null, null)
-                    .map(StrategySettings::isActive)
-                    .orElse(false)) {
-                active++;
-            }
+
+            // BINANCE MAINNET
+            if (isActiveSafe(chatId, t, "BINANCE", NetworkType.MAINNET)) active++;
+
+            // BINANCE TESTNET
+            if (isActiveSafe(chatId, t, "BINANCE", NetworkType.TESTNET)) active++;
+
+            // BYBIT MAINNET
+            if (isActiveSafe(chatId, t, "BYBIT", NetworkType.MAINNET)) active++;
+
+            // BYBIT TESTNET
+            if (isActiveSafe(chatId, t, "BYBIT", NetworkType.TESTNET)) active++;
+
+            // OKX MAINNET (если у тебя OKX без тестнета — оставь только MAINNET)
+            if (isActiveSafe(chatId, t, "OKX", NetworkType.MAINNET)) active++;
+
+            // OKX TESTNET (если есть — оставь; если нет — можно удалить)
+            if (isActiveSafe(chatId, t, "OKX", NetworkType.TESTNET)) active++;
         }
 
         return new GlobalState(BigDecimal.ZERO, BigDecimal.ZERO, active);
+    }
+
+    private boolean isActiveSafe(Long chatId, StrategyType type, String exchange, NetworkType network) {
+        try {
+            StrategySettings s = settingsService.getSettings(chatId, type, exchange, network);
+            return s != null && s.isActive();
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 
     // =====================================================================
@@ -171,26 +194,16 @@ public class AiStrategyOrchestrator {
             String exchange,
             NetworkType network
     ) {
-        return settingsService
-                .findLatest(chatId, type, exchange, network)
-                .orElseThrow(() ->
-                        new IllegalStateException(
-                                "Настройки стратегии не найдены (chatId="
-                                + chatId + ", type=" + type
-                                + ", exchange=" + exchange
-                                + ", network=" + network + ")"
-                        )
-                );
+        // ✅ раньше было findLatest(...) — теперь строго ключ.
+        // И ВАЖНО: orchestrator должен уметь стартовать даже если строки ещё нет
+        // (после твоего DROP таблицы это прям критично), поэтому getOrCreate().
+        return settingsService.getOrCreate(chatId, type, exchange, network);
     }
 
     // =====================================================================
     // 🧱 RUN INFO (DTO)
     // =====================================================================
     private StrategyRunInfo buildRunInfo(StrategySettings s, boolean active, String msg) {
-
-        // ⚠️ В unified StrategySettings больше нет capital/commission/tp/sl/pnl/mlConfidence.
-        // Они берутся из таблиц конкретных стратегий/рантайма и будут подключены отдельно.
-        // Здесь отдаём только то, что реально принадлежит unified.
 
         return StrategyRunInfo.builder()
                 .chatId(s.getChatId())

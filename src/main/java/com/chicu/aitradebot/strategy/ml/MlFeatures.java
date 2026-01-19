@@ -1,4 +1,4 @@
-// src/main/java/com/chicu/aitradebot/strategy/ml/MlFeatures.java
+// src/main/java/com/chicu/aitradebot/strategy/ai/MlFeatures.java
 package com.chicu.aitradebot.strategy.ml;
 
 import com.chicu.aitradebot.strategy.core.CandleProvider;

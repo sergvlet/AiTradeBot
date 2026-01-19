@@ -1,4 +1,4 @@
-// src/main/java/com/chicu/aitradebot/strategy/ml/MlClassificationSettingsRepository.java
+// src/main/java/com/chicu/aitradebot/strategy/ai/MlClassificationSettingsRepository.java
 package com.chicu.aitradebot.strategy.ml;
 
 import org.springframework.data.jpa.repository.JpaRepository;

@@ -8,6 +8,7 @@ import lombok.*;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
+import java.util.Locale;
 
 @Entity
 @Table(
@@ -65,21 +66,18 @@ public class StrategySettings {
     private Integer cachedCandlesLimit = 500;
 
     // =====================================================================
-    // GENERAL: АКТИВ / БЮДЖЕТ / ДНЕВНОЙ ЛИМИТ / РЕИНВЕСТ
+    // GENERAL
     // =====================================================================
 
     @Column(name = "account_asset", length = 16)
     private String accountAsset;
 
-    /** Бюджет стратегии в USD (если задан — лимитирует максимальную аллокацию) */
     @Column(name = "max_exposure_usd", precision = 18, scale = 6)
     private BigDecimal maxExposureUsd;
 
-    /** Бюджет стратегии в % от доступного баланса (если задан) */
     @Column(name = "max_exposure_pct", precision = 10, scale = 4)
     private BigDecimal maxExposurePct;
 
-    /** Максимальная потеря за день (%) */
     @Column(name = "daily_loss_limit_pct", precision = 10, scale = 4)
     private BigDecimal dailyLossLimitPct;
 
@@ -88,18 +86,15 @@ public class StrategySettings {
     private boolean reinvestProfit = false;
 
     // =====================================================================
-    // RISK: ЛИМИТЫ / АНТИТИЛЬТ / ПРЕДОХРАНИТЕЛИ
+    // RISK
     // =====================================================================
 
-    /** Риск на сделку (%) */
     @Column(name = "risk_per_trade_pct", precision = 10, scale = 4)
     private BigDecimal riskPerTradePct;
 
-    /** Мин. Risk/Reward */
     @Column(name = "min_risk_reward", precision = 10, scale = 4)
     private BigDecimal minRiskReward;
 
-    /** Плечо (для спота обычно 1; держим универсально) */
     @Builder.Default
     @Column(nullable = false)
     private int leverage = 1;
@@ -129,7 +124,7 @@ public class StrategySettings {
     private Integer maxTradesPerDay;
 
     // =====================================================================
-    // TRADE: ОГРАНИЧЕНИЯ СТРАТЕГИИ
+    // TRADE
     // =====================================================================
 
     @Column(name = "max_open_orders")
@@ -139,7 +134,7 @@ public class StrategySettings {
     private Integer cooldownSeconds;
 
     // =====================================================================
-    // ADVANCED: РЕЖИМ УПРАВЛЕНИЯ + AI метрики
+    // ADVANCED
     // =====================================================================
 
     @Enumerated(EnumType.STRING)
@@ -163,26 +158,100 @@ public class StrategySettings {
     @Column(nullable = false)
     private boolean active = false;
 
+    @Column(name = "started_at")
     private LocalDateTime startedAt;
+
+    @Column(name = "stopped_at")
     private LocalDateTime stoppedAt;
 
-    @Column(nullable = false, updatable = false)
+    @Column(name = "created_at", nullable = false, updatable = false)
     private LocalDateTime createdAt;
 
+    @Column(name = "updated_at")
     private LocalDateTime updatedAt;
 
     @Version
     private Integer version;
 
+    // =====================================================================
+    // LIFECYCLE
+    // =====================================================================
+
     @PrePersist
     protected void onCreate() {
         LocalDateTime now = LocalDateTime.now();
-        this.createdAt = now;
-        this.updatedAt = now;
+        this.createdAt = (this.createdAt != null) ? this.createdAt : now;
+        this.updatedAt = (this.updatedAt != null) ? this.updatedAt : now;
+
+        // ✅ FIX: гарантируем NOT NULL поля только при создании записи (а не в сервисе на каждый save)
+        if (this.symbol == null || this.symbol.trim().isEmpty()) {
+            this.symbol = "BTCUSDT";
+        } else {
+            this.symbol = this.symbol.trim().toUpperCase(Locale.ROOT);
+        }
+
+        if (this.timeframe == null || this.timeframe.trim().isEmpty()) {
+            this.timeframe = "1m";
+        } else {
+            this.timeframe = this.timeframe.trim().toLowerCase(Locale.ROOT);
+        }
+
+        if (this.cachedCandlesLimit == null || this.cachedCandlesLimit < 50) {
+            this.cachedCandlesLimit = 500;
+        }
+
+        if (this.exchangeName != null) {
+            this.exchangeName = this.exchangeName.trim().toUpperCase(Locale.ROOT);
+        }
+
+        if (this.accountAsset != null) {
+            String a = this.accountAsset.trim().toUpperCase(Locale.ROOT);
+            this.accountAsset = a.isEmpty() ? null : a;
+        }
+
+        if (this.advancedControlMode == null) {
+            this.advancedControlMode = AdvancedControlMode.MANUAL;
+        }
+
+        if (this.mlConfidence == null) this.mlConfidence = BigDecimal.ZERO;
+        if (this.totalProfitPct == null) this.totalProfitPct = BigDecimal.ZERO;
     }
 
     @PreUpdate
     protected void onUpdate() {
         this.updatedAt = LocalDateTime.now();
+
+        // ✅ лёгкая нормализация без перезатирания значений дефолтами
+        if (this.symbol != null) {
+            String s = this.symbol.trim().toUpperCase(Locale.ROOT);
+            this.symbol = s.isEmpty() ? this.symbol : s;
+        }
+
+        if (this.timeframe != null) {
+            String tf = this.timeframe.trim().toLowerCase(Locale.ROOT);
+            this.timeframe = tf.isEmpty() ? this.timeframe : tf;
+        }
+
+        if (this.exchangeName != null) {
+            String ex = this.exchangeName.trim().toUpperCase(Locale.ROOT);
+            this.exchangeName = ex.isEmpty() ? this.exchangeName : ex;
+        }
+
+        if (this.accountAsset != null) {
+            String a = this.accountAsset.trim().toUpperCase(Locale.ROOT);
+            this.accountAsset = a.isEmpty() ? null : a;
+        }
+
+        if (this.cachedCandlesLimit != null && this.cachedCandlesLimit < 50) {
+            this.cachedCandlesLimit = 50;
+        }
+
+        if (this.advancedControlMode == null) {
+            // на всякий случай (колонка NOT NULL)
+            this.advancedControlMode = AdvancedControlMode.MANUAL;
+        }
+
+        if (this.mlConfidence == null) this.mlConfidence = BigDecimal.ZERO;
+        if (this.totalProfitPct == null) this.totalProfitPct = BigDecimal.ZERO;
     }
 }

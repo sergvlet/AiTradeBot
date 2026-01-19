@@ -28,7 +28,7 @@ public class SmartFusionStrategySettings {
 
     /**
      * Веса “источников” в итоговом решении.
-     * Итоговый score = wTech*tech + wMl*ml + wRl*rl
+     * Итоговый score = wTech*tech + wMl*ai + wRl*rl
      */
     @Column(nullable = false, precision = 10, scale = 6)
     private BigDecimal weightTech;

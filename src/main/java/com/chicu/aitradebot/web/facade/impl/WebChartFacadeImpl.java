@@ -1,5 +1,6 @@
 package com.chicu.aitradebot.web.facade.impl;
 
+import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
 import com.chicu.aitradebot.exchange.client.ExchangeClient;
@@ -14,9 +15,9 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.lang.reflect.Method;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
-import java.util.Optional;
 
 @Slf4j
 @Service
@@ -45,13 +46,13 @@ public class WebChartFacadeImpl implements WebChartFacade {
 
         final String sym = symbol.trim().toUpperCase(Locale.ROOT);
 
-        // 2) Берём актуальные StrategySettings (baseline)
+        // 2) Берём baseline StrategySettings (контекст: exchange/network + дефолтный tf/limit)
         StrategySettings s = null;
         try {
-            Optional<StrategySettings> opt = settingsService.findLatest(chatId, strategyType, null, null);
-            s = opt.orElse(null);
+            s = resolveBaselineSettings(chatId, strategyType);
         } catch (Exception e) {
-            log.warn("⚠️ Chart: cannot read StrategySettings (chatId={}, type={})", chatId, strategyType, e);
+            log.warn("⚠️ Chart: cannot resolve baseline StrategySettings (chatId={}, type={})",
+                    chatId, strategyType, e);
         }
 
         // 3) tf и limit: приоритет параметров запроса, иначе из StrategySettings
@@ -99,6 +100,33 @@ public class WebChartFacadeImpl implements WebChartFacade {
                 .lastPrice(lastClose)
                 .layers(StrategyChartDto.Layers.empty())
                 .build();
+    }
+
+    /**
+     * ✅ ВАЖНО:
+     * Раньше было findLatest(chatId,type,null,null) — теперь метода нет и “latest без контекста”
+     * в принципе опасен.
+     *
+     * Поэтому:
+     * - берём все настройки по chatId (без фильтра exchange/network)
+     * - выбираем для данного type:
+     *   1) сначала active=true (если есть)
+     *   2) затем по updatedAt (desc)
+     *   3) затем по id (desc)
+     */
+    private StrategySettings resolveBaselineSettings(long chatId, StrategyType type) {
+        List<StrategySettings> all = settingsService.findAllByChatId(chatId, null);
+        if (all == null || all.isEmpty()) return null;
+
+        return all.stream()
+                .filter(s -> s != null && s.getType() == type)
+                .sorted(Comparator
+                        .comparing(StrategySettings::isActive).reversed()
+                        .thenComparing(StrategySettings::getUpdatedAt, Comparator.nullsLast(Comparator.naturalOrder())).reversed()
+                        .thenComparing(StrategySettings::getId, Comparator.nullsLast(Comparator.naturalOrder())).reversed()
+                )
+                .findFirst()
+                .orElse(null);
     }
 
     private void tryPreloadFromExchange(
@@ -176,9 +204,6 @@ public class WebChartFacadeImpl implements WebChartFacade {
                 Object res = m.invoke(exchangeClientFactory, exArg, netArg);
                 if (res instanceof ExchangeClient ec) return ec;
             }
-
-            // fallback (на всякий): если есть только getByChat, но он может требовать exchange settings
-            // return exchangeClientFactory.getByChat(s.getChatId());
 
             return null;
         } catch (Exception e) {

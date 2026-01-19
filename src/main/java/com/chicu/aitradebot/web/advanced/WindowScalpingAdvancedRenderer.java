@@ -28,12 +28,13 @@ public class WindowScalpingAdvancedRenderer implements StrategyAdvancedRenderer 
 
         WindowScalpingStrategySettings s = settingsService.getOrCreate(ctx.getChatId());
 
-        boolean readOnly = ctx.isReadOnly();
-        String dis = readOnly ? " disabled" : "";
-        String ro  = readOnly ? " readonly" : "";
+        boolean canEdit = ctx.canSubmit();
+        boolean readOnly = !canEdit;
 
-        return ""
-                + "<div class='card card-theme p-3 mb-3'>"
+        String dis    = readOnly ? " disabled" : "";
+        String roAttr = readOnly ? " readonly" : "";
+
+        return "<div class='card card-theme p-3 mb-3'>"
 
                 + "  <div class='d-flex align-items-center justify-content-between mb-2'>"
                 + "    <div class='fw-bold'>WINDOW_SCALPING — параметры стратегии</div>"
@@ -42,61 +43,27 @@ public class WindowScalpingAdvancedRenderer implements StrategyAdvancedRenderer 
 
                 + "  <div class='row g-3'>"
 
-                + fieldNumber(
-                    "windowSize",
-                    "Размер окна (bars)",
-                    valInt(s.getWindowSize()),
-                    "min='5' max='1000' step='1'",
-                    dis, ro,
-                    "Количество баров/тиков для High/Low окна."
-                )
+                + fieldNumber("windowSize", "Размер окна", valInt(s.getWindowSize()),
+                "min='1' step='1'", dis, roAttr, "Кол-во тиков/баров для high/low окна.")
 
-                + fieldNumber(
-                    "entryFromLowPct",
-                    "Вход у низа (%)",
-                    valDbl(s.getEntryFromLowPct()),
-                    "min='1' max='49' step='0.1'",
-                    dis, ro,
-                    "Например 20 = нижние 20% диапазона."
-                )
+                + fieldNumber("entryFromLowPct", "Вход от низа (%)", valDouble(s.getEntryFromLowPct()),
+                "min='0' step='0.01'", dis, roAttr, "Вход в нижних X% диапазона окна.")
 
-                + fieldNumber(
-                    "entryFromHighPct",
-                    "Зона у верха (%)",
-                    valDbl(s.getEntryFromHighPct()),
-                    "min='1' max='49' step='0.1'",
-                    dis, ro,
-                    "Например 20 = верхние 20% диапазона."
-                )
+                + fieldNumber("entryFromHighPct", "Зона у верха (%)", valDouble(s.getEntryFromHighPct()),
+                "min='0' step='0.01'", dis, roAttr, "Верхние X% диапазона окна.")
 
-                + fieldNumber(
-                    "minRangePct",
-                    "Мин. диапазон окна (%)",
-                    valDbl(s.getMinRangePct()),
-                    "min='0.01' max='50' step='0.01'",
-                    dis, ro,
-                    "Если диапазон меньше — сделки блокируются."
-                )
+                + fieldNumber("minRangePct", "Мин. ширина диапазона (%)", valDouble(s.getMinRangePct()),
+                "min='0' step='0.01'", dis, roAttr, "Если окно слишком узкое — не торгуем.")
 
-                + fieldNumber(
-                    "maxSpreadPct",
-                    "Макс. спред (%)",
-                    valDbl(s.getMaxSpreadPct()),
-                    "min='0' max='10' step='0.01'",
-                    dis, ro,
-                    "Опционально (на будущее). Сейчас может не использоваться."
-                )
+                + fieldNumber("maxSpreadPct", "Макс. спред (%)", valDouble(s.getMaxSpreadPct()),
+                "min='0' step='0.01'", dis, roAttr, "Поле на будущее (если появится источник спреда).")
 
                 + "  </div>"
 
                 + (readOnly
-                    ? "<div class='alert alert-info small mt-3 mb-0'>"
-                      + "Режим <b>AI</b>: ручное редактирование отключено."
-                      + "</div>"
-                    : "<div class='alert alert-secondary small mt-3 mb-0'>"
-                      + "Режим <b>MANUAL / HYBRID</b>: параметры можно редактировать."
-                      + "</div>"
-                )
+                ? "<div class='alert alert-info small mt-3 mb-0'>Режим <b>AI</b>: параметры управляются автоматически.</div>"
+                : "<div class='alert alert-secondary small mt-3 mb-0'>Режим <b>MANUAL / HYBRID</b>: параметры можно редактировать.</div>"
+        )
 
                 + "</div>";
     }
@@ -121,12 +88,9 @@ public class WindowScalpingAdvancedRenderer implements StrategyAdvancedRenderer 
                 .build();
 
         settingsService.update(ctx.getChatId(), incoming);
+
         log.info("✅ WINDOW_SCALPING advanced settings saved (chatId={})", ctx.getChatId());
     }
-
-    // =====================================================
-    // HELPERS
-    // =====================================================
 
     private static String badge(boolean ro) {
         return ro
@@ -140,44 +104,31 @@ public class WindowScalpingAdvancedRenderer implements StrategyAdvancedRenderer 
             String value,
             String extraAttrs,
             String dis,
-            String ro,
+            String roAttr,
             String help
     ) {
         String safe = value == null ? "" : HtmlUtils.htmlEscape(value);
-        return ""
-                + "<div class='col-md-3'>"
+
+        return "<div class='col-md-3'>"
                 + "  <label class='form-label'>" + HtmlUtils.htmlEscape(label) + "</label>"
                 + "  <input type='number' class='form-control' name='" + HtmlUtils.htmlEscape(name) + "'"
-                + "         value='" + safe + "' " + extraAttrs + dis + ro + ">"
+                + "         value='" + safe + "' " + extraAttrs + dis + roAttr + ">"
                 + "  <div class='form-text'>" + HtmlUtils.htmlEscape(help) + "</div>"
                 + "</div>";
     }
 
-    private static String valInt(Integer v) {
-        return v == null ? "" : String.valueOf(v);
-    }
-
-    private static String valDbl(Double v) {
-        if (v == null) return "";
-        double x = v;
-        if (Double.isNaN(x) || Double.isInfinite(x)) return "";
-        return String.valueOf(x);
-    }
+    private static String valInt(Integer v) { return v == null ? "" : String.valueOf(v); }
+    private static String valDouble(Double v) { return v == null ? "" : String.valueOf(v); }
 
     private static Integer parseInt(String v) {
-        try {
-            return v == null || v.isBlank() ? null : Integer.parseInt(v.trim());
-        } catch (Exception e) {
-            return null;
-        }
+        try { return v == null || v.isBlank() ? null : Integer.parseInt(v.trim()); }
+        catch (Exception e) { return null; }
     }
 
     private static Double parseDouble(String v) {
         try {
-            if (v == null) return null;
-            String s = v.trim();
-            if (s.isEmpty()) return null;
-            s = s.replace(",", ".");
+            if (v == null || v.isBlank()) return null;
+            String s = v.trim().replace(",", ".");
             return Double.parseDouble(s);
         } catch (Exception e) {
             return null;

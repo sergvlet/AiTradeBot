@@ -37,8 +37,7 @@ public class ScalpingAdvancedRenderer implements StrategyAdvancedRenderer {
         String dis    = readOnly ? " disabled" : "";
         String roAttr = readOnly ? " readonly" : "";
 
-        return ""
-               + "<div class='card card-theme p-3 mb-3'>"
+        return "<div class='card card-theme p-3 mb-3'>"
 
                + "  <div class='d-flex align-items-center justify-content-between mb-2'>"
                + "    <div class='fw-bold'>SCALPING — параметры стратегии</div>"
@@ -138,8 +137,7 @@ public class ScalpingAdvancedRenderer implements StrategyAdvancedRenderer {
     ) {
         String safe = value == null ? "" : HtmlUtils.htmlEscape(value);
 
-        return ""
-               + "<div class='col-md-3'>"
+        return "<div class='col-md-3'>"
                + "  <label class='form-label'>" + HtmlUtils.htmlEscape(label) + "</label>"
                + "  <input type='number' class='form-control' name='" + HtmlUtils.htmlEscape(name) + "'"
                + "         value='" + safe + "' " + extraAttrs + dis + roAttr + ">"

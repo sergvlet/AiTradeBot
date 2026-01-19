@@ -106,13 +106,13 @@ window.SettingsTabTrade = (function () {
             return err && (err.name === "AbortError" || String(err).includes("AbortError"));
         }
 
-        function modeNow() {
-            const v = (controlModeSelect?.value || "").trim();
+        function nowMode() {
+            const v = (controlModeSelect?.value || ctx.advancedControlMode || "MANUAL").trim().toUpperCase();
             return v || "MANUAL";
         }
 
         function setModeUi() {
-            const m = modeNow();
+            const m = nowMode();
 
             if (tradeModeBadge) tradeModeBadge.textContent = m;
 
@@ -129,7 +129,24 @@ window.SettingsTabTrade = (function () {
                 }
             }
 
-            if (m === "AI") {
+            // ✅ важное: в AI отключаем редактирование trade-полей (но сохраняем отображение)
+            const disable = (m === "AI");
+
+            if (tfSelect) tfSelect.disabled = disable;
+            if (candlesInput) candlesInput.disabled = disable;
+
+            // символы: в AI не даём менять символ (чтобы не было “сохраню, а потом откатит”)
+            if (modeGroup) {
+                for (const b of modeGroup.querySelectorAll("button[data-symbol-mode]")) {
+                    b.disabled = disable;
+                }
+            }
+            if (symbolList) {
+                const buttons = symbolList.querySelectorAll("button.dropdown-item");
+                buttons.forEach(btn => btn.disabled = disable);
+            }
+
+            if (disable) {
                 tfSelect?.classList.add("d-none");
                 tfReadonly?.classList.remove("d-none");
                 tfAiNote?.classList.remove("d-none");
@@ -226,6 +243,17 @@ window.SettingsTabTrade = (function () {
         }
 
         function buildPayload() {
+            // ✅ в AI сохранять trade-параметры нельзя (иначе потом “откатывает” и бесит)
+            if (nowMode() === "AI") {
+                return {
+                    chatId: ctx.chatId,
+                    type: ctx.type,
+                    exchange: ctx.exchange || "BINANCE",
+                    network: ctx.network || "TESTNET",
+                    scope: "trade"
+                };
+            }
+
             return {
                 chatId: ctx.chatId,
                 type: ctx.type,
@@ -311,6 +339,7 @@ window.SettingsTabTrade = (function () {
             }
 
             const current = normalizeSymbol(symbolHidden?.value || "");
+            const disable = (nowMode() === "AI");
 
             for (const it of items) {
                 const sym = normalizeSymbol(it.symbol);
@@ -319,6 +348,7 @@ window.SettingsTabTrade = (function () {
                 const btn = document.createElement("button");
                 btn.type = "button";
                 btn.className = "dropdown-item d-flex justify-content-between align-items-center gap-2";
+                btn.disabled = disable;
 
                 const left = document.createElement("span");
                 left.textContent = sym || "—";
@@ -347,6 +377,7 @@ window.SettingsTabTrade = (function () {
                 }
 
                 btn.addEventListener("click", async () => {
+                    if (nowMode() === "AI") return;
                     await selectSymbol(sym);
                 });
 
@@ -359,7 +390,6 @@ window.SettingsTabTrade = (function () {
             try {
                 const items = await fetchSymbols(activeMode);
 
-                // null = устаревший ответ (или запрос отменён другим) — тихо выходим
                 if (items == null) return;
 
                 rebuildMap(items);
@@ -370,7 +400,6 @@ window.SettingsTabTrade = (function () {
                 else setLimitsUiEmpty();
 
             } catch (e) {
-                // AbortError — это ожидаемо, не ошибка
                 if (isAbortError(e)) return;
 
                 console.error("reloadSymbols failed", e);
@@ -395,36 +424,46 @@ window.SettingsTabTrade = (function () {
 
             applyLimitsFromDescriptor(lastMap.get(s) || null);
 
-            scheduleSave(350);
+            // ✅ тут же отправим автосейв, чтобы symbol реально закрепился в БД
+            scheduleSave(200);
         }
 
         // =====================================================
-        // ✅ СИНХРОНИЗАЦИЯ АКТИВА (без двойного reload и без циклов)
+        // ✅ СИНХРОНИЗАЦИЯ АКТИВА + CONTROL MODE (единые события)
         // =====================================================
         let _lastAsset = "";
+        let _lastMode  = "";
 
         function notifyAssetChanged(asset, opts) {
             const a = (asset || "").trim().toUpperCase();
             if (!a) return;
 
-            // если не изменился — ничего не делаем
             if (a === _lastAsset) return;
             _lastAsset = a;
 
-            // обновляем ctx как кэш
             ctx.accountAsset = a;
 
-            // silent = только обновить кэш без оповещения
             if (opts?.silent) return;
-
             window.dispatchEvent(new CustomEvent("strategy:asset-changed", { detail: { asset: a } }));
+        }
+
+        function notifyModeChanged(mode, opts) {
+            const m = (mode || "").trim().toUpperCase();
+            if (!m) return;
+
+            if (m === _lastMode) return;
+            _lastMode = m;
+
+            ctx.advancedControlMode = m;
+
+            if (opts?.silent) return;
+            window.dispatchEvent(new CustomEvent("strategy:controlModeChanged", { detail: { mode: m } }));
         }
 
         // 1) если актив меняется через select
         if (accountAssetSelect) {
             accountAssetSelect.addEventListener("change", () => {
                 const a = (accountAssetSelect.value || "").trim();
-                // ✅ НЕ вызываем reloadSymbols тут — оно будет по событию один раз
                 notifyAssetChanged(a);
             });
         }
@@ -434,7 +473,6 @@ window.SettingsTabTrade = (function () {
             const a = e?.detail?.asset;
             if (!a) return;
 
-            // если событие пришло с тем же активом — выходим
             const next = String(a).trim().toUpperCase();
             if (!next || next === _lastAsset) return;
 
@@ -442,11 +480,34 @@ window.SettingsTabTrade = (function () {
             await reloadSymbols();
         });
 
+        // 3) режим управления — источник правды общий (General)
+        if (controlModeSelect) {
+            controlModeSelect.addEventListener("change", () => {
+                notifyModeChanged(controlModeSelect.value, { silent: true });
+                setModeUi();
+                renderSymbolList(Array.from(lastMap.values())); // обновим disabled на кнопках
+            });
+        }
+
+        // 4) общий сигнал от General (мы его диспатчим там)
+        window.addEventListener("strategy:controlModeChanged", (e) => {
+            const m = String(e?.detail?.mode || "").toUpperCase();
+            if (!m) return;
+
+            if (m === _lastMode) return;
+            notifyModeChanged(m, { silent: true });
+
+            setModeUi();
+            renderSymbolList(Array.from(lastMap.values()));
+        });
+
         // =====================================================
         // binds
         // =====================================================
         if (modeGroup) {
             modeGroup.addEventListener("click", async (e) => {
+                if (nowMode() === "AI") return;
+
                 const btn = e.target?.closest?.("button[data-symbol-mode]");
                 if (!btn) return;
 
@@ -462,29 +523,31 @@ window.SettingsTabTrade = (function () {
 
         if (tfSelect) {
             tfSelect.addEventListener("change", async () => {
-                if (modeNow() === "AI") {
+                if (nowMode() === "AI") {
                     setModeUi();
                     return;
                 }
                 markChanged("timeframe");
-                scheduleSave(350);
+                scheduleSave(250);
             });
         }
 
         if (candlesInput) {
             let t = null;
             candlesInput.addEventListener("input", () => {
+                if (nowMode() === "AI") return;
+
                 markChanged("cachedCandlesLimit");
                 if (t) clearTimeout(t);
                 t = setTimeout(() => scheduleSave(200), 600);
             });
             candlesInput.addEventListener("change", () => {
+                if (nowMode() === "AI") return;
+
                 markChanged("cachedCandlesLimit");
                 scheduleSave(200);
             });
         }
-
-        controlModeSelect?.addEventListener("change", () => setModeUi());
 
         // =====================================================
         // first load
@@ -494,10 +557,10 @@ window.SettingsTabTrade = (function () {
         setSymbolUi(symbolHidden?.value || symbolLabel?.textContent || "");
         setLimitsUiEmpty();
 
-        // ✅ при старте: только обновляем ctx, без события (чтобы не словить лишний reload)
+        // ✅ при старте: только обновляем ctx кэши, без событий
         notifyAssetChanged(getAssetForRequest(), { silent: true });
+        notifyModeChanged(nowMode(), { silent: true });
 
-        // и один нормальный загрузочный запрос
         reloadSymbols().catch(() => {});
     }
 
