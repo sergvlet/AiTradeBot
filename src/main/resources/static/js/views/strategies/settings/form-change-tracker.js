@@ -9,11 +9,12 @@
  * ВАЖНО:
  * - endpoints.apply может отсутствовать (например, для вкладки Trade)
  *
- * ✅ FIX (критично для твоих вкладок):
- * 1) saveNow() теперь возвращает JSON-ответ (tabs ждут snapshot / tuningResult и т.д.)
+ * ✅ Критично для вкладок:
+ * 1) saveNow() возвращает JSON-ответ (tabs ждут snapshot / tuningResult и т.д.)
  * 2) защита от гонок: если save в процессе — ставим очередь и выполняем после завершения
  * 3) applyNow() тоже возвращает JSON-ответ
  * 4) onAfterSave/onAfterApply хуки (если надо синхронизировать вкладки)
+ * 5) autosaveNow() = alias saveNow() (единое имя для UI-контракта)
  */
 window.SettingsAutoSave = (function () {
 
@@ -105,7 +106,6 @@ window.SettingsAutoSave = (function () {
             const payload = options.buildPayload ? options.buildPayload() : null;
 
             try {
-                // ✅ важно: вернуть ответ наружу
                 resp = await api.postJson(endpoints.autosave, payload);
 
                 if (isRunning()) {
@@ -117,7 +117,6 @@ window.SettingsAutoSave = (function () {
                 setMeta("· " + nowTime());
                 clearPending();
 
-                // hook после сохранения (для синхронизации вкладок)
                 try {
                     if (typeof options.onAfterSave === "function") {
                         await options.onAfterSave(resp, payload);
@@ -126,16 +125,11 @@ window.SettingsAutoSave = (function () {
                     console.warn("SettingsAutoSave.onAfterSave failed", e);
                 }
 
-                // автоприменение: только если
-                // 1) стратегия запущена
-                // 2) есть toggle
-                // 3) он включён
-                // 4) есть endpoints.apply
                 if (isRunning()
                     && hasApplyEndpoint
                     && elements.autoApplyToggle
                     && elements.autoApplyToggle.checked) {
-                    await applyNow(); // applyNow сам корректно отработает
+                    await applyNow();
                 }
 
                 return resp;
@@ -144,19 +138,14 @@ window.SettingsAutoSave = (function () {
                 console.error("autosave failed", e);
                 setBadge("danger", "Ошибка сохранения");
                 setMeta("· проверь API/логи");
-
-                // ⚠️ pending не чистим — чтобы пользователь видел, что не сохранилось
                 return null;
 
             } finally {
                 savingNow = false;
 
-                // ✅ если во время save прилетели новые изменения — сохраним ещё раз
                 if (saveQueued) {
                     saveQueued = false;
-                    // небольшой микродилей, чтобы UI не дёргался
                     setTimeout(() => {
-                        // не делаем scheduleSave, а сразу saveNow, чтобы не терять изменения
                         saveNow().catch(() => {});
                     }, 120);
                 }
@@ -164,7 +153,6 @@ window.SettingsAutoSave = (function () {
         }
 
         async function applyNow(extra) {
-            // ✅ если apply не поддерживается — просто выходим
             if (!hasApplyEndpoint) return null;
             if (!isRunning()) return null;
 
@@ -181,13 +169,11 @@ window.SettingsAutoSave = (function () {
                 };
 
                 const body = Object.assign(base, (extra && typeof extra === "object") ? extra : {});
-
                 const resp = await api.postJson(endpoints.apply, body);
 
                 setBadge("success", "Применено в торговлю");
                 setMeta("· " + nowTime());
 
-                // hook после применения
                 try {
                     if (typeof options.onAfterApply === "function") {
                         await options.onAfterApply(resp, body);
@@ -209,7 +195,6 @@ window.SettingsAutoSave = (function () {
         function bindApplyButton() {
             if (!elements.applyBtn) return;
 
-            // если apply endpoint отсутствует — просто отключаем кнопку, чтобы UX был ясный
             if (!hasApplyEndpoint) {
                 elements.applyBtn.disabled = true;
                 elements.applyBtn.title = "Применение не настроено (нет endpoints.apply)";
@@ -232,6 +217,7 @@ window.SettingsAutoSave = (function () {
             markChanged,
             scheduleSave,
             saveNow,
+            autosaveNow: saveNow, // ✅ единое имя для UI-контракта
             applyNow,
             bindApplyButton
         };

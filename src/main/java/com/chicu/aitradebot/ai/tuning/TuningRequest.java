@@ -6,7 +6,7 @@ import lombok.Builder;
 
 import java.time.Instant;
 
-@Builder
+@Builder(toBuilder = true)
 public record TuningRequest(
         Long chatId,
         StrategyType strategyType,

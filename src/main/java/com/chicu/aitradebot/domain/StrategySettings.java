@@ -81,6 +81,8 @@ public class StrategySettings {
     @Column(name = "daily_loss_limit_pct", precision = 10, scale = 4)
     private BigDecimal dailyLossLimitPct;
 
+    // ✅ Совместимость для разных мест в проекте/старого кода
+    @Getter
     @Builder.Default
     @Column(name = "reinvest_profit", nullable = false)
     private boolean reinvestProfit = false;
@@ -253,5 +255,14 @@ public class StrategySettings {
 
         if (this.mlConfidence == null) this.mlConfidence = BigDecimal.ZERO;
         if (this.totalProfitPct == null) this.totalProfitPct = BigDecimal.ZERO;
+    }
+
+    public boolean getReinvestProfit() {
+        return this.reinvestProfit;
+    }
+
+
+    public Boolean isReinvestProfit() {
+        return this.reinvestProfit;
     }
 }

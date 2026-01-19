@@ -216,7 +216,7 @@ public class AiStrategyOrchestrator {
                 .networkType(s.getNetworkType())
 
                 .riskPerTradePct(s.getRiskPerTradePct())
-                .reinvestProfit(s.isReinvestProfit())
+                .reinvestProfit(s.getReinvestProfit())
                 .version(s.getVersion())
 
                 .startedAt(toInstant(s.getStartedAt()))

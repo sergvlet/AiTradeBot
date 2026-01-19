@@ -58,8 +58,8 @@ public class WindowScalpingStrategySettings {
     private Double minRangePct = 0.25;
 
     /**
-     * Максимальный спред (%) — на будущее (если появится источник спреда).
-     * Сейчас не используется, но поле есть в настройках.
+     * Максимальный спред (%)
+
      */
     @Builder.Default
     @Column(name = "max_spread_pct", nullable = false)

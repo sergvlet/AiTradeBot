@@ -13,6 +13,7 @@ import com.chicu.aitradebot.service.StrategySettingsService;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
@@ -22,6 +23,7 @@ import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 
 @Slf4j
 @RestController
@@ -34,88 +36,97 @@ public class StrategySettingsApiController {
     private final AutoTunerOrchestrator autoTunerOrchestrator;
 
     // =========================================================
-    // 1) POST /asset — смена выбранного актива + возврат snapshot
+    // 1) POST /asset — смена выбранного актива + snapshot
     // =========================================================
     @PostMapping("/asset")
-    public AccountBalanceSnapshot changeAsset(
+    public ResponseEntity<?> changeAsset(
             @RequestParam long chatId,
             @RequestParam StrategyType type,
             @RequestParam String exchange,
             @RequestParam NetworkType network,
             @RequestParam String asset
     ) {
-        String ex = normalizeExchange(exchange);
+        String ex = normalizeExchangeOrThrow(exchange);
+        requireNonNull(network, "network is required");
 
         StrategySettings s = strategySettingsService.getOrCreate(chatId, type, ex, network);
-
-        String normalized = normalizeAssetOrNull(asset);
-        s.setAccountAsset(normalized); // null = очистить выбор
+        s.setAccountAsset(normalizeAssetOrNull(asset));
         strategySettingsService.save(s);
 
-        return accountBalanceService.getSnapshot(chatId, type, ex, network);
+        return ResponseEntity.ok(accountBalanceService.getSnapshot(chatId, type, ex, network));
     }
 
     // =========================================================
-    // 2) GET /balance — вернуть актуальный snapshot
+    // 2) GET /balance — snapshot
     // =========================================================
     @GetMapping("/balance")
-    public AccountBalanceSnapshot getBalance(
+    public ResponseEntity<?> getBalance(
             @RequestParam long chatId,
             @RequestParam StrategyType type,
             @RequestParam String exchange,
             @RequestParam NetworkType network,
             @RequestParam(required = false) String asset
     ) {
-        String ex = normalizeExchange(exchange);
+        String ex = normalizeExchangeOrThrow(exchange);
+        requireNonNull(network, "network is required");
 
-        // если параметр asset присутствует (даже пустой) — сохраняем (включая очистку -> null)
         if (asset != null) {
             StrategySettings s = strategySettingsService.getOrCreate(chatId, type, ex, network);
             s.setAccountAsset(normalizeAssetOrNull(asset));
             strategySettingsService.save(s);
         }
 
-        return accountBalanceService.getSnapshot(chatId, type, ex, network);
+        return ResponseEntity.ok(accountBalanceService.getSnapshot(chatId, type, ex, network));
     }
 
     // =========================================================
     // 3) POST /autosave — автосейв StrategySettings + snapshot
-    // scope: "general" | "risk" | "trade" | "" (пусто = применить всё)
+    // + автозапуск тюнинга при изменении trade-контекста в HYBRID/AI
     // =========================================================
     @PostMapping("/autosave")
-    public ResponseEntity<AutosaveResponse> autosave(@RequestBody AutosaveRequest req) {
+    public ResponseEntity<?> autosave(@RequestBody AutosaveRequest req) {
 
-        String ex = normalizeExchange(req.getExchange());
+        if (req == null) return badRequest("request body is null");
+        if (req.getChatId() == null) return badRequest("chatId is required");
+        if (req.getType() == null) return badRequest("type is required");
 
-        StrategySettings s = strategySettingsService.getOrCreate(
-                req.getChatId(),
-                req.getType(),
-                ex,
-                req.getNetwork()
-        );
-
-        // =========================================================
-        // ✅ РЕЖИМ — сохраняем ВСЕГДА, если пришёл валидный (не зависит от scope)
-        // =========================================================
-        AdvancedControlMode before = s.getAdvancedControlMode();
-        AdvancedControlMode parsed = parseEnumOrNull(AdvancedControlMode.class, req.getAdvancedControlMode());
-
-        if (req.getAdvancedControlMode() != null) {
-            // пришло с фронта (даже если пусто) — логируем
-            log.info("🧠 AUTOSAVE MODE incoming='{}' parsed={} before={} ctx: chatId={} type={} ex={} net={}",
-                    req.getAdvancedControlMode(), parsed, before,
-                    req.getChatId(), req.getType(), ex, req.getNetwork());
+        final String ex;
+        try {
+            ex = normalizeExchangeOrThrow(req.getExchange());
+        } catch (IllegalArgumentException e) {
+            return badRequest(e.getMessage());
         }
 
-        if (parsed != null && parsed != before) {
-            s.setAdvancedControlMode(parsed);
+        if (req.getNetwork() == null) return badRequest("network is required");
+
+        // ✅ детект "нового контекста" (сменили биржу/сеть → записи ещё нет)
+        StrategySettings existed = strategySettingsService.getSettings(req.getChatId(), req.getType(), ex, req.getNetwork());
+        boolean ctxWasMissing = (existed == null);
+
+        StrategySettings s = strategySettingsService.getOrCreate(req.getChatId(), req.getType(), ex, req.getNetwork());
+
+        // "до" (для триггеров тюнинга)
+        AdvancedControlMode modeBefore = s.getAdvancedControlMode();
+        String symbolBefore = s.getSymbol();
+        String tfBefore = s.getTimeframe();
+        Integer candlesBefore = s.getCachedCandlesLimit();
+
+        // ---------------------------------------------------------
+        // MODE — сохраняем, если пришёл валидный
+        // ---------------------------------------------------------
+        AdvancedControlMode parsedMode = parseEnumOrNull(AdvancedControlMode.class, req.getAdvancedControlMode());
+        if (parsedMode != null && parsedMode != modeBefore) {
+            // лог только при реальном изменении
+            log.info("🧠 MODE change {} -> {} (chatId={}, type={}, ex={}, net={})",
+                    modeBefore, parsedMode, req.getChatId(), req.getType(), ex, req.getNetwork());
+            s.setAdvancedControlMode(parsedMode);
         }
 
         String scope = normalizeScope(req.getScope());
-        boolean applyAll     = scope.isEmpty();
+        boolean applyAll = scope.isEmpty();
         boolean applyGeneral = applyAll || scope.equals("general");
-        boolean applyRisk    = applyAll || scope.equals("risk");
-        boolean applyTrade   = applyAll || scope.equals("trade");
+        boolean applyRisk = applyAll || scope.equals("risk");
+        boolean applyTrade = applyAll || scope.equals("trade");
 
         // -------------------------
         // GENERAL
@@ -123,7 +134,6 @@ public class StrategySettingsApiController {
         if (applyGeneral) {
 
             if (req.getAccountAsset() != null) {
-                // можно и очистить (пустая строка -> null)
                 s.setAccountAsset(normalizeAssetOrNull(req.getAccountAsset()));
             }
 
@@ -147,16 +157,22 @@ public class StrategySettingsApiController {
         // -------------------------
         if (applyTrade) {
 
-            String sym = normalizeSymbolOrNull(req.getSymbol());
-            if (sym != null) s.setSymbol(sym);
+            if (req.getSymbol() != null) {
+                String sym = normalizeSymbolOrNull(req.getSymbol());
+                if (sym != null) s.setSymbol(sym);
+            }
 
-            String tf = normalizeTimeframeOrNull(req.getTimeframe());
-            if (tf != null) s.setTimeframe(tf);
+            if (req.getTimeframe() != null) {
+                String tf = normalizeTimeframeOrNull(req.getTimeframe());
+                if (tf != null) s.setTimeframe(tf);
+            }
 
-            Integer candles = parseIntOrNull(req.getCachedCandlesLimit());
-            if (candles != null) {
-                if (candles < 50) candles = 50;
-                s.setCachedCandlesLimit(candles);
+            if (req.getCachedCandlesLimit() != null) {
+                Integer candles = parseIntOrNull(req.getCachedCandlesLimit());
+                if (candles != null) {
+                    candles = Math.max(50, candles);
+                    s.setCachedCandlesLimit(candles);
+                }
             }
         }
 
@@ -173,10 +189,9 @@ public class StrategySettingsApiController {
                 s.setMinRiskReward(validatePositiveOrNull(parseBdOrNull(req.getMinRiskReward())));
             }
 
-            Integer lev = parseIntOrNull(req.getLeverage());
-            if (lev != null) {
-                if (lev < 1) lev = 1;
-                s.setLeverage(lev);
+            if (req.getLeverage() != null) {
+                Integer lev = parseIntOrNull(req.getLeverage());
+                if (lev != null) s.setLeverage(Math.max(1, lev));
             }
 
             if (req.getAllowAveraging() != null) {
@@ -184,21 +199,17 @@ public class StrategySettingsApiController {
             }
 
             if (req.getCooldownSeconds() != null) {
-                Integer cd = parseIntOrNull(req.getCooldownSeconds());
-                s.setCooldownSeconds(toNullablePositive(cd));
+                s.setCooldownSeconds(toNullablePositive(parseIntOrNull(req.getCooldownSeconds())));
             }
 
             if (req.getMaxTradesPerDay() != null) {
-                Integer mtd = parseIntOrNull(req.getMaxTradesPerDay());
-                s.setMaxTradesPerDay(toNullablePositive(mtd));
+                s.setMaxTradesPerDay(toNullablePositive(parseIntOrNull(req.getMaxTradesPerDay())));
             }
 
             if (req.getMaxOpenOrders() != null) {
-                Integer moo = parseIntOrNull(req.getMaxOpenOrders());
-                s.setMaxOpenOrders(toNullablePositive(moo));
+                s.setMaxOpenOrders(toNullablePositive(parseIntOrNull(req.getMaxOpenOrders())));
             }
 
-            // drawdown pct/usd взаимоисключающие
             if (req.getMaxDrawdownPct() != null) {
                 BigDecimal v = validatePctOrNull(parseBdOrNull(req.getMaxDrawdownPct()));
                 s.setMaxDrawdownPct(v);
@@ -210,7 +221,6 @@ public class StrategySettingsApiController {
                 if (v != null) s.setMaxDrawdownPct(null);
             }
 
-            // position pct/usd взаимоисключающие
             if (req.getMaxPositionPct() != null) {
                 BigDecimal v = validatePctOrNull(parseBdOrNull(req.getMaxPositionPct()));
                 s.setMaxPositionPct(v);
@@ -223,72 +233,124 @@ public class StrategySettingsApiController {
             }
 
             if (req.getCooldownAfterLossSeconds() != null) {
-                Integer v = parseIntOrNull(req.getCooldownAfterLossSeconds());
-                s.setCooldownAfterLossSeconds(toNullablePositive(v));
+                s.setCooldownAfterLossSeconds(toNullablePositive(parseIntOrNull(req.getCooldownAfterLossSeconds())));
             }
             if (req.getMaxConsecutiveLosses() != null) {
-                Integer v = parseIntOrNull(req.getMaxConsecutiveLosses());
-                s.setMaxConsecutiveLosses(toNullablePositive(v));
+                s.setMaxConsecutiveLosses(toNullablePositive(parseIntOrNull(req.getMaxConsecutiveLosses())));
             }
         }
 
-        // ✅ сохраняем ровно одну строку по ключу (это гарантирует getOrCreate + UNIQUE)
         StrategySettings saved = strategySettingsService.save(s);
+        AdvancedControlMode modeAfter = saved.getAdvancedControlMode();
 
-        AdvancedControlMode after = saved.getAdvancedControlMode();
-        if (parsed != null) {
-            log.info("✅ AUTOSAVE MODE stored={} (before={}) id={} ctx: chatId={} type={} ex={} net={}",
-                    after, before, saved.getId(), req.getChatId(), req.getType(), ex, req.getNetwork());
+        // =========================================================
+        // ✅ АВТО-ТЮНИНГ
+        // Триггеры:
+        // - symbol/timeframe/candlesLimit изменились
+        // - новый контекст (объект для ex/net появился впервые)
+        // - режим стал HYBRID/AI (переключили с MANUAL)
+        // =========================================================
+        boolean modeBecameHybridOrAi =
+                (modeBefore != modeAfter)
+                        && modeAfter != null
+                        && modeAfter != AdvancedControlMode.MANUAL;
+
+        boolean tradeChanged =
+                !Objects.equals(symbolBefore, saved.getSymbol())
+                        || !Objects.equals(tfBefore, saved.getTimeframe())
+                        || !Objects.equals(candlesBefore, saved.getCachedCandlesLimit());
+
+        boolean shouldTune =
+                modeAfter != null
+                        && modeAfter != AdvancedControlMode.MANUAL
+                        && (modeBecameHybridOrAi || tradeChanged || ctxWasMissing);
+
+        TuningResult tuningResult = null;
+
+        if (shouldTune) {
+            // лог 1 строка, без спама
+            log.info("🧠 TUNE trigger chatId={} type={} ex={} net={} sym={} tf={} candles={} reason={}",
+                    saved.getChatId(), saved.getType(), ex, saved.getNetworkType(),
+                    saved.getSymbol(), saved.getTimeframe(), saved.getCachedCandlesLimit(),
+                    ctxWasMissing ? "CTX_MISSING" : (modeBecameHybridOrAi ? "MODE_SWITCH" : "TRADE_CHANGED")
+            );
+
+            try {
+                tuningResult = autoTunerOrchestrator.tune(
+                        TuningRequest.builder()
+                                .chatId(saved.getChatId())
+                                .strategyType(saved.getType())
+                                .exchange(ex)
+                                .network(saved.getNetworkType())
+                                .symbol(saved.getSymbol())
+                                .timeframe(saved.getTimeframe())
+                                .candlesLimit(saved.getCachedCandlesLimit())
+                                .reason("AUTOSAVE_TRIGGER")
+                                .build()
+                );
+            } catch (Exception e) {
+                log.warn("🧠 auto-tune failed: {}", e.getMessage());
+            }
         }
 
-        AccountBalanceSnapshot snap = accountBalanceService.getSnapshot(
-                req.getChatId(),
-                req.getType(),
-                ex,
-                req.getNetwork()
-        );
+        // перечитываем после тюнинга (чтобы UI сразу получил mlConfidence/totalProfit)
+        StrategySettings refreshed = strategySettingsService.getOrCreate(req.getChatId(), req.getType(), ex, req.getNetwork());
+
+        AccountBalanceSnapshot balanceSnap = accountBalanceService.getSnapshot(req.getChatId(), req.getType(), ex, req.getNetwork());
+        StrategySettingsSnapshot settingsSnap = StrategySettingsSnapshot.from(refreshed);
 
         return ResponseEntity.ok(
                 AutosaveResponse.builder()
                         .ok(true)
                         .savedAt(nowHHmmss())
-                        .snapshot(snap)
 
-                        // дополнительные поля (UI может синхронизировать вкладки)
-                        .advancedControlMode(after != null ? after.name() : null)
-                        .accountAsset(saved.getAccountAsset())
-                        .symbol(saved.getSymbol())
-                        .timeframe(saved.getTimeframe())
-                        .cachedCandlesLimit(saved.getCachedCandlesLimit())
+                        .snapshot(balanceSnap)
+                        .settingsSnapshot(settingsSnap)
 
-                        // ✅ очень полезно для отладки: в какую строку реально сохранили
-                        .id(saved.getId())
-                        .chatId(saved.getChatId())
-                        .type(saved.getType() != null ? saved.getType().name() : null)
-                        .exchange(saved.getExchangeName())
-                        .network(saved.getNetworkType() != null ? saved.getNetworkType().name() : null)
+                        .advancedControlMode(refreshed.getAdvancedControlMode() != null ? refreshed.getAdvancedControlMode().name() : null)
+                        .accountAsset(refreshed.getAccountAsset())
+                        .symbol(refreshed.getSymbol())
+                        .timeframe(refreshed.getTimeframe())
+                        .cachedCandlesLimit(refreshed.getCachedCandlesLimit())
 
+                        .mlConfidence(refreshed.getMlConfidence())
+                        .totalProfitPct(refreshed.getTotalProfitPct())
+
+                        .tuningApplied(tuningResult != null && tuningResult.applied())
+                        .tuningReason(tuningResult != null ? tuningResult.reason() : null)
+
+                        .id(refreshed.getId())
+                        .chatId(refreshed.getChatId())
+                        .type(refreshed.getType() != null ? refreshed.getType().name() : null)
+                        .exchange(refreshed.getExchangeName())
+                        .network(refreshed.getNetworkType() != null ? refreshed.getNetworkType().name() : null)
                         .build()
         );
     }
 
     // =========================================================
-    // 4) POST /apply — применить HYBRID/AI (тюнинг)
+    // 4) POST /apply — явное применение режима HYBRID/AI (тюнинг)
     // =========================================================
     @PostMapping("/apply")
-    public ResponseEntity<ApplyResponse> apply(@RequestBody ApplyRequest req) {
-        String ex = normalizeExchange(req.getExchange());
+    public ResponseEntity<?> apply(@RequestBody ApplyRequest req) {
 
-        StrategySettings s = strategySettingsService.getOrCreate(
-                req.getChatId(),
-                req.getType(),
-                ex,
-                req.getNetwork()
-        );
+        if (req == null) return badRequest("request body is null");
+        if (req.getChatId() == null) return badRequest("chatId is required");
+        if (req.getType() == null) return badRequest("type is required");
+
+        final String ex;
+        try {
+            ex = normalizeExchangeOrThrow(req.getExchange());
+        } catch (IllegalArgumentException e) {
+            return badRequest(e.getMessage());
+        }
+        if (req.getNetwork() == null) return badRequest("network is required");
+
+        StrategySettings s = strategySettingsService.getOrCreate(req.getChatId(), req.getType(), ex, req.getNetwork());
 
         AdvancedControlMode incoming = parseEnumOrNull(AdvancedControlMode.class, req.getAdvancedControlMode());
         if (incoming != null && incoming != s.getAdvancedControlMode()) {
-            log.info("🧠 APPLY MODE change {} -> {} ctx: chatId={} type={} ex={} net={}",
+            log.info("🧠 APPLY MODE change {} -> {} (chatId={}, type={}, ex={}, net={})",
                     s.getAdvancedControlMode(), incoming, req.getChatId(), req.getType(), ex, req.getNetwork());
             s.setAdvancedControlMode(incoming);
             s = strategySettingsService.save(s);
@@ -317,15 +379,21 @@ public class StrategySettingsApiController {
                         .build()
         );
 
+        StrategySettings refreshed = strategySettingsService.getOrCreate(req.getChatId(), req.getType(), ex, req.getNetwork());
+
         return ResponseEntity.ok(
                 ApplyResponse.builder()
-                        .applied(tr.applied())
-                        .reason(tr.reason())
-                        .modelVersion(tr.modelVersion())
-                        .scoreBefore(tr.scoreBefore())
-                        .scoreAfter(tr.scoreAfter())
-                        .oldParams(tr.oldParams())
-                        .newParams(tr.newParams())
+                        .applied(tr != null && tr.applied())
+                        .reason(tr != null ? tr.reason() : "tuningResult=null")
+                        .modelVersion(tr != null ? tr.modelVersion() : null)
+                        .scoreBefore(tr != null ? tr.scoreBefore() : null)
+                        .scoreAfter(tr != null ? tr.scoreAfter() : null)
+                        .oldParams(tr != null ? tr.oldParams() : null)
+                        .newParams(tr != null ? tr.newParams() : null)
+
+                        .mlConfidence(refreshed.getMlConfidence())
+                        .totalProfitPct(refreshed.getTotalProfitPct())
+                        .settingsSnapshot(StrategySettingsSnapshot.from(refreshed))
                         .build()
         );
     }
@@ -356,6 +424,10 @@ public class StrategySettingsApiController {
 
         private Map<String, Object> oldParams;
         private Map<String, Object> newParams;
+
+        private BigDecimal mlConfidence;
+        private BigDecimal totalProfitPct;
+        private StrategySettingsSnapshot settingsSnapshot;
     }
 
     @Data
@@ -372,8 +444,8 @@ public class StrategySettingsApiController {
 
         private String maxExposureUsd;
         private String maxExposurePct;
-
         private String dailyLossLimitPct;
+
         private Boolean reinvestProfit;
 
         // trade
@@ -407,7 +479,9 @@ public class StrategySettingsApiController {
     public static class AutosaveResponse {
         private boolean ok;
         private String savedAt;
+
         private AccountBalanceSnapshot snapshot;
+        private StrategySettingsSnapshot settingsSnapshot;
 
         private String advancedControlMode;
         private String accountAsset;
@@ -415,7 +489,12 @@ public class StrategySettingsApiController {
         private String timeframe;
         private Integer cachedCandlesLimit;
 
-        // ✅ ДОБАВИЛ: отладочный контекст (не ломает старый UI)
+        private BigDecimal mlConfidence;
+        private BigDecimal totalProfitPct;
+
+        private Boolean tuningApplied;
+        private String tuningReason;
+
         private Long id;
         private Long chatId;
         private String type;
@@ -423,9 +502,74 @@ public class StrategySettingsApiController {
         private String network;
     }
 
+    @Data
+    @lombok.Builder
+    public static class StrategySettingsSnapshot {
+        private Long id;
+        private Long chatId;
+        private String type;
+        private String exchange;
+        private String network;
+
+        private String advancedControlMode;
+
+        private String accountAsset;
+        private String symbol;
+        private String timeframe;
+        private Integer cachedCandlesLimit;
+
+        private BigDecimal maxExposureUsd;
+        private BigDecimal maxExposurePct;
+        private BigDecimal dailyLossLimitPct;
+
+        private Boolean reinvestProfit;
+
+        private BigDecimal mlConfidence;
+        private BigDecimal totalProfitPct;
+
+        public static StrategySettingsSnapshot from(StrategySettings s) {
+            if (s == null) return null;
+            return StrategySettingsSnapshot.builder()
+                    .id(s.getId())
+                    .chatId(s.getChatId())
+                    .type(s.getType() != null ? s.getType().name() : null)
+                    .exchange(s.getExchangeName())
+                    .network(s.getNetworkType() != null ? s.getNetworkType().name() : null)
+
+                    .advancedControlMode(s.getAdvancedControlMode() != null ? s.getAdvancedControlMode().name() : null)
+
+                    .accountAsset(s.getAccountAsset())
+                    .symbol(s.getSymbol())
+                    .timeframe(s.getTimeframe())
+                    .cachedCandlesLimit(s.getCachedCandlesLimit())
+
+                    .maxExposureUsd(s.getMaxExposureUsd())
+                    .maxExposurePct(s.getMaxExposurePct())
+                    .dailyLossLimitPct(s.getDailyLossLimitPct())
+
+                    .reinvestProfit(s.isReinvestProfit())
+
+                    .mlConfidence(s.getMlConfidence())
+                    .totalProfitPct(s.getTotalProfitPct())
+                    .build();
+        }
+    }
+
     // =========================================================
-    // helpers
+    // helpers (prod-safe, без хардкодов)
     // =========================================================
+
+    private static ResponseEntity<?> badRequest(String msg) {
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of(
+                "ok", false,
+                "error", "BAD_REQUEST",
+                "message", msg
+        ));
+    }
+
+    private static void requireNonNull(Object v, String msg) {
+        if (v == null) throw new IllegalArgumentException(msg);
+    }
 
     private static String nowHHmmss() {
         return LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
@@ -439,10 +583,12 @@ public class StrategySettingsApiController {
         return s;
     }
 
-    private static String normalizeExchange(String exchange) {
-        if (exchange == null) return "BINANCE";
+    /** ✅ Без дефолта BINANCE — если пусто, это ошибка клиента. */
+    private static String normalizeExchangeOrThrow(String exchange) {
+        if (exchange == null) throw new IllegalArgumentException("exchange is required");
         String ex = exchange.trim().toUpperCase(Locale.ROOT);
-        return ex.isEmpty() ? "BINANCE" : ex;
+        if (ex.isEmpty()) throw new IllegalArgumentException("exchange is required");
+        return ex;
     }
 
     private static String normalizeAssetOrNull(String asset) {
@@ -480,12 +626,22 @@ public class StrategySettingsApiController {
         catch (Exception e) { return null; }
     }
 
-    private static <E extends Enum<E>> E parseEnumOrNull(Class<E> enumClass, String raw) {
-        if (raw == null) return null;
-        String s = raw.trim().toUpperCase(Locale.ROOT);
-        if (s.isEmpty()) return null;
-        try { return Enum.valueOf(enumClass, s); }
-        catch (Exception e) { return null; }
+    private static BigDecimal validatePctOrNull(BigDecimal v) {
+        if (v == null) return null;
+        if (v.compareTo(BigDecimal.ZERO) < 0) return null;
+        return v.setScale(4, RoundingMode.HALF_UP);
+    }
+
+    private static BigDecimal validateMoneyOrNull(BigDecimal v) {
+        if (v == null) return null;
+        if (v.compareTo(BigDecimal.ZERO) < 0) return null;
+        return v.setScale(8, RoundingMode.HALF_UP);
+    }
+
+    private static BigDecimal validatePositiveOrNull(BigDecimal v) {
+        if (v == null) return null;
+        if (v.compareTo(BigDecimal.ZERO) <= 0) return null;
+        return v;
     }
 
     private static Integer toNullablePositive(Integer v) {
@@ -493,22 +649,11 @@ public class StrategySettingsApiController {
         return v > 0 ? v : null;
     }
 
-    private static BigDecimal validateMoneyOrNull(BigDecimal v) {
-        if (v == null) return null;
-        if (v.compareTo(BigDecimal.ZERO) <= 0) return null;
-        return v.setScale(6, RoundingMode.HALF_UP);
-    }
-
-    private static BigDecimal validatePositiveOrNull(BigDecimal v) {
-        if (v == null) return null;
-        if (v.compareTo(BigDecimal.ZERO) <= 0) return null;
-        return v.setScale(6, RoundingMode.HALF_UP);
-    }
-
-    private static BigDecimal validatePctOrNull(BigDecimal v) {
-        if (v == null) return null;
-        if (v.compareTo(BigDecimal.ZERO) < 0) v = BigDecimal.ZERO;
-        if (v.compareTo(BigDecimal.valueOf(100)) > 0) v = BigDecimal.valueOf(100);
-        return v.setScale(4, RoundingMode.HALF_UP);
+    private static <E extends Enum<E>> E parseEnumOrNull(Class<E> enumClass, String raw) {
+        if (raw == null) return null;
+        String s = raw.trim();
+        if (s.isEmpty()) return null;
+        try { return Enum.valueOf(enumClass, s.toUpperCase(Locale.ROOT)); }
+        catch (Exception e) { return null; }
     }
 }

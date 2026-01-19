@@ -1,5 +1,6 @@
 package com.chicu.aitradebot.ai.tuning.eval.impl;
 
+import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.exchange.client.ExchangeClient;
 import com.chicu.aitradebot.exchange.client.ExchangeClientFactory;
@@ -22,7 +23,9 @@ public class HistoryWarmupService {
     private final StrategyEnvResolver envResolver;
 
     /**
-     * Прогрев истории: грузим REST klines и кладём в MarketStreamManager как "закрытые" свечи.
+     * ✅ BACKWARD COMPAT:
+     * Старый метод — оставляем, но он НЕ гарантирует MAINNET/TESTNET,
+     * потому что берёт окружение из envResolver.resolve(chatId, type).
      */
     public int warmup(long chatId,
                       StrategyType type,
@@ -32,17 +35,54 @@ public class HistoryWarmupService {
                       long endMs,
                       int limit) {
 
-        String s = symbol.toUpperCase(Locale.ROOT);
-        String tf = timeframe.toLowerCase(Locale.ROOT);
+        return warmup(chatId, type, null, null, symbol, timeframe, startMs, endMs, limit);
+    }
 
-        StrategyEnvResolver.Env env = envResolver.resolve(chatId, type);
-        ExchangeClient client = exchangeClientFactory.get(env.exchangeName(), env.networkType());
+    /**
+     * ✅ FIXED:
+     * Прогрев истории с явным указанием exchange/network.
+     * Если exchange/network не заданы — используем envResolver.resolve(chatId, type).
+     */
+    public int warmup(long chatId,
+                      StrategyType type,
+                      String exchange,
+                      NetworkType network,
+                      String symbol,
+                      String timeframe,
+                      long startMs,
+                      long endMs,
+                      int limit) {
+
+        if (symbol == null || symbol.isBlank() || timeframe == null || timeframe.isBlank()) {
+            log.warn("🔥 Warmup skipped: blank symbol/timeframe (chatId={} type={} symbol='{}' tf='{}')",
+                    chatId, type, symbol, timeframe);
+            return 0;
+        }
+
+        String s = symbol.trim().toUpperCase(Locale.ROOT);
+        String tf = timeframe.trim().toLowerCase(Locale.ROOT);
+
+        final String exUsed;
+        final NetworkType netUsed;
+
+        if (exchange != null && !exchange.trim().isEmpty() && network != null) {
+            exUsed = exchange.trim().toUpperCase(Locale.ROOT);
+            netUsed = network;
+        } else {
+            StrategyEnvResolver.Env env = envResolver.resolve(chatId, type);
+            exUsed = env.exchangeName();
+            netUsed = env.networkType();
+        }
+
+        ExchangeClient client = exchangeClientFactory.get(exUsed, netUsed);
 
         try {
             List<ExchangeClient.Kline> klines = client.getKlines(s, tf, startMs, endMs, limit);
-            if (klines == null || klines.isEmpty()) return 0;
+            if (klines == null || klines.isEmpty()) {
+                log.info("🔥 Warmup empty: {} {} exchange={} network={} (0 candles)", s, tf, exUsed, netUsed);
+                return 0;
+            }
 
-            // кладём в кеш (закрытые свечи)
             for (ExchangeClient.Kline k : klines) {
                 Candle candle = new Candle(
                         k.openTime(),
@@ -57,13 +97,13 @@ public class HistoryWarmupService {
             }
 
             log.info("🔥 Warmup done: {} {} candles={} exchange={} network={}",
-                    s, tf, klines.size(), env.exchangeName(), env.networkType());
+                    s, tf, klines.size(), exUsed, netUsed);
 
             return klines.size();
 
         } catch (Exception e) {
-            log.warn("Warmup failed: {} {} (exchange={} network={}): {}",
-                    s, tf, env.exchangeName(), env.networkType(), e.getMessage());
+            log.warn("🔥 Warmup failed: {} {} (exchange={} network={}): {}",
+                    s, tf, exUsed, netUsed, e.getMessage());
             return 0;
         }
     }

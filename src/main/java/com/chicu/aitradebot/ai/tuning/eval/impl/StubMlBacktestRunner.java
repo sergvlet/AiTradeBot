@@ -1,8 +1,9 @@
 package com.chicu.aitradebot.ai.tuning.eval.impl;
 
-import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.ai.tuning.eval.BacktestMetrics;
 import com.chicu.aitradebot.ai.tuning.eval.MlBacktestRunner;
+import com.chicu.aitradebot.common.enums.NetworkType;
+import com.chicu.aitradebot.common.enums.StrategyType;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.stereotype.Service;
@@ -18,17 +19,18 @@ public class StubMlBacktestRunner implements MlBacktestRunner {
     @Override
     public BacktestMetrics run(Long chatId,
                                StrategyType type,
+                               String exchange,
+                               NetworkType network,
                                String symbolOverride,
                                String timeframeOverride,
                                Map<String, Object> candidateParams,
                                Instant startAt,
                                Instant endAt) {
 
-        log.warn("🧪 ML BacktestRunner = STUB (type={}, symbol={}, tf={}) — подключи RealMlBacktestRunner",
-                type, symbolOverride, timeframeOverride);
+        log.warn("🧪 ML BacktestRunner = STUB (type={}, ex={}, net={}, symbol={}, tf={}) — подключи RealMlBacktestRunner",
+                type, exchange, network, symbolOverride, timeframeOverride);
 
-        // ВАЖНО: ok=true, чтобы пайплайн тюнера не ломался.
-        // Когда подключишь реальный — заменишь на реальный расчёт.
+        // ok=true, чтобы пайплайн тюнера не ломался
         return BacktestMetrics.stubOk(chatId, type, symbolOverride, timeframeOverride, candidateParams, startAt, endAt);
     }
 }

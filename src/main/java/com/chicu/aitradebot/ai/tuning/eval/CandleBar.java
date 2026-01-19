@@ -10,4 +10,8 @@ public record CandleBar(
         BigDecimal low,
         BigDecimal close,
         BigDecimal volume
-) {}
+) {
+    public Instant time() {
+        return openTime;
+    }
+}

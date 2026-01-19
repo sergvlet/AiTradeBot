@@ -165,16 +165,32 @@ window.SettingsTabGeneral = (function () {
         }
 
         // =====================================================
+        // CSRF helpers (Spring Security friendly)
+        // =====================================================
+        function readCsrf() {
+            const token = document.querySelector('meta[name="_csrf"]')?.getAttribute("content") || "";
+            const header = document.querySelector('meta[name="_csrf_header"]')?.getAttribute("content") || "";
+            if (!token || !header) return null;
+            return { token, header };
+        }
+
+        // =====================================================
         // ✅ ЖЁСТКИЙ AUTOSAVE: гарантирует payload из buildPayload
-        // (обходит кривую реализацию SettingsAutoSave.saveNow)
+        // + CSRF/credentials
         // =====================================================
         async function postAutosaveDirect(payload) {
+            const headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            };
+
+            const csrf = readCsrf();
+            if (csrf) headers[csrf.header] = csrf.token;
+
             const res = await fetch(AUTOSAVE_ENDPOINT, {
                 method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    "Accept": "application/json"
-                },
+                credentials: "same-origin",
+                headers,
                 body: JSON.stringify(payload)
             });
 
@@ -185,27 +201,65 @@ window.SettingsTabGeneral = (function () {
         }
 
         // =====================================================
+        // ✅ НОРМАЛИЗАТОР ответа сервера
+        // =====================================================
+        function unwrapSnapshot(resp) {
+            if (!resp) return null;
+            return resp.snapshot || resp.settingsSnapshot || resp.data?.snapshot || resp;
+        }
+
+        // =====================================================
         // ✅ FIX: синхронизация контекста (обязательно!)
-        // если режим сохранялся в другую строку — это покажет и починит
         // =====================================================
         function syncContextFromServer(resp) {
-            const ex = (resp?.exchange || resp?.exchangeName || "").toString().trim();
-            const net = (resp?.network || resp?.networkType || "").toString().trim();
-            const type = (resp?.type || "").toString().trim();
+            const snap = unwrapSnapshot(resp) || {};
+
+            const ex =
+                (snap.exchange || snap.exchangeName || resp?.exchange || resp?.exchangeName || "")
+                    .toString().trim();
+
+            const net =
+                (snap.network || snap.networkType || resp?.network || resp?.networkType || "")
+                    .toString().trim();
+
+            const type =
+                (snap.type || resp?.type || "")
+                    .toString().trim();
 
             if (ex) ctx.exchange = ex;
             if (net) ctx.network = net;
             if (type) ctx.type = type;
         }
 
+        // =====================================================
+        // ✅ FIX: прижим режима к факту БД (snapshot.advancedControlMode)
+        // =====================================================
         function syncControlModeFromServer(resp) {
-            const mode = String(resp?.advancedControlMode || "").trim().toUpperCase();
+            const snap = unwrapSnapshot(resp) || {};
+            const raw =
+                snap.advancedControlMode ??
+                resp?.advancedControlMode ??
+                snap.controlMode ??
+                resp?.controlMode ??
+                null;
+
+            const mode = String(raw || "").trim().toUpperCase();
             if (!mode) return;
 
             if (controlModeSelect) {
-                const cur = String(controlModeSelect.value || "").trim().toUpperCase();
-                if (cur !== mode) controlModeSelect.value = mode;
-                controlModeSelect.dataset.prevValue = mode;
+                // прижимаем только если реально есть такой option
+                const hasOpt = Array.from(controlModeSelect.options || []).some(o =>
+                    String(o.value || "").trim().toUpperCase() === mode
+                );
+
+                if (hasOpt) {
+                    const cur = String(controlModeSelect.value || "").trim().toUpperCase();
+                    if (cur !== mode) controlModeSelect.value = mode;
+                    controlModeSelect.dataset.prevValue = mode;
+                } else {
+                    // если option нет — просто фиксируем prevValue, чтобы не было отката/петли
+                    controlModeSelect.dataset.prevValue = String(controlModeSelect.value || "").trim().toUpperCase();
+                }
             }
 
             ctx.advancedControlMode = mode;
@@ -254,7 +308,7 @@ window.SettingsTabGeneral = (function () {
                 `&network=${encodeURIComponent(ctx.network)}` +
                 `&asset=${encodeURIComponent(a)}`;
 
-            const res = await fetch(url, { method: "GET", headers: { "Accept": "application/json" } });
+            const res = await fetch(url, { method: "GET", headers: { "Accept": "application/json" }, credentials: "same-origin" });
             if (!res.ok) throw new Error(`balance http ${res.status}`);
 
             const text = await res.text();
@@ -385,32 +439,27 @@ window.SettingsTabGeneral = (function () {
         })();
 
         // =====================================================
-        // ✅ SAVE NOW: сначала пробуем autosave.saveNow, но режим — только через direct
+        // ✅ SAVE NOW: всегда POST /autosave с advancedControlMode
+        // + прижим селекта к snapshot.advancedControlMode
         // =====================================================
         async function autosaveNowStrict() {
             const payload = buildPayload();
 
             setSavingUiHint();
 
-            // 1) прямой POST гарантирует что advancedControlMode реально уйдёт
             const resp = await postAutosaveDirect(payload);
 
-            // 2) подтягиваем контекст и режим
+            // 1) синхронизируем ctx (exchange/network/type)
             syncContextFromServer(resp);
+
+            // 2) жёстко прижимаем режим к факту БД
             syncControlModeFromServer(resp);
 
-            // 3) баланс
+            // 3) баланс (если сервер вернул)
             const snap = resp?.snapshot || resp?.balanceSnapshot || null;
             if (snap?.selectedAsset) {
                 setBalanceUi(snap.selectedAsset, snap.selectedFreeBalance);
                 setBudgetUi(false);
-            }
-
-            // 4) (не обязательно) диагностический лог
-            if (resp?.id) {
-                console.log("✅ AUTOSAVE OK", {
-                    id: resp.id, ex: resp.exchange, net: resp.network, mode: resp.advancedControlMode
-                });
             }
 
             setSavedUiHint();
@@ -432,12 +481,18 @@ window.SettingsTabGeneral = (function () {
                 reason: (reason || "").trim() || null
             };
 
+            const headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            };
+
+            const csrf = readCsrf();
+            if (csrf) headers[csrf.header] = csrf.token;
+
             const res = await fetch(APPLY_ENDPOINT, {
                 method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    "Accept": "application/json"
-                },
+                credentials: "same-origin",
+                headers,
                 body: JSON.stringify(payload)
             });
 
@@ -677,6 +732,7 @@ window.SettingsTabGeneral = (function () {
 
                 markChanged("advancedControlMode");
 
+                // ✅ 1) мгновенно отражаем в runtime + событие
                 window.__StrategyControlMode = nextUpper;
                 try {
                     window.dispatchEvent(new CustomEvent("strategy:controlModeChanged", { detail: { mode: nextUpper } }));
@@ -690,16 +746,14 @@ window.SettingsTabGeneral = (function () {
                 }
 
                 try {
-                    // ✅ строгое сохранение (гарантирует advancedControlMode)
+                    // ✅ 2) всегда autosaveNow() → POST /autosave (в payload есть advancedControlMode)
                     const saved = await autosaveNowStrict();
-
                     if (!saved) throw new Error("autosave returned null");
 
-                    // 2) для HYBRID/AI — apply
+                    // ✅ 3) для HYBRID/AI — apply (pipeline)
                     if (isAiMode) {
                         try {
-                            const applyResp = await applyControlMode(null);
-                            // applyResp может быть null — не критично
+                            await applyControlMode(null);
                             setSavedUiHint(`${nowHHmm()} • apply ok`);
                         } catch (e) {
                             console.error("applyControlMode failed", e);
@@ -712,6 +766,7 @@ window.SettingsTabGeneral = (function () {
                         setSavedUiHint();
                     }
 
+                    // ✅ 4) prevValue фиксируем ПОСЛЕ прижима к серверу (syncControlModeFromServer)
                     controlModeSelect.dataset.prevValue = String(controlModeSelect.value || "").trim();
 
                 } catch (e) {
