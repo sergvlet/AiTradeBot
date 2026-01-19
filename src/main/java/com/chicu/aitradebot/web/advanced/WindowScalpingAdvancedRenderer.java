@@ -9,6 +9,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import org.springframework.web.util.HtmlUtils;
 
+import java.math.BigDecimal;
 import java.util.Map;
 
 @Slf4j
@@ -43,8 +44,16 @@ public class WindowScalpingAdvancedRenderer implements StrategyAdvancedRenderer 
 
                 + "  <div class='row g-3'>"
 
+                // ✅ TP/SL
+                + fieldNumber("takeProfitPct", "Take Profit (%)", valBd(s.getTakeProfitPct()),
+                "min='0' step='0.01'", dis, roAttr, "TP в процентах (например 0.60 = 0.60%).")
+
+                + fieldNumber("stopLossPct", "Stop Loss (%)", valBd(s.getStopLossPct()),
+                "min='0' step='0.01'", dis, roAttr, "SL в процентах (например 0.35 = 0.35%).")
+
+                // ✅ window params
                 + fieldNumber("windowSize", "Размер окна", valInt(s.getWindowSize()),
-                "min='1' step='1'", dis, roAttr, "Кол-во тиков/баров для high/low окна.")
+                "min='5' step='1'", dis, roAttr, "Кол-во тиков/баров для high/low окна.")
 
                 + fieldNumber("entryFromLowPct", "Вход от низа (%)", valDouble(s.getEntryFromLowPct()),
                 "min='0' step='0.01'", dis, roAttr, "Вход в нижних X% диапазона окна.")
@@ -63,7 +72,7 @@ public class WindowScalpingAdvancedRenderer implements StrategyAdvancedRenderer 
                 + (readOnly
                 ? "<div class='alert alert-info small mt-3 mb-0'>Режим <b>AI</b>: параметры управляются автоматически.</div>"
                 : "<div class='alert alert-secondary small mt-3 mb-0'>Режим <b>MANUAL / HYBRID</b>: параметры можно редактировать.</div>"
-        )
+                )
 
                 + "</div>";
     }
@@ -80,6 +89,12 @@ public class WindowScalpingAdvancedRenderer implements StrategyAdvancedRenderer 
 
         WindowScalpingStrategySettings incoming = WindowScalpingStrategySettings.builder()
                 .chatId(ctx.getChatId())
+
+                // ✅ TP/SL
+                .takeProfitPct(parseBigDecimal(p.get("takeProfitPct")))
+                .stopLossPct(parseBigDecimal(p.get("stopLossPct")))
+
+                // ✅ WINDOW
                 .windowSize(parseInt(p.get("windowSize")))
                 .entryFromLowPct(parseDouble(p.get("entryFromLowPct")))
                 .entryFromHighPct(parseDouble(p.get("entryFromHighPct")))
@@ -119,6 +134,7 @@ public class WindowScalpingAdvancedRenderer implements StrategyAdvancedRenderer 
 
     private static String valInt(Integer v) { return v == null ? "" : String.valueOf(v); }
     private static String valDouble(Double v) { return v == null ? "" : String.valueOf(v); }
+    private static String valBd(BigDecimal v) { return v == null ? "" : v.stripTrailingZeros().toPlainString(); }
 
     private static Integer parseInt(String v) {
         try { return v == null || v.isBlank() ? null : Integer.parseInt(v.trim()); }
@@ -130,6 +146,16 @@ public class WindowScalpingAdvancedRenderer implements StrategyAdvancedRenderer 
             if (v == null || v.isBlank()) return null;
             String s = v.trim().replace(",", ".");
             return Double.parseDouble(s);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static BigDecimal parseBigDecimal(String v) {
+        try {
+            if (v == null || v.isBlank()) return null;
+            String s = v.trim().replace(",", ".");
+            return new BigDecimal(s);
         } catch (Exception e) {
             return null;
         }

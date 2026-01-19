@@ -57,10 +57,12 @@ public class AiStrategyOrchestrator {
             return buildRunInfo(s, false, "Стратегия не найдена");
         }
 
+        // ✅ подписка по символу на нужной бирже
         streamManager.subscribeSymbol(exchange, s.getSymbol());
 
         try {
-            strategy.start(chatId, s.getSymbol());
+            // ✅ ВАЖНО: передаём env (exchange/network), чтобы стратегия выбрала правильную запись
+            strategy.start(chatId, s.getSymbol(), s.getExchangeName(), s.getNetworkType());
         } catch (Exception e) {
             log.error("❌ startStrategy failed", e);
             return buildRunInfo(s, false, "Ошибка запуска стратегии");
@@ -72,7 +74,9 @@ public class AiStrategyOrchestrator {
         s.setStoppedAt(null);
         settingsService.save(s);
 
-        log.info("▶️ START {} chatId={} {} {}", type, chatId, exchange, s.getSymbol());
+        log.info("▶️ START {} chatId={} ex={} net={} symbol={}",
+                type, chatId, s.getExchangeName(), s.getNetworkType(), s.getSymbol());
+
         return buildRunInfo(s, true, "Стратегия запущена");
     }
 
@@ -90,7 +94,8 @@ public class AiStrategyOrchestrator {
 
         if (strategy != null) {
             try {
-                strategy.stop(chatId, s.getSymbol());
+                // ✅ симметрично: останавливаем в контексте env
+                strategy.stop(chatId, s.getSymbol(), s.getExchangeName(), s.getNetworkType());
             } catch (Exception e) {
                 log.error("❌ stopStrategy failed", e);
             }
@@ -101,7 +106,9 @@ public class AiStrategyOrchestrator {
         s.setStoppedAt(LocalDateTime.now());
         settingsService.save(s);
 
-        log.info("⏹ STOP {} chatId={} {} {}", type, chatId, exchange, s.getSymbol());
+        log.info("⏹ STOP {} chatId={} ex={} net={} symbol={}",
+                type, chatId, s.getExchangeName(), s.getNetworkType(), s.getSymbol());
+
         return buildRunInfo(s, false, "Стратегия остановлена");
     }
 
@@ -118,10 +125,10 @@ public class AiStrategyOrchestrator {
 
         TradingStrategy strategy = strategyRegistry.get(type);
 
-        // ✅ реальный runtime-статус, а не флаг из БД
+        // ✅ runtime-статус
         boolean runtimeActive = strategy != null && strategy.isActive(chatId);
 
-        // самовосстановление рассинхрона после рестарта
+        // ✅ самовосстановление рассинхрона после рестарта
         if (s.isActive() != runtimeActive) {
             s.setActive(runtimeActive);
             if (!runtimeActive && s.getStoppedAt() == null) {
@@ -149,27 +156,15 @@ public class AiStrategyOrchestrator {
     public GlobalState getGlobalState(Long chatId) {
         int active = 0;
 
-        // ✅ больше НЕ используем findLatest(...). У нас есть строгий ключ.
-        // Для глобального счётчика нам достаточно пройтись по сетям/биржам,
-        // которые реально используются в UI/проекте.
         for (StrategyType t : StrategyType.values()) {
 
-            // BINANCE MAINNET
             if (isActiveSafe(chatId, t, "BINANCE", NetworkType.MAINNET)) active++;
-
-            // BINANCE TESTNET
             if (isActiveSafe(chatId, t, "BINANCE", NetworkType.TESTNET)) active++;
 
-            // BYBIT MAINNET
             if (isActiveSafe(chatId, t, "BYBIT", NetworkType.MAINNET)) active++;
-
-            // BYBIT TESTNET
             if (isActiveSafe(chatId, t, "BYBIT", NetworkType.TESTNET)) active++;
 
-            // OKX MAINNET (если у тебя OKX без тестнета — оставь только MAINNET)
             if (isActiveSafe(chatId, t, "OKX", NetworkType.MAINNET)) active++;
-
-            // OKX TESTNET (если есть — оставь; если нет — можно удалить)
             if (isActiveSafe(chatId, t, "OKX", NetworkType.TESTNET)) active++;
         }
 
@@ -194,9 +189,6 @@ public class AiStrategyOrchestrator {
             String exchange,
             NetworkType network
     ) {
-        // ✅ раньше было findLatest(...) — теперь строго ключ.
-        // И ВАЖНО: orchestrator должен уметь стартовать даже если строки ещё нет
-        // (после твоего DROP таблицы это прям критично), поэтому getOrCreate().
         return settingsService.getOrCreate(chatId, type, exchange, network);
     }
 
@@ -303,14 +295,9 @@ public class AiStrategyOrchestrator {
         }
     }
 
-    /**
-     * Никаких прямых вызовов deprecated getTimestamp().
-     * Достаём время максимально совместимо: timestampMs/timeMs/createdAt/updatedAt и т.д.
-     */
     private Long extractOrderTimestamp(Order o) {
         if (o == null) return null;
 
-        // 1) millis
         Long ms = tryLong(o, "getTimestampMs")
                 .or(() -> tryLong(o, "getTimeMs"))
                 .or(() -> tryLong(o, "getTs"))
@@ -318,7 +305,6 @@ public class AiStrategyOrchestrator {
                 .orElse(null);
         if (ms != null && ms > 0) return ms;
 
-        // 2) Instant / LocalDateTime
         Instant inst = tryInstant(o, "getCreatedAt")
                 .or(() -> tryInstant(o, "getUpdatedAt"))
                 .or(() -> tryInstant(o, "getExecutedAt"))

@@ -61,9 +61,19 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         final StrategyType type = StrategyType.WINDOW_SCALPING;
 
         // =========================================================
-        // ✅ окружение: request -> db -> fallback
+        // ✅ окружение: request -> db (без хардкода дефолтов)
         // =========================================================
-        Env env = resolveEnv(chatId, type, request.exchange(), request.network());
+        final Env env;
+        try {
+            env = resolveEnv(chatId, type, request.exchange(), request.network());
+        } catch (Exception e) {
+            return TuningResult.builder()
+                    .applied(false)
+                    .reason("Не могу определить exchange/network: " + e.getMessage())
+                    .modelVersion(props.getModelVersion())
+                    .build();
+        }
+
         final String ex = env.exchange;
         final NetworkType net = env.network;
 
@@ -74,7 +84,7 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         // strategy params
         // ---------------------------------------------------------------------
         Map<String, Object> base = new LinkedHashMap<>();
-        base.put("windowSize", nz(curWs.getWindowSize()));
+        base.put("windowSize", nz(curWs.getWindowSize(), 30));
         base.put("entryFromLowPct", nz(curWs.getEntryFromLowPct(), 20.0));
         base.put("entryFromHighPct", nz(curWs.getEntryFromHighPct(), 20.0));
         base.put("minRangePct", nz(curWs.getMinRangePct(), 0.25));
@@ -87,9 +97,8 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         riskTrade.put("riskPerTradePct", bdOr(curSs.getRiskPerTradePct(), "1.0"));
         riskTrade.put("minRiskReward", bdOr(curSs.getMinRiskReward(), "1.2"));
 
-        // ✅ leverage = int (примитив) => null-check запрещён
-        int levDb = curSs.getLeverage();
-        riskTrade.put("leverage", levDb > 0 ? levDb : 1);
+        // ✅ leverage у тебя int → никаких null-check
+        riskTrade.put("leverage", normalizeLeverage(curSs.getLeverage()));
 
         riskTrade.put("allowAveraging", parseBool(curSs.getAllowAveraging()));
 
@@ -102,7 +111,7 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         riskTrade.put("maxOpenOrders", curSs.getMaxOpenOrders());
 
         // ---------------------------------------------------------------------
-        // candlesLimit (int props -> без null)
+        // ✅ candlesLimit (без сравнений int != null)
         // ---------------------------------------------------------------------
         final int minCandles = props.getMinCandlesLimit();
         final int defaultCandles = props.getDefaultCandlesLimit();
@@ -173,8 +182,10 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
 
         BigDecimal score0 = score(bm0, oldParams);
 
-        // candidates (int props -> без null)
-        final int candidatesN = Math.max(1, props.getCandidates());
+        // ---------------------------------------------------------------------
+        // candidates (int)
+        // ---------------------------------------------------------------------
+        int candidatesN = Math.max(1, props.getCandidates());
 
         BigDecimal bestScore = score0;
         Map<String, Object> bestParams = oldParams;
@@ -204,7 +215,9 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
 
         BigDecimal delta = bestScore.subtract(score0);
 
+        // ---------------------------------------------------------------------
         // thresholds
+        // ---------------------------------------------------------------------
         BigDecimal minAbsImprove = nzBd(props.getMinAbsImprove(), new BigDecimal("0.02"));
         BigDecimal minRelImprove = nzBd(props.getMinRelImprove(), new BigDecimal("0.03"));
         BigDecimal relThreshold = score0.abs().multiply(minRelImprove).max(minAbsImprove);
@@ -244,7 +257,7 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
 
         WindowScalpingStrategySettings patchedWs = WindowScalpingStrategySettings.builder()
                 .chatId(chatId)
-                .windowSize(clampInt(bestParams.get("windowSize"), 5, 2000, nz(curWs.getWindowSize())))
+                .windowSize(clampInt(bestParams.get("windowSize"), 5, 2000, nz(curWs.getWindowSize(), 30)))
                 .entryFromLowPct(clampDouble(bestParams.get("entryFromLowPct"), 0.0, 100.0, nz(curWs.getEntryFromLowPct(), 20.0)))
                 .entryFromHighPct(clampDouble(bestParams.get("entryFromHighPct"), 0.0, 100.0, nz(curWs.getEntryFromHighPct(), 20.0)))
                 .minRangePct(clampDouble(bestParams.get("minRangePct"), 0.01, 50.0, nz(curWs.getMinRangePct(), 0.25)))
@@ -256,10 +269,8 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         curSs.setRiskPerTradePct(parseBd(bestParams.get("riskPerTradePct")));
         curSs.setMinRiskReward(parseBd(bestParams.get("minRiskReward")));
 
-        // ✅ leverage def = int (примитив)
-        int levDef = curSs.getLeverage();
-        if (levDef <= 0) levDef = 1;
-        curSs.setLeverage(clampInt(bestParams.get("leverage"), 1, 50, levDef));
+        // ✅ leverage у тебя int → никаких null-check, дефолт через normalizeLeverage()
+        curSs.setLeverage(clampInt(bestParams.get("leverage"), 1, 50, normalizeLeverage(curSs.getLeverage())));
 
         curSs.setAllowAveraging(parseBool(bestParams.get("allowAveraging")));
 
@@ -301,7 +312,7 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
     }
 
     // =====================================================================
-    // ENV resolve
+    // ENV resolve (без хардкода дефолтов)
     // =====================================================================
 
     private Env resolveEnv(Long chatId, StrategyType type, String exchange, NetworkType network) {
@@ -320,16 +331,34 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
                         .thenComparing(StrategySettings::getId, Comparator.nullsLast(Comparator.naturalOrder()))
                         .reversed();
 
+        Comparator<StrategySettings> byActiveFirst =
+                Comparator.comparing((StrategySettings s) -> !activeValue(s)); // false(активна) -> раньше
+
+        // 1) пытаемся найти запись именно этой стратегии
         StrategySettings best = all.stream()
-                .filter(s -> s != null && s.getType() == type).min(Comparator.comparing((StrategySettings s) -> !activeValue(s))
-                        .thenComparing(byFreshDesc))
+                .filter(s -> s != null)
+                .filter(s -> s.getType() == type)
+                .filter(s -> s.getExchangeName() != null && s.getNetworkType() != null)
+                .sorted(byActiveFirst.thenComparing(byFreshDesc))
+                .findFirst()
                 .orElse(null);
+
+        // 2) если нет — любая запись с env, чтобы не падать без причины
+        if (best == null) {
+            best = all.stream()
+                    .filter(s -> s != null)
+                    .filter(s -> s.getExchangeName() != null && s.getNetworkType() != null)
+                    .sorted(byFreshDesc)
+                    .findFirst()
+                    .orElse(null);
+        }
 
         if (ex == null && best != null) ex = normalizeExchangeOrNull(best.getExchangeName());
         if (net == null && best != null) net = best.getNetworkType();
 
-        if (ex == null) ex = "BINANCE";
-        if (net == null) net = NetworkType.MAINNET;
+        if (ex == null || net == null) {
+            throw new IllegalStateException("Нет данных env в request и в базе (сначала выбери сеть/биржу в UI)");
+        }
 
         return new Env(ex, net);
     }
@@ -339,12 +368,14 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
     private static boolean activeValue(StrategySettings s) {
         if (s == null) return false;
 
+        // 1) Boolean getActive()
         try {
             Method m = s.getClass().getMethod("getActive");
             Object v = m.invoke(s);
             if (v instanceof Boolean b) return b;
         } catch (Exception ignored) {}
 
+        // 2) boolean isActive()
         try {
             Method m = s.getClass().getMethod("isActive");
             Object v = m.invoke(s);
@@ -352,6 +383,10 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         } catch (Exception ignored) {}
 
         return false;
+    }
+
+    private static int normalizeLeverage(int lev) {
+        return lev > 0 ? lev : 1;
     }
 
     // =====================================================================
@@ -362,7 +397,7 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         ThreadLocalRandom r = ThreadLocalRandom.current();
         Map<String, Object> m = new LinkedHashMap<>(base);
 
-        m.put("windowSize", clampInt(jitterInt(m.get("windowSize"), r), 5, 2000, 30));
+        m.put("windowSize", clampInt(jitterInt(m.get("windowSize"), r, 0.25), 5, 2000, 30));
         m.put("entryFromLowPct", clampDouble(jitterDouble(m.get("entryFromLowPct"), r, 6.0), 0, 100, 20));
         m.put("entryFromHighPct", clampDouble(jitterDouble(m.get("entryFromHighPct"), r, 6.0), 0, 100, 20));
         m.put("minRangePct", clampDouble(jitterDouble(m.get("minRangePct"), r, 0.15), 0.01, 50.0, 0.25));
@@ -387,8 +422,8 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         m.put("cooldownAfterLossSeconds", jitterNullableInt(m.get("cooldownAfterLossSeconds"), r, 0, 7200));
         m.put("maxConsecutiveLosses", jitterNullableInt(m.get("maxConsecutiveLosses"), r, 0, 20));
 
-        m.put("maxDrawdownPct", jitterNullableBdPct(m.get("maxDrawdownPct"), r));
-        m.put("maxPositionPct", jitterNullableBdPct(m.get("maxPositionPct"), r));
+        m.put("maxDrawdownPct", jitterNullableBdPct(m.get("maxDrawdownPct"), r, "0.8"));
+        m.put("maxPositionPct", jitterNullableBdPct(m.get("maxPositionPct"), r, "0.8"));
 
         m.put("maxTradesPerDay", jitterNullableInt(m.get("maxTradesPerDay"), r, 0, 300));
         m.put("maxOpenOrders", jitterNullableInt(m.get("maxOpenOrders"), r, 1, 50));
@@ -431,7 +466,7 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
     // =====================================================================
 
     private static BigDecimal nzBd(BigDecimal v, BigDecimal def) { return v != null ? v : def; }
-    private static Integer nz(Integer v) { return v != null ? v : 30; }
+    private static Integer nz(Integer v, int def) { return v != null ? v : def; }
     private static Double nz(Double v, double def) { return v != null ? v : def; }
     private static BigDecimal bdOr(BigDecimal v, String def) { return v != null ? v : new BigDecimal(def); }
     private static BigDecimal safeBd(BigDecimal v) { return v != null ? v : BigDecimal.ZERO; }
@@ -476,7 +511,8 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         try {
             int x = (v instanceof Number n) ? n.intValue() : Integer.parseInt(String.valueOf(v).trim());
             if (x < min) return min;
-            return Math.min(x, max);
+            if (x > max) return max;
+            return x;
         } catch (Exception e) {
             return def;
         }
@@ -487,7 +523,8 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
             double x = (v instanceof Number n) ? n.doubleValue()
                     : Double.parseDouble(String.valueOf(v).trim().replace(",", "."));
             if (x < min) return min;
-            return Math.min(x, max);
+            if (x > max) return max;
+            return x;
         } catch (Exception e) {
             return def;
         }
@@ -520,9 +557,9 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         }
     }
 
-    private static int jitterInt(Object v, ThreadLocalRandom r) {
+    private static int jitterInt(Object v, ThreadLocalRandom r, double frac) {
         int x = clampInt(v, 1, Integer.MAX_VALUE, 30);
-        int delta = Math.max(1, (int) Math.round(x * 0.25));
+        int delta = Math.max(1, (int) Math.round(x * frac));
         return x + r.nextInt(-delta, delta + 1);
     }
 
@@ -559,11 +596,11 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         return x;
     }
 
-    private static Object jitterNullableBdPct(Object v, ThreadLocalRandom r) {
+    private static Object jitterNullableBdPct(Object v, ThreadLocalRandom r, String deltaAbs) {
         if (r.nextDouble() < 0.20) return null;
         BigDecimal x = parseBd(v);
         if (x == null) x = new BigDecimal("10.0");
-        BigDecimal d = new BigDecimal("0.8");
+        BigDecimal d = new BigDecimal(deltaAbs);
         BigDecimal j = BigDecimal.valueOf(r.nextDouble(-1.0, 1.0)).multiply(d);
         x = x.add(j);
         if (x.compareTo(BigDecimal.ZERO) < 0) x = BigDecimal.ZERO;

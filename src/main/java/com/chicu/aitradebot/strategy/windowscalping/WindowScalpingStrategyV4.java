@@ -19,9 +19,7 @@ import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayDeque;
-import java.util.Comparator;
 import java.util.Deque;
-import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
@@ -33,7 +31,6 @@ import java.util.concurrent.ConcurrentHashMap;
 @RequiredArgsConstructor
 public class WindowScalpingStrategyV4 implements TradingStrategy {
 
-    // ✅ в проде — через properties (без “магии” в коде)
     @Value("${strategy.window.settingsRefreshSeconds:10}")
     private long settingsRefreshSeconds;
 
@@ -92,11 +89,17 @@ public class WindowScalpingStrategyV4 implements TradingStrategy {
 
     @Override
     public void start(Long chatId, String symbolHint) {
+        start(chatId, symbolHint, null, null);
+    }
 
-        // ✅ symbolHint приходит из orchestrator.start(..., settings.getSymbol())
-        String hint = normalizeSymbolOrNull(symbolHint);
+    @Override
+    public void start(Long chatId, String symbolHint, String exchange, NetworkType network) {
 
-        StrategySettings ss = loadStrategySettings(chatId, hint, null, null);
+        String hintEx = normalizeExchangeOrNull(exchange);
+
+        // ✅ строго по env
+        StrategySettings ss = loadStrategySettingsStrict(chatId, hintEx, network);
+
         WindowScalpingStrategySettings cfg = windowSettingsService.getOrCreate(chatId);
 
         LocalState st = new LocalState();
@@ -106,34 +109,53 @@ public class WindowScalpingStrategyV4 implements TradingStrategy {
         st.ss = ss;
         st.cfg = cfg;
 
-        st.symbol = normalizeSymbolOrNull(ss != null ? ss.getSymbol() : hint);
-        st.exchange = ss != null ? ss.getExchangeName() : null;
-        st.network = ss != null ? ss.getNetworkType() : null;
+        st.exchange = ss.getExchangeName();
+        st.network  = ss.getNetworkType();
+
+        // symbol берём из ss, hint — запасной
+        String sym = normalizeSymbolOrNull(ss.getSymbol());
+        if (sym == null) sym = normalizeSymbolOrNull(symbolHint);
+        st.symbol = sym;
 
         st.lastSettingsLoadAt = Instant.now();
         st.lastFingerprint = buildFingerprint(ss, cfg);
 
         states.put(chatId, st);
 
-        log.info("[WINDOW] ▶ START chatId={} ex={} net={} symbol={} windowSize={} entryLowPct={} minRangePct={}",
+        log.info("[WINDOW] 🎯 selected StrategySettings id={} active={} ex={} net={} symbol={} updatedAt={}",
+                ss.getId(),
+                ss.isActive(),
+                ss.getExchangeName(),
+                ss.getNetworkType(),
+                ss.getSymbol(),
+                ss.getUpdatedAt()
+        );
+
+        log.info("[WINDOW] ▶ START chatId={} ex={} net={} symbol={} windowSize={} entryLowPct={} minRangePct={} tpPct={} slPct={}",
                 chatId,
                 st.exchange,
                 st.network,
                 st.symbol,
                 cfg != null ? cfg.getWindowSize() : null,
                 cfg != null ? cfg.getEntryFromLowPct() : null,
-                cfg != null ? cfg.getMinRangePct() : null
+                cfg != null ? cfg.getMinRangePct() : null,
+                cfg != null ? cfg.getTakeProfitPct() : null,
+                cfg != null ? cfg.getStopLossPct() : null
         );
 
-        final String sym = st.symbol;
-        if (sym != null) {
-            safeLive(() -> live.pushState(chatId, StrategyType.WINDOW_SCALPING, sym, true));
-            safeLive(() -> live.pushSignal(chatId, StrategyType.WINDOW_SCALPING, sym, null, Signal.hold("started")));
+        if (st.symbol != null) {
+            safeLive(() -> live.pushState(chatId, StrategyType.WINDOW_SCALPING, st.symbol, true));
+            safeLive(() -> live.pushSignal(chatId, StrategyType.WINDOW_SCALPING, st.symbol, null, Signal.hold("started")));
         }
     }
 
     @Override
     public void stop(Long chatId, String ignored) {
+        stop(chatId, ignored, null, null);
+    }
+
+    @Override
+    public void stop(Long chatId, String ignored, String exchange, NetworkType network) {
 
         LocalState st = states.remove(chatId);
         if (st == null) return;
@@ -186,7 +208,6 @@ public class WindowScalpingStrategyV4 implements TradingStrategy {
         String tickSymbol = normalizeSymbolOrNull(symbolFromTick);
         String cfgSymbol  = normalizeSymbolOrNull(st.symbol);
 
-        // фильтруем чужие тики
         if (cfgSymbol != null && tickSymbol != null && !cfgSymbol.equals(tickSymbol)) return;
         if (cfgSymbol == null && tickSymbol != null) st.symbol = tickSymbol;
 
@@ -203,7 +224,7 @@ public class WindowScalpingStrategyV4 implements TradingStrategy {
             WindowScalpingStrategySettings cfg = st.cfg;
             String sym = normalizeSymbolOrNull(st.symbol);
 
-            if (sym == null || cfg == null) {
+            if (sym == null || cfg == null || ss == null) {
                 pushHoldThrottled(chatId, sym, st, "no_settings", time);
                 return;
             }
@@ -258,9 +279,15 @@ public class WindowScalpingStrategyV4 implements TradingStrategy {
                 return;
             }
 
+            // pos в диапазоне [0..1]
             double pos = price.subtract(low)
                     .divide(range, 10, RoundingMode.HALF_UP)
                     .doubleValue();
+
+            if (Double.isNaN(pos) || Double.isInfinite(pos)) {
+                pushHoldThrottled(chatId, sym, st, "pos_invalid", time);
+                return;
+            }
 
             double entryLowPct  = cfg.getEntryFromLowPct()  != null ? cfg.getEntryFromLowPct()  : 0.0;
             double entryHighPct = cfg.getEntryFromHighPct() != null ? cfg.getEntryFromHighPct() : 0.0;
@@ -280,11 +307,11 @@ public class WindowScalpingStrategyV4 implements TradingStrategy {
             }
 
             // =====================================================
-            // ENTRY (SPOT LONG)
+            // ENTRY (SPOT LONG) - вход у низа
             // =====================================================
             if (!st.inPosition && pos <= lowZone) {
 
-                Integer cooldown = ss != null ? ss.getCooldownSeconds() : null;
+                Integer cooldown = ss.getCooldownSeconds();
                 if (cooldown != null && cooldown > 0 && st.lastTradeClosedAt != null) {
                     long passed = Duration.between(st.lastTradeClosedAt, time).getSeconds();
                     if (passed < cooldown) {
@@ -293,15 +320,29 @@ public class WindowScalpingStrategyV4 implements TradingStrategy {
                     }
                 }
 
+                // ✅ score только для UI
                 final double score = clamp01(
                         (lowZone <= 0.000001) ? 1.0 : (1.0 - (pos / lowZone))
                 ) * 100.0;
 
-                log.info("[WINDOW] ⚡ ENTRY try chatId={} ex={} net={} sym={} price={} posPct={} rangePct={}",
+                // ✅ diffPct (для TradeExecution) = насколько близко к low: чем ниже pos, тем выше "плюс"
+                // (внутри TradeExecution у тебя SPOT-ограничение diffPct>0)
+                BigDecimal diffPctForEntry = BigDecimal.valueOf(Math.max(0.000001, (lowZone - pos) * 100.0));
+
+                BigDecimal tpPct = cfg.getTakeProfitPct();
+                BigDecimal slPct = cfg.getStopLossPct();
+                if (tpPct == null || tpPct.signum() <= 0 || slPct == null || slPct.signum() <= 0) {
+                    pushHoldThrottled(chatId, sym, st, "tp_sl_pct_invalid", time);
+                    return;
+                }
+
+                log.info("[WINDOW] ⚡ ENTRY try chatId={} ex={} net={} sym={} price={} posPct={} rangePct={} tpPct={} slPct={}",
                         chatId, st.exchange, st.network, sym,
                         price.stripTrailingZeros().toPlainString(),
                         fmt(pos * 100.0),
-                        fmt(rangePct)
+                        fmt(rangePct),
+                        tpPct.stripTrailingZeros().toPlainString(),
+                        slPct.stripTrailingZeros().toPlainString()
                 );
 
                 try {
@@ -310,9 +351,11 @@ public class WindowScalpingStrategyV4 implements TradingStrategy {
                             StrategyType.WINDOW_SCALPING,
                             sym,
                             price,
-                            BigDecimal.valueOf(pos),
+                            diffPctForEntry,
                             time,
-                            ss
+                            ss,
+                            tpPct,
+                            slPct
                     );
 
                     if (!res.executed()) {
@@ -329,6 +372,11 @@ public class WindowScalpingStrategyV4 implements TradingStrategy {
                     st.sl = res.sl();
                     st.entryQty = res.qty();
                     st.entryOrderId = res.orderId();
+
+                    // ✅ рисуем линии TP/SL
+                    if (st.tp != null && st.sl != null) {
+                        safeLive(() -> live.pushTpSl(chatId, StrategyType.WINDOW_SCALPING, sym, st.tp, st.sl));
+                    }
 
                     safeLive(() -> live.pushSignal(chatId, StrategyType.WINDOW_SCALPING, sym, null,
                             Signal.buy(score, "window_low")));
@@ -406,13 +454,15 @@ public class WindowScalpingStrategyV4 implements TradingStrategy {
         Duration refreshEvery = Duration.ofSeconds(Math.max(1, settingsRefreshSeconds));
 
         if (st.lastSettingsLoadAt != null &&
-                Duration.between(st.lastSettingsLoadAt, now).compareTo(refreshEvery) < 0) {
+            Duration.between(st.lastSettingsLoadAt, now).compareTo(refreshEvery) < 0) {
             return;
         }
 
         try {
-            // ✅ грузим строго “свои” настройки: символ + ex/net из текущего стейта
-            StrategySettings loaded = loadStrategySettings(chatId, st.symbol, st.exchange, st.network);
+            StrategySettings loaded = (st.exchange != null && st.network != null)
+                    ? loadStrategySettingsStrict(chatId, st.exchange, st.network)
+                    : null;
+
             WindowScalpingStrategySettings cfg = windowSettingsService.getOrCreate(chatId);
 
             String fp = buildFingerprint(loaded, cfg);
@@ -436,14 +486,16 @@ public class WindowScalpingStrategyV4 implements TradingStrategy {
             if (changed) {
                 st.lastFingerprint = fp;
 
-                log.info("[WINDOW] ⚙️ settings updated chatId={} ex={} net={} symbol={} windowSize={} entryLowPct={} minRangePct={}",
+                log.info("[WINDOW] ⚙️ settings updated chatId={} ex={} net={} symbol={} windowSize={} entryLowPct={} minRangePct={} tpPct={} slPct={}",
                         chatId,
                         st.exchange,
                         st.network,
                         st.symbol,
                         cfg != null ? cfg.getWindowSize() : null,
                         cfg != null ? cfg.getEntryFromLowPct() : null,
-                        cfg != null ? cfg.getMinRangePct() : null
+                        cfg != null ? cfg.getMinRangePct() : null,
+                        cfg != null ? cfg.getTakeProfitPct() : null,
+                        cfg != null ? cfg.getStopLossPct() : null
                 );
 
                 String newSymbol = normalizeSymbolOrNull(st.symbol);
@@ -472,52 +524,24 @@ public class WindowScalpingStrategyV4 implements TradingStrategy {
         String high = cfg != null ? String.valueOf(cfg.getEntryFromHighPct()) : "null";
         String minR = cfg != null ? String.valueOf(cfg.getMinRangePct()) : "null";
 
+        String tpPct = cfg != null && cfg.getTakeProfitPct() != null ? cfg.getTakeProfitPct().stripTrailingZeros().toPlainString() : "null";
+        String slPct = cfg != null && cfg.getStopLossPct() != null ? cfg.getStopLossPct().stripTrailingZeros().toPlainString() : "null";
+
         return (symbol != null ? symbol : "null") + "|" + ex + "|" + net + "|" + tf + "|" + candles + "|" + cooldown
-                + "|" + w + "|" + low + "|" + high + "|" + minR;
+               + "|" + w + "|" + low + "|" + high + "|" + minR
+               + "|" + tpPct + "|" + slPct;
     }
 
     // =====================================================
-    // LOAD StrategySettings (без “берём последние абы какие”)
+    // STRICT SETTINGS LOAD (PROD)
     // =====================================================
 
-    private StrategySettings loadStrategySettings(Long chatId, String symbolHint, String exHint, NetworkType netHint) {
-
-        List<StrategySettings> all = strategySettingsService.findAllByChatId(chatId, null, null)
-                .stream()
-                .filter(s -> s.getType() == StrategyType.WINDOW_SCALPING)
-                .toList();
-
-        if (all.isEmpty()) {
-            throw new IllegalStateException("StrategySettings для WINDOW_SCALPING не найдены (chatId=" + chatId + ")");
+    private StrategySettings loadStrategySettingsStrict(Long chatId, String exchange, NetworkType network) {
+        String ex = normalizeExchangeOrNull(exchange);
+        if (ex == null || network == null) {
+            throw new IllegalStateException("exchange/network required for strict StrategySettings load (chatId=" + chatId + ")");
         }
-
-        String sym = normalizeSymbolOrNull(symbolHint);
-        String ex  = normalizeExchangeOrNull(exHint);
-
-        // 1) сначала пытаемся найти максимально “точное” совпадение
-        StrategySettings best = all.stream()
-                .filter(s -> sym == null || sym.equals(normalizeSymbolOrNull(s.getSymbol())))
-                .filter(s -> ex == null || ex.equals(normalizeExchangeOrNull(s.getExchangeName())))
-                .filter(s -> netHint == null || netHint == s.getNetworkType())
-                .sorted(byUpdatedDesc())
-                .findFirst()
-                .orElse(null);
-
-        if (best != null) return best;
-
-        // 2) fallback: просто самые свежие по типу (но это будет уже редкий случай)
-        return all.stream()
-                .sorted(byUpdatedDesc())
-                .findFirst()
-                .orElseThrow();
-    }
-
-    private static Comparator<StrategySettings> byUpdatedDesc() {
-        return Comparator
-                .comparing(StrategySettings::getUpdatedAt, Comparator.nullsLast(Comparator.naturalOrder()))
-                .reversed()
-                .thenComparing(StrategySettings::getId, Comparator.nullsLast(Comparator.naturalOrder()))
-                .reversed();
+        return strategySettingsService.getOrCreate(chatId, StrategyType.WINDOW_SCALPING, ex, network);
     }
 
     // =====================================================

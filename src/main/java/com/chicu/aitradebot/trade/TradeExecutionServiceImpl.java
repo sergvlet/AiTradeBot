@@ -12,6 +12,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Instant;
@@ -22,11 +23,18 @@ import java.time.Instant;
 public class TradeExecutionServiceImpl implements TradeExecutionService {
 
     private static final int QTY_SCALE = 8;
+    private static final int PRICE_SCALE = 8;
 
     private final OrderService orderService;
     private final StrategyLivePublisher live;
     private final AccountBalanceService accountBalanceService;
 
+    /**
+     * ✅ BACKWARD COMPAT:
+     * Старые стратегии пока могут звать этот метод.
+     * Мы попробуем вытащить tp/sl через рефлексию из StrategySettings (если они ещё там есть),
+     * иначе вернём понятную ошибку.
+     */
     @Override
     public EntryResult executeEntry(Long chatId,
                                     StrategyType strategyType,
@@ -35,6 +43,27 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                                     BigDecimal diffPct,
                                     Instant time,
                                     StrategySettings ss) {
+
+        BigDecimal tpPct = readBigDecimal(ss, "getTakeProfitPct");
+        BigDecimal slPct = readBigDecimal(ss, "getStopLossPct");
+        return executeEntry(chatId, strategyType, symbol, price, diffPct, time, ss, tpPct, slPct);
+    }
+
+    /**
+     * ✅ НОВЫЙ КОНТРАКТ:
+     * tpPct/slPct приходят из настроек КОНКРЕТНОЙ стратегии
+     * (например WindowScalpingStrategySettings / ScalpingStrategySettings и т.д.)
+     */
+    @Override
+    public EntryResult executeEntry(Long chatId,
+                                    StrategyType strategyType,
+                                    String symbol,
+                                    BigDecimal price,
+                                    BigDecimal diffPct,
+                                    Instant time,
+                                    StrategySettings ss,
+                                    BigDecimal tpPct,
+                                    BigDecimal slPct) {
 
         if (chatId == null) return EntryResult.fail("chatId=null");
         if (strategyType == null) return EntryResult.fail("strategyType=null");
@@ -55,6 +84,10 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             return EntryResult.fail("networkType пустой в StrategySettings");
         }
 
+        // ✅ TP/SL проценты — ТЕПЕРЬ из стратегии
+        if (!isValidPct(tpPct)) return EntryResult.fail("takeProfitPct invalid (нужно в настройках стратегии)");
+        if (!isValidPct(slPct)) return EntryResult.fail("stopLossPct invalid (нужно в настройках стратегии)");
+
         // сумма входа в QUOTE (USDT/USDC/...)
         BigDecimal quoteAmount = resolveQuoteAmount(chatId, strategyType, ss);
         if (quoteAmount == null || quoteAmount.signum() <= 0) {
@@ -70,13 +103,16 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             return EntryResult.fail("qty=0: мало средств или слишком высокая цена");
         }
 
-        // ❗ TP/SL здесь НЕ вычисляем: они больше не в StrategySettings.
-        // Их должен отдавать слой стратегии/параметров (из таблицы конкретной стратегии).
-        BigDecimal tp = null;
-        BigDecimal sl = null;
+        // ✅ Считаем абсолютные TP/SL от цены входа
+        BigDecimal tp = calcTp(price, tpPct);
+        BigDecimal sl = calcSl(price, slPct);
 
-        // сигнал в UI
-        live.pushSignal(chatId, strategyType, symbol, null, Signal.buy(price.doubleValue(), "entry"));
+        if (tp.compareTo(price) <= 0) return EntryResult.fail("TP <= entryPrice (check takeProfitPct)");
+        if (sl.compareTo(price) >= 0) return EntryResult.fail("SL >= entryPrice (check stopLossPct)");
+        if (sl.signum() <= 0) return EntryResult.fail("SL <= 0 (check stopLossPct)");
+
+        // UI: сигнал входа
+        safeLive(() -> live.pushSignal(chatId, strategyType, symbol, null, Signal.buy(price.doubleValue(), "entry")));
 
         Order order = orderService.placeMarket(
                 chatId,
@@ -89,8 +125,8 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
 
         Long orderId = order != null ? order.getId() : null;
 
-        log.info("[TRADE] ENTRY SPOT BUY {} qty={} price={} quoteAmount={} chatId={}",
-                symbol, qty, price, quoteAmount, chatId);
+        log.info("[TRADE] ENTRY SPOT BUY {} qty={} price={} quoteAmount={} tpPct={} slPct={} tp={} sl={} chatId={}",
+                symbol, qty, price, quoteAmount, tpPct, slPct, tp, sl, chatId);
 
         return EntryResult.ok(true, "BUY", qty, price, tp, sl, orderId);
     }
@@ -131,10 +167,10 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         );
 
         // UI
-        live.clearTpSl(chatId, strategyType, symbol);
-        live.clearPriceLines(chatId, strategyType, symbol);
-        live.pushSignal(chatId, strategyType, symbol, null,
-                Signal.sell(price.doubleValue(), tpHit ? "TP" : "SL"));
+        safeLive(() -> live.clearTpSl(chatId, strategyType, symbol));
+        safeLive(() -> live.clearPriceLines(chatId, strategyType, symbol));
+        safeLive(() -> live.pushSignal(chatId, strategyType, symbol, null,
+                Signal.sell(price.doubleValue(), tpHit ? "TP" : "SL")));
 
         log.info("[TRADE] EXIT SPOT SELL {} qty={} price={} tpHit={} slHit={} chatId={}",
                 symbol, entryQty, price, tpHit, slHit, chatId);
@@ -146,16 +182,39 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
     // helpers
     // =====================================================
 
-    /**
-     * Сумма входа в QUOTE.
-     * Источник денег:
-     * - если есть соединение с биржей -> используем free выбранного asset
-     * - если соединения нет -> используем maxExposureUsd как бюджет (из StrategySettings)
-     *
-     * Затем:
-     * - применяем ограничения maxExposureUsd / maxExposurePct
-     * - применяем риск riskPerTradePct
-     */
+    private void safeLive(Runnable r) {
+        try { r.run(); } catch (Exception ignored) {}
+    }
+
+    private static boolean isValidPct(BigDecimal pct) {
+        if (pct == null) return false;
+        if (pct.signum() <= 0) return false;
+        // в процентах: 0 < pct < 100
+        return pct.compareTo(BigDecimal.valueOf(100)) < 0;
+    }
+
+    private BigDecimal calcTp(BigDecimal entryPrice, BigDecimal tpPct) {
+        BigDecimal k = tpPct.divide(BigDecimal.valueOf(100), 12, RoundingMode.HALF_UP);
+        return entryPrice.multiply(BigDecimal.ONE.add(k)).setScale(PRICE_SCALE, RoundingMode.HALF_UP);
+    }
+
+    private BigDecimal calcSl(BigDecimal entryPrice, BigDecimal slPct) {
+        BigDecimal k = slPct.divide(BigDecimal.valueOf(100), 12, RoundingMode.HALF_UP);
+        return entryPrice.multiply(BigDecimal.ONE.subtract(k)).setScale(PRICE_SCALE, RoundingMode.HALF_UP);
+    }
+
+    private BigDecimal readBigDecimal(Object target, String getter) {
+        if (target == null || getter == null) return null;
+        try {
+            Method m = target.getClass().getMethod(getter);
+            Object v = m.invoke(target);
+            if (v instanceof BigDecimal bd) return bd;
+            return null;
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
     private BigDecimal resolveQuoteAmount(Long chatId, StrategyType strategyType, StrategySettings ss) {
 
         BigDecimal riskPct = ss.getRiskPerTradePct();
@@ -198,7 +257,6 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             return available.min(maxUsd);
         }
 
-        // ✅ FIX: maxExposurePct теперь BigDecimal (а не Integer)
         BigDecimal pct = ss.getMaxExposurePct();
         if (pct != null && pct.signum() > 0 && pct.compareTo(BigDecimal.valueOf(100)) <= 0) {
             BigDecimal byPct = available
