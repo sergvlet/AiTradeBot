@@ -1,0 +1,211 @@
+/* ========================================================================
+   STRATEGY SETTINGS — SAFE UI (BOOTSTRAP SAFE)
+   ======================================================================== */
+
+/* ========================================================================
+   🌙 DARK THEME
+   ======================================================================== */
+
+body[data-theme="dark"] .strategy-settings-page {
+    background: #0b0d10;
+    color: #e5e7eb;
+}
+
+body[data-theme="dark"] .strategy-settings-page .card,
+body[data-theme="dark"] .strategy-settings-page .card-theme {
+    background: #15171a;
+    border: 1px solid rgba(148,163,184,0.25);
+    border-radius: 14px;
+    padding: 20px;
+}
+
+/* tabs */
+body[data-theme="dark"] .strategy-settings-page .nav-tabs {
+    border-bottom: 1px solid rgba(148,163,184,0.25);
+}
+
+body[data-theme="dark"] .strategy-settings-page .nav-tabs .nav-link {
+    color: #9ca3af;
+}
+
+body[data-theme="dark"] .strategy-settings-page .nav-tabs .nav-link.active {
+    color: #38bdf8;
+    border-bottom: 2px solid #38bdf8;
+    background: transparent;
+}
+
+/* tab content fix */
+.strategy-settings-page .tab-pane {
+    display: none;
+}
+.strategy-settings-page .tab-pane.active {
+    display: block;
+}
+
+/* inputs */
+body[data-theme="dark"] .strategy-settings-page input,
+body[data-theme="dark"] .strategy-settings-page select,
+body[data-theme="dark"] .strategy-settings-page textarea {
+    background-color: #0e0f11;
+    color: #e5e7eb;
+    border: 1px solid #2a2e35;
+}
+
+body[data-theme="dark"] .strategy-settings-page input::placeholder {
+    color: #9ca3af;
+}
+
+/* disabled */
+body[data-theme="dark"] .strategy-settings-page input:disabled,
+body[data-theme="dark"] .strategy-settings-page select:disabled,
+body[data-theme="dark"] .strategy-settings-page input[readonly] {
+    background-color: #15171a !important;
+    color: #9ca3af !important;
+}
+
+/* alerts */
+body[data-theme="dark"] .strategy-settings-page .alert {
+    background: #15171a;
+    border: 1px solid #2a2e35;
+    color: #e5e7eb;
+}
+
+/* hr */
+body[data-theme="dark"] .strategy-settings-page hr {
+    border-color: #2a2e35;
+}
+
+/* ========================================================================
+   🔥 SYMBOL PICKER — DARK
+   ======================================================================== */
+
+body[data-theme="dark"] .strategy-settings-page .strategy-input {
+    background-color: #0e0f11 !important;
+    color: #e5e7eb !important;
+    border: 1px solid #2a2e35 !important;
+}
+
+body[data-theme="dark"] .strategy-settings-page .strategy-input.dropdown-toggle::after {
+    filter: invert(1);
+}
+
+body[data-theme="dark"] .strategy-settings-page .strategy-dropdown {
+    background-color: #15171a;
+    border: 1px solid #2a2e35;
+}
+
+body[data-theme="dark"] .strategy-settings-page .strategy-dropdown .dropdown-item {
+    color: #e5e7eb;
+}
+
+body[data-theme="dark"] .strategy-settings-page .strategy-dropdown .dropdown-item:hover {
+    background-color: #1e2228;
+    color: #ffffff;
+}
+
+body[data-theme="dark"] .strategy-settings-page .strategy-dropdown .text-muted {
+    color: #9ca3af !important;
+}
+
+/* ========================================================================
+   ☀️ LIGHT THEME — ИСПРАВЛЕНО
+   ======================================================================== */
+
+body[data-theme="light"] .strategy-settings-page {
+    background: #f8fafc;
+    color: #111827;
+}
+
+body[data-theme="light"] .strategy-settings-page .card,
+body[data-theme="light"] .strategy-settings-page .card-theme {
+    background: #ffffff;
+    border: 1px solid #e5e7eb;
+    border-radius: 14px;
+    padding: 20px;
+}
+
+/* tabs */
+body[data-theme="light"] .strategy-settings-page .nav-tabs {
+    border-bottom: 1px solid #e5e7eb;
+}
+
+body[data-theme="light"] .strategy-settings-page .nav-tabs .nav-link {
+    color: #6b7280;
+}
+
+body[data-theme="light"] .strategy-settings-page .nav-tabs .nav-link.active {
+    color: #2563eb;
+    border-bottom: 2px solid #2563eb;
+    background: transparent;
+}
+
+/* inputs */
+body[data-theme="light"] .strategy-settings-page input,
+body[data-theme="light"] .strategy-settings-page select,
+body[data-theme="light"] .strategy-settings-page textarea {
+    background-color: #ffffff;
+    color: #111827;
+    border: 1px solid #d1d5db;
+}
+
+body[data-theme="light"] .strategy-settings-page input::placeholder {
+    color: #9ca3af;
+}
+
+/* disabled */
+body[data-theme="light"] .strategy-settings-page input:disabled,
+body[data-theme="light"] .strategy-settings-page select:disabled,
+body[data-theme="light"] .strategy-settings-page input[readonly] {
+    background-color: #f3f4f6 !important;
+    color: #9ca3af !important;
+}
+
+/* alerts */
+body[data-theme="light"] .strategy-settings-page .alert {
+    background: #f9fafb;
+    border: 1px solid #e5e7eb;
+    color: #111827;
+}
+
+/* hr */
+body[data-theme="light"] .strategy-settings-page hr {
+    border-color: #e5e7eb;
+}
+
+/* ========================================================================
+   🔥 SYMBOL PICKER — LIGHT
+   ======================================================================== */
+
+body[data-theme="light"] .strategy-settings-page .strategy-input {
+    background-color: #ffffff !important;
+    color: #111827 !important;
+    border: 1px solid #d1d5db !important;
+}
+
+body[data-theme="light"] .strategy-settings-page .strategy-input.dropdown-toggle::after {
+    filter: none;
+}
+
+body[data-theme="light"] .strategy-settings-page .strategy-dropdown {
+    background-color: #ffffff;
+    border: 1px solid #d1d5db;
+}
+
+body[data-theme="light"] .strategy-settings-page .strategy-dropdown .dropdown-item {
+    color: #111827;
+}
+
+body[data-theme="light"] .strategy-settings-page .strategy-dropdown .dropdown-item:hover {
+    background-color: #f3f4f6;
+    color: #000000;
+}
+
+body[data-theme="light"] .strategy-settings-page .strategy-dropdown .text-muted {
+    color: #6b7280 !important;
+}
+
+/* active mode */
+.strategy-settings-page [data-symbol-mode].active {
+    background-color: #2563eb;
+    color: #ffffff;
+}

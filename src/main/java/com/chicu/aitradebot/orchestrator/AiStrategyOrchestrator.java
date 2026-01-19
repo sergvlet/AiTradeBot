@@ -1,24 +1,26 @@
 package com.chicu.aitradebot.orchestrator;
 
+import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
-import com.chicu.aitradebot.engine.StrategyEngine;
 import com.chicu.aitradebot.exchange.model.Order;
 import com.chicu.aitradebot.market.stream.StreamConnectionManager;
 import com.chicu.aitradebot.orchestrator.dto.StrategyRunInfo;
 import com.chicu.aitradebot.service.OrderService;
 import com.chicu.aitradebot.service.StrategySettingsService;
+import com.chicu.aitradebot.strategy.core.TradingStrategy;
+import com.chicu.aitradebot.strategy.registry.StrategyRegistry;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
+import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.LocalDateTime;
-import java.util.ArrayList;
+import java.time.ZoneId;
 import java.util.List;
-import java.util.Set;
 
 @Slf4j
 @Component
@@ -26,120 +28,206 @@ import java.util.Set;
 public class AiStrategyOrchestrator {
 
     private final OrderService orderService;
-    private final StrategyEngine strategyEngine;
     private final StrategySettingsService settingsService;
     private final StreamConnectionManager streamManager;
+    private final StrategyRegistry strategyRegistry;
 
     @PostConstruct
     public void init() {
-        log.info("🧠 AiStrategyOrchestrator v4.5 initialized (dynamic WS subscription, multi-exchange).");
+        log.info("🧠 AiStrategyOrchestrator v4 initialized");
     }
 
     // =====================================================================
-    // ▶️ START STRATEGY
+    // ▶️ START (КОНТЕКСТНЫЙ)
     // =====================================================================
+    public StrategyRunInfo startStrategy(
+            Long chatId,
+            StrategyType type,
+            String exchange,
+            NetworkType network
+    ) {
+        StrategySettings s = loadSettingsStrict(chatId, type, exchange, network);
 
-    public StrategyRunInfo startStrategy(Long chatId, StrategyType type) {
-        StrategySettings s = settingsService.getOrCreate(chatId, type);
-
-        String symbol   = s.getSymbol();
-        String exchange = s.getExchangeName();
-        String timeframe = s.getTimeframe();
-        int tick = resolveTickIntervalSec(type);
-
-        if (symbol == null || symbol.isBlank()) {
-            log.error("❌ Нельзя запустить стратегию без символа! chatId={} type={}", chatId, type);
+        if (s.getSymbol() == null || s.getSymbol().isBlank()) {
             return buildRunInfo(s, false, "Ошибка: не выбран символ");
         }
 
-        // 🔥 Подписываем только нужную биржу
-        streamManager.subscribeSymbol(symbol, exchange);
-
-        strategyEngine.start(chatId, type, symbol, tick);
-
-        s.setActive(true);
-        s.setUpdatedAt(LocalDateTime.now());
-        settingsService.save(s);
-
-        log.info("▶️ START {} | chatId={} exchange={} symbol={} tf={} tick={}s",
-                type, chatId, exchange, symbol, timeframe, tick);
-
-        return buildRunInfo(s, true, "Стратегия запущена");
-    }
-
-    public StrategyRunInfo startStrategy(Long chatId,
-                                         StrategyType type,
-                                         String symbol,
-                                         int tick) {
-
-        StrategySettings s = settingsService.getOrCreate(chatId, type);
-        String exchange = s.getExchangeName();
-
-        if (symbol == null || symbol.isBlank()) {
-            log.error("❌ Пустой символ при ручном запуске!");
-            return buildRunInfo(s, false, "Ошибка: символ пустой");
+        TradingStrategy strategy = strategyRegistry.get(type);
+        if (strategy == null) {
+            return buildRunInfo(s, false, "Стратегия не найдена");
         }
 
-        streamManager.subscribeSymbol(symbol, exchange);
+        // ✅ подписка по символу на нужной бирже
+        streamManager.subscribeSymbol(exchange, s.getSymbol());
 
-        strategyEngine.start(chatId, type, symbol, tick);
+        try {
+            // ✅ ВАЖНО: передаём env (exchange/network), чтобы стратегия выбрала правильную запись
+            strategy.start(chatId, s.getSymbol(), s.getExchangeName(), s.getNetworkType());
+        } catch (Exception e) {
+            log.error("❌ startStrategy failed", e);
+            return buildRunInfo(s, false, "Ошибка запуска стратегии");
+        }
 
-        s.setSymbol(symbol);
+        // ✅ фиксируем реальный старт
         s.setActive(true);
-        s.setUpdatedAt(LocalDateTime.now());
+        s.setStartedAt(LocalDateTime.now());
+        s.setStoppedAt(null);
         settingsService.save(s);
 
-        log.info("▶️ START {} (manual) | chatId={} exchange={} symbol={} tick={}",
-                type, chatId, exchange, symbol, tick);
+        log.info("▶️ START {} chatId={} ex={} net={} symbol={}",
+                type, chatId, s.getExchangeName(), s.getNetworkType(), s.getSymbol());
 
         return buildRunInfo(s, true, "Стратегия запущена");
     }
 
     // =====================================================================
-    // ⏹ STOP STRATEGY
+    // ⏹ STOP (КОНТЕКСТНЫЙ)
     // =====================================================================
+    public StrategyRunInfo stopStrategy(
+            Long chatId,
+            StrategyType type,
+            String exchange,
+            NetworkType network
+    ) {
+        StrategySettings s = loadSettingsStrict(chatId, type, exchange, network);
+        TradingStrategy strategy = strategyRegistry.get(type);
 
-    public StrategyRunInfo stopStrategy(Long chatId, StrategyType type) {
-        strategyEngine.stop(chatId, type);
+        if (strategy != null) {
+            try {
+                // ✅ симметрично: останавливаем в контексте env
+                strategy.stop(chatId, s.getSymbol(), s.getExchangeName(), s.getNetworkType());
+            } catch (Exception e) {
+                log.error("❌ stopStrategy failed", e);
+            }
+        }
 
-        StrategySettings s = settingsService.getOrCreate(chatId, type);
+        // ✅ фиксируем реальную остановку
         s.setActive(false);
-        s.setUpdatedAt(LocalDateTime.now());
+        s.setStoppedAt(LocalDateTime.now());
         settingsService.save(s);
 
-        log.info("⏹ STOP {} | chatId={}", type, chatId);
+        log.info("⏹ STOP {} chatId={} ex={} net={} symbol={}",
+                type, chatId, s.getExchangeName(), s.getNetworkType(), s.getSymbol());
 
         return buildRunInfo(s, false, "Стратегия остановлена");
     }
 
     // =====================================================================
-    // ❓ STATUS
+    // ℹ STATUS (КОНТЕКСТНЫЙ)
     // =====================================================================
+    public StrategyRunInfo getStatus(
+            Long chatId,
+            StrategyType type,
+            String exchange,
+            NetworkType network
+    ) {
+        StrategySettings s = loadSettingsStrict(chatId, type, exchange, network);
 
-    public boolean isActive(Long chatId, StrategyType type) {
-        return strategyEngine.isRunning(chatId, type);
-    }
+        TradingStrategy strategy = strategyRegistry.get(type);
 
-    // =====================================================================
-    // 📋 STRATEGY LIST (UI)
-    // =====================================================================
+        // ✅ runtime-статус
+        boolean runtimeActive = strategy != null && strategy.isActive(chatId);
 
-    public record StrategyInfo(StrategyType type, boolean active) {}
-
-    public List<StrategyInfo> getStrategies(Long chatId) {
-        Set<StrategyType> running = strategyEngine.getRunningStrategies(chatId);
-
-        List<StrategyInfo> list = new ArrayList<>();
-        for (StrategyType t : StrategyType.values()) {
-            list.add(new StrategyInfo(t, running.contains(t)));
+        // ✅ самовосстановление рассинхрона после рестарта
+        if (s.isActive() != runtimeActive) {
+            s.setActive(runtimeActive);
+            if (!runtimeActive && s.getStoppedAt() == null) {
+                s.setStoppedAt(LocalDateTime.now());
+            }
+            settingsService.save(s);
         }
-        return list;
+
+        return buildRunInfo(
+                s,
+                runtimeActive,
+                runtimeActive ? "Стратегия запущена" : "Стратегия остановлена"
+        );
     }
 
     // =====================================================================
-    // 💰 ORDER MANAGEMENT
+    // 🌍 GLOBAL DASHBOARD
     // =====================================================================
+    public record GlobalState(
+            BigDecimal totalBalance,
+            BigDecimal totalProfitPct,
+            int activeStrategies
+    ) {}
 
+    public GlobalState getGlobalState(Long chatId) {
+        int active = 0;
+
+        for (StrategyType t : StrategyType.values()) {
+
+            if (isActiveSafe(chatId, t, "BINANCE", NetworkType.MAINNET)) active++;
+            if (isActiveSafe(chatId, t, "BINANCE", NetworkType.TESTNET)) active++;
+
+            if (isActiveSafe(chatId, t, "BYBIT", NetworkType.MAINNET)) active++;
+            if (isActiveSafe(chatId, t, "BYBIT", NetworkType.TESTNET)) active++;
+
+            if (isActiveSafe(chatId, t, "OKX", NetworkType.MAINNET)) active++;
+            if (isActiveSafe(chatId, t, "OKX", NetworkType.TESTNET)) active++;
+        }
+
+        return new GlobalState(BigDecimal.ZERO, BigDecimal.ZERO, active);
+    }
+
+    private boolean isActiveSafe(Long chatId, StrategyType type, String exchange, NetworkType network) {
+        try {
+            StrategySettings s = settingsService.getSettings(chatId, type, exchange, network);
+            return s != null && s.isActive();
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    // =====================================================================
+    // 🔑 STRICT LOAD
+    // =====================================================================
+    private StrategySettings loadSettingsStrict(
+            Long chatId,
+            StrategyType type,
+            String exchange,
+            NetworkType network
+    ) {
+        return settingsService.getOrCreate(chatId, type, exchange, network);
+    }
+
+    // =====================================================================
+    // 🧱 RUN INFO (DTO)
+    // =====================================================================
+    private StrategyRunInfo buildRunInfo(StrategySettings s, boolean active, String msg) {
+
+        return StrategyRunInfo.builder()
+                .chatId(s.getChatId())
+                .type(s.getType())
+                .symbol(s.getSymbol())
+                .active(active)
+
+                .timeframe(s.getTimeframe())
+                .exchangeName(s.getExchangeName())
+                .networkType(s.getNetworkType())
+
+                .riskPerTradePct(s.getRiskPerTradePct())
+                .reinvestProfit(s.getReinvestProfit())
+                .version(s.getVersion())
+
+                .startedAt(toInstant(s.getStartedAt()))
+                .stoppedAt(toInstant(s.getStoppedAt()))
+                .updatedAt(Instant.now())
+
+                .message(msg)
+                .build();
+    }
+
+    private Instant toInstant(LocalDateTime time) {
+        return time != null
+                ? time.atZone(ZoneId.systemDefault()).toInstant()
+                : null;
+    }
+
+    // =====================================================================
+    // 💰 ORDER API
+    // =====================================================================
     public record OrderResult(boolean success, String message, Long orderId) {}
 
     public record OrderView(
@@ -153,45 +241,26 @@ public class AiStrategyOrchestrator {
             Long timestamp
     ) {}
 
-    public List<OrderView> listOrders(Long chatId, String symbol) {
-        try {
-            List<Order> orders = orderService.getOrdersByChatIdAndSymbol(chatId, symbol);
-
-            return orders.stream()
-                    .map(o -> new OrderView(
-                            o.getId(),
-                            o.getSymbol(),
-                            o.getSide(),
-                            o.getStatus(),
-                            o.getPrice(),
-                            o.getQuantity(),
-                            o.isFilled(),
-                            o.getTimestamp()
-                    ))
-                    .toList();
-
-        } catch (Exception e) {
-            log.error("❌ listOrders error: {}", e.getMessage(), e);
-            return List.of();
-        }
-    }
-
     public OrderResult marketBuy(Long chatId, String symbol, BigDecimal qty) {
         try {
-            var order = orderService.placeMarket(chatId, symbol, "BUY", qty, BigDecimal.ZERO, "ORCHESTRATOR");
+            Order order = orderService.placeMarket(
+                    chatId, symbol, "BUY", qty, BigDecimal.ZERO, "WEB_UI"
+            );
             return new OrderResult(true, "BUY OK", order.getId());
         } catch (Exception e) {
-            log.error("❌ marketBuy error: {}", e.getMessage(), e);
+            log.error("❌ marketBuy error", e);
             return new OrderResult(false, e.getMessage(), null);
         }
     }
 
     public OrderResult marketSell(Long chatId, String symbol, BigDecimal qty) {
         try {
-            var order = orderService.placeMarket(chatId, symbol, "SELL", qty, BigDecimal.ZERO, "ORCHESTRATOR");
+            Order order = orderService.placeMarket(
+                    chatId, symbol, "SELL", qty, BigDecimal.ZERO, "WEB_UI"
+            );
             return new OrderResult(true, "SELL OK", order.getId());
         } catch (Exception e) {
-            log.error("❌ marketSell error: {}", e.getMessage(), e);
+            log.error("❌ marketSell error", e);
             return new OrderResult(false, e.getMessage(), null);
         }
     }
@@ -200,86 +269,90 @@ public class AiStrategyOrchestrator {
         try {
             return orderService.cancelOrder(chatId, orderId);
         } catch (Exception e) {
-            log.error("❌ cancelOrder error: {}", e.getMessage(), e);
+            log.error("❌ cancelOrder error", e);
             return false;
         }
     }
 
-    // =====================================================================
-    // GLOBAL
-    // =====================================================================
-
-    public record GlobalState(BigDecimal totalBalance, BigDecimal totalProfitPct, int activeStrategies) {}
-
-    public GlobalState getGlobalState(Long chatId) {
-        int active = strategyEngine.getRunningStrategies(chatId).size();
-        return new GlobalState(BigDecimal.ZERO, BigDecimal.ZERO, active);
+    public List<OrderView> listOrders(Long chatId, String symbol) {
+        try {
+            return orderService.getOrdersByChatIdAndSymbol(chatId, symbol)
+                    .stream()
+                    .map(o -> new OrderView(
+                            o.getId(),
+                            o.getSymbol(),
+                            o.getSide(),
+                            o.getStatus(),
+                            o.getPrice(),
+                            o.getQuantity(),
+                            o.isFilled(),
+                            extractOrderTimestamp(o)
+                    ))
+                    .toList();
+        } catch (Exception e) {
+            log.error("❌ listOrders error", e);
+            return List.of();
+        }
     }
 
-    // =====================================================================
-    // BALANCE (заглушка пока)
-    // =====================================================================
+    private Long extractOrderTimestamp(Order o) {
+        if (o == null) return null;
 
-    public record BalanceView(BigDecimal total, BigDecimal free, BigDecimal locked) {}
+        Long ms = tryLong(o, "getTimestampMs")
+                .or(() -> tryLong(o, "getTimeMs"))
+                .or(() -> tryLong(o, "getTs"))
+                .or(() -> tryLong(o, "getTime"))
+                .orElse(null);
+        if (ms != null && ms > 0) return ms;
 
-    public BalanceView getBalance(Long chatId) {
-        return new BalanceView(BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO);
+        Instant inst = tryInstant(o, "getCreatedAt")
+                .or(() -> tryInstant(o, "getUpdatedAt"))
+                .or(() -> tryInstant(o, "getExecutedAt"))
+                .orElse(null);
+        if (inst != null) return inst.toEpochMilli();
+
+        LocalDateTime ldt = tryLocalDateTime(o, "getCreatedAt")
+                .or(() -> tryLocalDateTime(o, "getUpdatedAt"))
+                .orElse(null);
+        if (ldt != null) return ldt.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
+
+        return null;
     }
 
-    public record AssetBalanceView(String asset, BigDecimal free, BigDecimal locked) {}
-
-    public List<AssetBalanceView> getAssets(Long chatId) {
-        return List.of(
-                new AssetBalanceView("USDT", BigDecimal.ZERO, BigDecimal.ZERO),
-                new AssetBalanceView("BTC", BigDecimal.ZERO, BigDecimal.ZERO)
-        );
+    private java.util.Optional<Long> tryLong(Object target, String method) {
+        try {
+            Method m = target.getClass().getMethod(method);
+            Object v = m.invoke(target);
+            if (v == null) return java.util.Optional.empty();
+            if (v instanceof Long l) return java.util.Optional.of(l);
+            if (v instanceof Integer i) return java.util.Optional.of(i.longValue());
+            if (v instanceof BigDecimal bd) return java.util.Optional.of(bd.longValue());
+            if (v instanceof String s) return java.util.Optional.of(Long.parseLong(s.trim()));
+            return java.util.Optional.empty();
+        } catch (Exception ignored) {
+            return java.util.Optional.empty();
+        }
     }
 
-    // =====================================================================
-    // 🚀 BUILD StrategyRunInfo
-    // =====================================================================
-
-    private StrategyRunInfo buildRunInfo(StrategySettings s, boolean active, String msg) {
-
-        return StrategyRunInfo.builder()
-                .chatId(s.getChatId())
-                .type(s.getType())
-                .symbol(s.getSymbol())
-                .active(active)
-
-                .timeframe(s.getTimeframe())
-                .exchangeName(s.getExchangeName())
-                .networkType(s.getNetworkType())
-
-                .capitalUsd(s.getCapitalUsd())
-                .equityUsd(s.getCapitalUsd())
-                .totalProfitPct(s.getTotalProfitPct())
-                .commissionPct(s.getCommissionPct())
-                .takeProfitPct(s.getTakeProfitPct())
-                .stopLossPct(s.getStopLossPct())
-                .riskPerTradePct(s.getRiskPerTradePct())
-                .mlConfidence(s.getMlConfidence())
-                .reinvestProfit(s.isReinvestProfit())
-
-                .totalTrades(0L)
-                .startedAt(active ? Instant.now() : null)
-                .stoppedAt(active ? null : Instant.now())
-                .message(msg)
-                .build();
+    private java.util.Optional<Instant> tryInstant(Object target, String method) {
+        try {
+            Method m = target.getClass().getMethod(method);
+            Object v = m.invoke(target);
+            if (v instanceof Instant inst) return java.util.Optional.of(inst);
+            return java.util.Optional.empty();
+        } catch (Exception ignored) {
+            return java.util.Optional.empty();
+        }
     }
 
-    // =====================================================================
-    // HELPERS
-    // =====================================================================
-
-    private int resolveTickIntervalSec(StrategyType type) {
-        return switch (type) {
-            case SMART_FUSION -> 10;
-            case SCALPING -> 3;
-            case FIBONACCI_GRID -> 15;
-            case RSI_EMA -> 5;
-            case ML_INVEST -> 30;
-            default -> 10;
-        };
+    private java.util.Optional<LocalDateTime> tryLocalDateTime(Object target, String method) {
+        try {
+            Method m = target.getClass().getMethod(method);
+            Object v = m.invoke(target);
+            if (v instanceof LocalDateTime ldt) return java.util.Optional.of(ldt);
+            return java.util.Optional.empty();
+        } catch (Exception ignored) {
+            return java.util.Optional.empty();
+        }
     }
 }

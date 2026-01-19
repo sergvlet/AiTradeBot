@@ -1,72 +1,122 @@
 package com.chicu.aitradebot.market;
 
-import com.chicu.aitradebot.strategy.core.CandleProvider;
+import com.chicu.aitradebot.market.model.Candle;
 
-import java.time.Instant;
-import java.util.*;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 
-/**
- * ⏱️ Агрегатор тиков в свечи (для субминутных таймфреймов).
- */
-public class CandleResampler {
+public final class CandleResampler {
 
-    public interface Tick {
-        Instant ts();
-        double price();
-        double qty();
-    }
+    private CandleResampler() {}
 
-    public static List<CandleProvider.Candle> fromTicks(List<? extends Tick> ticks,
-                                                        int stepSeconds,
-                                                        int limit) {
-        if (ticks == null || ticks.isEmpty()) return List.of();
+    // =====================================================
+    // PUBLIC API
+    // =====================================================
 
-        ticks.sort(Comparator.comparing(Tick::ts));
+    /**
+     * Ресемплинг свечей в более крупный таймфрейм.
 
-        Map<Long, Bucket> buckets = new LinkedHashMap<>();
+     * ⏱ ВХОД:
+     *  - source.time = epoch millis
+     *  - source отсортирован ИЛИ будет отсортирован
 
-        for (var t : ticks) {
-            long bucketSec = (t.ts().getEpochSecond() / stepSeconds) * stepSeconds;
-            Bucket b = buckets.computeIfAbsent(bucketSec, Bucket::new);
-            b.add(t.price(), t.qty());
+     * ⏱ ВЫХОД:
+     *  - Candle.time = начало бакета (epoch millis)
+     *  - последняя свеча МОЖЕТ быть НЕЗАКРЫТОЙ
+     */
+    public static List<Candle> resample(
+            List<Candle> source,
+            String targetTf
+    ) {
+
+        if (source == null || source.isEmpty()) {
+            return List.of();
         }
 
-        List<CandleProvider.Candle> out = new ArrayList<>(buckets.size());
-        for (Bucket b : buckets.values()) out.add(b.toCandle());
+        String tf = normalizeTf(targetTf);
+        long tfMillis = timeframeToMillis(tf);
 
-        int from = Math.max(0, out.size() - limit);
-        return out.subList(from, out.size());
-    }
-
-    private static class Bucket {
-        final long second;
-        double open, high, low, close, volume;
-        boolean first = true;
-
-        Bucket(long second) {
-            this.second = second;
+        if (tfMillis <= 0) {
+            throw new IllegalArgumentException("Unsupported timeframe: " + targetTf);
         }
 
-        void add(double price, double qty) {
-            if (first) {
-                open = high = low = close = price;
-                first = false;
+        // 🔒 страховка: сортируем по времени
+        List<Candle> input = source.stream()
+                .sorted(Comparator.comparingLong(Candle::getTime))
+                .toList();
+
+        List<Candle> out = new ArrayList<>();
+
+        Candle current = null;
+        long bucketStart = -1;
+
+        for (Candle c : input) {
+
+            long ts = c.getTime();
+            long bucket = (ts / tfMillis) * tfMillis;
+
+            if (current == null || bucket != bucketStart) {
+
+                // закрываем предыдущую свечу
+                if (current != null) {
+                    current.setClosed(true);
+                    out.add(current);
+                }
+
+                bucketStart = bucket;
+
+                current = new Candle(
+                        bucket,
+                        c.getOpen(),
+                        c.getHigh(),
+                        c.getLow(),
+                        c.getClose(),
+                        c.getVolume(),
+                        false // ❗ новая свеча ВСЕГДА начинается как незакрытая
+                );
+
+            } else {
+                // обновление текущей свечи
+                current.setHigh(Math.max(current.getHigh(), c.getHigh()));
+                current.setLow(Math.min(current.getLow(), c.getLow()));
+                current.setClose(c.getClose());
+                current.setVolume(current.getVolume() + c.getVolume());
             }
-            high = Math.max(high, price);
-            low = Math.min(low, price);
-            close = price;
-            volume += qty;
         }
 
-        CandleProvider.Candle toCandle() {
-            return new CandleProvider.Candle(
-                    second * 1000L,  // 🔥 теперь строго long millis
-                    open,
-                    high,
-                    low,
-                    close,
-                    volume
-            );
+        // ❗ ВАЖНО:
+        // последнюю свечу НЕ закрываем принудительно
+        if (current != null) {
+            out.add(current);
         }
+
+        return out;
+    }
+
+    // =====================================================
+    // TIMEFRAME UTILS
+    // =====================================================
+
+    private static String normalizeTf(String tf) {
+        return tf == null ? null : tf.trim().toLowerCase();
+    }
+
+    private static long timeframeToMillis(String tf) {
+
+        if (tf == null) return -1;
+
+        return switch (tf) {
+            case "1m"  -> Duration.ofMinutes(1).toMillis();
+            case "3m"  -> Duration.ofMinutes(3).toMillis();
+            case "5m"  -> Duration.ofMinutes(5).toMillis();
+            case "15m" -> Duration.ofMinutes(15).toMillis();
+            case "30m" -> Duration.ofMinutes(30).toMillis();
+            case "1h"  -> Duration.ofHours(1).toMillis();
+            case "4h"  -> Duration.ofHours(4).toMillis();
+            case "1d"  -> Duration.ofDays(1).toMillis();
+            default -> -1;
+        };
     }
 }

@@ -1,5 +1,6 @@
 package com.chicu.aitradebot.service;
 
+import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.OrderEntity;
 import com.chicu.aitradebot.exchange.model.Order;
 
@@ -7,6 +8,40 @@ import java.math.BigDecimal;
 import java.util.List;
 
 public interface OrderService {
+
+    // =========================
+    // ✅ НОВОЕ: контекст ордера (для журнала/обучения)
+    // =========================
+    record OrderContext(
+            Long chatId,
+            StrategyType strategyType,
+            String symbol,
+            String timeframe,
+            String correlationId, // id intent-а (из TradeIntentJournalService)
+            String role           // ENTRY / TP / SL / EXIT / OCO / UNKNOWN
+    ) {}
+
+    // ✅ НОВОЕ: методы с контекстом (их будет звать SCALPING)
+    Order placeMarket(OrderContext ctx,
+                      String side,
+                      BigDecimal quantity,
+                      BigDecimal executionPrice);
+
+    Order placeLimit(OrderContext ctx,
+                     String side,
+                     BigDecimal quantity,
+                     BigDecimal limitPrice,
+                     String timeInForce);
+
+    Order placeOco(OrderContext ctx,
+                   BigDecimal quantity,
+                   BigDecimal takeProfitPrice,
+                   BigDecimal stopPrice,
+                   BigDecimal stopLimitPrice);
+
+    // =========================
+    // ⚠️ Старые методы (оставляем для совместимости)
+    // =========================
 
     // ====== MARKET ======
     Order placeMarket(Long chatId,
@@ -46,16 +81,8 @@ public interface OrderService {
     Order createOrder(Order order);
 
     // ====== ИСТОРИЯ ДЛЯ СТРАТЕГИЙ (DTO) ======
-    /**
-     * Старый метод: возвращает DTO-ордеры (exchange.model.Order),
-     * используется стратегиями / логикой торговли.
-     */
     List<Order> getOrdersByChatIdAndSymbol(long chatId, String symbol);
 
     // ====== ИСТОРИЯ ДЛЯ ДАШБОРДА / ГРАФИКА (ENTITY) ======
-    /**
-     * Новый метод: возвращает JPA-сущности OrderEntity
-     * для ULTRA-графика (PNL, TP/SL, причины входа/выхода, ML и т.д.)
-     */
     List<OrderEntity> getOrderEntitiesByChatIdAndSymbol(long chatId, String symbol);
 }

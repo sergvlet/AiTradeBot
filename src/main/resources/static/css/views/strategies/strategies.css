@@ -1,0 +1,5 @@
+/* strategies.css — заглушка чтобы убрать 500 и не ломать страницу */
+:root { color-scheme: dark; }
+
+body { background:#0e0f11; color:#e0e0e0; }
+.card, .card-theme { background:#16191d; border:1px solid rgba(255,255,255,0.06); border-radius:12px; }

@@ -1,11 +1,17 @@
 package com.chicu.aitradebot.strategy.scalping;
 
-import com.chicu.aitradebot.common.enums.NetworkType;
 import jakarta.persistence.*;
 import lombok.*;
 
+import java.time.Instant;
+
 @Entity
-@Table(name = "scalping_strategy_settings")
+@Table(
+        name = "scalping_strategy_settings",
+        indexes = {
+                @Index(name = "ix_scalping_settings_chat", columnList = "chat_id")
+        }
+)
 @Getter
 @Setter
 @NoArgsConstructor
@@ -15,34 +21,49 @@ public class ScalpingStrategySettings {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
-    private Long id;                 // ← обязательно нужно!
+    private Long id;
 
     @Column(nullable = false)
     private Long chatId;
 
-    private String symbol;
-    private String timeframe;
+    // =========================
+    // LOGIC PARAMS
+    // =========================
 
-    @Column(name = "candle_limit")
-    private int candleLimit;
+    @Builder.Default
+    @Column(nullable = false)
+    private Integer windowSize = 20;
 
-    private double priceChangeThreshold;
-    private double spreadThreshold;
-    private double orderVolume;
+    @Builder.Default
+    @Column(nullable = false)
+    private Double priceChangeThreshold = 0.3;
 
-    private int leverage;
+    @Builder.Default
+    @Column(nullable = false)
+    private Double spreadThreshold = 0.1;
 
-    private int windowSize;
+    // =========================
+    // AUDIT
+    // =========================
 
-    private int cachedCandlesLimit;
+    @Builder.Default
+    @Column(nullable = false, updatable = false)
+    private Instant createdAt = Instant.now();
 
-    private double takeProfitPct;
-    private double stopLossPct;
+    @Column(nullable = true)
+    private Instant updatedAt;
 
-    @Enumerated(EnumType.STRING)
-    private NetworkType networkType = NetworkType.TESTNET;
+    @PrePersist
+    public void prePersist() {
+        Instant now = Instant.now();
+        if (createdAt == null) createdAt = now;
 
-    private boolean active = false;
+        // ✅ чтобы не было null на свежесозданной записи
+        if (updatedAt == null) updatedAt = createdAt;
+    }
 
-    private java.time.Instant createdAt;
+    @PreUpdate
+    public void preUpdate() {
+        updatedAt = Instant.now();
+    }
 }

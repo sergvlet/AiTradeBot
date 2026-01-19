@@ -5,27 +5,41 @@ import com.chicu.aitradebot.strategy.core.TradingStrategy;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.config.BeanDefinition;
+import org.springframework.context.annotation.Role;
 import org.springframework.stereotype.Component;
 
-import java.util.*;
+import java.util.EnumMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
+/**
+ * Универсальный реестр стратегий (v4)
+ */
 @Slf4j
 @Component
+@Role(BeanDefinition.ROLE_INFRASTRUCTURE)
 public class StrategyRegistry {
 
-    // ========= СТАРЫЙ UI-ФУНКЦИОНАЛ (оставляем полностью) =========
+    // =====================================================================
+    // 1) UI-МЕТАДАННЫЕ (НЕ ТРОГАЕМ)
+    // =====================================================================
 
     @Data
     @AllArgsConstructor
     public static class FieldMeta {
-        private String name;   // имя свойства в StrategySettings
-        private String label;  // название для UI
-        private String type;   // text | number | checkbox
+        private String name;
+        private String label;
+        private String type;
     }
 
-    private final Map<StrategyType, List<FieldMeta>> fields = new HashMap<>();
+    private final Map<StrategyType, List<FieldMeta>> fields =
+            new EnumMap<>(StrategyType.class);
 
     public StrategyRegistry() {
+
         fields.put(StrategyType.SMART_FUSION, List.of(
                 new FieldMeta("emaPeriod", "EMA период", "number"),
                 new FieldMeta("atrPeriod", "ATR период", "number"),
@@ -47,30 +61,83 @@ public class StrategyRegistry {
                 new FieldMeta("stopLossPct", "SL (%)", "number")
         ));
 
-        fields.put(StrategyType.ML_INVEST, List.of(
-                new FieldMeta("confidenceThreshold", "Порог уверенности ML", "number"),
-                new FieldMeta("lookback", "Lookback", "number"),
-                new FieldMeta("modelName", "Название модели", "text")
-        ));
+
     }
 
     public List<FieldMeta> getFields(StrategyType type) {
         return fields.getOrDefault(type, List.of());
     }
 
-    // ========= НОВАЯ ЧАСТЬ — РЕЕСТР СТРАТЕГИЙ ДЛЯ ENGINE =========
+    // =====================================================================
+    // 2) JAVA-РЕЕСТР СТРАТЕГИЙ (ENGINE)
+    // =====================================================================
 
-    /** Реестр настоящих Java-объектов стратегий */
-    private final Map<StrategyType, TradingStrategy> strategies = new EnumMap<>(StrategyType.class);
+    /**
+     * Потокобезопасно + не зависит от того, когда/как регистрируются бины.
+     */
+    private final Map<StrategyType, TradingStrategy> strategies = new ConcurrentHashMap<>();
 
-    /** StrategyBindingProcessor вызывает это автоматически */
+    /**
+     * Вызывается StrategyBindingProcessor
+     */
     public void register(StrategyType type, TradingStrategy strategy) {
-        strategies.put(type, strategy);
-        log.info("📌 Strategy registered: {} → {}", type, strategy.getClass().getSimpleName());
+        if (type == null) throw new IllegalArgumentException("StrategyType is null");
+        if (strategy == null) throw new IllegalArgumentException("TradingStrategy is null for type=" + type);
+
+        TradingStrategy prev = strategies.put(type, strategy);
+
+        if (prev != null) {
+            log.warn(
+                    "⚠ Strategy overwritten: {} | {} → {}",
+                    type,
+                    prev.getClass().getSimpleName(),
+                    strategy.getClass().getSimpleName()
+            );
+        } else {
+            log.info(
+                    "📌 Strategy registered: {} → {}",
+                    type,
+                    strategy.getClass().getSimpleName()
+            );
+        }
     }
 
-    /** Получить стратегию по типу (для StrategyEngine) */
+    /**
+     * Основной метод (nullable, как у тебя)
+     */
     public TradingStrategy getStrategy(StrategyType type) {
-        return strategies.get(type);
+        if (type == null) return null;
+
+        TradingStrategy strategy = strategies.get(type);
+
+        if (strategy == null) {
+            log.error("❌ Strategy NOT FOUND for type={}. Registered={}", type, strategies.keySet());
+        }
+        return strategy;
+    }
+
+    /**
+     * Строгий вариант: если стратегии нет — кидаем понятную ошибку.
+     * Очень удобно, когда "должно быть всегда".
+     */
+    public TradingStrategy require(StrategyType type) {
+        TradingStrategy s = getStrategy(type);
+        if (s == null) {
+            throw new IllegalStateException(
+                    "Strategy NOT FOUND for type=" + type + ". Registered=" + strategies.keySet()
+            );
+        }
+        return s;
+    }
+
+    /**
+     * Алиас (используется в StrategyMarketBridge)
+     */
+    public TradingStrategy get(StrategyType type) {
+        return getStrategy(type);
+    }
+
+    public Set<StrategyType> getRegisteredTypes() {
+        return Set.copyOf(strategies.keySet());
     }
 }

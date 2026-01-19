@@ -15,12 +15,9 @@ public class HomeController {
 
     @GetMapping("/")
     public String dashboard(Model model) {
-        model.addAttribute("active", "dashboard");
-        model.addAttribute("chatId", 123456789L);
 
         DashboardStats stats = dashboardService.getDashboardStats();
         if (stats == null) {
-            // 👇 страховка от null
             stats = DashboardStats.builder()
                     .activeStrategies(0)
                     .totalStrategies(0)
@@ -30,7 +27,12 @@ public class HomeController {
                     .build();
         }
 
+        model.addAttribute("active", "dashboard");
+        model.addAttribute("page", "dashboard");      // <-- имя view
+        model.addAttribute("pageTitle", "Дашборд");
+        model.addAttribute("chatId", 123456789L);
         model.addAttribute("stats", stats);
-        return "home";
+
+        return "layout/app";
     }
 }

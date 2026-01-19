@@ -1,81 +1,125 @@
 package com.chicu.aitradebot.strategy.scalping;
 
+import com.chicu.aitradebot.common.enums.StrategyType;
+import com.chicu.aitradebot.ai.override.AiOverrideService;
+import com.chicu.aitradebot.strategy.core.SettingsSnapshot;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.time.Instant;
+import java.util.Map;
+
 @Slf4j
 @Service
 @RequiredArgsConstructor
-public class ScalpingStrategySettingsServiceImpl implements ScalpingStrategySettingsService {
+public class ScalpingStrategySettingsServiceImpl
+        implements ScalpingStrategySettingsService {
 
     private final ScalpingStrategySettingsRepository repo;
-
+    private final AiOverrideService aiOverrideService;
+    private final ObjectMapper mapper;
+    // =====================================================================
+    // 1) Получение или создание
+    // =====================================================================
     @Override
     public ScalpingStrategySettings getOrCreate(Long chatId) {
+
         return repo.findTopByChatIdOrderByIdDesc(chatId)
                 .orElseGet(() -> {
-
-                    // ⚠️ ВАЖНО: значения передаются ТОЛЬКО в реальные поля
                     ScalpingStrategySettings def = ScalpingStrategySettings.builder()
                             .chatId(chatId)
-                            .symbol("BTCUSDT")
-                            .timeframe("1m")
-                            .windowSize(20)
-                            .priceChangeThreshold(0.1)
-                            .spreadThreshold(0.05)
-                            .orderVolume(10.0)
-                            .takeProfitPct(0.5)
-                            .stopLossPct(0.3)
-                            .cachedCandlesLimit(150)
-                            .leverage(1)
                             .build();
 
-                    log.info("🆕 Созданы настройки Scalping (chatId={})", chatId);
+                    log.info("🆕 Созданы настройки SCALPING (chatId={})", chatId);
                     return repo.save(def);
                 });
     }
 
+    // =====================================================================
+    // 2) Сохранение
+    // =====================================================================
     @Override
     public ScalpingStrategySettings save(ScalpingStrategySettings settings) {
         return repo.save(settings);
     }
 
+    // =====================================================================
+    // 3) Частичное обновление (ТОЛЬКО SCALPING)
+    // =====================================================================
     @Override
-    public ScalpingStrategySettings update(Long chatId, ScalpingStrategySettings dto) {
+    public ScalpingStrategySettings update(Long chatId,
+                                           ScalpingStrategySettings incoming) {
+        ScalpingStrategySettings s = getOrCreate(chatId);
+
+        // windowSize
+        if (incoming.getWindowSize() != null && incoming.getWindowSize() > 0) {
+            s.setWindowSize(incoming.getWindowSize());
+        }
+
+        // priceChangeThreshold (%)
+        if (incoming.getPriceChangeThreshold() != null
+            && incoming.getPriceChangeThreshold() > 0) {
+            s.setPriceChangeThreshold(incoming.getPriceChangeThreshold());
+        }
+
+        // spreadThreshold (%)
+        if (incoming.getSpreadThreshold() != null
+            && incoming.getSpreadThreshold() > 0) {
+            s.setSpreadThreshold(incoming.getSpreadThreshold());
+        }
+
+        return repo.save(s);
+    }
+
+    // =====================================================================
+    // 4) Snapshot — КАНОНИЧЕСКИЙ ВАРИАНТ
+    // =====================================================================
+    @Override
+    public SettingsSnapshot getSnapshot(long chatId) {
 
         ScalpingStrategySettings s = getOrCreate(chatId);
 
-        if (dto.getSymbol() != null)
-            s.setSymbol(dto.getSymbol());
+        return SettingsSnapshot.builder()
+                .chatId(chatId)
+                // идентификация стратегии
+                .put("strategy", "SCALPING")
+                // параметры стратегии
+                .put("windowSize", s.getWindowSize())
+                .put("priceChangeThreshold", s.getPriceChangeThreshold())
+                .put("spreadThreshold", s.getSpreadThreshold())
+                .build();
+    }
 
-        if (dto.getTimeframe() != null)
-            s.setTimeframe(dto.getTimeframe());
+    @Override
+    public ScalpingStrategySettings getEffective(Long chatId) {
+        ScalpingStrategySettings base = getOrCreate(chatId);
 
-        if (dto.getWindowSize() > 0)
-            s.setWindowSize(dto.getWindowSize());
+        var patchOpt = aiOverrideService.getActivePatch(chatId, StrategyType.SCALPING, Instant.now());
+        if (patchOpt.isEmpty() || patchOpt.get().isEmpty()) {
+            return base;
+        }
 
-        if (dto.getCachedCandlesLimit() > 0)
-            s.setCachedCandlesLimit(dto.getCachedCandlesLimit());
+        Map<String, Object> patch = patchOpt.get();
 
-        if (dto.getPriceChangeThreshold() > 0)
-            s.setPriceChangeThreshold(dto.getPriceChangeThreshold());
+        // мета поля запрещаем патчить
+        patch.remove("id");
+        patch.remove("chatId");
+        patch.remove("createdAt");
+        patch.remove("updatedAt");
+        patch.remove("version");
 
-        if (dto.getSpreadThreshold() > 0)
-            s.setSpreadThreshold(dto.getSpreadThreshold());
+        // base -> map -> apply patch -> map -> settings
+        Map<String, Object> baseMap = mapper.convertValue(base, new com.fasterxml.jackson.core.type.TypeReference<>() {});
+        baseMap.putAll(patch);
 
-        if (dto.getOrderVolume() > 0)
-            s.setOrderVolume(dto.getOrderVolume());
+        ScalpingStrategySettings effective = mapper.convertValue(baseMap, ScalpingStrategySettings.class);
 
-        if (dto.getTakeProfitPct() > 0)
-            s.setTakeProfitPct(dto.getTakeProfitPct());
+        // гарантируем идентичность (чтобы нигде не “поплыло”)
+        effective.setId(base.getId());
+        effective.setChatId(base.getChatId());
 
-        if (dto.getStopLossPct() > 0)
-            s.setStopLossPct(dto.getStopLossPct());
-
-        if (dto.getLeverage() > 0)
-            s.setLeverage(dto.getLeverage());
-
-        return repo.save(s);
+        return effective;
     }
 }

@@ -1,0 +1,110 @@
+Чек-лист (актуально по логам 2026-01-04)
+Фаза 0 — Контракты и правила
+
+✅ Ключ стратегии в системе есть: chatId + StrategyType (в логах toggle/start/stop).
+
+✅ Биржа/сеть присутствуют и реально живые: BINANCE/BYBIT + MAINNET/TESTNET (регистрация клиентов в старте).
+
+✅ Оркестрация запуска/остановки есть: AiStrategyOrchestrator старт/стоп по логам.
+
+✅ WS/STOMP поднят: /ws/strategy, брокер /topic.
+
+⏳ Правило “стратегия читает настройки только через единый шлюз (EffectiveSettings)” — нет, сейчас читается из разных мест (факт: были проблемы с “не те/устаревшие” значения).
+
+⏳ Единый risk-stop слой (RiskEngine как общий “стоп-кран” перед ордером) — нет.
+
+Фаза 1 — Данные и журнал
+
+1.1 Trade/Signal Journal (intent/candidate)
+
+⏳ Единого журнала сигналов/интентов нет.
+
+⏳ Запись candidate до исполнения — нет.
+
+1.2 Источник истины по ограничениям/комиссиям
+
+✅ Exchange constraints частично есть (Binance rules/minNotional/NOTIONAL retry и т.п. — по твоему описанию и прошлым фиксам).
+
+✅ Бэктест умеет комиссию/лимиты через BacktestSettings (раньше фиксировали).
+
+⏳ Execution-journal (лог фактического исполнения + комиссия/фильтры) — нет.
+
+Фаза 2 — Три слоя настроек (Baseline/AiPolicy/AiOverride)
+
+✅ Baseline настройки стратегий в БД есть (StrategySettings + per-strategy settings).
+
+⏳ AiPolicy (DB) — нет.
+
+⏳ AiOverride (DB/runtime) — нет.
+
+⏳ AiRecommendation (HYBRID) — нет.
+
+Фаза 3 — EffectiveSettings как единственный вход
+
+⏳ EffectiveSettingsResolver (baseline → override → constraints → risk → effective) — нет.
+
+⏳ Запрет “прямого чтения настроек” — нет.
+
+Фаза 4 — RiskEngine
+
+⏳ RiskEngine (ALLOW/DENY/REDUCE/COOLDOWN) — нет.
+
+⏳ “обязательный вызов перед OrderService” — нет.
+
+Фаза 5 — MetaDecisionService (AI решение)
+
+⏳ Универсального сервиса решения (ALLOW/REJECT/ABSTAIN + confidence) — нет.
+
+⏳ Режимы SHADOW/FILTER/AUTO на уровне решения — нет.
+
+Фаза 6 — FeatureStore
+
+⏳ Единого FeatureStore/версий схемы/записи фич — нет.
+
+Фаза 7 — Training Orchestrator
+
+✅ AutoTunerOrchestrator поднимается (в логах: “тюнеров: 1”).
+
+⏳ Но полноценного TrainingOrchestrator (pipeline: dataset → train → validate → save model → publish champion) — нет.
+
+Фаза 8 — Inference hardening
+
+⏳ Таймауты/фолбэки/TTL-кеш решений AI — нет как отдельного слоя.
+
+Фаза 9 — UI / Telegram
+
+✅ Web UI живой: dashboard, chart controller, STOMP подписки работают.
+
+✅ Стратегия из UI запускается/останавливается (лог: TOGGLE → START/STOP).
+
+✅ Market stream реально подключается (лог: subscribeSymbol + Binance WS connected + KLINE/AGGTRADE open).
+
+✅ Мы исправили главную проблему графика: preload истории свечей (теперь не пусто).
+
+✅ Выявлено по логам:
+
+❌ GET /js/views/strategies.js -> 404 — это отдельная мелочь фронта, не критично для трейдинга.
+
+❌ Было: “нет включённых exchange settings” ломало preload — мы это уже обошли правкой в фасаде графика.
+
+⏳ AI mode (OFF/SHADOW/FILTER/AUTO) + сравнение baseline vs effective в UI — нет.
+
+Фаза 10 — Prod safety
+
+⏳ kill-switch/canary/auto-rollback — нет.
+
+Что “точно сделано” по твоим логам (ядро системы)
+
+✅ StrategyRegistry + StrategyEngineRegistry
+
+✅ AiStrategyOrchestrator
+
+✅ SchedulerServiceImpl
+
+✅ ExchangeClientFactory (BINANCE/BYBIT MAINNET/TESTNET)
+
+✅ AutoTunerOrchestrator (есть, но пока не встроен в торговый контур)
+
+✅ WebSocket STOMP /ws/strategy + /topic
+
+✅ Подписка на Binance market stream и реальные события onPriceUpdate в ScalpingStrategyV4

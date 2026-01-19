@@ -2,126 +2,143 @@ package com.chicu.aitradebot.exchange.client;
 
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.exchange.enums.OrderSide;
+import com.chicu.aitradebot.exchange.model.AccountFees;
 import com.chicu.aitradebot.exchange.model.AccountInfo;
 import com.chicu.aitradebot.exchange.model.Order;
+import com.chicu.aitradebot.market.model.SymbolDescriptor;
 
 import java.math.BigDecimal;
 import java.util.List;
 import java.util.Map;
 
 /**
- * 🌐 ExchangeClient — унифицированный интерфейс для всех бирж.
- *
- * 🧩 Реализуют:
- *   - BinanceExchangeClient
- *   - BybitExchangeClient
- *   - OkxExchangeClient
- *   - KucoinExchangeClient
- *
- * 🔹 Возможности:
- *   - Получение свечей (klines)
- *   - Получение текущей цены
- *   - Размещение ордеров (market / limit)
- *   - Получение балансов
- *   - Отмена ордеров
+ * 🌐 ExchangeClient — унифицированный, STATELESS интерфейс биржи.
+
+ * ❗ Клиент НЕ хранит network.
+ * ❗ Network ВСЕГДА передаётся явно.
+
+ * Реализации:
+ *  - BinanceExchangeClient
+ *  - BybitExchangeClient
+ *  - OkxExchangeClient
  */
 public interface ExchangeClient {
 
+    // =====================================================================
+    // META
+    // =====================================================================
+
     /**
-     * Возвращает имя биржи ("BINANCE", "BYBIT", ...).
+     * Имя биржи ("BINANCE", "BYBIT", ...).
      */
     String getExchangeName();
 
+    // =====================================================================
+    // MARKET DATA
+    // =====================================================================
+
     /**
-     * Возвращает тип сети (MAINNET / TESTNET).
-     * Может использоваться как "дефолтная" сеть, если не передана явно.
+     * Получение свечей (REST).
      */
-    NetworkType getNetworkType();
+    List<Kline> getKlines(
+            String symbol,
+            String interval,
+            int limit
+    ) throws Exception;
 
-    // ==================== 🔹 MARKET DATA ====================
+    // в ExchangeClient
+    default List<Kline> getKlines(
+            String symbol,
+            String interval,
+            long startTimeMs,
+            long endTimeMs,
+            int limit
+    ) throws Exception {
+        // fallback: старое поведение "последние limit"
+        return getKlines(symbol, interval, limit);
+    }
+
 
     /**
-     * Возвращает список свечей (klines) по символу.
-     *
-     * @param symbol    Торговая пара (BTCUSDT, ETHUSDT, ...).
-     * @param interval  Таймфрейм ("1m", "1h", "4h", "1d", ...).
-     * @param limit     Количество свечей.
-     */
-    List<Kline> getKlines(String symbol, String interval, int limit) throws Exception;
-
-    /**
-     * Возвращает последнюю рыночную цену символа.
+     * Последняя цена (REST).
      */
     double getPrice(String symbol) throws Exception;
 
-    // ==================== 🔹 ORDERS ====================
+    // =====================================================================
+    // ORDERS
+    // =====================================================================
 
     /**
-     * Размещает ордер (MARKET / LIMIT).
-     *
-     * @param chatId Пользователь (из БД).
-     * @param symbol Торговая пара.
-     * @param side   BUY / SELL.
-     * @param type   MARKET / LIMIT.
-     * @param qty    Количество.
-     * @param price  Цена (для LIMIT).
+     * Универсальный ордер.
      */
-    OrderResult placeOrder(Long chatId,
-                           String symbol,
-                           String side,
-                           String type,
-                           double qty,
-                           Double price) throws Exception;
+    OrderResult placeOrder(
+            Long chatId,
+            String symbol,
+            String side,
+            String type,
+            double qty,
+            Double price
+    ) throws Exception;
 
     /**
-     * Размещает MARKET ордер в унифицированной форме.
-     *
-     * @param symbol Торговая пара.
-     * @param side   BUY / SELL.
-     * @param qty    Количество.
+     * MARKET ордер.
      */
-    Order placeMarketOrder(String symbol, OrderSide side, BigDecimal qty) throws Exception;
+    Order placeMarketOrder(
+            String symbol,
+            OrderSide side,
+            BigDecimal qty
+    ) throws Exception;
 
     /**
-     * Отменяет активный ордер по ID.
+     * Отмена ордера.
      */
-    boolean cancelOrder(Long chatId, String symbol, String orderId) throws Exception;
+    boolean cancelOrder(
+            Long chatId,
+            String symbol,
+            String orderId
+    ) throws Exception;
 
-    // ==================== 🔹 BALANCE ====================
+    // =====================================================================
+    // BALANCE (❗ network всегда явный)
+    // =====================================================================
 
-    /**
-     * Возвращает баланс пользователя по конкретному активу
-     * в КОНКРЕТНОЙ сети.
-     */
-    Balance getBalance(Long chatId, String asset, NetworkType network) throws Exception;
+    Balance getBalance(
+            Long chatId,
+            String asset,
+            NetworkType network
+    ) throws Exception;
 
-    /**
-     * Возвращает все активные балансы пользователя
-     * (только активы с total > 0) в КОНКРЕТНОЙ сети.
-     */
-    Map<String, Balance> getFullBalance(Long chatId, NetworkType network) throws Exception;
+    Map<String, Balance> getFullBalance(
+            Long chatId,
+            NetworkType network
+    ) throws Exception;
 
-    /**
-     * Старый вариант без указания сети — оставляем как default
-     * для обратной совместимости. По умолчанию использует getNetworkType().
-     */
-    default Balance getBalance(Long chatId, String asset) throws Exception {
-        return getBalance(chatId, asset, getNetworkType());
+    // =====================================================================
+    // SYMBOLS / INFO
+    // =====================================================================
+
+    List<String> getAllSymbols();
+
+    default List<String> getAvailableTimeframes() {
+        return List.of("1m", "5m", "15m", "1h", "4h", "1d");
     }
 
-    /**
-     * Старый вариант без указания сети — оставляем как default.
-     */
-    default Map<String, Balance> getFullBalance(Long chatId) throws Exception {
-        return getFullBalance(chatId, getNetworkType());
-    }
+    AccountInfo getAccountInfo(
+            long chatId,
+            NetworkType network
+    );
 
-    // ==================== 🔹 DTO ====================
+    AccountFees getAccountFees(
+            long chatId,
+            NetworkType network
+    );
 
-    /**
-     * DTO свечи (kline).
-     * Используем double, чтобы было удобно кормить стратегии и графики.
-     */
+    List<SymbolDescriptor> getTradableSymbols(String quoteAsset);
+
+    // =====================================================================
+    // DTO
+    // =====================================================================
+
     record Kline(
             long openTime,
             double open,
@@ -129,12 +146,8 @@ public interface ExchangeClient {
             double low,
             double close,
             double volume
-    ) {
-    }
+    ) {}
 
-    /**
-     * DTO результата ордера.
-     */
     record OrderResult(
             String orderId,
             String symbol,
@@ -144,36 +157,11 @@ public interface ExchangeClient {
             double price,
             String status,
             long timestamp
-    ) {
-    }
+    ) {}
 
-    /**
-     * DTO баланса.
-     */
     record Balance(String asset, double free, double locked) {
         public double total() {
             return free + locked;
         }
     }
-
-    /**
-     * 📜 Получить список всех доступных торговых пар.
-     */
-    List<String> getAllSymbols();
-
-    /**
-     * Возвращает список поддерживаемых таймфреймов для этой биржи.
-     */
-    default List<String> getAvailableTimeframes() {
-        // По умолчанию — минимальный набор (для клиентов без реализации).
-        return List.of("1m", "5m", "15m", "1h", "4h", "1d");
-    }
-
-    /**
-     * Возвращает информацию об аккаунте:
-     * - VIP level
-     * - комиссии maker/taker
-     * - наличие BNB (для Binance)
-     */
-    AccountInfo getAccountInfo(long chatId, NetworkType network);
 }

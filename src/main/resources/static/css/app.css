@@ -1,0 +1,376 @@
+/* ========================================================================
+   AITRADEBOT UI V4 — ChatGPT-like Design System
+   ======================================================================== */
+
+
+/* =========================================================================
+   01. THEME TOKEN VARIABLES — DARK / LIGHT
+   =========================================================================*/
+
+/* 🌙 DARK THEME — базовая */
+body.app-body[data-theme="dark"] {
+    --bg-main: #0d0d0f;
+    --bg-elevated: rgba(255, 255, 255, 0.04);
+    --bg-elevated-soft: rgba(255, 255, 255, 0.06);
+
+    --text-main: #e8e9ec;
+    --text-muted: #9b9ca8;
+
+    --border-soft: rgba(255, 255, 255, 0.08);
+    --shadow-soft: 0 4px 20px rgba(0, 0, 0, 0.35);
+
+    --accent: #00c084;
+    --accent-soft: rgba(0, 192, 132, 0.15);
+
+    --sidebar-width: 280px;
+    --sidebar-width-collapsed: 80px;
+}
+
+
+/* ☀️ LIGHT THEME */
+body.app-body[data-theme="light"] {
+    --bg-main: #ffffff;
+    --bg-elevated: #f9f9fb;
+    --bg-elevated-soft: #f2f2f5;
+
+    --text-main: #1b1c1e;
+    --text-muted: #6d6e75;
+
+    --border-soft: rgba(0, 0, 0, 0.08);
+    --shadow-soft: 0 4px 12px rgba(0, 0, 0, 0.1);
+
+    --accent: #0e8f68;
+    --accent-soft: rgba(14, 143, 104, 0.12);
+
+    --sidebar-width: 280px;
+    --sidebar-width-collapsed: 80px;
+}
+
+
+/* =========================================================================
+   02. GLOBAL BODY STYLING
+   ========================================================================= */
+
+body.app-body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg-main);
+    color: var(--text-main);
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro", sans-serif;
+
+    transition:
+            background 0.25s ease,
+            color 0.25s ease,
+            border-color 0.25s ease;
+}
+
+/* Глобальная перекраска текста */
+.app-body,
+.app-body h1,
+.app-body h2,
+.app-body h3,
+.app-body h4,
+.app-body h5,
+.app-body h6,
+.app-body p,
+.app-body span,
+.app-body div,
+.app-body small,
+.app-body strong,
+.app-body b {
+    color: var(--text-main) !important;
+}
+
+.text-muted {
+    color: var(--text-muted) !important;
+}
+
+
+/* =========================================================================
+   03. MAIN LAYOUT STRUCTURE
+   ========================================================================= */
+
+.page-wrapper {
+    display: flex;
+    min-height: 100vh;
+    overflow: hidden;
+}
+
+.main-column {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-main);
+}
+
+.content {
+    flex: 1;
+}
+
+
+/* =========================================================================
+   04. SIDEBAR PANEL
+   ========================================================================= */
+
+.sidebar-inner {
+    width: var(--sidebar-width);
+    background: var(--bg-elevated);
+    backdrop-filter: blur(14px);
+    border-right: 1px solid var(--border-soft);
+
+    padding: 16px;
+    z-index: 20;
+
+    transition:
+            width 0.2s ease,
+            transform 0.2s ease,
+            background 0.25s ease,
+            border-color 0.25s ease;
+}
+
+/* свернутое состояние */
+body.sidebar-collapsed .sidebar-inner {
+    width: var(--sidebar-width-collapsed);
+}
+
+body.sidebar-collapsed .sidebar-inner .logo-text,
+body.sidebar-collapsed .sidebar-inner .sidebar-nav .text,
+body.sidebar-collapsed .sidebar-inner .sidebar-footer .text {
+    display: none;
+}
+
+
+/* =========================================================================
+   05. TOPBAR PANEL
+   ========================================================================= */
+
+.topbar-inner {
+    height: 56px;
+    display: flex;
+    align-items: center;
+
+    background: var(--bg-elevated);
+    border-bottom: 1px solid var(--border-soft);
+    backdrop-filter: blur(10px);
+
+    padding-inline: 16px;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+
+    transition: background 0.25s ease;
+}
+
+
+/* =========================================================================
+   06. FOOTER
+   ========================================================================= */
+
+.footer-inner {
+    background: var(--bg-main);
+    border-top: 1px solid var(--border-soft);
+    padding: 8px 16px;
+
+    font-size: 13px;
+    color: var(--text-muted);
+}
+
+
+/* =========================================================================
+   07. SIDEBAR CONTENT (brand, nav, footer)
+   ========================================================================= */
+
+.sidebar-brand .logo-icon {
+    width: 32px;
+    height: 32px;
+    border-radius: 12px;
+
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+
+    color: var(--accent);
+    background: var(--accent-soft);
+    font-size: 18px;
+}
+
+.sidebar-brand .logo-text {
+    font-weight: 600;
+    letter-spacing: .03em;
+}
+
+.sidebar-collapse-btn {
+    width: 28px;
+    height: 28px;
+
+    border-radius: 999px;
+    border: 1px solid var(--border-soft);
+    background: transparent;
+    color: var(--text-muted);
+
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+
+    transition: color .2s, border-color .2s;
+}
+
+/* навигация */
+.sidebar-nav .nav-link {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+
+    padding: 10px 12px;
+    margin-bottom: 4px;
+
+    color: var(--text-muted);
+    border-radius: 12px;
+    text-decoration: none;
+
+    transition: background .2s ease, color .2s ease;
+}
+
+.sidebar-nav .nav-link:hover {
+    color: var(--text-main);
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.sidebar-nav .nav-link.active {
+    color: var(--accent);
+    background: var(--accent-soft);
+}
+
+
+/* =========================================================================
+   08. CARDS / STATISTICS BLOCKS
+   ========================================================================= */
+
+.card-theme {
+    background: var(--bg-elevated-soft);
+    border-radius: 14px;
+    border: 1px solid var(--border-soft);
+
+    padding: 16px;
+    box-shadow: var(--shadow-soft);
+
+    transition:
+            background .25s ease,
+            border-color .25s ease,
+            box-shadow .25s ease;
+}
+
+.stat-value {
+    font-size: 24px;
+    font-weight: 600;
+}
+
+
+/* =========================================================================
+   09. THEME SWITCH BUTTON
+   ========================================================================= */
+
+.theme-btn {
+    width: 32px;
+    height: 32px;
+
+    border-radius: 999px;
+    border: 1px solid var(--border-soft);
+    background: transparent;
+
+    display: inline-flex;
+    justify-content: center;
+    align-items: center;
+
+    color: var(--text-muted);
+    transition: all .25s ease;
+}
+
+.theme-btn:hover {
+    color: var(--text-main);
+    border-color: var(--text-main);
+    background: rgba(255, 255, 255, 0.03);
+}
+
+
+/* =========================================================================
+   10. MOBILE SIDEBAR (slide)
+   ========================================================================= */
+
+.sidebar-handle {
+    position: fixed;
+    left: 0;
+    top: 50%;
+    width: 12px;
+    height: 64px;
+
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 0 8px 8px 0;
+
+    transform: translateY(-50%);
+    display: none;
+
+    cursor: pointer;
+    z-index: 25;
+}
+
+.sidebar-overlay {
+    position: fixed;
+    inset: 0;
+
+    background: rgba(5, 5, 9, 0.7);
+    visibility: hidden;
+    opacity: 0;
+
+    transition: all .2s ease;
+    z-index: 15;
+}
+
+
+@media (max-width: 991.98px) {
+
+    .sidebar-inner {
+        position: fixed;
+        left: 0;
+        top: 0;
+        bottom: 0;
+
+        transform: translateX(-100%);
+    }
+
+    body.sidebar-open .sidebar-inner {
+        transform: translateX(0);
+    }
+
+    .sidebar-handle {
+        display: block;
+    }
+
+    body.sidebar-open .sidebar-overlay {
+        opacity: 1;
+        visibility: visible;
+    }
+}
+
+
+/* =========================================================================
+   11. LIGHT THEME EXTRA FIXES
+   ========================================================================= */
+
+body.app-body[data-theme="light"] .topbar-inner {
+    background: #ffffff;
+}
+
+body.app-body[data-theme="light"] .sidebar-inner {
+    background: #ffffff;
+}
+
+body.app-body[data-theme="light"] .card-theme {
+    background: #ffffff;
+    border-color: rgba(0, 0, 0, 0.06);
+}
+
+body.app-body[data-theme="light"] .footer-inner {
+    background: #ffffff;
+    border-top: 1px solid rgba(0, 0, 0, 0.06);
+}

@@ -1,9 +1,10 @@
 package com.chicu.aitradebot.web.dto;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.*;
 
 import java.util.List;
-import java.util.Map;
 
 @Getter
 @Setter
@@ -12,45 +13,65 @@ import java.util.Map;
 @AllArgsConstructor
 public class StrategyChartDto {
 
-    private String symbol;
-    private String timeframe;
-    private List<LinePoint> equity;
-    private Map<String, Double> kpis;
-    private List<CandleDto> candles;
-    /** 📅 PnL по месяцам (например: {"2025-01": +12.4}) */
-    private Map<String, Double> monthlyPnl;
+    @Builder.Default
+    private List<CandleDto> candles = List.of();
 
-    // EMA (универсальные)
-    private List<LinePoint> emaFast;
-    private List<LinePoint> emaSlow;
+    private Double lastPrice;
 
-    // EMA (конкретные названия, чтобы твой контроллер работал)
-    private List<LinePoint> ema20;
-    private List<LinePoint> ema50;
+    @Builder.Default
+    private Layers layers = Layers.empty();
 
-    // Bollinger Bands: {"upper": [...], "middle": [...], "lower": [...]}
-    private Map<String, List<LinePoint>> bollinger;
+    // =====================================================
+    // DTOs
+    // =====================================================
 
-    // ATR points
-    private List<LinePoint> atr;
+    @Getter
+    @Setter
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class Layers {
 
-    // Supertrend points
-    private List<LinePoint> supertrend;
+        @Builder.Default
+        private List<Double> levels = List.of();
 
-    // Orders/Trades
-    private List<TradeMarker> trades;
+        @Builder.Default
+        private Zone zone = null;
 
-    private List<Double> tpLevels;
-    private List<Double> slLevels;
+        // ✅ ДОБАВЛЕНО: SCALPING window zone (high/low)
+        @Builder.Default
+        private WindowZone windowZone = null;
 
-    // KPI / Stats
-    private Map<String, Double> stats;
+        public static Layers empty() {
+            return Layers.builder()
+                    .levels(List.of())
+                    .zone(null)
+                    .windowZone(null)
+                    .build();
+        }
+    }
 
-    // Meta info
-    private double lastPrice;
-    private long serverTime;
+    @Getter
+    @Setter
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class Zone {
+        private double top;
+        private double bottom;
+        private String color;
+    }
 
-    // ======================== Inner DTOs ========================
+    // ✅ ДОБАВЛЕНО
+    @Getter
+    @Setter
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class WindowZone {
+        private double high;
+        private double low;
+    }
 
     @Getter
     @Setter
@@ -58,33 +79,40 @@ public class StrategyChartDto {
     @NoArgsConstructor
     @AllArgsConstructor
     public static class CandleDto {
+
+        @JsonProperty("time")
         private long time;
+
         private double open;
         private double high;
         private double low;
         private double close;
-        private double volume;
-    }
 
-    @Getter
-    @Setter
-    @Builder
-    @NoArgsConstructor
-    @AllArgsConstructor
-    public static class LinePoint {
-        private long time;
-        private double value;
-    }
+        @JsonIgnore
+        public static long toSeconds(long epochMillisOrSeconds) {
+            return epochMillisOrSeconds > 3_000_000_000L
+                    ? (epochMillisOrSeconds / 1000L)
+                    : epochMillisOrSeconds;
+        }
 
-    @Getter
-    @Setter
-    @Builder
-    @NoArgsConstructor
-    @AllArgsConstructor
-    public static class TradeMarker {
-        private long time;
-        private double price;
-        private double qty;
-        private String side;
+        public static CandleDto ofMillis(long epochMillis, double open, double high, double low, double close) {
+            return CandleDto.builder()
+                    .time(epochMillis / 1000L)
+                    .open(open)
+                    .high(high)
+                    .low(low)
+                    .close(close)
+                    .build();
+        }
+
+        public static CandleDto ofSeconds(long epochSeconds, double open, double high, double low, double close) {
+            return CandleDto.builder()
+                    .time(epochSeconds)
+                    .open(open)
+                    .high(high)
+                    .low(low)
+                    .close(close)
+                    .build();
+        }
     }
 }

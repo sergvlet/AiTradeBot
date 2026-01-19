@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="ru" xmlns:th="http://www.thymeleaf.org">
+<body>
+
+<div th:fragment="content"
+     th:with="
+        type=${type},
+        chatId=${chatId},
+        symbolSafe=${symbol != null ? #strings.trim(symbol) : ''},
+        hasSymbol=${!#strings.isEmpty(symbolSafe)},
+        infoSafe=${info},
+        activeSafe=${infoSafe != null and infoSafe.active},
+        exchangeSafe=${(infoSafe != null and infoSafe.exchangeName != null) ? infoSafe.exchangeName : 'BINANCE'},
+        networkSafe=${(infoSafe != null and infoSafe.networkType != null) ? infoSafe.networkType : 'MAINNET'},
+        tfSafe=${(infoSafe != null and infoSafe.timeframe != null) ? infoSafe.timeframe : ''}
+     ">
+
+    <!-- ROOT ДЛЯ JS -->
+    <div id="strategy-root"
+         th:attr="
+            data-chat-id=${chatId},
+            data-type=${type},
+            data-symbol=${hasSymbol ? symbolSafe : ''}
+         ">
+    </div>
+
+    <!-- =========================================
+         ⚠️ NOT CONFIGURED WARNING
+         ========================================= -->
+    <div th:if="${!hasSymbol}"
+         class="alert alert-warning d-flex align-items-center gap-2 mb-4"
+         role="alert">
+        <i class="bi bi-exclamation-triangle-fill"></i>
+        <div>
+            <b>Стратегия ещё не настроена.</b>
+            Открой настройки и укажи хотя бы <b>символ</b> и <b>таймфрейм</b>.
+        </div>
+    </div>
+
+    <!-- Заголовок -->
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <div>
+            <h2 class="fw-bold mb-1 d-flex align-items-center gap-2">
+                <i class="bi bi-graph-up"></i>
+                <span th:text="${type}">STRATEGY</span> — Дашборд
+            </h2>
+
+            <div class="text-secondary">
+                Символ:
+                <span class="fw-semibold"
+                      th:text="${hasSymbol ? symbolSafe : '— не настроено —'}">BTCUSDT</span>
+            </div>
+        </div>
+
+        <div class="d-flex align-items-center gap-2">
+
+            <!-- STATUS -->
+            <span class="badge px-3 py-2"
+                  th:classappend="${activeSafe} ? ' bg-success' : ' bg-danger'">
+                <span th:text="${activeSafe} ? '🟢 Работает' : '🔴 Остановлена'">—</span>
+            </span>
+
+            <!-- ▶ START (только если НЕ активна и ЕСТЬ символ) -->
+            <form method="post"
+                  th:action="@{/strategies/toggle}"
+                  th:if="${!activeSafe}"
+                  th:classappend="${!hasSymbol} ? ' opacity-50 pe-none' : ''">
+
+                <input type="hidden" name="chatId" th:value="${chatId}">
+                <input type="hidden" name="type" th:value="${type}">
+                <input type="hidden" name="exchange" th:value="${exchangeSafe}">
+                <input type="hidden" name="network" th:value="${networkSafe}">
+
+                <button type="submit"
+                        class="btn btn-outline-success"
+                        th:disabled="${!hasSymbol}"
+                        th:attr="title=${hasSymbol} ? 'Запустить' : 'Сначала настрой стратегию'">
+                    <i class="bi bi-play-fill"></i> Запустить
+                </button>
+            </form>
+
+            <!-- ⏹ STOP (только если активна) -->
+            <form method="post"
+                  th:action="@{/strategies/toggle}"
+                  th:if="${activeSafe}">
+
+                <input type="hidden" name="chatId" th:value="${chatId}">
+                <input type="hidden" name="type" th:value="${type}">
+                <input type="hidden" name="exchange" th:value="${exchangeSafe}">
+                <input type="hidden" name="network" th:value="${networkSafe}">
+
+                <button type="submit" class="btn btn-outline-danger">
+                    <i class="bi bi-stop-fill"></i> Остановить
+                </button>
+            </form>
+
+        </div>
+    </div>
+
+    <!-- КАРТОЧКИ -->
+    <div class="row g-4 mb-4">
+
+        <div class="col-md-3">
+            <div class="card card-theme p-3">
+                <div class="small-label">ROI</div>
+                <div class="fs-4 fw-bold"
+                     th:classappend="${infoSafe != null and infoSafe.totalProfitPct != null and infoSafe.totalProfitPct >= 0} ? ' text-success' : ' text-danger'"
+                     th:text="${infoSafe != null and infoSafe.totalProfitPct != null ? infoSafe.totalProfitPct + '%' : '—'}">
+                </div>
+                <div class="text-secondary small">Общая доходность</div>
+            </div>
+        </div>
+
+        <div class="col-md-3">
+            <div class="card card-theme p-3">
+                <div class="small-label">AI Confidence</div>
+                <div class="fs-4 fw-bold"
+                     th:text="${infoSafe != null and infoSafe.mlConfidence != null ? infoSafe.mlConfidence : '—'}">
+                </div>
+                <div class="text-secondary small">Уровень уверенности AI</div>
+            </div>
+        </div>
+
+        <div class="col-md-3">
+            <div class="card card-theme p-3">
+                <div class="small-label">TP / SL</div>
+                <div class="fs-5 fw-bold">
+                    <span th:text="${infoSafe != null and infoSafe.takeProfitPct != null ? infoSafe.takeProfitPct : '—'}">—</span>% /
+                    <span th:text="${infoSafe != null and infoSafe.stopLossPct != null ? infoSafe.stopLossPct : '—'}">—</span>%
+                </div>
+                <div class="text-secondary small">Take / Stop</div>
+            </div>
+        </div>
+
+        <div class="col-md-3">
+            <div class="card card-theme p-3">
+                <div class="small-label">Риск / сделку</div>
+                <div class="fs-4 fw-bold"
+                     th:text="${infoSafe != null and infoSafe.riskPerTradePct != null ? infoSafe.riskPerTradePct + '%' : '—'}">
+                </div>
+                <div class="text-secondary small">Risk per trade</div>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- ГРАФИК -->
+    <div class="card card-theme p-3 mb-4" id="chart-card">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+            <h5 class="mb-0">
+                <i class="bi bi-bar-chart-line me-2"></i>График цены
+            </h5>
+
+            <div class="d-flex align-items-center gap-2">
+                <div class="small">
+                    <span class="text-secondary">WS:</span>
+                    <span id="chart-ws-status" class="fw-bold text-danger">OFFLINE</span>
+                </div>
+
+                <button class="btn btn-sm btn-outline-secondary"
+                        id="btn-fullscreen"
+                        type="button"
+                        title="На весь экран">
+                    ⛶
+                </button>
+
+                <button class="btn btn-sm btn-outline-success"
+                        id="btn-save-chart"
+                        type="button"
+                        title="Сохранить изображение">
+                    💾
+                </button>
+            </div>
+        </div>
+
+        <!-- Кнопки -->
+        <div class="chart-controls d-flex flex-wrap gap-2 mb-3">
+            <div class="btn-group btn-group-sm">
+                <button class="btn btn-outline-secondary" type="button" onclick="window.chartCtrl?.setTimeframe?.('1m')">1m</button>
+                <button class="btn btn-outline-secondary" type="button" onclick="window.chartCtrl?.setTimeframe?.('5m')">5m</button>
+                <button class="btn btn-outline-secondary" type="button" onclick="window.chartCtrl?.setTimeframe?.('15m')">15m</button>
+                <button class="btn btn-outline-secondary" type="button" onclick="window.chartCtrl?.setTimeframe?.('1h')">1h</button>
+            </div>
+
+            <div class="btn-group btn-group-sm">
+                <button class="btn btn-outline-warning" type="button" onclick="window.chartCtrl?.addSMA?.(14)">SMA</button>
+                <button class="btn btn-outline-info" type="button" onclick="window.chartCtrl?.addEMA?.(14)">EMA</button>
+                <button class="btn btn-outline-success" type="button" onclick="window.chartCtrl?.addVolumeSeries?.()">VOL</button>
+            </div>
+        </div>
+
+        <!-- Tooltip -->
+        <div id="tooltip-date"
+             style="position:absolute;top:8px;right:12px;
+                background:rgba(0,0,0,.75);
+                color:#fff;
+                font-size:12px;
+                padding:4px 8px;
+                border-radius:4px;
+                pointer-events:none;
+                z-index:100;">
+            —
+        </div>
+
+        <div id="strategy-chart-container" style="height:400px; position:relative;">
+            <div id="strategy-chart" style="width:100%; height:100%;"></div>
+        </div>
+    </div>
+
+    <script>
+        (function () {
+            const fsBtn = document.getElementById("btn-fullscreen");
+            const card = document.getElementById("chart-card");
+
+            if (fsBtn && card) {
+                fsBtn.addEventListener("click", async () => {
+                    try {
+                        if (!document.fullscreenElement) {
+                            await (card.requestFullscreen?.() ?? Promise.resolve());
+                        } else {
+                            await (document.exitFullscreen?.() ?? Promise.resolve());
+                        }
+                    } catch (e) {
+                        console.warn("Fullscreen failed:", e);
+                    }
+                });
+            }
+
+            const saveBtn = document.getElementById("btn-save-chart");
+            if (saveBtn) {
+                saveBtn.addEventListener("click", () => {
+                    try {
+                        const canvas = document.querySelector("#strategy-chart canvas");
+                        if (!canvas) {
+                            alert("Canvas не найден (график ещё не загрузился)");
+                            return;
+                        }
+                        const link = document.createElement("a");
+                        link.download = `chart_${Date.now()}.png`;
+                        link.href = canvas.toDataURL("image/png");
+                        link.click();
+                    } catch (e) {
+                        console.error("Save chart failed:", e);
+                    }
+                });
+            }
+
+            // подсказка даты под курсором — только когда chart реально готов
+            const tryBindCrosshair = () => {
+                if (!window.chartCtrl?.chart?.subscribeCrosshairMove) return false;
+
+                window.chartCtrl.chart.subscribeCrosshairMove(param => {
+                    const el = document.getElementById("tooltip-date");
+                    if (!el) return;
+
+                    if (!param || !param.time) {
+                        el.textContent = "—";
+                        return;
+                    }
+
+                    const t = (typeof param.time === "object" && param.time && "unix" in param.time)
+                        ? param.time.unix
+                        : param.time;
+
+                    el.textContent = new Date(Number(t) * 1000).toISOString();
+                });
+
+                return true;
+            };
+
+            // несколько попыток, т.к. chartCtrl поднимается асинхронно
+            let tries = 0;
+            const timer = setInterval(() => {
+                tries++;
+                if (tryBindCrosshair() || tries >= 20) clearInterval(timer);
+            }, 300);
+        })();
+    </script>
+
+    <!-- НИЖНИЕ БЛОКИ -->
+    <div class="row g-4">
+
+        <!-- ЖУРНАЛ -->
+        <div class="col-lg-7">
+            <div class="card card-theme p-3 h-100">
+                <h5 class="mb-2">
+                    <i class="bi bi-list-check me-2"></i>Журнал сделок
+                </h5>
+
+                <div class="table-responsive" style="max-height:300px">
+                    <table class="table table-dark-custom table-sm">
+                        <thead>
+                        <tr>
+                            <th>Время</th>
+                            <th>Тип</th>
+                            <th>Цена</th>
+                            <th>Объём</th>
+                            <th>Профит</th>
+                        </tr>
+                        </thead>
+                        <tbody>
+                        <tr>
+                            <td colspan="5" class="text-center text-secondary py-3">
+                                Загрузка…
+                            </td>
+                        </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- НАСТРОЙКИ -->
+        <div class="col-lg-5">
+            <div class="card card-theme p-3 h-100">
+                <h5 class="mb-3">
+                    <i class="bi bi-gear me-2"></i>Настройки стратегии
+                </h5>
+
+                <ul class="list-unstyled small">
+                    <li>Биржа: <b th:text="${exchangeSafe}">BINANCE</b></li>
+                    <li>Сеть: <b th:text="${networkSafe}">MAINNET</b></li>
+                    <li>Пара: <b th:text="${hasSymbol ? symbolSafe : '—'}">BTCUSDT</b></li>
+                    <li>ТФ: <b th:text="${!#strings.isEmpty(tfSafe) ? tfSafe : '—'}">1m</b></li>
+                    <li>Комиссия: <b th:text="${infoSafe != null and infoSafe.commissionPct != null ? infoSafe.commissionPct : '—'}">—</b>%</li>
+                </ul>
+
+                <!-- config: передаём chatId + (если есть) exchange/network -->
+                <a class="btn btn-outline-primary w-100 mt-3"
+                   th:href="@{'/strategies/' + ${type} + '/config'(
+                        chatId=${chatId},
+                        exchange=${exchangeSafe},
+                        network=${networkSafe}
+                   )}">
+                    <i class="bi bi-pencil-square me-2"></i>Настроить стратегию
+                </a>
+            </div>
+        </div>
+
+    </div>
+
+</div>
+
+</body>
+</html>

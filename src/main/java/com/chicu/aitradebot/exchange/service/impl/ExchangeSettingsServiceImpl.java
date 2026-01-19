@@ -2,8 +2,7 @@ package com.chicu.aitradebot.exchange.service.impl;
 
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.domain.ExchangeSettings;
-import com.chicu.aitradebot.exchange.binance.BinanceExchangeClient;
-import com.chicu.aitradebot.exchange.model.BinanceConnectionStatus;
+import com.chicu.aitradebot.exchange.model.ApiKeyDiagnostics;
 import com.chicu.aitradebot.exchange.repository.ExchangeSettingsRepository;
 import com.chicu.aitradebot.exchange.service.ExchangeSettingsService;
 import lombok.RequiredArgsConstructor;
@@ -18,240 +17,357 @@ import org.springframework.web.client.RestTemplate;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
-import java.time.Instant;
 import java.util.List;
-import java.util.Optional;
+import java.util.Map;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
-@Slf4j
 public class ExchangeSettingsServiceImpl implements ExchangeSettingsService {
 
     private final ExchangeSettingsRepository repository;
+
+    // Лучше бы инжектить как @Bean, но оставляю как у тебя (минимум изменений)
     private final RestTemplate restTemplate = new RestTemplate();
 
-    // ========================================================================
-    // getOrCreate
-    // ========================================================================
     @Override
     @Transactional
     public ExchangeSettings getOrCreate(Long chatId, String exchange, NetworkType network) {
-        return repository.findByChatIdAndExchangeAndNetwork(chatId, exchange, network)
+        String ex = normalizeExchange(exchange);
+
+        return repository.findByChatIdAndExchangeAndNetwork(chatId, ex, network)
                 .orElseGet(() -> {
-                    ExchangeSettings s = new ExchangeSettings();
-                    s.setChatId(chatId);
-                    s.setExchange(exchange.toUpperCase());
-                    s.setNetwork(network);
+                    ExchangeSettings s = ExchangeSettings.builder()
+                            .chatId(chatId)
+                            .exchange(ex)
+                            .network(network)
+                            // ключи могут быть null (после миграции)
+                            .apiKey(null)
+                            .apiSecret(null)
+                            .passphrase(null)
+                            .subAccount(null)
+                            .build();
 
-                    s.setApiKey("");
-                    s.setApiSecret("");
-                    s.setPassphrase("");
-                    s.setSubAccount("");
-                    s.setEnabled(false);
-
-                    s.setCreatedAt(Instant.now());
-                    s.setUpdatedAt(Instant.now());
-
-                    repository.save(s);
-
-                    log.info("🆕 Созданы ExchangeSettings {}@{} (chatId={})",
-                            exchange, network, chatId);
-
-                    return s;
+                    ExchangeSettings saved = repository.save(s);
+                    log.info("🆕 Созданы ExchangeSettings {}@{} (chatId={})", ex, network, chatId);
+                    return saved;
                 });
     }
 
-
-
-
-
-    // ========================================================================
-    // save
-    // ========================================================================
     @Override
     @Transactional
-    public ExchangeSettings save(ExchangeSettings incoming) {
+    public ExchangeSettings saveKeys(Long chatId,
+                                     String exchange,
+                                     NetworkType network,
+                                     String apiKey,
+                                     String apiSecret,
+                                     String passphrase,
+                                     String subAccount) {
 
-        Optional<ExchangeSettings> existingOpt =
-                repository.findByChatIdAndExchangeAndNetwork(
-                        incoming.getChatId(),
-                        incoming.getExchange(),
-                        incoming.getNetwork()
-                );
+        String ex = normalizeExchange(exchange);
 
-        ExchangeSettings target = existingOpt.orElseGet(ExchangeSettings::new);
+        // ✅ одна строка на (chatId, exchange, network) — дальше только UPDATE
+        ExchangeSettings s = getOrCreate(chatId, ex, network);
 
-        target.setChatId(incoming.getChatId());
-        target.setExchange(incoming.getExchange().toUpperCase());
-        target.setNetwork(incoming.getNetwork());
-        target.setApiKey(incoming.getApiKey());
-        target.setApiSecret(incoming.getApiSecret());
-        target.setPassphrase(incoming.getPassphrase());
-        target.setSubAccount(incoming.getSubAccount());
-        target.setEnabled(incoming.isEnabled());
+        // ✅ ВАЖНО: пустая строка должна ОЧИЩАТЬ ключ (становится null)
+        s.setApiKey(normalizeNullable(apiKey));
+        s.setApiSecret(normalizeNullable(apiSecret));
+        s.setPassphrase(normalizeNullable(passphrase));
+        s.setSubAccount(normalizeNullable(subAccount));
 
-        if (target.getCreatedAt() == null)
-            target.setCreatedAt(Instant.now());
+        ExchangeSettings saved = repository.save(s);
 
-        target.setUpdatedAt(Instant.now());
-
-        ExchangeSettings saved = repository.save(target);
-
-        log.info("💾 ExchangeSettings updated {}@{} (chatId={})",
-                saved.getExchange(), saved.getNetwork(), saved.getChatId());
+        // лог без спама и без секретов
+        log.info("🔐 Keys saved {}@{} (chatId={}, hasBaseKeys={}, hasAnySecret={})",
+                ex, network, chatId, saved.hasBaseKeys(), saved.hasAnySecret());
 
         return saved;
     }
 
-    // ========================================================================
-    // find-all
-    // ========================================================================
     @Override
     public List<ExchangeSettings> findAllByChatId(Long chatId) {
         return repository.findAllByChatId(chatId);
     }
 
-
-
-
-
     @Override
     @Transactional
     public void delete(Long chatId, String exchange, NetworkType network) {
-        repository.findByChatIdAndExchangeAndNetwork(chatId, exchange, network)
-                .ifPresent(repository::delete);
-
-        log.warn("🗑 Deleted ExchangeSettings {}@{} (chatId={})",
-                exchange, network, chatId);
+        repository.deleteByChatIdAndExchangeAndNetwork(chatId, normalizeExchange(exchange), network);
+        log.warn("🗑 Deleted ExchangeSettings {}@{} (chatId={})", exchange, network, chatId);
     }
 
+    @Override
+    public ApiKeyDiagnostics diagnose(Long chatId, String exchange, NetworkType network) {
+        ExchangeSettings s = repository.findByChatIdAndExchangeAndNetwork(chatId, normalizeExchange(exchange), network)
+                .orElse(null);
+        return testConnectionDetailed(s);
+    }
 
-
-    // ========================================================================
-    // testConnection
-    // ========================================================================
     @Override
     public boolean testConnection(ExchangeSettings s) {
+        if (s == null) return false;
+        if (isBlank(s.getExchange()) || s.getNetwork() == null) return false;
+        if (!s.hasBaseKeys()) return false;
 
-        if (s == null || isBlank(s.getExchange()) || s.getNetwork() == null)
-            return false;
-
-        if (isBlank(s.getApiKey()) || isBlank(s.getApiSecret()))
-            return false;
-
-        return switch (s.getExchange().toUpperCase()) {
-            case "BINANCE" -> testBinanceConnection(s);
-            case "BYBIT"   -> testBybitConnection(s);
+        return switch (normalizeExchange(s.getExchange())) {
+            case "BINANCE" -> testBinanceConnectionQuick(s);
+            case "BYBIT" -> testBybitConnectionQuick(s);
             default -> false;
         };
     }
 
-    // ========================================================================
-    // Binance simple test
-    // ========================================================================
-    private boolean testBinanceConnection(ExchangeSettings s) {
+    @Override
+    public ApiKeyDiagnostics testConnectionDetailed(ExchangeSettings s) {
 
-        String baseUrl = s.getNetwork() == NetworkType.TESTNET
-                ? "https://testnet.binance.vision"
-                : "https://api.binance.com";
-
-        long ts = System.currentTimeMillis();
-        String query = "recvWindow=5000&timestamp=" + ts;
-        String signature = hmacSha256(query, s.getApiSecret());
-
-        String url = baseUrl + "/api/v3/account?" + query + "&signature=" + signature;
-
-        HttpHeaders headers = new HttpHeaders();
-        headers.set("X-MBX-APIKEY", s.getApiKey());
-
-        try {
-            ResponseEntity<String> resp = restTemplate.exchange(
-                    url, HttpMethod.GET, new HttpEntity<>("", headers), String.class);
-
-            return resp.getStatusCode().is2xxSuccessful();
-
-        } catch (HttpClientErrorException e) {
-            return false;
+        if (s == null) {
+            return ApiKeyDiagnostics.builder()
+                    .ok(false)
+                    .exchange("UNKNOWN")
+                    .message("Exchange settings not found")
+                    .build();
         }
+
+        String exchange = normalizeExchange(s.getExchange());
+
+        // ✅ если ключей нет — диагностику не делаем
+        if (!s.hasBaseKeys()) {
+            return ApiKeyDiagnostics.notConfigured(exchange, "Ключи не заданы (apiKey/apiSecret пустые)");
+        }
+
+        return switch (exchange) {
+            case "BINANCE" -> diagnoseBinance(s);
+            case "BYBIT" -> diagnoseBybit(s);
+            default -> ApiKeyDiagnostics.builder()
+                    .ok(false)
+                    .exchange(exchange)
+                    .message("Диагностика не поддерживается для: " + exchange)
+                    .build();
+        };
     }
 
-    // ========================================================================
-    // Bybit simple test
-    // ========================================================================
-    private boolean testBybitConnection(ExchangeSettings s) {
-        String baseUrl = s.getNetwork() == NetworkType.TESTNET
-                ? "https://api-testnet.bybit.com"
-                : "https://api.bybit.com";
+    // =====================================================================
+    // QUICK TESTS
+    // =====================================================================
 
-        long ts = System.currentTimeMillis();
-        String recvWindow = "5000";
-        String query = "accountType=UNIFIED";
-
-        String preSign = ts + s.getApiKey() + recvWindow + query;
-        String signature = hmacSha256(preSign, s.getApiSecret());
-
-        HttpHeaders headers = new HttpHeaders();
-        headers.set("X-BAPI-API-KEY", s.getApiKey());
-        headers.set("X-BAPI-SIGN", signature);
-        headers.set("X-BAPI-TIMESTAMP", String.valueOf(ts));
-        headers.set("X-BAPI-RECV-WINDOW", recvWindow);
-
-        String url = baseUrl + "/v5/account/wallet-balance?" + query;
-
+    private boolean testBinanceConnectionQuick(ExchangeSettings s) {
         try {
-            ResponseEntity<String> resp = restTemplate.exchange(
-                    url, HttpMethod.GET, new HttpEntity<>("", headers), String.class);
+            String base = (s.getNetwork() == NetworkType.TESTNET)
+                    ? "https://testnet.binance.vision"
+                    : "https://api.binance.com";
 
-            if (!resp.getStatusCode().is2xxSuccessful())
-                return false;
+            long ts = System.currentTimeMillis();
+            String query = "recvWindow=5000&timestamp=" + ts;
+            String sign = hmacSha256(query, s.getApiSecret());
 
-            JSONObject json = new JSONObject(resp.getBody());
-            return json.optInt("retCode", -1) == 0;
+            HttpHeaders h = new HttpHeaders();
+            h.set("X-MBX-APIKEY", s.getApiKey());
 
+            ResponseEntity<String> r = restTemplate.exchange(
+                    base + "/api/v3/account?" + query + "&signature=" + sign,
+                    HttpMethod.GET,
+                    new HttpEntity<>("", h),
+                    String.class
+            );
+
+            return r.getStatusCode().is2xxSuccessful();
         } catch (Exception e) {
             return false;
         }
     }
 
-    // ========================================================================
-    // Detailed diagnostics
-    // ========================================================================
-    @Override
-    public BinanceConnectionStatus testConnectionDetailed(ExchangeSettings settings) {
-
-        if (settings == null ||
-            !"BINANCE".equalsIgnoreCase(settings.getExchange()) ||
-            isBlank(settings.getApiKey()) ||
-            isBlank(settings.getApiSecret())) {
-
-            return BinanceConnectionStatus.builder()
-                    .ok(false)
-                    .message("Ключи отсутствуют или биржа не Binance")
-                    .build();
-        }
-
+    private boolean testBybitConnectionQuick(ExchangeSettings s) {
         try {
-            BinanceExchangeClient client = new BinanceExchangeClient(this);
+            String base = (s.getNetwork() == NetworkType.TESTNET)
+                    ? "https://api-demo.bybit.com"
+                    : "https://api.bybit.com";
 
-            return client.extendedTestConnection(
-                    settings.getApiKey(),
-                    settings.getApiSecret(),
-                    settings.getNetwork() == NetworkType.TESTNET
+            long ts = System.currentTimeMillis();
+            String recv = "5000";
+            String query = "accountType=UNIFIED";
+
+            String sign = hmacSha256(ts + s.getApiKey() + recv + query, s.getApiSecret());
+
+            HttpHeaders h = new HttpHeaders();
+            h.set("X-BAPI-API-KEY", s.getApiKey());
+            h.set("X-BAPI-SIGN", sign);
+            h.set("X-BAPI-TIMESTAMP", String.valueOf(ts));
+            h.set("X-BAPI-RECV-WINDOW", recv);
+
+            ResponseEntity<String> r = restTemplate.exchange(
+                    base + "/v5/account/wallet-balance?" + query,
+                    HttpMethod.GET,
+                    new HttpEntity<>("", h),
+                    String.class
             );
 
-        } catch (Exception ex) {
-            return BinanceConnectionStatus.builder()
+            return r.getStatusCode().is2xxSuccessful();
+        } catch (Exception e) {
+            log.warn("Bybit quick test failed: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    // =====================================================================
+    // DIAGNOSE
+    // =====================================================================
+
+    private ApiKeyDiagnostics diagnoseBinance(ExchangeSettings s) {
+
+        String base = (s.getNetwork() == NetworkType.TESTNET)
+                ? "https://testnet.binance.vision"
+                : "https://api.binance.com";
+
+        try {
+            long ts = System.currentTimeMillis();
+            String query = "recvWindow=5000&timestamp=" + ts;
+            String sign = hmacSha256(query, s.getApiSecret());
+
+            HttpHeaders h = new HttpHeaders();
+            h.set("X-MBX-APIKEY", s.getApiKey());
+
+            ResponseEntity<String> r = restTemplate.exchange(
+                    base + "/api/v3/account?" + query + "&signature=" + sign,
+                    HttpMethod.GET,
+                    new HttpEntity<>("", h),
+                    String.class
+            );
+
+            JSONObject json = new JSONObject(r.getBody());
+
+            return ApiKeyDiagnostics.builder()
+                    .ok(true)
+                    .exchange("BINANCE")
+                    .message("Binance API OK")
+                    .apiKeyValid(true)
+                    .secretValid(true)
+                    .signatureValid(true)
+                    .accountReadable(true)
+                    .tradingAllowed(true)
+                    .ipAllowed(true)
+                    .networkOk(true)
+                    .extra(Map.of("balancesPresent", json.optJSONArray("balances") != null))
+                    .build();
+
+        } catch (HttpClientErrorException e) {
+
+            int status = e.getStatusCode().value();
+            boolean ipBlocked = status == 401 || status == 403;
+
+            return ApiKeyDiagnostics.builder()
                     .ok(false)
-                    .message("Ошибка: " + ex.getMessage())
+                    .exchange("BINANCE")
+                    .message("Binance API error: " + status)
+                    .apiKeyValid(true)
+                    .secretValid(true)
+                    .signatureValid(true)
+                    .accountReadable(false)
+                    .tradingAllowed(false)
+                    .ipAllowed(!ipBlocked)
+                    .networkOk(true)
+                    .build();
+
+        } catch (Exception e) {
+            return ApiKeyDiagnostics.builder()
+                    .ok(false)
+                    .exchange("BINANCE")
+                    .message("Binance connection failed: " + e.getMessage())
+                    .networkOk(false)
                     .build();
         }
     }
 
-    // ========================================================================
-    // helpers
-    // ========================================================================
+    private ApiKeyDiagnostics diagnoseBybit(ExchangeSettings s) {
+
+        String base = (s.getNetwork() == NetworkType.TESTNET)
+                ? "https://api-demo.bybit.com"
+                : "https://api.bybit.com";
+
+        try {
+            long ts = System.currentTimeMillis();
+            String recv = "5000";
+            String query = "accountType=UNIFIED";
+
+            String sign = hmacSha256(ts + s.getApiKey() + recv + query, s.getApiSecret());
+
+            HttpHeaders h = new HttpHeaders();
+            h.set("X-BAPI-API-KEY", s.getApiKey());
+            h.set("X-BAPI-SIGN", sign);
+            h.set("X-BAPI-TIMESTAMP", String.valueOf(ts));
+            h.set("X-BAPI-RECV-WINDOW", recv);
+
+            ResponseEntity<String> r = restTemplate.exchange(
+                    base + "/v5/account/wallet-balance?" + query,
+                    HttpMethod.GET,
+                    new HttpEntity<>("", h),
+                    String.class
+            );
+
+            JSONObject json = new JSONObject(r.getBody());
+            int retCode = json.optInt("retCode", -1);
+            boolean ok = retCode == 0;
+
+            return ApiKeyDiagnostics.builder()
+                    .ok(ok)
+                    .exchange("BYBIT")
+                    .message(ok ? "Bybit API OK" : "Bybit error: " + retCode)
+                    .apiKeyValid(ok)
+                    .secretValid(ok)
+                    .signatureValid(ok)
+                    .accountReadable(ok)
+                    .tradingAllowed(ok)
+                    .ipAllowed(true)
+                    .networkOk(true)
+                    .extra(Map.of(
+                            "retCode", retCode,
+                            "retMsg", json.optString("retMsg")
+                    ))
+                    .build();
+
+        } catch (HttpClientErrorException e) {
+
+            boolean ipBlocked = e.getStatusCode().value() == 401 || e.getStatusCode().value() == 403;
+
+            return ApiKeyDiagnostics.builder()
+                    .ok(false)
+                    .exchange("BYBIT")
+                    .message("Bybit API error: " + e.getStatusCode().value())
+                    .apiKeyValid(true)
+                    .secretValid(true)
+                    .signatureValid(true)
+                    .accountReadable(false)
+                    .tradingAllowed(false)
+                    .ipAllowed(!ipBlocked)
+                    .networkOk(true)
+                    .build();
+
+        } catch (Exception e) {
+            return ApiKeyDiagnostics.builder()
+                    .ok(false)
+                    .exchange("BYBIT")
+                    .message("Bybit connection failed: " + e.getMessage())
+                    .networkOk(false)
+                    .build();
+        }
+    }
+
+    // =====================================================================
+    // HELPERS
+    // =====================================================================
+
+    private String normalizeExchange(String exchange) {
+        return (exchange == null || exchange.isBlank())
+                ? "BINANCE"
+                : exchange.trim().toUpperCase();
+    }
+
     private boolean isBlank(String s) {
         return s == null || s.trim().isEmpty();
+    }
+
+    private String normalizeNullable(String s) {
+        if (s == null) return null;
+        String v = s.trim();
+        return v.isEmpty() ? null : v;
     }
 
     private String hmacSha256(String data, String secret) {
@@ -261,13 +377,10 @@ public class ExchangeSettingsServiceImpl implements ExchangeSettingsService {
             byte[] h = mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
 
             StringBuilder sb = new StringBuilder();
-            for (byte b : h)
-                sb.append(String.format("%02x", b));
-
+            for (byte b : h) sb.append(String.format("%02x", b));
             return sb.toString();
-
         } catch (Exception e) {
-            throw new RuntimeException("Ошибка HMAC-SHA256", e);
+            throw new RuntimeException("HMAC-SHA256 error", e);
         }
     }
 }

@@ -1,0 +1,180 @@
+static/js/
+├── app.js                     # 🌍 глобальная оболочка UI (НЕ ТРОГАЕМ)
+│
+├── chart/                     # 📊 ГРАФИК (низкий уровень)
+│   ├── chart-controller.js    # 🟢 ШАГ 0 — рынок / свечи / price
+│   ├── layer-renderer.js      # 🟢 ШАГ 0 — ТОЛЬКО рисование
+│   │
+│   ├── features/              # 🟡 ШАГ 1–8 — ЛОГИКА ОТОБРАЖЕНИЯ
+│   │   ├── feature-base.js    # 🟡 ШАГ 1 — контракт feature
+│   │   ├── feature-levels.js  # 🟡 ШАГ 2 — уровни
+│   │   ├── feature-zones.js   # 🟡 ШАГ 3 — зоны (generic / trade)
+│   │   ├── feature-tp-sl.js   # 🟡 ШАГ 4 — TP / SL
+│   │   ├── feature-orders.js  # 🟡 ШАГ 5 — лимитные ордера
+│   │   ├── feature-trades.js  # 🟡 ШАГ 6 — BUY / SELL маркеры
+│   │   ├── feature-window.js  # 🟡 ШАГ 7 — window high/low
+│   │   └── feature-atr.js     # 🟡 ШАГ 8 — ATR / volatility
+│   │
+│   └── strategy-dashboard.js  # 🔴 ШАГ 11 — ОРКЕСТРАТОР (потом)
+│
+├── strategies/                # 🔵 ШАГ 9–10 — АДАПТЕРЫ
+│   ├── base-strategy.js       # 🔵 ШАГ 9 — адаптер → features
+│   ├── scalping.strategy.js   # 🔵 ШАГ 10
+│   ├── fibonacci.strategy.js  # 🔵 ШАГ 10
+│   └── smartfusion.strategy.js# 🔵 ШАГ 10
+│
+└── views/                     # 🖥 обычные страницы (НЕ ГРАФИК)
+    ├── dashboard.js
+    ├── strategies.js
+    └── strategies/
+        ├── settings.js
+        └── diagnostics.js
+
+
+🧠 ГЛАВНЫЙ ПРИНЦИП (зафиксируем сразу)
+Тип данных	Где живёт	Кто меняет	Как часто
+Правила / лимиты	StrategySettings	User / AI	редко
+Параметры стратегии	*StrategySettings	User / AI	средне
+Фактические значения	LocalState / Runtime	Strategy	постоянно
+Данные биржи	Exchange API	Биржа	live
+
+❗ Никогда не сохраняем runtime в БД
+❗ AI не торгует, AI меняет настройки
+
+📘 1️⃣ StrategySettings (ОБЩИЕ, ДЛЯ ВСЕХ СТРАТЕГИЙ)
+🎯 Назначение
+
+Глобальные правила, границы и политика управления
+
+📦 Таблица: strategy_settings
+Поле	Тип	Назначение	                   AI может менять
+chatId	long	Владелец	                   ❌
+type	enum	Тип стратегии	               ❌
+exchangeName	String	Биржа	               ❌
+networkType	enum	Сеть	                   ❌
+symbol	String	Торговая пара	               ⚠️ (AI)
+timeframe	String	Таймфрейм	               ⚠️
+cachedCandlesLimit	int	Глубина истории        ⚠️
+accountAsset	String	Актив баланса	        ⚠️
+dailyLossLimitPct	BigDecimal	❌         жёсткий стоп	❌
+riskPerTradePct	BigDecimal	макс риск	    ✅ (только ↓)
+stopLossPct	BigDecimal	❌ минимум SL	    ❌
+takeProfitPct	BigDecimal	базовый TP	    ✅
+maxExposureUsd	BigDecimal	лимит суммы	    ⚠️
+maxExposurePct	BigDecimal	лимит %	⚠️
+advancedControlMode	enum	MANUAL / HYBRID / AI	❌
+active	boolean	включена ли стратегия	❌
+🔥 КЛЮЧЕВОЕ
+
+maxExposureUsd = null и
+
+maxExposurePct = null
+➡️ использовать ВЕСЬ баланс (runtime-расчёт)
+
+📕 2️⃣ Strategy-specific Settings
+
+(пример: Scalping)
+
+🎯 Назначение
+
+Как именно стратегия торгует
+
+📦 Таблица: scalping_strategy_settings
+Поле	Тип	Назначение	AI
+windowSize	int	окно анализа	✅
+priceChangeThreshold	double	порог входа	✅
+orderVolume	BigDecimal	базовая сумма сделки	✅
+spreadThreshold	double	фильтр спреда	✅
+entryOrderType	enum	MARKET / LIMIT	✅
+timeInForce	enum	GTC / IOC / FOK	✅
+useOcoExit	boolean	авто TP+SL	⚠️
+
+❗ НЕТ:
+
+баланса
+
+лимитов
+
+стопов аккаунта
+
+📗 3️⃣ Runtime / LocalState (НЕ В БД)
+🎯 Назначение
+
+Фактическая торговля
+
+Поле	Где	Комментарий
+entryPrice	LocalState	факт
+entryQty	LocalState	факт
+tp	LocalState	адаптированный
+sl	LocalState	адаптированный
+inPosition	LocalState	состояние
+cooldownUntil	LocalState	защита
+
+❌ НИЧЕГО отсюда не сохраняем
+
+📙 4️⃣ Данные биржи (READ-ONLY)
+🎯 Назначение
+
+Валидация и расчёты
+
+Источник	Примеры
+Balance	free / locked
+Fees	maker / taker
+SymbolInfo	minNotional, stepSize
+Price	live price
+
+❌ Не сохраняются
+❌ Не редактируются
+✅ Используются в расчётах
+
+🧠 5️⃣ AI-ЛОГИКА (важно!)
+
+AI НЕ ИМЕЕТ ДОСТУПА к:
+
+OrderService
+
+ExchangeClient
+
+LocalState
+
+AI МОЖЕТ:
+
+менять StrategySettings
+
+менять *StrategySettings
+
+ТОЛЬКО если advancedControlMode != MANUAL
+
+✅ ИТОГОВАЯ КАРТА
+
+UI
+ ↓
+StrategySettings  ← лимиты / правила
+ ↓
+StrategySpecificSettings
+ ↓
+Strategy (читает + адаптирует)
+ ↓
+LocalState (runtime)
+ ↓
+Exchange
+
+
+➜ СЛЕДУЮЩИЕ ЛОГИЧНЫЕ ПОЛЯ (НА ВЫБОР)
+
+🧠 Макс. сделок в минуту / час (runtime)
+
+🔥 Auto-disable после N убытков подряд (runtime + AI)
+
+📊 Dynamic TP/SL (ATR / volatility) (runtime + AI)
+
+🚦 Trade window (UTC часы)
+
+
+
+№№№№№№№№№№№№№№№№№№№№№№№№№№№№№№
+
+
+тюнинг параметров (windowSize / threshold / TP / SL),
+
+обучение (XGBoost), потому что метки/сделки станут корректными.

@@ -29,7 +29,7 @@ public class WebBalanceFacadeImpl implements WebBalanceFacade {
             // ⭐ Получаем активные настройки exchange + network
             ExchangeSettings es = settingsService.findAllByChatId(chatId)
                     .stream()
-                    .filter(ExchangeSettings::isEnabled)
+
                     .findFirst()
                     .orElseThrow(() -> new IllegalStateException(
                             "Нет активных настроек биржи для chatId=" + chatId));
@@ -64,7 +64,7 @@ public class WebBalanceFacadeImpl implements WebBalanceFacade {
         try {
             ExchangeSettings es = settingsService.findAllByChatId(chatId)
                     .stream()
-                    .filter(ExchangeSettings::isEnabled)
+
                     .findFirst()
                     .orElseThrow(() -> new IllegalStateException(
                             "Нет активных exchange settings chatId=" + chatId));

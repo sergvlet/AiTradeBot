@@ -1,6 +1,5 @@
 package com.chicu.aitradebot.market;
 
-import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.exchange.client.ExchangeClient;
 
 import java.math.BigDecimal;

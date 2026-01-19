@@ -6,6 +6,10 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
+/**
+ * Универсальный менеджер WebSocket-подписок.
+ * Теперь полностью безопасен: exchangeName никогда не вызовет NPE.
+ */
 @Slf4j
 @Component
 @RequiredArgsConstructor
@@ -14,28 +18,37 @@ public class StreamConnectionManager {
     private final BinanceMarketStreamAdapter binance;
     private final BybitMarketStreamAdapter bybit;
 
-    // ⭐ текущие активные подписки
     private String currentBinanceSymbol = null;
     private String currentBybitSymbol = null;
 
     /**
-     * Главная точка входа:
-     * Стратегия вызывает → подключаем WS → подписываемся на нужную пару.
+     * Главная точка входа.
+     * Оркестратор вызывает:
+     *     subscribeSymbol(exchangeName, symbol)
+     *
+     * Мы приводим к безопасному состоянию и подписываем WS.
      */
-    public synchronized void subscribeSymbol(String rawSymbol, String exchangeName) {
+    public synchronized void subscribeSymbol(String exchangeName, String rawSymbol) {
 
-        String symbol = normalizeSymbol(rawSymbol);
-
-        if (symbol.isEmpty()) {
-            log.warn("⚠ Пустой символ — пропускаем подписку");
+        if (exchangeName == null || exchangeName.isBlank()) {
+            log.error("❌ subscribeSymbol: exchangeName == null → ПРОПУСК ПОДПИСКИ");
             return;
         }
 
-        switch (exchangeName.toUpperCase()) {
+        String symbol = normalizeSymbol(rawSymbol);
+        if (symbol.isEmpty()) {
+            log.warn("⚠ subscribeSymbol: пустой символ, отказ");
+            return;
+        }
+
+        String ex = exchangeName.trim().toUpperCase();
+
+        log.info("📡 subscribeSymbol(exchange={}, symbol={})", ex, symbol);
+
+        switch (ex) {
             case "BINANCE" -> subscribeBinance(symbol);
             case "BYBIT"   -> subscribeBybit(symbol);
-            default ->
-                    log.warn("⚠ Неизвестная биржа: {}", exchangeName);
+            default -> log.warn("⚠ Неизвестная биржа '{}', символ '{}' пропущен", ex, symbol);
         }
     }
 
@@ -44,26 +57,28 @@ public class StreamConnectionManager {
     // =====================================================================
 
     private void subscribeBinance(String symbol) {
-
         ensureBinanceConnected();
 
-        // отписка от предыдущего символа
+        // если другой символ был подписан -> отписываем
         if (currentBinanceSymbol != null && !currentBinanceSymbol.equals(symbol)) {
-            try {
-                binance.unsubscribeTicker(currentBinanceSymbol);
-                log.info("🔌 Binance unsubscribed: {}", currentBinanceSymbol);
-            } catch (Exception ex) {
-                log.warn("⚠ Ошибка Binance unsubscribe: {}", ex.getMessage());
-            }
+            safeUnsubscribeBinance(currentBinanceSymbol);
         }
 
-        // подписка на новый символ
         try {
             binance.subscribeTicker(symbol);
             currentBinanceSymbol = symbol;
-            log.info("📡 Binance subscribed: {}", symbol);
+            log.info("✅ Binance WS subscribed → {}", symbol);
         } catch (Exception ex) {
-            log.error("❌ Ошибка subscribe Binance {}", ex.getMessage());
+            log.error("❌ Binance subscribe error: {}", ex.getMessage());
+        }
+    }
+
+    private void safeUnsubscribeBinance(String symbol) {
+        try {
+            binance.unsubscribeTicker(symbol);
+            log.info("🔌 Binance unsubscribed: {}", symbol);
+        } catch (Exception ex) {
+            log.warn("⚠ Binance unsubscribe error: {}", ex.getMessage());
         }
     }
 
@@ -83,23 +98,26 @@ public class StreamConnectionManager {
     // =====================================================================
 
     private void subscribeBybit(String symbol) {
-
         ensureBybitConnected();
 
         if (currentBybitSymbol != null && !currentBybitSymbol.equals(symbol)) {
-            try {
-                bybit.unsubscribeTicker(currentBybitSymbol);
-                log.info("🔌 Bybit unsubscribed: {}", currentBybitSymbol);
-            } catch (Exception ignored) {}
+            safeUnsubscribeBybit(currentBybitSymbol);
         }
 
         try {
             bybit.subscribeTicker(symbol);
             currentBybitSymbol = symbol;
-            log.info("📡 Bybit subscribed: {}", symbol);
+            log.info("✅ Bybit WS subscribed → {}", symbol);
         } catch (Exception ex) {
-            log.error("❌ Bybit subscribe error {}", ex.getMessage());
+            log.error("❌ Bybit subscribe error: {}", ex.getMessage());
         }
+    }
+
+    private void safeUnsubscribeBybit(String symbol) {
+        try {
+            bybit.unsubscribeTicker(symbol);
+            log.info("🔌 Bybit unsubscribed: {}", symbol);
+        } catch (Exception ignored) {}
     }
 
     private void ensureBybitConnected() {
