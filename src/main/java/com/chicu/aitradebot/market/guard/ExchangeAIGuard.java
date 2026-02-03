@@ -2,6 +2,7 @@ package com.chicu.aitradebot.market.guard;
 
 import com.chicu.aitradebot.market.model.ExchangeLimitScope;
 import com.chicu.aitradebot.market.model.SymbolDescriptor;
+import com.chicu.aitradebot.trade.math.QtyMath;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
@@ -137,15 +138,36 @@ public class ExchangeAIGuard {
         }
 
         // =====================================================
-        // 5) STEP SIZE (QTY) — округляем ВНИЗ
+        // 5) STEP SIZE (QTY)
+        //    - По умолчанию округляем ВНИЗ (безопасно)
+        //    - Но для MARKET на TESTNET (allowIncreaseQtyToMinNotional=true)
+        //      разрешаем "поднять" qty до минимального шага, чтобы не улетать в 0.
         // =====================================================
         if (isPositive(d.stepSize())) {
-            BigDecimal snapped = snapDownToStep(finalQty, d.stepSize());
-            if (snapped != null && snapped.compareTo(finalQty) != 0) {
-                warnings.add("Количество округлено под stepSize: " + strip(finalQty) + " → " + strip(snapped));
-                finalQty = snapped;
-                adjusted = true;
+
+            BigDecimal snappedDown = snapDownToStep(finalQty, d.stepSize());
+
+            // qty слишком маленький и после floor стал 0
+            if (!isPositive(snappedDown) && isPositive(finalQty)) {
+                if (isMarketOrder && allowIncreaseQtyToMinNotional) {
+                    BigDecimal snappedUp = QtyMath.ceilToStep(finalQty, d.stepSize());
+                    if (!isPositive(snappedUp)) {
+                        snappedUp = d.stepSize();
+                    }
+                    warnings.add("qty меньше stepSize — поднят до шага: " + strip(finalQty) + " → " + strip(snappedUp));
+                    finalQty = snappedUp;
+                    adjusted = true;
+                } else {
+                    errors.add("qty меньше stepSize (" + strip(d.stepSize()) + ") — увеличь qty.");
+                }
+            } else {
+                if (snappedDown != null && snappedDown.compareTo(finalQty) != 0) {
+                    warnings.add("Количество округлено под stepSize: " + strip(finalQty) + " → " + strip(snappedDown));
+                    finalQty = snappedDown;
+                    adjusted = true;
+                }
             }
+
             if (!isPositive(finalQty)) {
                 errors.add("После округления под stepSize количество стало 0 — увеличь qty.");
             }
@@ -173,8 +195,8 @@ public class ExchangeAIGuard {
                     BigDecimal requiredQty = computeRequiredQty(finalPrice, d.minNotional(), d.stepSize());
                     if (requiredQty != null && requiredQty.compareTo(finalQty) > 0) {
                         warnings.add("qty повышен для прохождения minNotional: "
-                                + strip(finalQty) + " → " + strip(requiredQty)
-                                + " (minNotional=" + strip(d.minNotional()) + ")");
+                                     + strip(finalQty) + " → " + strip(requiredQty)
+                                     + " (minNotional=" + strip(d.minNotional()) + ")");
                         finalQty = requiredQty;
                         adjusted = true;
                         notional = computeNotional(finalQty, finalPrice);
@@ -183,7 +205,7 @@ public class ExchangeAIGuard {
 
                 if (notional != null && notional.compareTo(d.minNotional()) < 0) {
                     errors.add("Сумма сделки (qty*price=" + strip(notional) +
-                            ") меньше minNotional=" + strip(d.minNotional()));
+                               ") меньше minNotional=" + strip(d.minNotional()));
                 }
             }
         } else {

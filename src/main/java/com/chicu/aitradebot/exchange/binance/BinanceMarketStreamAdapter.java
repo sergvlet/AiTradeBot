@@ -1,6 +1,5 @@
 package com.chicu.aitradebot.exchange.binance;
 
-import com.chicu.aitradebot.market.MarketStreamService;
 import com.chicu.aitradebot.market.model.UnifiedKline;
 import com.chicu.aitradebot.market.stream.MarketStreamRouter;
 import com.chicu.aitradebot.market.stream.Tick;
@@ -11,6 +10,7 @@ import org.jetbrains.annotations.NotNull;
 import org.json.JSONObject;
 import org.springframework.stereotype.Component;
 
+import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -20,7 +20,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class BinanceMarketStreamAdapter {
 
     private final MarketStreamRouter router;
-    private final MarketStreamService marketStreamService;
 
     private final OkHttpClient client = new OkHttpClient();
     private WebSocket ws;
@@ -117,6 +116,36 @@ public class BinanceMarketStreamAdapter {
     }
 
     // ============================================================
+    // 🧠 ROUTER INVOKE (без знания точной сигнатуры)
+    // ============================================================
+
+    private void routeKlineViaRouter(UnifiedKline uk) {
+        if (uk == null) return;
+
+        // 1) router.route(UnifiedKline)
+        if (tryInvoke(router, "route", new Class<?>[]{UnifiedKline.class}, new Object[]{uk})) return;
+
+        // 2) router.routeKline(UnifiedKline)
+        if (tryInvoke(router, "routeKline", new Class<?>[]{UnifiedKline.class}, new Object[]{uk})) return;
+
+        // 3) router.routeKline(String exchange, UnifiedKline)
+        if (tryInvoke(router, "routeKline", new Class<?>[]{String.class, UnifiedKline.class}, new Object[]{exchange(), uk})) return;
+
+        log.warn("⚠ MarketStreamRouter не имеет метода для UnifiedKline (route/routeKline). Kline пропущен: {} {}",
+                uk.getSymbol(), uk.getTimeframe());
+    }
+
+    private boolean tryInvoke(Object target, String methodName, Class<?>[] argTypes, Object[] args) {
+        try {
+            Method m = target.getClass().getMethod(methodName, argTypes);
+            m.invoke(target, args);
+            return true;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    // ============================================================
     // 🧠 LISTENER
     // ============================================================
 
@@ -157,9 +186,14 @@ public class BinanceMarketStreamAdapter {
                             .low(new BigDecimal(k.getString("l")))
                             .close(new BigDecimal(k.getString("c")))
                             .volume(new BigDecimal(k.getString("v")))
+                            // если у твоего UnifiedKline есть поле closed/closeTime — раскомментируй:
+                            // .closeTime(k.optLong("T", 0L))
+                            // .closed(k.getBoolean("x"))
                             .build();
 
-                    marketStreamService.onKline(uk);
+                    // ❌ НЕ вызываем marketStreamService.onKline(uk) — нет chatId/type, это и ломало компиляцию
+                    // ✅ отправляем в Router (который знает, куда маршрутизировать)
+                    routeKlineViaRouter(uk);
                 }
 
             } catch (Exception e) {

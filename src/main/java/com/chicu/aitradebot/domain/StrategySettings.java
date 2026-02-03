@@ -153,6 +153,54 @@ public class StrategySettings {
     private BigDecimal totalProfitPct = BigDecimal.ZERO;
 
     // =====================================================================
+    // AI / ML / AUTOTUNE (единая точка настройки режимов)
+    // =====================================================================
+
+    /**
+     * Фаза исполнения (COLLECT / BACKTEST / PAPER / LIVE и т.д.)
+     * Значения задаются снаружи (UI/сервис), тут только хранение.
+     */
+    @Column(name = "run_phase", length = 24)
+    private String runPhase;
+
+    @Builder.Default
+    @Column(name = "collect_enabled", nullable = false)
+    private boolean collectEnabled = false;
+
+    @Builder.Default
+    @Column(name = "auto_tune_enabled", nullable = false)
+    private boolean autoTuneEnabled = false;
+
+    @Builder.Default
+    @Column(name = "ml_gate_enabled", nullable = false)
+    private boolean mlGateEnabled = false;
+
+    /**
+     * Ключ модели (если хочешь фиксировать конкретную модель).
+     * Если null — можно строить ключ на лету через ModelKeyFactory.
+     */
+    @Column(name = "ml_model_key", length = 160)
+    private String mlModelKey;
+
+    /**
+     * Хэш схемы фич (если ты его используешь в modelKey).
+     */
+    @Column(name = "ml_schema_hash", length = 80)
+    private String mlSchemaHash;
+
+    /**
+     * Версия модели (последняя использованная/актуальная для UI).
+     */
+    @Column(name = "ml_model_version", length = 80)
+    private String mlModelVersion;
+
+    /**
+     * Минимальная вероятность (для BUY или SELL) чтобы разрешить вход.
+     */
+    @Column(name = "gate_min_prob", precision = 10, scale = 6)
+    private BigDecimal gateMinProb;
+
+    // =====================================================================
     // СОСТОЯНИЕ / ВРЕМЯ
     // =====================================================================
 
@@ -185,7 +233,7 @@ public class StrategySettings {
         this.createdAt = (this.createdAt != null) ? this.createdAt : now;
         this.updatedAt = (this.updatedAt != null) ? this.updatedAt : now;
 
-        // ✅ FIX: гарантируем NOT NULL поля только при создании записи (а не в сервисе на каждый save)
+        // ✅ FIX: гарантируем NOT NULL поля только при создании записи
         if (this.symbol == null || this.symbol.trim().isEmpty()) {
             this.symbol = "BTCUSDT";
         } else {
@@ -214,6 +262,12 @@ public class StrategySettings {
         if (this.advancedControlMode == null) {
             this.advancedControlMode = AdvancedControlMode.MANUAL;
         }
+
+        // нормализация строк AI/ML
+        this.runPhase = normalizeUpperNullable(this.runPhase);
+        this.mlModelKey = normalizeTrimNullable(this.mlModelKey);
+        this.mlSchemaHash = normalizeTrimNullable(this.mlSchemaHash);
+        this.mlModelVersion = normalizeTrimNullable(this.mlModelVersion);
 
         if (this.mlConfidence == null) this.mlConfidence = BigDecimal.ZERO;
         if (this.totalProfitPct == null) this.totalProfitPct = BigDecimal.ZERO;
@@ -249,18 +303,35 @@ public class StrategySettings {
         }
 
         if (this.advancedControlMode == null) {
-            // на всякий случай (колонка NOT NULL)
             this.advancedControlMode = AdvancedControlMode.MANUAL;
         }
+
+        // нормализация строк AI/ML
+        this.runPhase = normalizeUpperNullable(this.runPhase);
+        this.mlModelKey = normalizeTrimNullable(this.mlModelKey);
+        this.mlSchemaHash = normalizeTrimNullable(this.mlSchemaHash);
+        this.mlModelVersion = normalizeTrimNullable(this.mlModelVersion);
 
         if (this.mlConfidence == null) this.mlConfidence = BigDecimal.ZERO;
         if (this.totalProfitPct == null) this.totalProfitPct = BigDecimal.ZERO;
     }
 
+    private static String normalizeTrimNullable(String s) {
+        if (s == null) return null;
+        String v = s.trim();
+        return v.isEmpty() ? null : v;
+    }
+
+    private static String normalizeUpperNullable(String s) {
+        if (s == null) return null;
+        String v = s.trim();
+        if (v.isEmpty()) return null;
+        return v.toUpperCase(Locale.ROOT);
+    }
+
     public boolean getReinvestProfit() {
         return this.reinvestProfit;
     }
-
 
     public Boolean isReinvestProfit() {
         return this.reinvestProfit;

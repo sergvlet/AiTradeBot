@@ -17,6 +17,7 @@ import org.springframework.web.bind.annotation.RequestParam;
 
 import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
 
 @Slf4j
 @Controller
@@ -28,22 +29,14 @@ public class StrategyDashboardController {
     private final StrategySettingsService strategySettingsService;
     private final MarketDataStreamService marketDataStreamService;
 
-    /**
-     * 📊 Strategy dashboard
-     *
-     * ВАЖНО:
-     * - НЕ кидаем 500, если стратегия ещё не настроена
-     * - Показываем страницу с понятным состоянием "не настроено"
-     */
     @GetMapping("/{type}/dashboard")
     public String strategyDashboardPage(
             @PathVariable StrategyType type,
             @RequestParam Long chatId,
             Model model
     ) {
-
         // =====================================================
-        // 0) БАЗОВЫЙ UI-КОНТЕКСТ (чтобы страница всегда открывалась)
+        // 0) БАЗОВЫЙ UI-КОНТЕКСТ
         // =====================================================
         model.addAttribute("page", "strategies/strategy_dashboard");
         model.addAttribute("chatId", chatId);
@@ -51,11 +44,9 @@ public class StrategyDashboardController {
 
         // =====================================================
         // 1) LOAD STRATEGY SETTINGS (baseline)
-        // (раньше: findLatest(chatId, type, null, null) — теперь этого нет)
         // =====================================================
         StrategySettings settings = resolveBaselineSettings(chatId, type);
 
-        // ✅ НЕТ НАСТРОЕК — НЕ 500, а нормальная страница
         if (settings == null) {
             log.warn("⚠️ DASHBOARD: StrategySettings not found (NOT CONFIGURED) chatId={} type={}", chatId, type);
 
@@ -68,13 +59,8 @@ public class StrategyDashboardController {
 
             StrategyRunInfo info = new StrategyRunInfo();
             info.setActive(false);
-            info.setSymbol(null);
-            info.setTimeframe(null);
-            info.setExchangeName(null);
-            info.setNetworkType(null);
 
             model.addAttribute("info", info);
-
             model.addAttribute("notice",
                     "Стратегия ещё не настроена. Зайди в «Настройки», выбери символ и таймфрейм, затем открой дашборд.");
 
@@ -82,44 +68,62 @@ public class StrategyDashboardController {
         }
 
         // =====================================================
-        // 2) VALIDATE REQUIRED FIELDS (symbol/timeframe)
+        // 2) VALIDATE REQUIRED FIELDS
         // =====================================================
         String rawSymbol = settings.getSymbol();
         String rawTimeframe = settings.getTimeframe();
 
-        boolean configured = rawSymbol != null && !rawSymbol.isBlank()
-                             && rawTimeframe != null && !rawTimeframe.isBlank();
+        // Нормализуем аккуратно (но null не трогаем)
+        String symbol = (rawSymbol == null) ? null : rawSymbol.trim().toUpperCase(Locale.ROOT);
+        String timeframe = (rawTimeframe == null) ? null : rawTimeframe.trim().toLowerCase(Locale.ROOT);
 
-        model.addAttribute("configured", configured);
+        // exchange/network для потоков/ключей тоже должны быть консистентны
+        String exchangeNorm = (settings.getExchangeName() == null) ? null : settings.getExchangeName().trim().toUpperCase(Locale.ROOT);
+
+        boolean configuredBase =
+                symbol != null && !symbol.isBlank() &&
+                timeframe != null && !timeframe.isBlank();
+
+        boolean configuredMarket =
+                configuredBase &&
+                exchangeNorm != null && !exchangeNorm.isBlank() &&
+                settings.getNetworkType() != null;
+
+        model.addAttribute("configured", configuredMarket); // ✅ “сконфигурировано” = можно реально стримить/рисовать
         model.addAttribute("strategy", settings);
 
-        // если частично пусто — тоже не падаем
-        if (!configured) {
+        // для UI — отдаём НОРМАЛИЗОВАННЫЕ значения, чтобы JS не ловил кашу
+        model.addAttribute("symbol", symbol);
+        model.addAttribute("exchange", exchangeNorm);
+        model.addAttribute("network", settings.getNetworkType() != null ? settings.getNetworkType().name() : null);
+
+        // если частично пусто — не падаем
+        if (!configuredBase) {
             log.warn("⚠️ DASHBOARD: StrategySettings present but incomplete chatId={} type={} id={} symbol={} timeframe={}",
                     chatId, type, settings.getId(), rawSymbol, rawTimeframe);
 
-            model.addAttribute("symbol", rawSymbol);
-            model.addAttribute("exchange", settings.getExchangeName());
-            model.addAttribute("network", settings.getNetworkType() != null ? settings.getNetworkType().name() : null);
-
             StrategyRunInfo info = new StrategyRunInfo();
             info.setActive(settings.isActive());
-            info.setSymbol(rawSymbol);
-            info.setTimeframe(rawTimeframe);
-            info.setExchangeName(settings.getExchangeName());
+            info.setSymbol(symbol);
+            info.setTimeframe(timeframe);
+            info.setExchangeName(exchangeNorm);
             info.setNetworkType(settings.getNetworkType());
 
             model.addAttribute("info", info);
-
             model.addAttribute("notice",
                     "Настройки стратегии неполные. Укажи символ и таймфрейм в «Настройки», затем вернись на дашборд.");
 
             return "layout/app";
         }
 
-        // нормализуем уже после проверки
-        String symbol = rawSymbol.trim().toUpperCase();
-        String timeframe = rawTimeframe.trim().toLowerCase();
+        // Если символ/ТФ есть, но биржа/сеть не выбраны — тоже покажем подсказку
+        if (!configuredMarket) {
+            log.warn("⚠️ DASHBOARD: Settings ok, but exchange/network missing chatId={} type={} id={} ex={} net={}",
+                    chatId, type, settings.getId(), settings.getExchangeName(), settings.getNetworkType());
+
+            model.addAttribute("notice",
+                    "Не выбрана биржа/сеть. Укажи их в «Настройки», иначе поток рынка и график не подключатся.");
+        }
 
         log.info(
                 "📊 DASHBOARD SETTINGS id={} chatId={} type={} symbol={} tf={} limit={} ex={} net={} active={}",
@@ -129,57 +133,61 @@ public class StrategyDashboardController {
                 symbol,
                 timeframe,
                 settings.getCachedCandlesLimit(),
-                settings.getExchangeName(),
+                exchangeNorm,
                 settings.getNetworkType(),
                 settings.isActive()
         );
 
-        model.addAttribute("symbol", symbol);
-        model.addAttribute("exchange", settings.getExchangeName());
-        model.addAttribute("network", settings.getNetworkType() != null ? settings.getNetworkType().name() : null);
-
         // =====================================================
         // 3) START MARKET STREAM (IDEMPOTENT)
         // =====================================================
-        try {
-            marketDataStreamService.subscribeCandles(chatId, type, symbol, timeframe);
-            log.info("📡 MARKET STREAM OK chatId={} type={} {} {}", chatId, type, symbol, timeframe);
+        if (configuredMarket) {
+            try {
+                marketDataStreamService.subscribe(
+                        exchangeNorm,
+                        settings.getNetworkType(),
+                        chatId,
+                        type,
+                        symbol,
+                        timeframe
+                );
+                log.info("📡 MARKET STREAM OK chatId={} type={} ex={} net={} {} {}",
+                        chatId, type, exchangeNorm, settings.getNetworkType(), symbol, timeframe);
 
-        } catch (Exception e) {
-            // НЕ валим страницу
-            log.error("❌ MARKET STREAM FAILED chatId={} type={} {} {}", chatId, type, symbol, timeframe, e);
-            model.addAttribute("notice",
-                    "Не удалось подключить поток рынка (WS). Страница открыта, но данные могут не обновляться.");
+            } catch (Exception e) {
+                log.error("❌ MARKET STREAM FAILED chatId={} type={} ex={} net={} {} {}",
+                        chatId, type, exchangeNorm, settings.getNetworkType(), symbol, timeframe, e);
+
+                model.addAttribute("notice",
+                        "Не удалось подключить поток рынка (WS). Страница открыта, но данные могут не обновляться.");
+            }
         }
 
         // =====================================================
         // 4) STRATEGY LIVE STATE (RUN INFO)
+        // ✅ Тут тоже передаём нормализованный exchange
         // =====================================================
         StrategyRunInfo info =
                 webStrategyFacade.getRunInfo(
                         chatId,
                         type,
-                        settings.getExchangeName(),
+                        exchangeNorm,
                         settings.getNetworkType()
                 );
 
         if (info == null) {
             log.warn("⚠️ StrategyRunInfo is null chatId={} type={} ex={} net={}",
-                    chatId, type, settings.getExchangeName(), settings.getNetworkType());
+                    chatId, type, exchangeNorm, settings.getNetworkType());
 
             info = new StrategyRunInfo();
             info.setActive(false);
-            info.setSymbol(symbol);
-            info.setTimeframe(timeframe);
-            info.setExchangeName(settings.getExchangeName());
-            info.setNetworkType(settings.getNetworkType());
-        } else {
-            // на всякий случай подстрахуем поля, чтобы UI был консистентным
-            if (info.getSymbol() == null) info.setSymbol(symbol);
-            if (info.getTimeframe() == null) info.setTimeframe(timeframe);
-            if (info.getExchangeName() == null) info.setExchangeName(settings.getExchangeName());
-            if (info.getNetworkType() == null) info.setNetworkType(settings.getNetworkType());
         }
+
+        // Подстраховка полей для UI
+        if (info.getSymbol() == null) info.setSymbol(symbol);
+        if (info.getTimeframe() == null) info.setTimeframe(timeframe);
+        if (info.getExchangeName() == null) info.setExchangeName(exchangeNorm);
+        if (info.getNetworkType() == null) info.setNetworkType(settings.getNetworkType());
 
         model.addAttribute("info", info);
 
@@ -187,9 +195,10 @@ public class StrategyDashboardController {
     }
 
     /**
-     * baseline selection без exchange/network в запросе:
-     * - сначала active=true
-     * - иначе updatedAt desc, затем id desc
+     * baseline selection:
+     * - active=true first
+     * - then updatedAt desc
+     * - then id desc
      */
     private StrategySettings resolveBaselineSettings(Long chatId, StrategyType type) {
         if (chatId == null || chatId <= 0) return null;
@@ -197,13 +206,14 @@ public class StrategyDashboardController {
         List<StrategySettings> all = strategySettingsService.findAllByChatId(chatId, null);
         if (all == null || all.isEmpty()) return null;
 
+        Comparator<StrategySettings> cmp =
+                Comparator.comparing(StrategySettings::isActive).reversed()
+                        .thenComparing(StrategySettings::getUpdatedAt, Comparator.nullsLast(Comparator.reverseOrder()))
+                        .thenComparing(StrategySettings::getId, Comparator.nullsLast(Comparator.reverseOrder()));
+
         return all.stream()
                 .filter(s -> s != null && s.getType() == type)
-                .sorted(Comparator
-                        .comparing(StrategySettings::isActive).reversed()
-                        .thenComparing(StrategySettings::getUpdatedAt, Comparator.nullsLast(Comparator.naturalOrder())).reversed()
-                        .thenComparing(StrategySettings::getId, Comparator.nullsLast(Comparator.naturalOrder())).reversed()
-                )
+                .sorted(cmp)
                 .findFirst()
                 .orElse(null);
     }

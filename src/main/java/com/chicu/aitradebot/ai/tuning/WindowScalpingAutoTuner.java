@@ -15,23 +15,21 @@ import org.springframework.stereotype.Service;
 import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
-import java.time.Instant;
-import java.util.Comparator;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-import java.util.concurrent.ThreadLocalRandom;
+import java.time.*;
+import java.util.*;
 
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class WindowScalpingAutoTuner implements StrategyAutoTuner {
 
-    private final WindowScalpingStrategySettingsService windowSettingsService;
-    private final StrategySettingsService strategySettingsService;
-    private final MlBacktestRunner backtestRunner;
+    private static final ZoneId ZONE = ZoneId.of("Europe/Warsaw");
+
     private final WindowScalpingTunerProperties props;
+    private final MlBacktestRunner backtestRunner;
+
+    private final StrategySettingsService strategySettingsService;
+    private final WindowScalpingStrategySettingsService windowSettingsService;
 
     @Override
     public StrategyType getStrategyType() {
@@ -41,587 +39,768 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
     @Override
     public TuningResult tune(TuningRequest request) {
 
-        if (request == null || request.chatId() == null) {
+        // ✅ FAIL-SAFE: тюнер должен работать только с реальным раннером
+        String runnerName = (backtestRunner != null)
+                ? backtestRunner.getClass().getSimpleName()
+                : "null";
+        if (runnerName.toLowerCase(Locale.ROOT).contains("stub")) {
+            log.warn("[WS-TUNER] ❌ MlBacktestRunner выглядит как STUB: {}. Тюнинг отключён, нужен реальный бэктест-раннер.",
+                    runnerName);
             return TuningResult.builder()
                     .applied(false)
-                    .reason("WINDOW_SCALPING tuner: request/chatId is null")
-                    .modelVersion(props.getModelVersion())
+                    .reason("stub_backtest_runner")
+                    .modelVersion(safe(props.getModelVersion()))
                     .build();
         }
 
-        if (request.strategyType() != null && request.strategyType() != StrategyType.WINDOW_SCALPING) {
-            return TuningResult.builder()
-                    .applied(false)
-                    .reason("WINDOW_SCALPING tuner: wrong strategyType=" + request.strategyType())
-                    .modelVersion(props.getModelVersion())
-                    .build();
+        if (request == null) {
+            return TuningResult.builder().applied(false).reason("request=null").build();
         }
 
-        final Long chatId = request.chatId();
-        final StrategyType type = StrategyType.WINDOW_SCALPING;
-
-        // =========================================================
-        // ✅ окружение: request -> db (без хардкода дефолтов)
-        // =========================================================
-        final Env env;
-        try {
-            env = resolveEnv(chatId, type, request.exchange(), request.network());
-        } catch (Exception e) {
-            return TuningResult.builder()
-                    .applied(false)
-                    .reason("Не могу определить exchange/network: " + e.getMessage())
-                    .modelVersion(props.getModelVersion())
-                    .build();
+        Long chatId = request.chatId();
+        if (chatId == null || chatId <= 0) {
+            return TuningResult.builder().applied(false).reason("bad chatId").build();
         }
 
-        final String ex = env.exchange;
-        final NetworkType net = env.network;
+        String ex = normalizeExchange(request.exchange());
+        NetworkType net = request.network() != null ? request.network() : NetworkType.MAINNET;
 
-        WindowScalpingStrategySettings curWs = windowSettingsService.getOrCreate(chatId);
-        StrategySettings curSs = strategySettingsService.getOrCreate(chatId, type, ex, net);
+        StrategySettings ss = strategySettingsService.getOrCreate(chatId, StrategyType.WINDOW_SCALPING, ex, net);
+        WindowScalpingStrategySettings cfg = windowSettingsService.getOrCreate(chatId);
 
-        // ---------------------------------------------------------------------
-        // strategy params
-        // ---------------------------------------------------------------------
-        Map<String, Object> base = new LinkedHashMap<>();
-        base.put("windowSize", nz(curWs.getWindowSize(), 30));
-        base.put("entryFromLowPct", nz(curWs.getEntryFromLowPct(), 20.0));
-        base.put("entryFromHighPct", nz(curWs.getEntryFromHighPct(), 20.0));
-        base.put("minRangePct", nz(curWs.getMinRangePct(), 0.25));
-        base.put("maxSpreadPct", nz(curWs.getMaxSpreadPct(), 0.08));
-
-        // ---------------------------------------------------------------------
-        // risk/trade params
-        // ---------------------------------------------------------------------
-        Map<String, Object> riskTrade = new LinkedHashMap<>();
-        riskTrade.put("riskPerTradePct", bdOr(curSs.getRiskPerTradePct(), "1.0"));
-        riskTrade.put("minRiskReward", bdOr(curSs.getMinRiskReward(), "1.2"));
-
-        // ✅ leverage у тебя int → никаких null-check
-        riskTrade.put("leverage", normalizeLeverage(curSs.getLeverage()));
-
-        riskTrade.put("allowAveraging", parseBool(curSs.getAllowAveraging()));
-
-        riskTrade.put("cooldownSeconds", curSs.getCooldownSeconds());
-        riskTrade.put("cooldownAfterLossSeconds", curSs.getCooldownAfterLossSeconds());
-        riskTrade.put("maxConsecutiveLosses", curSs.getMaxConsecutiveLosses());
-        riskTrade.put("maxDrawdownPct", curSs.getMaxDrawdownPct());
-        riskTrade.put("maxPositionPct", curSs.getMaxPositionPct());
-        riskTrade.put("maxTradesPerDay", curSs.getMaxTradesPerDay());
-        riskTrade.put("maxOpenOrders", curSs.getMaxOpenOrders());
-
-        // ---------------------------------------------------------------------
-        // ✅ candlesLimit (без сравнений int != null)
-        // ---------------------------------------------------------------------
-        final int minCandles = props.getMinCandlesLimit();
-        final int defaultCandles = props.getDefaultCandlesLimit();
-
-        Integer candlesLimit = request.candlesLimit();
-        if (candlesLimit == null || candlesLimit < minCandles) {
-            candlesLimit = curSs.getCachedCandlesLimit();
-        }
-        if (candlesLimit == null || candlesLimit < minCandles) {
-            candlesLimit = defaultCandles;
-        }
-        riskTrade.put("cachedCandlesLimit", candlesLimit);
-
-        Map<String, Object> oldParams = new LinkedHashMap<>();
-        oldParams.putAll(base);
-        oldParams.putAll(riskTrade);
-
-        // ---------------------------------------------------------------------
-        // period
-        // ---------------------------------------------------------------------
-        Instant startAt = (request.startAt() != null)
-                ? request.startAt()
-                : Instant.now().minusSeconds((long) props.getDefaultPeriodDays() * 86_400L);
-
-        Instant endAt = (request.endAt() != null) ? request.endAt() : Instant.now();
-
-        // symbol/tf
-        String symbol = normalizeSymbol(firstNonBlank(request.symbol(), curSs.getSymbol()));
-        String timeframe = normalizeTimeframe(firstNonBlank(request.timeframe(), curSs.getTimeframe()));
-
-        if (symbol == null || timeframe == null) {
-            return TuningResult.builder()
-                    .applied(false)
-                    .reason("symbol/timeframe is blank (request+db)")
-                    .modelVersion(props.getModelVersion())
-                    .oldParams(oldParams)
-                    .newParams(oldParams)
-                    .build();
+        if (ss == null || cfg == null) {
+            return TuningResult.builder().applied(false).reason("no_settings").build();
         }
 
-        // ---------------------------------------------------------------------
+        String symbol = safeSym(firstNonBlank(request.symbol(), ss.getSymbol()));
+        String tf = safeTf(firstNonBlank(request.timeframe(), ss.getTimeframe()));
+
+        Integer candlesLimit = request.candlesLimit() != null ? request.candlesLimit() : ss.getCachedCandlesLimit();
+        int minCL = Math.max(50, props.getMinCandlesLimit());
+        int defCL = Math.max(minCL, props.getDefaultCandlesLimit());
+        int cl = (candlesLimit == null || candlesLimit < minCL) ? defCL : candlesLimit;
+
+        int days = Math.max(3, props.getDefaultPeriodDays());
+        LocalDate endDate = LocalDate.now(ZONE);
+        LocalDate startDate = endDate.minusDays(days);
+
+        Instant start = startDate.atStartOfDay(ZONE).toInstant();
+        Instant end = endDate.plusDays(1).atStartOfDay(ZONE).toInstant();
+
         // baseline
-        // ---------------------------------------------------------------------
-        BacktestMetrics bm0 = backtestRunner.run(
-                chatId,
-                type,
-                ex, net,
-                symbol,
-                timeframe,
-                oldParams,
-                startAt,
-                endAt
-        );
+        Map<String, Object> baselineParams = buildParamsFromCurrent(ss, cfg);
+        baselineParams.put("candlesLimit", cl);
+        baselineParams.put("cachedCandlesLimit", cl);
 
-        if (bm0 == null || !bm0.ok()) {
-            String why = (bm0 == null) ? "BacktestMetrics is null" : ("Backtest failed: " + bm0.reason());
-            log.warn("🧠 WINDOW_SCALPING baseline FAIL chatId={} ex={} net={} sym={} tf={} reason={}",
-                    chatId, ex, net, symbol, timeframe, why);
+        BacktestMetrics baseMetrics = safeRunBacktest(chatId, ex, net, symbol, tf, baselineParams, start, end);
 
-            return TuningResult.builder()
-                    .applied(false)
-                    .reason(why)
-                    .modelVersion(props.getModelVersion())
-                    .oldParams(oldParams)
-                    .newParams(oldParams)
-                    .build();
+        // ✅ FIX: score() может быть BigDecimal → всегда приводим к double безопасно
+        double baseScore = (baseMetrics != null && baseMetrics.score() != null)
+                ? baseMetrics.score().doubleValue()
+                : -1.0;
+
+        Integer baseTrades = (baseMetrics != null ? baseMetrics.trades() : null);
+
+        // ✅ если базово сделок нет — разжимаем грубые фильтры 1 раз
+        if (baseTrades != null && baseTrades <= 0) {
+            log.warn("[WS-TUNER] baseline NO_TRADES chatId={} ex={} net={} sym={} tf={} cl={} -> coarse adjust",
+                    chatId, ex, net, symbol, tf, cl);
+
+            boolean changed = adjustCoarseFiltersInternal(chatId, ex, net, symbol, tf, ss, cfg, "baseline_no_trades");
+            if (changed) {
+                persistSafe(strategySettingsService, ss);
+                persistSafe(windowSettingsService, cfg);
+            }
+
+            baselineParams = buildParamsFromCurrent(ss, cfg);
+            baselineParams.put("candlesLimit", cl);
+            baselineParams.put("cachedCandlesLimit", cl);
+
+            baseMetrics = safeRunBacktest(chatId, ex, net, symbol, tf, baselineParams, start, end);
+
+            baseScore = (baseMetrics != null && baseMetrics.score() != null)
+                    ? baseMetrics.score().doubleValue()
+                    : -1.0;
+
+            baseTrades = (baseMetrics != null ? baseMetrics.trades() : null);
         }
 
-        BigDecimal score0 = score(bm0, oldParams);
+        int candidates = Math.max(5, props.getCandidates());
+        long seed = Optional.ofNullable(request.seed()).orElse(System.nanoTime());
+        Random rnd = new Random(seed);
 
-        // ---------------------------------------------------------------------
-        // candidates (int)
-        // ---------------------------------------------------------------------
-        int candidatesN = Math.max(1, props.getCandidates());
+        Candidate best = new Candidate(baselineParams, baseScore, baseTrades, "baseline");
 
-        BigDecimal bestScore = score0;
-        Map<String, Object> bestParams = oldParams;
-        BacktestMetrics bestBm = bm0;
+        for (int i = 0; i < candidates; i++) {
+            Map<String, Object> cand = new HashMap<>(baselineParams);
+            mutateCandidate(cand, rnd);
 
-        for (int i = 0; i < candidatesN; i++) {
-            Map<String, Object> cand = mutateCandidate(oldParams);
+            cand.put("candlesLimit", cl);
+            cand.put("cachedCandlesLimit", cl);
 
-            BacktestMetrics bm = backtestRunner.run(
-                    chatId,
-                    type,
-                    ex, net,
-                    symbol,
-                    timeframe,
-                    cand,
-                    startAt,
-                    endAt
-            );
+            BacktestMetrics m = safeRunBacktest(chatId, ex, net, symbol, tf, cand, start, end);
 
-            BigDecimal sc = score(bm, cand);
-            if (sc.compareTo(bestScore) > 0) {
-                bestScore = sc;
-                bestParams = cand;
-                bestBm = bm;
+            // ✅ FIX: score() BigDecimal → double
+            double sc = (m != null && m.score() != null)
+                    ? m.score().doubleValue()
+                    : -1.0;
+
+            Integer tr = (m != null ? m.trades() : null);
+
+            if (isBetter(sc, tr, best.score, best.trades)) {
+                best = new Candidate(cand, sc, tr, "cand#" + i);
             }
         }
 
-        BigDecimal delta = bestScore.subtract(score0);
+        BigDecimal base = bd(baseScore);
+        BigDecimal bestSc = bd(best.score);
 
-        // ---------------------------------------------------------------------
-        // thresholds
-        // ---------------------------------------------------------------------
-        BigDecimal minAbsImprove = nzBd(props.getMinAbsImprove(), new BigDecimal("0.02"));
-        BigDecimal minRelImprove = nzBd(props.getMinRelImprove(), new BigDecimal("0.03"));
-        BigDecimal relThreshold = score0.abs().multiply(minRelImprove).max(minAbsImprove);
+        if (base == null) base = BigDecimal.valueOf(-1.0);
+        if (bestSc == null) bestSc = BigDecimal.valueOf(-1.0);
 
-        boolean passAbs = delta.compareTo(minAbsImprove) >= 0;
-        boolean passRel = delta.compareTo(relThreshold) >= 0;
+        BigDecimal delta = bestSc.subtract(base);
+        boolean apply = shouldApply(base, delta);
 
-        BigDecimal baselineTooBadScore = nzBd(props.getBaselineTooBadScore(), new BigDecimal("-1.00"));
-        BigDecimal baselineTooBadMinDelta = nzBd(props.getBaselineTooBadMinDelta(), new BigDecimal("0.01"));
+        String modelVersion = safe(props.getModelVersion());
 
-        boolean baselineTooBad = score0.compareTo(baselineTooBadScore) <= 0;
-        boolean passTooBad = baselineTooBad && delta.compareTo(baselineTooBadMinDelta) >= 0;
-
-        if (!(passAbs || passRel || passTooBad)) {
-            if (props.isLogSkipAsInfo()) {
-                log.info("🧠 WINDOW_SCALPING tune SKIP chatId={} ex={} net={} score0={} best={} delta={} thrAbs={} thrRel={}",
-                        chatId, ex, net, score0, bestScore, delta, minAbsImprove, relThreshold);
-            } else if (log.isDebugEnabled()) {
-                log.debug("🧠 WINDOW_SCALPING tune SKIP chatId={} ex={} net={} score0={} best={} delta={} thrAbs={} thrRel={}",
-                        chatId, ex, net, score0, bestScore, delta, minAbsImprove, relThreshold);
-            }
+        if (!apply) {
+            String reason = (best.trades != null && best.trades <= 0) ? "no_trades" : "no_improvement";
+            logSkip(chatId, ex, net, symbol, tf, base, bestSc, delta, reason);
 
             return TuningResult.builder()
                     .applied(false)
-                    .reason("Нет достаточного улучшения")
-                    .modelVersion(props.getModelVersion())
-                    .scoreBefore(score0)
-                    .scoreAfter(bestScore)
-                    .oldParams(oldParams)
-                    .newParams(oldParams)
+                    .scoreBefore(base)
+                    .scoreAfter(bestSc)
+                    .modelVersion(modelVersion)
+                    .reason(reason)
                     .build();
         }
 
-        // =====================================================================
-        // APPLY
-        // =====================================================================
+        // ✅ применяем лучший
+        applyToSettings(ss, cfg, best.params);
 
-        WindowScalpingStrategySettings patchedWs = WindowScalpingStrategySettings.builder()
-                .chatId(chatId)
-                .windowSize(clampInt(bestParams.get("windowSize"), 5, 2000, nz(curWs.getWindowSize(), 30)))
-                .entryFromLowPct(clampDouble(bestParams.get("entryFromLowPct"), 0.0, 100.0, nz(curWs.getEntryFromLowPct(), 20.0)))
-                .entryFromHighPct(clampDouble(bestParams.get("entryFromHighPct"), 0.0, 100.0, nz(curWs.getEntryFromHighPct(), 20.0)))
-                .minRangePct(clampDouble(bestParams.get("minRangePct"), 0.01, 50.0, nz(curWs.getMinRangePct(), 0.25)))
-                .maxSpreadPct(clampDouble(bestParams.get("maxSpreadPct"), 0.0, 50.0, nz(curWs.getMaxSpreadPct(), 0.08)))
-                .build();
+        persistSafe(strategySettingsService, ss);
+        persistSafe(windowSettingsService, cfg);
 
-        windowSettingsService.update(chatId, patchedWs);
-
-        curSs.setRiskPerTradePct(parseBd(bestParams.get("riskPerTradePct")));
-        curSs.setMinRiskReward(parseBd(bestParams.get("minRiskReward")));
-
-        // ✅ leverage у тебя int → никаких null-check, дефолт через normalizeLeverage()
-        curSs.setLeverage(clampInt(bestParams.get("leverage"), 1, 50, normalizeLeverage(curSs.getLeverage())));
-
-        curSs.setAllowAveraging(parseBool(bestParams.get("allowAveraging")));
-
-        curSs.setCooldownSeconds(toNullablePositiveInt(bestParams.get("cooldownSeconds")));
-        curSs.setCooldownAfterLossSeconds(toNullablePositiveInt(bestParams.get("cooldownAfterLossSeconds")));
-        curSs.setMaxConsecutiveLosses(toNullablePositiveInt(bestParams.get("maxConsecutiveLosses")));
-
-        curSs.setMaxDrawdownPct(parseBd(bestParams.get("maxDrawdownPct")));
-        curSs.setMaxPositionPct(parseBd(bestParams.get("maxPositionPct")));
-
-        curSs.setMaxTradesPerDay(toNullablePositiveInt(bestParams.get("maxTradesPerDay")));
-        curSs.setMaxOpenOrders(toNullablePositiveInt(bestParams.get("maxOpenOrders")));
-
-        // витрина (mlConfidence/totalProfit)
-        if (bestBm != null && bestBm.ok()) {
-            BigDecimal eps = nzBd(props.getEpsilon(), new BigDecimal("0.0001"));
-            curSs.setTotalProfitPct(normEps(bestBm.profitPct(), eps));
-            curSs.setMlConfidence(norm01(deriveMlConfidence(bestBm)));
-        }
-
-        strategySettingsService.save(curSs);
-
-        log.info("🧠 WINDOW_SCALPING tuned APPLY chatId={} ex={} net={} score {} -> {} delta={} profit={} dd={} trades={}",
-                chatId, ex, net, score0, bestScore, delta,
-                safeBd(bestBm != null ? bestBm.profitPct() : null),
-                safeBd(bestBm != null ? bestBm.maxDrawdownPct() : null),
-                bestBm != null ? bestBm.trades() : 0
+        log.info("[WS-TUNER] ✅ APPLIED chatId={} ex={} net={} sym={} tf={} base={} best={} delta={} trades={} model={}",
+                chatId, ex, net, symbol, tf,
+                strip(base), strip(bestSc), strip(delta),
+                best.trades, modelVersion
         );
 
         return TuningResult.builder()
                 .applied(true)
-                .reason("WINDOW_SCALPING tuned + applied")
-                .modelVersion(props.getModelVersion())
-                .scoreBefore(score0)
-                .scoreAfter(bestScore)
-                .oldParams(oldParams)
-                .newParams(new LinkedHashMap<>(bestParams))
+                .scoreBefore(base)
+                .scoreAfter(bestSc)
+                .modelVersion(modelVersion)
+                .reason("applied")
                 .build();
     }
 
-    // =====================================================================
-    // ENV resolve (без хардкода дефолтов)
-    // =====================================================================
+    // =====================================================
+    // ✅ NO_TRADES handlers (для AutoTunerOrchestrator reflection)
+    // =====================================================
 
-    private Env resolveEnv(Long chatId, StrategyType type, String exchange, NetworkType network) {
-
-        String ex = normalizeExchangeOrNull(exchange);
-        NetworkType net = network;
-
-        if (ex != null && net != null) {
-            return new Env(ex, net);
-        }
-
-        List<StrategySettings> all = strategySettingsService.findAllByChatId(chatId, null, null);
-
-        Comparator<StrategySettings> byFreshDesc =
-                Comparator.comparing(StrategySettings::getUpdatedAt, Comparator.nullsLast(Comparator.naturalOrder()))
-                        .thenComparing(StrategySettings::getId, Comparator.nullsLast(Comparator.naturalOrder()))
-                        .reversed();
-
-        Comparator<StrategySettings> byActiveFirst =
-                Comparator.comparing((StrategySettings s) -> !activeValue(s)); // false(активна) -> раньше
-
-        // 1) пытаемся найти запись именно этой стратегии
-        StrategySettings best = all.stream()
-                .filter(s -> s != null)
-                .filter(s -> s.getType() == type)
-                .filter(s -> s.getExchangeName() != null && s.getNetworkType() != null)
-                .sorted(byActiveFirst.thenComparing(byFreshDesc))
-                .findFirst()
-                .orElse(null);
-
-        // 2) если нет — любая запись с env, чтобы не падать без причины
-        if (best == null) {
-            best = all.stream()
-                    .filter(s -> s != null)
-                    .filter(s -> s.getExchangeName() != null && s.getNetworkType() != null)
-                    .sorted(byFreshDesc)
-                    .findFirst()
-                    .orElse(null);
-        }
-
-        if (ex == null && best != null) ex = normalizeExchangeOrNull(best.getExchangeName());
-        if (net == null && best != null) net = best.getNetworkType();
-
-        if (ex == null || net == null) {
-            throw new IllegalStateException("Нет данных env в request и в базе (сначала выбери сеть/биржу в UI)");
-        }
-
-        return new Env(ex, net);
+    public boolean onNoTrades(TuningRequest request) {
+        return adjustCoarseFilters(request);
     }
 
-    private record Env(String exchange, NetworkType network) {}
+    public boolean adjustCoarseFilters(TuningRequest request) {
+        return adjustCoarseFilters(request, "no_trades");
+    }
 
-    private static boolean activeValue(StrategySettings s) {
-        if (s == null) return false;
+    public boolean onNoTrades(TuningRequest request, String reason) {
+        return adjustCoarseFilters(request, reason);
+    }
 
-        // 1) Boolean getActive()
+    public boolean adjustCoarseFilters(TuningRequest request, String reason) {
+        if (request == null || request.chatId() == null || request.chatId() <= 0) return false;
+
+        Long chatId = request.chatId();
+        String ex = normalizeExchange(request.exchange());
+        NetworkType net = request.network() != null ? request.network() : NetworkType.MAINNET;
+
+        StrategySettings ss = strategySettingsService.getOrCreate(chatId, StrategyType.WINDOW_SCALPING, ex, net);
+        WindowScalpingStrategySettings cfg = windowSettingsService.getOrCreate(chatId);
+
+        if (ss == null || cfg == null) return false;
+
+        String symbol = safeSym(request.symbol());
+        String tf = safeTf(request.timeframe());
+
+        boolean applied = adjustCoarseFiltersInternal(chatId, ex, net, symbol, tf, ss, cfg, reason);
+        if (applied) {
+            persistSafe(strategySettingsService, ss);
+            persistSafe(windowSettingsService, cfg);
+        }
+        return applied;
+    }
+
+    // =====================================================
+    // coarse adjust
+    // =====================================================
+
+    private boolean adjustCoarseFiltersInternal(Long chatId,
+                                                String ex,
+                                                NetworkType net,
+                                                String symbol,
+                                                String tf,
+                                                StrategySettings ss,
+                                                WindowScalpingStrategySettings cfg,
+                                                String reason) {
+
+        boolean changed = false;
+
+        double oldMinRange = toDouble(readGetter(cfg, "getMinRangePct"));
+        double newMinRange;
+
+        if (reason != null && reason.toLowerCase(Locale.ROOT).contains("range")) {
+            newMinRange = Math.max(0.0, oldMinRange * 0.35);
+        } else {
+            newMinRange = Math.max(0.0, oldMinRange * 0.60);
+        }
+
+        newMinRange = clampD(newMinRange, 0.0, 10.0);
+
+        if (Math.abs(newMinRange - oldMinRange) > 1e-9) {
+            if (setNumeric(cfg, "setMinRangePct", newMinRange)) changed = true;
+        }
+
+        double oldLow = toDouble(readGetter(cfg, "getEntryFromLowPct"));
+        double oldHigh = toDouble(readGetter(cfg, "getEntryFromHighPct"));
+
+        double newLow = clampD(oldLow * 0.70, 0.1, 30.0);
+        double newHigh = clampD(oldHigh * 0.70, 0.1, 30.0);
+
+        if (newLow + newHigh > 60.0) {
+            double k = 60.0 / (newLow + newHigh);
+            newLow *= k;
+            newHigh *= k;
+        }
+
+        if (Math.abs(newLow - oldLow) > 1e-9) {
+            if (setNumeric(cfg, "setEntryFromLowPct", newLow)) changed = true;
+        }
+        if (Math.abs(newHigh - oldHigh) > 1e-9) {
+            if (setNumeric(cfg, "setEntryFromHighPct", newHigh)) changed = true;
+        }
+
+        double oldSpread = toDouble(readGetter(cfg, "getMaxSpreadPct"));
+        double newSpread = clampD(oldSpread + 0.05, 0.0, 5.0);
+        if (Math.abs(newSpread - oldSpread) > 1e-9) {
+            if (setNumeric(cfg, "setMaxSpreadPct", newSpread)) changed = true;
+        }
+
+        Integer w = cfg.getWindowSize();
+        Integer newWObj = w;
+        if (w != null && w > 20) {
+            int newW = clampInt((int) Math.round(w * 0.85), 5, 250);
+            if (newW != w) {
+                cfg.setWindowSize(newW);
+                newWObj = newW;
+                changed = true;
+            }
+        }
+
+        if (changed) {
+            log.info("[WS-TUNER] 🧱 COARSE_ADJUST chatId={} ex={} net={} sym={} tf={} reason={} | minRangePct {} -> {} | entryLow {} -> {} | entryHigh {} -> {} | maxSpread {} -> {} | window {} -> {}",
+                    chatId, ex, net, symbol, tf, String.valueOf(reason),
+                    fmt(oldMinRange), fmt(toDouble(readGetter(cfg, "getMinRangePct"))),
+                    fmt(oldLow), fmt(toDouble(readGetter(cfg, "getEntryFromLowPct"))),
+                    fmt(oldHigh), fmt(toDouble(readGetter(cfg, "getEntryFromHighPct"))),
+                    fmt(oldSpread), fmt(toDouble(readGetter(cfg, "getMaxSpreadPct"))),
+                    w, newWObj
+            );
+        }
+
+        return changed;
+    }
+
+    // =====================================================
+    // candidate / compare
+    // =====================================================
+
+    private record Candidate(Map<String, Object> params, double score, Integer trades, String tag) {}
+
+    private boolean isBetter(double scoreA, Integer tradesA, double scoreB, Integer tradesB) {
+        int ta = tradesA != null ? tradesA : -1;
+        int tb = tradesB != null ? tradesB : -1;
+
+        if (tb <= 0 && ta > 0) return true;
+        if (tb > 0 && ta <= 0) return false;
+
+        return scoreA > scoreB;
+    }
+
+    private boolean shouldApply(BigDecimal baseScore, BigDecimal delta) {
+        if (delta == null) return false;
+
+        BigDecimal baselineTooBadScore = nz(props.getBaselineTooBadScore(), "-999999");
+        BigDecimal baselineTooBadMinDelta = nz(props.getBaselineTooBadMinDelta(), "0.02");
+
+        if (baseScore != null && baseScore.compareTo(baselineTooBadScore) <= 0) {
+            return delta.compareTo(baselineTooBadMinDelta) >= 0;
+        }
+
+        BigDecimal minAbs = nz(props.getMinAbsImprove(), "0.02");
+        if (delta.compareTo(minAbs) < 0) return false;
+
+        BigDecimal absBase = baseScore != null ? baseScore.abs() : BigDecimal.ONE;
+        if (absBase.compareTo(new BigDecimal("0.000001")) < 0) absBase = BigDecimal.ONE;
+
+        BigDecimal rel = delta.divide(absBase, 8, RoundingMode.HALF_UP);
+        BigDecimal minRel = nz(props.getMinRelImprove(), "0.03");
+
+        return rel.compareTo(minRel) >= 0;
+    }
+
+    private void mutateCandidate(Map<String, Object> p, Random rnd) {
+
+        int windowJitter = 10;
+        double entryJitter = 2.0;
+        double minRangeJitter = 0.25;
+        double spreadJitter = 0.25;
+        double riskJitter = 0.15;
+        double rrJitter = 0.20;
+        int leverageJitter = 1;
+        int cooldownJitter = 60;
+
+        int w = intOf(p.get("windowSize"), 40);
+        w = clampInt(w + rndInt(rnd, -windowJitter, windowJitter), 5, 250);
+        p.put("windowSize", w);
+
+        double low = dblOf(p.get("entryFromLowPct"), 1.2);
+        double high = dblOf(p.get("entryFromHighPct"), 1.2);
+
+        low = clampD(low + rndD(rnd, -entryJitter, entryJitter), 0.1, 30.0);
+        high = clampD(high + rndD(rnd, -entryJitter, entryJitter), 0.1, 30.0);
+
+        if (low + high > 60.0) {
+            double k = 60.0 / (low + high);
+            low *= k;
+            high *= k;
+        }
+
+        p.put("entryFromLowPct", low);
+        p.put("entryFromHighPct", high);
+
+        double minR = dblOf(p.get("minRangePct"), 0.35);
+        minR = clampD(minR + rndD(rnd, -minRangeJitter, minRangeJitter), 0.0, 10.0);
+        p.put("minRangePct", minR);
+
+        double maxSp = dblOf(p.get("maxSpreadPct"), 0.30);
+        maxSp = clampD(maxSp + rndD(rnd, -spreadJitter, spreadJitter), 0.0, 5.0);
+        p.put("maxSpreadPct", maxSp);
+
+        BigDecimal risk = bd(p.get("riskPerTradePct"));
+        if (risk == null) risk = new BigDecimal("1.0");
+        risk = clampBD(risk.add(bd(rndD(rnd, -riskJitter, riskJitter))),
+                new BigDecimal("0.1"), new BigDecimal("10.0"));
+        p.put("riskPerTradePct", risk);
+
+        BigDecimal rr = bd(p.get("minRiskReward"));
+        if (rr == null) rr = new BigDecimal("1.5");
+        rr = clampBD(rr.add(bd(rndD(rnd, -rrJitter, rrJitter))),
+                new BigDecimal("0.5"), new BigDecimal("6.0"));
+        p.put("minRiskReward", rr);
+
+        int lev = intOf(p.get("leverage"), 1);
+        lev = clampInt(lev + rndInt(rnd, -leverageJitter, leverageJitter), 1, 25);
+        p.put("leverage", lev);
+
+        Boolean avg = boolOf(p.get("allowAveraging"));
+        if (avg == null) avg = Boolean.FALSE;
+        if (rnd.nextDouble() < 0.10) avg = !avg;
+        p.put("allowAveraging", avg);
+
+        Integer cd = intObjOf(p.get("cooldownAfterLossSeconds"));
+        if (cd == null) cd = 0;
+        cd = clampInt(cd + rndInt(rnd, -cooldownJitter, cooldownJitter), 0, 3600);
+        p.put("cooldownAfterLossSeconds", cd);
+
+        Integer mcl = intObjOf(p.get("maxConsecutiveLosses"));
+        if (mcl == null) mcl = 3;
+        if (rnd.nextDouble() < 0.20) {
+            mcl = clampInt(mcl + (rnd.nextBoolean() ? 1 : -1), 1, 15);
+        }
+        p.put("maxConsecutiveLosses", mcl);
+    }
+
+    // =====================================================
+    // params <-> settings
+    // =====================================================
+
+    private Map<String, Object> buildParamsFromCurrent(StrategySettings ss, WindowScalpingStrategySettings cfg) {
+        Map<String, Object> p = new HashMap<>();
+
+        // cfg (может быть double/Double/BigDecimal — нам всё равно, кладём как есть)
+        p.put("windowSize", cfg.getWindowSize());
+        p.put("entryFromLowPct", readGetter(cfg, "getEntryFromLowPct"));
+        p.put("entryFromHighPct", readGetter(cfg, "getEntryFromHighPct"));
+        p.put("minRangePct", readGetter(cfg, "getMinRangePct"));
+        p.put("maxSpreadPct", readGetter(cfg, "getMaxSpreadPct"));
+        p.put("takeProfitPct", cfg.getTakeProfitPct());
+        p.put("stopLossPct", cfg.getStopLossPct());
+
+        // ss
+        p.put("riskPerTradePct", ss.getRiskPerTradePct());
+        p.put("minRiskReward", ss.getMinRiskReward());
+        p.put("leverage", ss.getLeverage());
+        p.put("allowAveraging", ss.getAllowAveraging());
+        p.put("cooldownAfterLossSeconds", ss.getCooldownAfterLossSeconds());
+        p.put("maxConsecutiveLosses", ss.getMaxConsecutiveLosses());
+        p.put("maxDrawdownPct", ss.getMaxDrawdownPct());
+
+        return p;
+    }
+
+    private void applyToSettings(StrategySettings ss, WindowScalpingStrategySettings cfg, Map<String, Object> p) {
+
+        Integer w = intObjOf(p.get("windowSize"));
+        if (w != null && w > 0) cfg.setWindowSize(w);
+
+        setNumeric(cfg, "setEntryFromLowPct", dblOf(p.get("entryFromLowPct"), toDouble(readGetter(cfg, "getEntryFromLowPct"))));
+        setNumeric(cfg, "setEntryFromHighPct", dblOf(p.get("entryFromHighPct"), toDouble(readGetter(cfg, "getEntryFromHighPct"))));
+        setNumeric(cfg, "setMinRangePct", dblOf(p.get("minRangePct"), toDouble(readGetter(cfg, "getMinRangePct"))));
+        setNumeric(cfg, "setMaxSpreadPct", dblOf(p.get("maxSpreadPct"), toDouble(readGetter(cfg, "getMaxSpreadPct"))));
+
+        BigDecimal tp = bd(p.get("takeProfitPct"));
+        BigDecimal sl = bd(p.get("stopLossPct"));
+        if (tp != null && tp.signum() > 0) cfg.setTakeProfitPct(tp);
+        if (sl != null && sl.signum() > 0) cfg.setStopLossPct(sl);
+
+        BigDecimal risk = bd(p.get("riskPerTradePct"));
+        if (risk != null && risk.signum() > 0) ss.setRiskPerTradePct(risk);
+
+        BigDecimal rr = bd(p.get("minRiskReward"));
+        if (rr != null && rr.signum() > 0) ss.setMinRiskReward(rr);
+
+        Integer lev = intObjOf(p.get("leverage"));
+        if (lev != null && lev > 0) ss.setLeverage(lev);
+
+        Boolean avg = boolOf(p.get("allowAveraging"));
+        if (avg != null) ss.setAllowAveraging(avg);
+
+        Integer cd = intObjOf(p.get("cooldownAfterLossSeconds"));
+        if (cd != null && cd >= 0) ss.setCooldownAfterLossSeconds(cd);
+
+        Integer mcl = intObjOf(p.get("maxConsecutiveLosses"));
+        if (mcl != null && mcl > 0) ss.setMaxConsecutiveLosses(mcl);
+
+        BigDecimal dd = bd(p.get("maxDrawdownPct"));
+        if (dd != null && dd.signum() > 0) ss.setMaxDrawdownPct(dd);
+    }
+
+    // =====================================================
+    // backtest
+    // =====================================================
+
+    private BacktestMetrics safeRunBacktest(Long chatId,
+                                            String exchange,
+                                            NetworkType network,
+                                            String symbol,
+                                            String timeframe,
+                                            Map<String, Object> params,
+                                            Instant start,
+                                            Instant end) {
+
         try {
-            Method m = s.getClass().getMethod("getActive");
-            Object v = m.invoke(s);
-            if (v instanceof Boolean b) return b;
-        } catch (Exception ignored) {}
+            return backtestRunner.run(
+                    chatId,
+                    StrategyType.WINDOW_SCALPING,
+                    exchange,
+                    network,
+                    symbol,
+                    timeframe,
+                    params,
+                    start,
+                    end
+            );
+        } catch (Exception e) {
+            log.warn("[WS-TUNER] backtest fail: {}", e.getMessage());
+            return BacktestMetrics.fail("runner_error: " + e.getMessage());
+        }
+    }
 
-        // 2) boolean isActive()
+    // =====================================================
+    // persist (reflection-safe)
+    // =====================================================
+
+    private void persistSafe(Object service, Object entity) {
+        if (service == null || entity == null) return;
+
+        String[] methods = {"save", "saveOrUpdate", "update", "persist"};
+        for (String m : methods) {
+            if (tryInvoke1(service, m, entity)) return;
+        }
+
         try {
-            Method m = s.getClass().getMethod("isActive");
-            Object v = m.invoke(s);
-            if (v instanceof Boolean b) return b;
-        } catch (Exception ignored) {}
+            Method getRepo = service.getClass().getMethod("getRepository");
+            Object repo = getRepo.invoke(service);
+            if (repo != null) {
+                if (tryInvoke1(repo, "save", entity)) return;
+            }
+        } catch (Exception ignore) {
+            // ignore
+        }
+    }
+
+    private boolean tryInvoke1(Object target, String method, Object arg) {
+        try {
+            for (Method m : target.getClass().getMethods()) {
+                if (!m.getName().equals(method)) continue;
+                if (m.getParameterCount() != 1) continue;
+
+                Class<?> pt = m.getParameterTypes()[0];
+                if (!pt.isAssignableFrom(arg.getClass())) continue;
+
+                m.invoke(target, arg);
+                return true;
+            }
+        } catch (Exception ignore) {
+            // ignore
+        }
+        return false;
+    }
+
+    // =====================================================
+    // logs
+    // =====================================================
+
+    private void logSkip(Long chatId, String ex, NetworkType net, String sym, String tf,
+                         BigDecimal base, BigDecimal best, BigDecimal delta, String reason) {
+
+        String msg = String.format(Locale.ROOT,
+                "[WS-TUNER] SKIP chatId=%d ex=%s net=%s sym=%s tf=%s base=%s best=%s delta=%s reason=%s",
+                chatId, ex, net, sym, tf, strip(base), strip(best), strip(delta), reason
+        );
+
+        if (props.isLogSkipAsInfo()) log.info(msg);
+        else log.debug(msg);
+    }
+
+    // =====================================================
+    // utils
+    // =====================================================
+
+    private static String normalizeExchange(String exchange) {
+        if (exchange == null) return "BINANCE";
+        String ex = exchange.trim().toUpperCase(Locale.ROOT);
+        return ex.isEmpty() ? "BINANCE" : ex;
+    }
+
+    private static String safeSym(String s) {
+        if (s == null) return "BTCUSDT";
+        String x = s.trim().toUpperCase(Locale.ROOT);
+        return x.isEmpty() ? "BTCUSDT" : x;
+    }
+
+    private static String safeTf(String s) {
+        if (s == null) return "1m";
+        String x = s.trim().toLowerCase(Locale.ROOT);
+        return x.isEmpty() ? "1m" : x;
+    }
+
+    private static String firstNonBlank(String a, String b) {
+        String x = safe(a);
+        if (x != null) return x;
+        return safe(b);
+    }
+
+    private static String safe(String s) {
+        if (s == null) return null;
+        String t = s.trim();
+        return t.isEmpty() ? null : t;
+    }
+
+    private static BigDecimal bd(double v) {
+        return BigDecimal.valueOf(v);
+    }
+
+    private static BigDecimal bd(Object v) {
+        if (v == null) return null;
+        if (v instanceof BigDecimal bd) return bd;
+        if (v instanceof Number n) return BigDecimal.valueOf(n.doubleValue());
+        try { return new BigDecimal(String.valueOf(v).trim()); } catch (Exception ignore) {}
+        return null;
+    }
+
+    private static BigDecimal nz(BigDecimal v, String def) {
+        if (v != null) return v;
+        return new BigDecimal(def);
+    }
+
+    private static String strip(BigDecimal v) {
+        if (v == null) return "null";
+        return v.stripTrailingZeros().toPlainString();
+    }
+
+    private static int intOf(Object v, int def) {
+        if (v == null) return def;
+        if (v instanceof Number n) return n.intValue();
+        try { return Integer.parseInt(String.valueOf(v).trim()); } catch (Exception ignore) {}
+        return def;
+    }
+
+    private static Integer intObjOf(Object v) {
+        if (v == null) return null;
+        if (v instanceof Number n) return n.intValue();
+        try { return Integer.parseInt(String.valueOf(v).trim()); } catch (Exception ignore) {}
+        return null;
+    }
+
+    private static double dblOf(Object v, double def) {
+        if (v == null) return def;
+        if (v instanceof BigDecimal bd) return bd.doubleValue();
+        if (v instanceof Number n) return n.doubleValue();
+        try { return Double.parseDouble(String.valueOf(v).trim()); } catch (Exception ignore) {}
+        return def;
+    }
+
+    private static Boolean boolOf(Object v) {
+        if (v == null) return null;
+        if (v instanceof Boolean b) return b;
+        if (v instanceof Number n) return n.intValue() != 0;
+        String s = String.valueOf(v).trim().toLowerCase(Locale.ROOT);
+        if (s.isEmpty()) return null;
+        if (s.equals("true") || s.equals("1") || s.equals("yes") || s.equals("y")) return true;
+        if (s.equals("false") || s.equals("0") || s.equals("no") || s.equals("n")) return false;
+        return null;
+    }
+
+    private static int clampInt(int v, int lo, int hi) {
+        return Math.max(lo, Math.min(hi, v));
+    }
+
+    private static double clampD(double v, double lo, double hi) {
+        return Math.max(lo, Math.min(hi, v));
+    }
+
+    private static BigDecimal clampBD(BigDecimal v, BigDecimal lo, BigDecimal hi) {
+        if (v == null) return null;
+        if (v.compareTo(lo) < 0) return lo;
+        if (v.compareTo(hi) > 0) return hi;
+        return v;
+    }
+
+    private static int rndInt(Random r, int lo, int hi) {
+        if (hi < lo) { int t = lo; lo = hi; hi = t; }
+        return lo + r.nextInt((hi - lo) + 1);
+    }
+
+    private static double rndD(Random r, double lo, double hi) {
+        if (hi < lo) { double t = lo; lo = hi; hi = t; }
+        return lo + (hi - lo) * r.nextDouble();
+    }
+
+    private static String fmt(double v) {
+        return String.format(Locale.ROOT, "%.6f", v);
+    }
+
+    // =====================================================
+    // ✅ reflection numeric setters (поддержка double/Double/BigDecimal)
+    // =====================================================
+
+    private static Object readGetter(Object target, String getterName) {
+        if (target == null || getterName == null) return null;
+        try {
+            Method m = target.getClass().getMethod(getterName);
+            return m.invoke(target);
+        } catch (Exception ignore) {
+            return null;
+        }
+    }
+
+    private static double toDouble(Object v) {
+        if (v == null) return 0.0;
+        if (v instanceof BigDecimal bd) return bd.doubleValue();
+        if (v instanceof Number n) return n.doubleValue();
+        try { return Double.parseDouble(String.valueOf(v).trim()); } catch (Exception ignore) {}
+        return 0.0;
+    }
+
+    private static BigDecimal toBigDecimal(Object v) {
+        if (v == null) return null;
+        if (v instanceof BigDecimal bd) return bd;
+        if (v instanceof Number n) return BigDecimal.valueOf(n.doubleValue());
+        try { return new BigDecimal(String.valueOf(v).trim()); } catch (Exception ignore) {}
+        return null;
+    }
+
+    private static boolean setNumeric(Object target, String setterName, double value) {
+        if (target == null || setterName == null) return false;
+
+        // пробуем double/Double/BigDecimal
+        if (trySet(target, setterName, value, double.class)) return true;
+        if (trySet(target, setterName, value, Double.class)) return true;
+
+        BigDecimal bd = BigDecimal.valueOf(value);
+        if (trySet(target, setterName, bd, BigDecimal.class)) return true;
+
+        // fallback: Number
+        if (trySetAssignable(target, setterName, Double.valueOf(value))) return true;
 
         return false;
     }
 
-    private static int normalizeLeverage(int lev) {
-        return lev > 0 ? lev : 1;
-    }
-
-    // =====================================================================
-    // Candidate mutation / score
-    // =====================================================================
-
-    private static Map<String, Object> mutateCandidate(Map<String, Object> base) {
-        ThreadLocalRandom r = ThreadLocalRandom.current();
-        Map<String, Object> m = new LinkedHashMap<>(base);
-
-        m.put("windowSize", clampInt(jitterInt(m.get("windowSize"), r, 0.25), 5, 2000, 30));
-        m.put("entryFromLowPct", clampDouble(jitterDouble(m.get("entryFromLowPct"), r, 6.0), 0, 100, 20));
-        m.put("entryFromHighPct", clampDouble(jitterDouble(m.get("entryFromHighPct"), r, 6.0), 0, 100, 20));
-        m.put("minRangePct", clampDouble(jitterDouble(m.get("minRangePct"), r, 0.15), 0.01, 50.0, 0.25));
-        m.put("maxSpreadPct", clampDouble(jitterDouble(m.get("maxSpreadPct"), r, 0.08), 0.0, 50.0, 0.08));
-
-        m.put("riskPerTradePct", clampBd(jitterBd(m.get("riskPerTradePct"), r, "0.40"), "0.01", "20.0", "1.0"));
-        m.put("minRiskReward", clampBd(jitterBd(m.get("minRiskReward"), r, "0.35"), "0.1", "10.0", "1.2"));
-
-        int lev = clampInt(m.get("leverage"), 1, 50, 1);
-        if (r.nextDouble() < 0.35) {
-            lev = Math.max(1, Math.min(50, lev + (r.nextBoolean() ? 1 : -1)));
-        } else if (r.nextDouble() < 0.10) {
-            lev = r.nextInt(1, 11);
-        }
-        m.put("leverage", lev);
-
-        if (r.nextDouble() < 0.10) {
-            m.put("allowAveraging", !parseBool(m.get("allowAveraging")));
-        }
-
-        m.put("cooldownSeconds", jitterNullableInt(m.get("cooldownSeconds"), r, 0, 3600));
-        m.put("cooldownAfterLossSeconds", jitterNullableInt(m.get("cooldownAfterLossSeconds"), r, 0, 7200));
-        m.put("maxConsecutiveLosses", jitterNullableInt(m.get("maxConsecutiveLosses"), r, 0, 20));
-
-        m.put("maxDrawdownPct", jitterNullableBdPct(m.get("maxDrawdownPct"), r, "0.8"));
-        m.put("maxPositionPct", jitterNullableBdPct(m.get("maxPositionPct"), r, "0.8"));
-
-        m.put("maxTradesPerDay", jitterNullableInt(m.get("maxTradesPerDay"), r, 0, 300));
-        m.put("maxOpenOrders", jitterNullableInt(m.get("maxOpenOrders"), r, 1, 50));
-
-        return m;
-    }
-
-    private static BigDecimal score(BacktestMetrics m, Map<String, Object> params) {
-        if (m == null || !m.ok()) return new BigDecimal("-999999");
-
-        BigDecimal profit = safeBd(m.profitPct());
-        BigDecimal dd = safeBd(m.maxDrawdownPct());
-
-        int trades = m.trades();
-        int lev = clampInt(params.get("leverage"), 1, 50, 1);
-
-        BigDecimal risk = parseBd(params.get("riskPerTradePct"));
-        if (risk == null) risk = new BigDecimal("1.0");
-
-        boolean avg = parseBool(params.get("allowAveraging"));
-
-        BigDecimal s = profit
-                .subtract(dd.multiply(new BigDecimal("0.70")))
-                .subtract(BigDecimal.valueOf(Math.max(0, lev - 1)).multiply(new BigDecimal("0.25")))
-                .subtract(risk.multiply(new BigDecimal("0.10")));
-
-        if (trades < 5) s = s.subtract(new BigDecimal("1.0"));
-        if (avg) s = s.subtract(new BigDecimal("0.15"));
-
-        BigDecimal maxDdLimit = parseBd(params.get("maxDrawdownPct"));
-        if (maxDdLimit != null && dd.compareTo(maxDdLimit) > 0) {
-            s = s.subtract(new BigDecimal("50"));
-        }
-
-        return s.setScale(6, RoundingMode.HALF_UP);
-    }
-
-    // =====================================================================
-    // Helpers
-    // =====================================================================
-
-    private static BigDecimal nzBd(BigDecimal v, BigDecimal def) { return v != null ? v : def; }
-    private static Integer nz(Integer v, int def) { return v != null ? v : def; }
-    private static Double nz(Double v, double def) { return v != null ? v : def; }
-    private static BigDecimal bdOr(BigDecimal v, String def) { return v != null ? v : new BigDecimal(def); }
-    private static BigDecimal safeBd(BigDecimal v) { return v != null ? v : BigDecimal.ZERO; }
-
-    private static String normalizeExchangeOrNull(String ex) {
-        if (ex == null) return null;
-        String s = ex.trim().toUpperCase(Locale.ROOT);
-        return s.isEmpty() ? null : s;
-    }
-
-    private static String normalizeSymbol(String symbol) {
-        if (symbol == null) return null;
-        String s = symbol.trim().toUpperCase(Locale.ROOT);
-        return s.isEmpty() ? null : s;
-    }
-
-    private static String normalizeTimeframe(String timeframe) {
-        if (timeframe == null) return null;
-        String s = timeframe.trim().toLowerCase(Locale.ROOT);
-        return s.isEmpty() ? null : s;
-    }
-
-    private static String firstNonBlank(String a, String b) {
-        if (a != null && !a.trim().isEmpty()) return a.trim();
-        return (b != null && !b.trim().isEmpty()) ? b.trim() : null;
-    }
-
-    private static BigDecimal normEps(BigDecimal v, BigDecimal eps) {
-        if (v == null) return BigDecimal.ZERO;
-        if (eps == null) return v;
-        return v.abs().compareTo(eps) < 0 ? BigDecimal.ZERO : v;
-    }
-
-    private static BigDecimal norm01(BigDecimal v) {
-        if (v == null) return BigDecimal.ZERO;
-        if (v.compareTo(BigDecimal.ZERO) < 0) return BigDecimal.ZERO;
-        if (v.compareTo(BigDecimal.ONE) > 0) return BigDecimal.ONE;
-        return v;
-    }
-
-    private static int clampInt(Object v, int min, int max, int def) {
+    private static boolean trySet(Object target, String setterName, Object arg, Class<?> paramType) {
         try {
-            int x = (v instanceof Number n) ? n.intValue() : Integer.parseInt(String.valueOf(v).trim());
-            if (x < min) return min;
-            if (x > max) return max;
-            return x;
-        } catch (Exception e) {
-            return def;
+            Method m = target.getClass().getMethod(setterName, paramType);
+            m.invoke(target, arg);
+            return true;
+        } catch (Exception ignore) {
+            return false;
         }
     }
 
-    private static double clampDouble(Object v, double min, double max, double def) {
+    private static boolean trySetAssignable(Object target, String setterName, Object arg) {
         try {
-            double x = (v instanceof Number n) ? n.doubleValue()
-                    : Double.parseDouble(String.valueOf(v).trim().replace(",", "."));
-            if (x < min) return min;
-            if (x > max) return max;
-            return x;
-        } catch (Exception e) {
-            return def;
+            for (Method m : target.getClass().getMethods()) {
+                if (!m.getName().equals(setterName)) continue;
+                if (m.getParameterCount() != 1) continue;
+
+                Class<?> pt = m.getParameterTypes()[0];
+
+                Object coerced = coerceNumber(arg, pt);
+                if (coerced == null) continue;
+
+                m.invoke(target, coerced);
+                return true;
+            }
+        } catch (Exception ignore) {
+            // ignore
         }
+        return false;
     }
 
-    private static BigDecimal parseBd(Object v) {
-        if (v == null) return null;
-        if (v instanceof BigDecimal bd) return bd;
-        try {
-            return new BigDecimal(String.valueOf(v).trim().replace(",", "."));
-        } catch (Exception e) {
-            return null;
+    private static Object coerceNumber(Object value, Class<?> targetType) {
+        if (value == null || targetType == null) return null;
+
+        if (targetType.isInstance(value)) return value;
+
+        if (targetType == double.class || targetType == Double.class) {
+            return toDouble(value);
         }
-    }
-
-    private static boolean parseBool(Object v) {
-        if (v == null) return false;
-        if (v instanceof Boolean b) return b;
-        String s = String.valueOf(v).trim().toLowerCase(Locale.ROOT);
-        return s.equals("true") || s.equals("1") || s.equals("yes") || s.equals("y");
-    }
-
-    private static Integer toNullablePositiveInt(Object v) {
-        try {
-            if (v == null) return null;
-            int x = (v instanceof Number n) ? n.intValue() : Integer.parseInt(String.valueOf(v).trim());
-            return x > 0 ? x : null;
-        } catch (Exception e) {
-            return null;
+        if (targetType == float.class || targetType == Float.class) {
+            return (float) toDouble(value);
         }
-    }
-
-    private static int jitterInt(Object v, ThreadLocalRandom r, double frac) {
-        int x = clampInt(v, 1, Integer.MAX_VALUE, 30);
-        int delta = Math.max(1, (int) Math.round(x * frac));
-        return x + r.nextInt(-delta, delta + 1);
-    }
-
-    private static double jitterDouble(Object v, ThreadLocalRandom r, double deltaAbs) {
-        double x = clampDouble(v, -1e9, 1e9, 0.0);
-        return x + r.nextDouble(-deltaAbs, deltaAbs);
-    }
-
-    private static BigDecimal jitterBd(Object v, ThreadLocalRandom r, String deltaAbs) {
-        BigDecimal x = parseBd(v);
-        if (x == null) x = BigDecimal.ZERO;
-        BigDecimal d = new BigDecimal(deltaAbs);
-        BigDecimal j = BigDecimal.valueOf(r.nextDouble(-1.0, 1.0)).multiply(d);
-        return x.add(j);
-    }
-
-    private static BigDecimal clampBd(BigDecimal v, String min, String max, String def) {
-        BigDecimal x = (v != null ? v : new BigDecimal(def));
-        BigDecimal mn = new BigDecimal(min);
-        BigDecimal mx = new BigDecimal(max);
-        if (x.compareTo(mn) < 0) x = mn;
-        if (x.compareTo(mx) > 0) x = mx;
-        return x.setScale(6, RoundingMode.HALF_UP);
-    }
-
-    private static Object jitterNullableInt(Object v, ThreadLocalRandom r, int min, int max) {
-        if (min == 0 && r.nextDouble() < 0.20) return null;
-        int x = clampInt(v, min, max, min);
-        if (r.nextDouble() < 0.30) {
-            int d = r.nextInt(-30, 31);
-            x = Math.max(min, Math.min(max, x + d));
+        if (targetType == int.class || targetType == Integer.class) {
+            return (int) Math.round(toDouble(value));
         }
-        if (x <= 0 && min == 0) return null;
-        return x;
-    }
+        if (targetType == long.class || targetType == Long.class) {
+            return (long) Math.round(toDouble(value));
+        }
+        if (targetType == BigDecimal.class) {
+            return toBigDecimal(value);
+        }
 
-    private static Object jitterNullableBdPct(Object v, ThreadLocalRandom r, String deltaAbs) {
-        if (r.nextDouble() < 0.20) return null;
-        BigDecimal x = parseBd(v);
-        if (x == null) x = new BigDecimal("10.0");
-        BigDecimal d = new BigDecimal(deltaAbs);
-        BigDecimal j = BigDecimal.valueOf(r.nextDouble(-1.0, 1.0)).multiply(d);
-        x = x.add(j);
-        if (x.compareTo(BigDecimal.ZERO) < 0) x = BigDecimal.ZERO;
-        if (x.compareTo(BigDecimal.valueOf(100)) > 0) x = BigDecimal.valueOf(100);
-        return x.setScale(6, RoundingMode.HALF_UP);
-    }
+        if (Number.class.isAssignableFrom(targetType)) {
+            double d = toDouble(value);
+            if (targetType == Short.class) return (short) Math.round(d);
+            if (targetType == Byte.class) return (byte) Math.round(d);
+            return Double.valueOf(d);
+        }
 
-    private static BigDecimal deriveMlConfidence(BacktestMetrics bm) {
-        if (bm == null || !bm.ok()) return BigDecimal.ZERO;
-
-        int trades = bm.trades();
-        BigDecimal wr = bm.winRatePct() != null ? bm.winRatePct() : BigDecimal.ZERO;
-
-        BigDecimal t = BigDecimal.valueOf(Math.min(trades, 50))
-                .divide(BigDecimal.valueOf(50), 6, RoundingMode.HALF_UP);
-
-        BigDecimal w = wr.divide(BigDecimal.valueOf(100), 6, RoundingMode.HALF_UP)
-                .max(BigDecimal.ZERO).min(BigDecimal.ONE);
-
-        return w.multiply(new BigDecimal("0.60"))
-                .add(t.multiply(new BigDecimal("0.40")))
-                .setScale(6, RoundingMode.HALF_UP);
+        return null;
     }
 }

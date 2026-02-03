@@ -1,5 +1,6 @@
 package com.chicu.aitradebot.service;
 
+import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.OrderEntity;
 import com.chicu.aitradebot.exchange.model.Order;
@@ -10,21 +11,36 @@ import java.util.List;
 public interface OrderService {
 
     // =========================
-    // ✅ НОВОЕ: контекст ордера (для журнала/обучения)
+    // ✅ Контекст ордера (для журнала/обучения)
     // =========================
     record OrderContext(
             Long chatId,
             StrategyType strategyType,
             String symbol,
             String timeframe,
-            String correlationId, // id intent-а (из TradeIntentJournalService)
-            String role           // ENTRY / TP / SL / EXIT / OCO / UNKNOWN
+            String correlationId,
+            String role,
+            String exchangeName,
+            NetworkType networkType
     ) {}
 
-    // ✅ НОВОЕ: методы с контекстом (их будет звать SCALPING)
+    // =====================================================
+    // ✅ НОВОЕ API (с контекстом)
+    // =====================================================
+
+    /**
+     * MARKET ордер.
+     *
+     * ВАЖНО: семантика параметра {@code amount} зависит от {@code side}:
+     * - BUY (SPOT): {@code amount} = quoteAmount (например, USDT), который ты готов потратить.
+     *              Сервис обязан сам рассчитать baseQty с учётом stepSize/minNotional/precision и НЕ превысить budget.
+     * - SELL (SPOT): {@code amount} = baseQty (количество базовой монеты), которое ты продаёшь.
+     *
+     * {@code executionPrice} может быть последним тиком/оценкой для guard-проверок (minNotional и т.п.).
+     */
     Order placeMarket(OrderContext ctx,
                       String side,
-                      BigDecimal quantity,
+                      BigDecimal amount,
                       BigDecimal executionPrice);
 
     Order placeLimit(OrderContext ctx,
@@ -39,19 +55,49 @@ public interface OrderService {
                    BigDecimal stopPrice,
                    BigDecimal stopLimitPrice);
 
-    // =========================
-    // ⚠️ Старые методы (оставляем для совместимости)
-    // =========================
+    // =====================================================
+    // ✅ ГОВОРЯЩИЕ convenience-методы (чтобы не путаться)
+    // =====================================================
 
-    // ====== MARKET ======
+    /**
+     * SPOT BUY на MARKET: ты передаёшь budget в quote-валюте (обычно USDT).
+     */
+    default Order placeMarketBuyQuote(OrderContext ctx,
+                                      BigDecimal quoteAmount,
+                                      BigDecimal executionPrice) {
+        return placeMarket(ctx, "BUY", quoteAmount, executionPrice);
+    }
+
+    /**
+     * SPOT SELL на MARKET: ты передаёшь qty базовой монеты.
+     */
+    default Order placeMarketSellQty(OrderContext ctx,
+                                     BigDecimal baseQty,
+                                     BigDecimal executionPrice) {
+        return placeMarket(ctx, "SELL", baseQty, executionPrice);
+    }
+
+    // =====================================================
+    // ⚠️ Старые методы (оставляем для совместимости)
+    // =====================================================
+
+    /**
+     * Старый MARKET API.
+     *
+     * Семантика {@code amount} такая же:
+     * - BUY: quoteAmount (USDT budget)
+     * - SELL: baseQty
+     */
     Order placeMarket(Long chatId,
                       String symbol,
                       String side,
-                      BigDecimal quantity,
+                      BigDecimal amount,
                       BigDecimal executionPrice,
                       String strategyType);
 
-    // ====== LIMIT ======
+    /**
+     * Старый LIMIT API (оставляем как было: quantity = baseQty).
+     */
     Order placeLimit(Long chatId,
                      String symbol,
                      String side,
@@ -60,7 +106,9 @@ public interface OrderService {
                      String timeInForce,
                      String strategyType);
 
-    // ====== OCO ======
+    /**
+     * Старый OCO API (quantity = baseQty).
+     */
     Order placeOco(Long chatId,
                    String symbol,
                    BigDecimal quantity,

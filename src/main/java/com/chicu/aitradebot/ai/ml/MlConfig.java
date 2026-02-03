@@ -1,7 +1,6 @@
 package com.chicu.aitradebot.ai.ml;
 
 import com.chicu.aitradebot.ai.ml.dataset.MlStorageProperties;
-import com.chicu.aitradebot.ai.ml.sidecar.props.MlSidecarProperties;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import okhttp3.OkHttpClient;
 import org.springframework.beans.factory.ObjectProvider;
@@ -14,7 +13,6 @@ import java.time.Duration;
 
 @Configuration
 @EnableConfigurationProperties({
-        MlSidecarProperties.class,
         MlStorageProperties.class,
         MlProperties.class
 })
@@ -30,11 +28,15 @@ public class MlConfig {
     }
 
     /**
-     * Нужен для MlHealthProbe (и любых legacy вызовов).
+     * ML HTTP клиент (для /health, /predict и любых вызовов ML).
      *
-     * ВАЖНО:
-     * - OkHttpClient берём из твоего HttpClientConfig (чтобы не было дубля по имени).
-     * - если вдруг OkHttpClient bean отсутствует — создадим локальный fallback.
+     * Зачем здесь таймауты:
+     * - чтобы python sidecar НЕ мог повесить торговлю,
+     * - но при этом не ронять приложение, если ML выключен или недоступен.
+     *
+     * Важно:
+     * - OkHttpClient берём из общего HttpClientConfig (пул, DNS, keep-alive и т.д.)
+     * - если его нет — создаём локальный fallback.
      */
     @Bean
     @ConditionalOnMissingBean
@@ -43,15 +45,33 @@ public class MlConfig {
                              MlProperties props) {
 
         OkHttpClient base = okProvider.getIfAvailable(() ->
-                new OkHttpClient.Builder().callTimeout(Duration.ofSeconds(15)).build()
+                new OkHttpClient.Builder()
+                        .connectTimeout(Duration.ofMillis(1500))
+                        .readTimeout(Duration.ofMillis(8000))
+                        .callTimeout(Duration.ofSeconds(15))
+                        .build()
         );
 
-        int timeoutMs = Math.max(500, props.getTimeoutMs());
+        // Берём таймауты из ml.* (новая схема)
+        int connectMs = clamp(props.getConnectTimeoutMs(), 200, 30_000);
+        int readMs    = clamp(props.getReadTimeoutMs(), 200, 120_000);
+
+        // callTimeout — верхняя граница на весь вызов.
+        // Делаем чуть больше readTimeout, чтобы не обрубало на ровном месте.
+        int callMs = clamp(readMs + 1000, 500, 180_000);
 
         OkHttpClient tuned = base.newBuilder()
-                .callTimeout(Duration.ofMillis(timeoutMs))
+                .connectTimeout(Duration.ofMillis(connectMs))
+                .readTimeout(Duration.ofMillis(readMs))
+                .callTimeout(Duration.ofMillis(callMs))
                 .build();
 
         return new MlClient(tuned, om, props);
+    }
+
+    private static int clamp(int v, int min, int max) {
+        if (v < min) return min;
+        if (v > max) return max;
+        return v;
     }
 }

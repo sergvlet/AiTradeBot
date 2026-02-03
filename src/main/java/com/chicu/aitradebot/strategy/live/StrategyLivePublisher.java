@@ -665,4 +665,131 @@ public class StrategyLivePublisher {
         );
     }
 
+    // =====================================================
+    // ✅ ADAPTERS for MarketStreamServiceImpl (compile fix)
+    // =====================================================
+
+    /**
+     * MarketStreamServiceImpl ожидает publishAggTick(...).
+     * В текущем UI достаточно price tick (qty можно не публиковать отдельным событием).
+     */
+    public void publishAggTick(long chatId,
+                               StrategyType strategyType,
+                               String symbol,
+                               String timeframe,
+                               BigDecimal price,
+                               BigDecimal qty,
+                               long tradeTsMs) {
+        // qty пока не используем — при желании можно добавить отдельный "trade" event
+        pushPriceTick(chatId, strategyType, symbol, timeframe, price,
+                tradeTsMs > 0 ? Instant.ofEpochMilli(tradeTsMs) : null);
+    }
+
+    /**
+     * MarketStreamServiceImpl ожидает publishCandle(chatId, type, UnifiedKline).
+     * UnifiedKline у тебя, судя по ошибкам, без record-аксессоров, поэтому читаем через reflection.
+     */
+    public void publishCandle(long chatId, StrategyType strategyType, com.chicu.aitradebot.market.model.UnifiedKline kline) {
+        if (kline == null) return;
+
+        String symbol = asString(readAny(kline, "symbol", "getSymbol"));
+        String tf     = asString(readAny(kline, "timeframe", "getTimeframe", "interval", "getInterval"));
+
+        BigDecimal open   = asBigDecimal(readAny(kline, "open", "getOpen"));
+        BigDecimal high   = asBigDecimal(readAny(kline, "high", "getHigh"));
+        BigDecimal low    = asBigDecimal(readAny(kline, "low", "getLow"));
+        BigDecimal close  = asBigDecimal(readAny(kline, "close", "getClose"));
+        BigDecimal volume = asBigDecimal(readAny(kline, "volume", "getVolume"));
+
+        Long timeMs = asLong(readAny(kline,
+                "openTime", "getOpenTime",
+                "startTime", "getStartTime",
+                "time", "getTime",
+                "closeTime", "getCloseTime"
+        ));
+
+        pushCandleOhlc(
+                chatId,
+                strategyType,
+                symbol,
+                tf,
+                open,
+                high,
+                low,
+                close,
+                volume,
+                timeMs != null && timeMs > 0 ? Instant.ofEpochMilli(timeMs) : null
+        );
+    }
+
+    // =====================================================
+    // 🧩 Reflection helpers (compile-safe for any UnifiedKline shape)
+    // =====================================================
+
+    private static Object readAny(Object target, String... methodNames) {
+        if (target == null || methodNames == null) return null;
+
+        Class<?> c = target.getClass();
+        for (String name : methodNames) {
+            if (name == null || name.isBlank()) continue;
+            try {
+                // 1) method with no args
+                var m = c.getMethod(name);
+                return m.invoke(target);
+            } catch (NoSuchMethodException ignore) {
+                // 2) try boolean getter style for fields, e.g. isClosed()
+                if (!name.startsWith("get") && !name.startsWith("is")) {
+                    String cap = Character.toUpperCase(name.charAt(0)) + name.substring(1);
+                    try {
+                        var m2 = c.getMethod("get" + cap);
+                        return m2.invoke(target);
+                    } catch (Exception ignore2) {
+                        try {
+                            var m3 = c.getMethod("is" + cap);
+                            return m3.invoke(target);
+                        } catch (Exception ignore3) {
+                            // continue
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                // если метод есть, но падает — просто пропускаем
+            }
+        }
+        return null;
+    }
+
+    private static String asString(Object v) {
+        if (v == null) return null;
+        String s = String.valueOf(v).trim();
+        return s.isEmpty() ? null : s;
+    }
+
+    private static Long asLong(Object v) {
+        if (v == null) return null;
+        if (v instanceof Long l) return l;
+        if (v instanceof Integer i) return i.longValue();
+        if (v instanceof java.time.Instant it) return it.toEpochMilli();
+        if (v instanceof java.util.Date d) return d.getTime();
+        if (v instanceof Number n) return n.longValue();
+        try {
+            return Long.parseLong(String.valueOf(v));
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static BigDecimal asBigDecimal(Object v) {
+        if (v == null) return null;
+        if (v instanceof BigDecimal bd) return bd;
+        if (v instanceof Number n) return BigDecimal.valueOf(n.doubleValue());
+        try {
+            return new BigDecimal(String.valueOf(v));
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+
+
 }

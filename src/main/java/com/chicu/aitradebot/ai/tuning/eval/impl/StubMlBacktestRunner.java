@@ -8,6 +8,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.stereotype.Service;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Instant;
 import java.util.Map;
 
@@ -30,7 +32,23 @@ public class StubMlBacktestRunner implements MlBacktestRunner {
         log.warn("🧪 ML BacktestRunner = STUB (type={}, ex={}, net={}, symbol={}, tf={}) — подключи RealMlBacktestRunner",
                 type, exchange, network, symbolOverride, timeframeOverride);
 
-        // ok=true, чтобы пайплайн тюнера не ломался
-        return BacktestMetrics.stubOk(chatId, type, symbolOverride, timeframeOverride, candidateParams, startAt, endAt);
+        // ✅ ok=true, чтобы тюнер не падал, но score/trades будут нулевыми
+        return BacktestMetrics.builder()
+                .ok(true)
+                .reason("STUB")
+                .chatId(chatId)
+                .type(type)
+                .symbol(symbolOverride)
+                .timeframe(timeframeOverride)
+                .startAt(startAt)
+                .endAt(endAt)
+                .profitPct(BigDecimal.ZERO.setScale(6, RoundingMode.HALF_UP))
+                .maxDrawdownPct(BigDecimal.ZERO.setScale(6, RoundingMode.HALF_UP))
+                .trades(0)
+                .wins(0)
+                .losses(0)
+                .winRatePct(BigDecimal.ZERO.setScale(6, RoundingMode.HALF_UP))
+                .params(candidateParams)
+                .build();
     }
 }

@@ -34,4 +34,43 @@ public class RealMlBacktestRunnerProperties {
      * logging flags
      */
     private boolean logWarmupInfo = true;
+
+    /**
+     * safety: если warmupMultiplier выставят криво — не даём 0/отрицательное
+     * (используется в computeWarmupLimit()).
+     */
+    public double safeWarmupMultiplier() {
+        return Math.max(0.1, warmupMultiplier);
+    }
+
+    /**
+     * safety: min/max warmup
+     */
+    public int safeWarmupMin() {
+        return Math.max(1, warmupMin);
+    }
+
+    public int safeWarmupMax() {
+        return Math.max(safeWarmupMin(), warmupMax);
+    }
+
+    /**
+     * safety: candles limits
+     */
+    public int safeCandlesLimitMin() {
+        return Math.max(1, candlesLimitMin);
+    }
+
+    public int safeCandlesLimitMax() {
+        return Math.max(safeCandlesLimitMin(), candlesLimitMax);
+    }
+
+    public int safeDefaultCandlesLimit() {
+        int d = Math.max(1, defaultCandlesLimit);
+        int min = safeCandlesLimitMin();
+        int max = safeCandlesLimitMax();
+        if (d < min) d = min;
+        if (d > max) d = max;
+        return d;
+    }
 }

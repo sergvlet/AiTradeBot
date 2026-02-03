@@ -34,7 +34,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     const chatId = root.dataset.chatId;
-    const type   = (root.dataset.type || "").trim();            // например "MOMENTUM"
+    const type   = (root.dataset.type || "").trim();
     const symbol = (root.dataset.symbol || "").trim().toUpperCase();
 
     console.log("🧩 Context:", { chatId, type, symbol });
@@ -50,7 +50,7 @@ document.addEventListener("DOMContentLoaded", () => {
     // =========================================================================
     const chartCtrl = new ChartController(container);
     chartCtrl.symbol    = symbol;
-    chartCtrl.timeframe = "1m"; // если бек отдает иной — он всё равно обновит через snapshot/WS
+    chartCtrl.timeframe = "1m";
 
     const layers = new LayerRenderer(chartCtrl.chart, chartCtrl.candles);
 
@@ -76,18 +76,17 @@ document.addEventListener("DOMContentLoaded", () => {
 
         // ===================== VI) GRIDS =====================
         case "FIBONACCI_GRID":
-        case "FIBONACCI_RETRACE": // если твой FibonacciStrategy умеет и retrace — ок, если нет, останется generic
+        case "FIBONACCI_RETRACE":
             strategy = new FibonacciStrategy({ layers, ctx });
             break;
 
         case "GRID":
-            // пока нет отдельного grid.strategy.js — график будет работать, слоёв нет
             strategy = new GenericStrategy({ layers, ctx });
             break;
 
         // ===================== VIII) AI =====================
         case "SMART_FUSION":
-        case "HYBRID":            // если нет отдельного hybrid.strategy.js — оставляем generic или можно SmartFusion
+        case "HYBRID":
             strategy = new SmartFusionStrategy({ layers, ctx });
             break;
 
@@ -158,8 +157,6 @@ document.addEventListener("DOMContentLoaded", () => {
             // 1) история → в график
             if (Array.isArray(data?.candles)) {
                 chartCtrl.setHistory(data.candles);
-
-                // прогреваем фичи стратегии историей
                 strategy.onCandleHistory?.(chartCtrl.candlesData);
             }
 
@@ -167,7 +164,6 @@ document.addEventListener("DOMContentLoaded", () => {
             if (data?.layers) {
                 strategy.onEvent?.({ type: "layers", layers: data.layers });
 
-                // если бек хранит windowZone — рисуем
                 if ((type === "SCALPING" || type === "WINDOW_SCALPING") && data.layers.windowZone) {
                     strategy.onEvent?.({
                         type: "window_zone",
@@ -198,19 +194,37 @@ document.addEventListener("DOMContentLoaded", () => {
     stomp.connect({}, () => {
         console.log("✅ STOMP CONNECTED");
 
+        const symbolUpper = symbol;               // BTCUSDT
+        const symbolLower = symbol.toLowerCase(); // btcusdt
+
+        // ✅ подписываемся на оба варианта (topic может быть регистрозависим)
         const destinations = [
-            `/topic/strategy/${chatId}/${type}/${symbol}`,
+            `/topic/strategy/${chatId}/${type}/${symbolUpper}`,
+            `/topic/strategy/${chatId}/${type}/${symbolLower}`,
             `/topic/strategy/${chatId}/${type}`,
             `/topic/strategy/${chatId}`,
         ];
 
+        let wsCount = 0;
+        let lastLogAt = 0;
+
         destinations.forEach(dest => {
             stomp.subscribe(dest, msg => {
+                wsCount++;
+
+                // логируем редко (антиспам)
+                const now = Date.now();
+                if (now - lastLogAt > 3000) {
+                    lastLogAt = now;
+                    console.log(`📡 WS IN (#${wsCount}) from ${dest}:`, msg.body?.slice(0, 200));
+                }
+
                 let ev;
                 try { ev = JSON.parse(msg.body); } catch { return; }
 
+                // фильтр по symbol (если есть) — не мешаем другим вкладкам
                 const evSymbol = (ev?.symbol || "").trim().toUpperCase();
-                if (evSymbol && evSymbol !== symbol) return;
+                if (evSymbol && evSymbol !== symbolUpper) return;
 
                 // 🔥 ЕДИНСТВЕННЫЙ ВХОД В ГРАФИК
                 chartCtrl.onWsMessage(ev);
@@ -218,8 +232,14 @@ document.addEventListener("DOMContentLoaded", () => {
                 // стратегия получает ВСЁ
                 strategy.onEvent?.(ev);
 
-                // обновление зон по свечам (если нужно)
-                if ((type === "SCALPING" || type === "WINDOW_SCALPING") && (ev.type === "candle" || ev.kline)) {
+                // обновление зон по “свечным” сообщениям
+                const looksLikeCandle =
+                    ev?.type === "candle" ||
+                    !!ev?.kline ||
+                    !!ev?.k ||
+                    !!ev?.data?.k;
+
+                if ((type === "SCALPING" || type === "WINDOW_SCALPING") && looksLikeCandle) {
                     strategy.onCandleHistory?.(chartCtrl.candlesData);
                 }
             });

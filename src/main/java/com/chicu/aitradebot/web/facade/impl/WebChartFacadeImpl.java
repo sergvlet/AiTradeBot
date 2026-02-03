@@ -51,7 +51,7 @@ public class WebChartFacadeImpl implements WebChartFacade {
         try {
             s = resolveBaselineSettings(chatId, strategyType);
         } catch (Exception e) {
-            log.warn("⚠️ Chart: cannot resolve baseline StrategySettings (chatId={}, type={})",
+            log.warn("⚠️ Chart: не удалось получить baseline StrategySettings (chatId={}, type={})",
                     chatId, strategyType, e);
         }
 
@@ -60,20 +60,32 @@ public class WebChartFacadeImpl implements WebChartFacade {
         final int finalLimit = resolveLimit(limit, s);
 
         if (tf == null || tf.isBlank()) {
-            log.warn("⚠️ Chart: timeframe is empty (chatId={}, type={}, symbol={})", chatId, strategyType, sym);
+            log.warn("⚠️ Chart: timeframe пустой (chatId={}, type={}, symbol={})", chatId, strategyType, sym);
             return empty();
         }
 
-        // 4) Сначала пробуем кэш
-        List<Candle> cached = safeCandles(streamService.getCandles(chatId, strategyType, sym, tf));
+        // 4) Контекст (exchange/network) обязателен для кэша, иначе будут смешения
+        final String exchange = (s != null && s.getExchangeName() != null)
+                ? s.getExchangeName().trim().toUpperCase(Locale.ROOT)
+                : null;
+        final NetworkType network = (s != null) ? s.getNetworkType() : null;
 
-        // 5) Если кэша не хватает — preload из биржи (по exchange+network из StrategySettings)
-        if (cached.size() < finalLimit) {
-            tryPreloadFromExchange(chatId, strategyType, sym, tf, finalLimit, s);
+        if (exchange == null || exchange.isBlank() || network == null) {
+            log.warn("⚠️ Chart: пропуск кэша/прелоада — нет exchange/network (chatId={}, type={}, symbol={}, tf={}, ex={}, net={})",
+                    chatId, strategyType, sym, tf, exchange, network);
+            return empty();
         }
 
-        // 6) Собираем результат из кэша (после preload)
-        List<Candle> all = safeCandles(streamService.getCandles(chatId, strategyType, sym, tf));
+        // 5) Сначала пробуем кэш (СТРОГО по ex+net)
+        List<Candle> cached = safeCandles(streamService.getCandles(chatId, strategyType, exchange, network, sym, tf));
+
+        // 6) Если кэша не хватает — preload из биржи (по exchange+network из StrategySettings)
+        if (cached.size() < finalLimit) {
+            tryPreloadFromExchange(chatId, strategyType, exchange, network, sym, tf, finalLimit, s);
+        }
+
+        // 7) Собираем результат из кэша (после preload)
+        List<Candle> all = safeCandles(streamService.getCandles(chatId, strategyType, exchange, network, sym, tf));
         if (all.isEmpty()) return empty();
 
         // последние N свечей
@@ -94,7 +106,6 @@ public class WebChartFacadeImpl implements WebChartFacade {
 
         double lastClose = slice.get(slice.size() - 1).getClose();
 
-        // ВАЖНО: фасад графика не рисует “специфичные слои” (windowZone и т.п.)
         return StrategyChartDto.builder()
                 .candles(candleDtos)
                 .lastPrice(lastClose)
@@ -102,18 +113,6 @@ public class WebChartFacadeImpl implements WebChartFacade {
                 .build();
     }
 
-    /**
-     * ✅ ВАЖНО:
-     * Раньше было findLatest(chatId,type,null,null) — теперь метода нет и “latest без контекста”
-     * в принципе опасен.
-     *
-     * Поэтому:
-     * - берём все настройки по chatId (без фильтра exchange/network)
-     * - выбираем для данного type:
-     *   1) сначала active=true (если есть)
-     *   2) затем по updatedAt (desc)
-     *   3) затем по id (desc)
-     */
     private StrategySettings resolveBaselineSettings(long chatId, StrategyType type) {
         List<StrategySettings> all = settingsService.findAllByChatId(chatId, null);
         if (all == null || all.isEmpty()) return null;
@@ -132,6 +131,8 @@ public class WebChartFacadeImpl implements WebChartFacade {
     private void tryPreloadFromExchange(
             long chatId,
             StrategyType type,
+            String exchange,
+            NetworkType network,
             String symbol,
             String timeframe,
             int limit,
@@ -140,8 +141,8 @@ public class WebChartFacadeImpl implements WebChartFacade {
         ExchangeClient client = resolveClientForChart(s);
 
         if (client == null) {
-            log.warn("⚠️ Chart preload skipped: no exchange client (chatId={}, type={}, symbol={}, tf={})",
-                    chatId, type, symbol, timeframe);
+            log.warn("⚠️ Chart preload пропущен: нет exchange client (chatId={}, type={}, ex={}, net={}, symbol={}, tf={})",
+                    chatId, type, exchange, network, symbol, timeframe);
             return;
         }
 
@@ -161,22 +162,16 @@ public class WebChartFacadeImpl implements WebChartFacade {
                     .toList();
 
             if (!preload.isEmpty()) {
-                streamService.putCandles(chatId, type, symbol, timeframe, preload);
-                log.info("📥 Chart preloaded: {} candles (chatId={}, type={}, {} {}, limit={})",
-                        preload.size(), chatId, type, symbol, timeframe, limit);
+                streamService.putCandles(chatId, type, exchange, network, symbol, timeframe, preload);
+                log.info("📥 Chart preloaded: {} candles (chatId={}, type={}, ex={}, net={}, {} {}, limit={})",
+                        preload.size(), chatId, type, exchange, network, symbol, timeframe, limit);
             }
         } catch (Exception e) {
-            log.error("❌ Chart preload failed (chatId={}, type={}, {} {})", chatId, type, symbol, timeframe, e);
+            log.error("❌ Chart preload failed (chatId={}, type={}, ex={}, net={}, {} {})",
+                    chatId, type, exchange, network, symbol, timeframe, e);
         }
     }
 
-    /**
-     * ВАЖНО: для истории свечей НЕ должен требоваться “включённый exchange settings у пользователя”.
-     * Поэтому берём клиента по exchange+network из StrategySettings.
-     *
-     * Чтобы не привязываться к точной сигнатуре ExchangeClientFactory#get(...),
-     * аккуратно резолвим через reflection (поддерживает разные overload'ы).
-     */
     private ExchangeClient resolveClientForChart(StrategySettings s) {
         if (s == null) return null;
 
@@ -215,12 +210,10 @@ public class WebChartFacadeImpl implements WebChartFacade {
     private Object adaptExchangeArg(Object exchangeValue, Class<?> targetType) {
         if (targetType.isInstance(exchangeValue)) return exchangeValue;
 
-        // если targetType=String, а exchangeValue=Enum → берём name()
         if (targetType == String.class && exchangeValue instanceof Enum<?> en) {
             return en.name();
         }
 
-        // если targetType=Enum, а exchangeValue=String → Enum.valueOf(...)
         if (targetType.isEnum() && exchangeValue instanceof String s) {
             String name = s.trim().toUpperCase(Locale.ROOT);
             if (name.isBlank()) return null;
@@ -233,7 +226,6 @@ public class WebChartFacadeImpl implements WebChartFacade {
             }
         }
 
-        // если targetType=Enum, а exchangeValue=Enum другого типа → пробуем по имени
         if (targetType.isEnum() && exchangeValue instanceof Enum<?> en) {
             @SuppressWarnings({"rawtypes", "unchecked"})
             Class<? extends Enum> enumType = (Class<? extends Enum>) targetType;
@@ -250,12 +242,10 @@ public class WebChartFacadeImpl implements WebChartFacade {
     private Object adaptNetworkArg(Object networkValue, Class<?> targetType) {
         if (targetType.isInstance(networkValue)) return networkValue;
 
-        // если targetType=String, а networkValue=Enum → name()
         if (targetType == String.class && networkValue instanceof Enum<?> en) {
             return en.name();
         }
 
-        // если targetType=Enum, а networkValue=Enum другого типа → по имени
         if (targetType.isEnum() && networkValue instanceof Enum<?> en) {
             @SuppressWarnings({"rawtypes", "unchecked"})
             Class<? extends Enum> enumType = (Class<? extends Enum>) targetType;
@@ -282,14 +272,12 @@ public class WebChartFacadeImpl implements WebChartFacade {
     private int resolveLimit(int limit, StrategySettings s) {
         int resolved = limit;
 
-        // если лимит не задан/кривой — берём из StrategySettings
         if (resolved < MIN_LIMIT || resolved > MAX_LIMIT) {
             if (s != null && s.getCachedCandlesLimit() != null) {
                 resolved = s.getCachedCandlesLimit();
             }
         }
 
-        // финальная защита диапазона (контракт UI/графика)
         if (resolved < MIN_LIMIT) resolved = MIN_LIMIT;
         if (resolved > MAX_LIMIT) resolved = MAX_LIMIT;
 

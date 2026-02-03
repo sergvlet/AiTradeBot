@@ -18,8 +18,7 @@ public class MlClient {
     private final MlProperties props;
 
     public JsonNode health() {
-        Request req = new Request.Builder()
-                .url(props.getBaseUrl() + "/health")
+        Request req = baseRequest("/health")
                 .get()
                 .build();
 
@@ -39,8 +38,7 @@ public class MlClient {
             String json = om.writeValueAsString(payload);
             RequestBody rb = RequestBody.create(json, JSON);
 
-            Request req = new Request.Builder()
-                    .url(props.getBaseUrl() + path)
+            Request req = baseRequest(path)
                     .post(rb)
                     .build();
 
@@ -54,5 +52,29 @@ public class MlClient {
         } catch (Exception e) {
             throw new IllegalStateException("ML POST " + path + " failed: " + e.getMessage(), e);
         }
+    }
+
+    private Request.Builder baseRequest(String path) {
+        String url = join(props.getBaseUrl(), path);
+
+        Request.Builder b = new Request.Builder().url(url);
+
+        String apiKey = props.getApiKey();
+        if (apiKey != null && !apiKey.trim().isEmpty()) {
+            // если у тебя на python ожидается другое имя заголовка — поменяешь тут в одном месте
+            b.header("X-API-KEY", apiKey.trim());
+        }
+
+        return b;
+    }
+
+    private static String join(String baseUrl, String path) {
+        String b = (baseUrl == null ? "" : baseUrl.trim());
+        String p = (path == null ? "" : path.trim());
+
+        if (b.endsWith("/")) b = b.substring(0, b.length() - 1);
+        if (!p.startsWith("/")) p = "/" + p;
+
+        return b + p;
     }
 }

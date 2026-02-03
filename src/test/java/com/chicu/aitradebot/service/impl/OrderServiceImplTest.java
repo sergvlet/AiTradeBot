@@ -50,10 +50,10 @@ class OrderServiceImplTest {
         when(exchangeClient.getExchangeName()).thenReturn("BINANCE");
 
         ExchangeSettings es = new ExchangeSettings();
-        es.setEnabled(true);
+
         es.setExchange("BINANCE");
         es.setNetwork(NetworkType.MAINNET);
-        es.setUpdatedAt(Instant.now()); // ✅ FIX: было Instant.from(LocalDateTime.now())
+  // ✅ FIX: было Instant.from(LocalDateTime.now())
 
         when(exchangeSettingsService.findAllByChatId(anyLong())).thenReturn(List.of(es));
 

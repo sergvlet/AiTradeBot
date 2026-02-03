@@ -1,6 +1,8 @@
-// src/main/java/com/chicu/aitradebot/strategy/ai/MlClassificationStrategyV4.java
 package com.chicu.aitradebot.strategy.ml;
 
+import com.chicu.aitradebot.ai.ml.MlFeatures;
+import com.chicu.aitradebot.ai.ml.MlPrediction;
+import com.chicu.aitradebot.ai.ml.MlSignalService;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
@@ -19,6 +21,7 @@ import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Comparator;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
@@ -27,11 +30,12 @@ import java.util.concurrent.ConcurrentHashMap;
  * ML_CLASSIFICATION Strategy (V4)
  *
  * Идея:
- * - Берём последние свечи через CandleProvider
- * - Формируем признаки (feature builder — внутри)
- * - Вызываем ML-предиктор (MlSignalService) -> probBuy/probSell
- * - Если probBuy >= threshold -> BUY (executeEntry)
- * - Выход только по TP/SL (executeExitIfHit)
+ * - берём последние свечи через CandleProvider
+ * - строим признаки (MlFeatures.fromCandles)
+ * - ML /predict -> probBuy/probSell
+ * - если ML недоступен -> fallback (простой фильтр), чтобы не было вечного HOLD
+ * - вход через TradeExecutionService.executeEntry()
+ * - выход по TP/SL через executeExitIfHit()
  */
 @Slf4j
 @Component
@@ -42,14 +46,16 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
     private static final Duration SETTINGS_REFRESH_EVERY = Duration.ofSeconds(10);
     private static final long LOG_EVERY_TICKS = 300;
 
+    // HOLD throttle (чтобы UI не засыпать)
+    private static final long HOLD_THROTTLE_MS = 2000;
+
     private final StrategyLivePublisher live;
     private final MlClassificationSettingsService mlSettingsService;
     private final StrategySettingsService strategySettingsService;
     private final TradeExecutionService tradeExecutionService;
-
     private final CandleProvider candleProvider;
 
-    /** Тонкий интерфейс — подставишь свою реализацию (PythonInferenceService/ML gateway и т.д.) */
+    /** Реальный ML gateway: HTTP /health + /predict */
     private final MlSignalService mlSignalService;
 
     private final Map<Long, LocalState> states = new ConcurrentHashMap<>();
@@ -78,6 +84,9 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
 
         String lastHoldReason;
         Instant lastHoldAt;
+
+        // чтобы не спамить логом “ML недоступен” на каждый тик
+        Instant lastMlWarnAt;
     }
 
     // =====================================================
@@ -104,8 +113,13 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
 
         states.put(chatId, st);
 
-        log.info("[ML_CLASSIFICATION] ▶ START chatId={} symbol={} threshold={} lookback={}",
-                chatId, st.symbol, fmtBd(cfg.getDecisionThreshold()), nz(cfg.getLookbackCandles(), 200));
+        log.info("[ML_CLASSIFICATION] ▶ START chatId={} symbol={} threshold={} lookback={} modelKey={}",
+                chatId,
+                st.symbol,
+                fmtBd(cfg.getDecisionThreshold()),
+                nz(cfg.getLookbackCandles(), 200),
+                safe(cfg.getModelKey())
+        );
 
         safeLive(() -> live.pushState(chatId, StrategyType.ML_CLASSIFICATION, st.symbol, true));
         safeLive(() -> live.pushSignal(chatId, StrategyType.ML_CLASSIFICATION, st.symbol, null, Signal.hold("started")));
@@ -207,7 +221,8 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
 
                         safeLive(() -> live.clearTpSl(chatId, StrategyType.ML_CLASSIFICATION, symFinal));
                         safeLive(() -> live.clearPriceLines(chatId, StrategyType.ML_CLASSIFICATION, symFinal));
-                        safeLive(() -> live.pushSignal(chatId, StrategyType.ML_CLASSIFICATION, symFinal, null, Signal.sell(1.0, "tp_sl_exit")));
+                        safeLive(() -> live.pushSignal(chatId, StrategyType.ML_CLASSIFICATION, symFinal, null,
+                                Signal.sell(1.0, "tp_sl_exit")));
                         return;
                     }
                 } catch (Exception e) {
@@ -227,32 +242,57 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
                     return;
                 }
 
-                // признаки (минимальные, чтобы было что кормить модели)
+                // ✅ ВАЖНО: используем твой универсальный билд признаков (там уже есть reflection/Map)
                 MlFeatures features = MlFeatures.fromCandles(candles, price);
 
-                MlPrediction pred;
-                try {
-                    pred = mlSignalService.predict(chatId, symFinal, ss.getTimeframe(), features);
-                } catch (Exception e) {
-                    log.warn("[ML_CLASSIFICATION] ⚠ predict failed chatId={} sym={} err={}", chatId, symFinal, e.toString());
-                    pushHoldThrottled(chatId, symFinal, st, "predict_failed", time);
-                    return;
-                }
-
-                if (pred == null) {
-                    pushHoldThrottled(chatId, symFinal, st, "predict_null", time);
-                    return;
-                }
-
                 double threshold = normalizeThreshold(cfg.getDecisionThreshold());
-                double pBuy = clamp01(pred.probBuy());
-                double pSell = clamp01(pred.probSell());
 
-                // простое решение: если BUY сильно выше SELL и выше threshold
+                // ==========================
+                // ML PREDICT (HTTP /predict)
+                // ==========================
+                MlPrediction pred = null;
+                boolean mlOk = mlSignalService.isAvailable();
+
+                if (mlOk) {
+                    try {
+                        pred = mlSignalService.predict(
+                                chatId,
+                                symFinal,
+                                ss.getTimeframe(),
+                                cfg.getModelKey(),
+                                features
+                        );
+                    } catch (Exception e) {
+                        warnMlOncePer(st, time,
+                                "[ML_CLASSIFICATION] ⚠ predict failed chatId=" + chatId +
+                                " sym=" + symFinal + " err=" + e.getMessage());
+                        pred = null;
+                        mlOk = false;
+                    }
+                }
+
+                double pBuy;
+                double pSell;
+
+                if (mlOk && pred != null) {
+                    pBuy = clamp01(pred.probBuy());
+                    pSell = clamp01(pred.probSell());
+                } else {
+                    // ===================================
+                    // FALLBACK: чтобы реально торговало
+                    // ===================================
+                    double fb = fallbackBuyScore(features);
+                    pBuy = clamp01(fb);
+                    pSell = clamp01(1.0 - fb);
+
+                    // один HOLD “объяснение”, но throttled (UI не засоряем)
+                    pushHoldThrottled(chatId, symFinal, st, "ml_off_fallback", time);
+                }
+
                 boolean buy = pBuy >= threshold && pBuy > pSell;
 
                 if (!buy) {
-                    pushHoldThrottled(chatId, symFinal, st, "no_ml_buy", time);
+                    pushHoldThrottled(chatId, symFinal, st, "no_buy pBuy=" + round2(pBuy), time);
                     return;
                 }
 
@@ -282,7 +322,7 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
                     st.sl = res.sl();
 
                     safeLive(() -> live.pushSignal(chatId, StrategyType.ML_CLASSIFICATION, symFinal, null,
-                            Signal.buy(scoreFinal, "ml_buy pBuy=" + round2(pBuy))));
+                            Signal.buy(scoreFinal, "buy pBuy=" + round2(pBuy))));
                     return;
 
                 } catch (Exception e) {
@@ -294,6 +334,15 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
 
             pushHoldThrottled(chatId, symFinal, st, "in_position", time);
         }
+    }
+
+    private void warnMlOncePer(LocalState st, Instant now, String msg) {
+        if (st.lastMlWarnAt != null) {
+            long ms = Duration.between(st.lastMlWarnAt, now).toMillis();
+            if (ms < 15_000) return; // раз в 15 секунд максимум
+        }
+        st.lastMlWarnAt = now;
+        log.warn(msg);
     }
 
     private void clearPosition(LocalState st) {
@@ -310,7 +359,7 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
 
     private void refreshSettingsIfNeeded(Long chatId, LocalState st, Instant now) {
         if (st.lastSettingsLoadAt != null &&
-                Duration.between(st.lastSettingsLoadAt, now).compareTo(SETTINGS_REFRESH_EVERY) < 0) {
+            Duration.between(st.lastSettingsLoadAt, now).compareTo(SETTINGS_REFRESH_EVERY) < 0) {
             return;
         }
 
@@ -334,8 +383,13 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
 
             if (changed) {
                 st.lastFingerprint = fp;
-                log.info("[ML_CLASSIFICATION] ⚙️ settings updated chatId={} symbol={} threshold={} lookback={}",
-                        chatId, st.symbol, fmtBd(cfg.getDecisionThreshold()), cfg.getLookbackCandles());
+                log.info("[ML_CLASSIFICATION] ⚙️ settings updated chatId={} symbol={} threshold={} lookback={} modelKey={}",
+                        chatId,
+                        st.symbol,
+                        fmtBd(cfg.getDecisionThreshold()),
+                        cfg.getLookbackCandles(),
+                        safe(cfg.getModelKey())
+                );
 
                 String newSymbol = safeUpper(st.symbol);
                 if (oldSymbol != null && newSymbol != null && !oldSymbol.equals(newSymbol)) {
@@ -355,7 +409,9 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
         String ex = ss != null ? String.valueOf(ss.getExchangeName()) : "null";
         String net = ss != null ? String.valueOf(ss.getNetworkType()) : "null";
         String tf = ss != null ? safe(ss.getTimeframe()) : "null";
-        String candles = (ss != null && ss.getCachedCandlesLimit() != null) ? String.valueOf(ss.getCachedCandlesLimit()) : "null";
+        String candles = (ss != null && ss.getCachedCandlesLimit() != null)
+                ? String.valueOf(ss.getCachedCandlesLimit())
+                : "null";
 
         String look = cfg != null ? String.valueOf(cfg.getLookbackCandles()) : "null";
         String thr = cfg != null ? String.valueOf(cfg.getDecisionThreshold()) : "null";
@@ -364,20 +420,21 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
         return symbol + "|" + ex + "|" + net + "|" + tf + "|" + candles + "|" + look + "|" + thr + "|" + model;
     }
 
+    /**
+     * Берём самый свежий StrategySettings для ML_CLASSIFICATION.
+     */
     private StrategySettings loadStrategySettings(Long chatId) {
         return strategySettingsService
                 .findAllByChatId(chatId, null, null)
                 .stream()
                 .filter(s -> s.getType() == StrategyType.ML_CLASSIFICATION)
-                .sorted(
-                        Comparator
-                                .comparing(StrategySettings::getUpdatedAt, Comparator.nullsLast(Comparator.naturalOrder()))
-                                .reversed()
-                                .thenComparing(StrategySettings::getId, Comparator.nullsLast(Comparator.naturalOrder()))
-                                .reversed()
+                .max(Comparator
+                        .comparing(StrategySettings::getUpdatedAt, Comparator.nullsLast(Comparator.naturalOrder()))
+                        .thenComparing(StrategySettings::getId, Comparator.nullsLast(Comparator.naturalOrder()))
                 )
-                .findFirst()
-                .orElseThrow(() -> new IllegalStateException("StrategySettings для ML_CLASSIFICATION не найдены (chatId=" + chatId + ")"));
+                .orElseThrow(() -> new IllegalStateException(
+                        "StrategySettings для ML_CLASSIFICATION не найдены (chatId=" + chatId + ")"
+                ));
     }
 
     // =====================================================
@@ -393,12 +450,33 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
 
         if (Objects.equals(st.lastHoldReason, reason) && st.lastHoldAt != null) {
             long ms = Duration.between(st.lastHoldAt, now).toMillis();
-            if (ms < 2000) return;
+            if (ms < HOLD_THROTTLE_MS) return;
         }
 
         st.lastHoldReason = reason;
         st.lastHoldAt = now;
         safeLive(() -> live.pushSignal(chatId, StrategyType.ML_CLASSIFICATION, symbol, null, Signal.hold(reason)));
+    }
+
+    // =====================================================
+    // FALLBACK (временный, чтобы торговля была даже без ML)
+    // =====================================================
+
+    private static double fallbackBuyScore(MlFeatures f) {
+        if (f == null) return 0.50;
+
+        double m = safeD(f.momentum1());      // -1..+1 примерно
+        double v = safeD(f.volatilityPct());  // 0..N
+
+        double base = 0.50 + (m * 0.25);
+        if (v < 0.0005) base -= 0.05; // слишком “тихо” — чуть хуже
+
+        return clamp01(base);
+    }
+
+    private static double safeD(Double d) {
+        if (d == null || !Double.isFinite(d)) return 0.0;
+        return d;
     }
 
     // =====================================================
@@ -412,7 +490,7 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
     private static String safeUpper(String s) {
         if (s == null) return null;
         String t = s.trim();
-        return t.isEmpty() ? null : t.toUpperCase();
+        return t.isEmpty() ? null : t.toUpperCase(Locale.ROOT);
     }
 
     private static int nz(Integer v, int def) {
@@ -427,7 +505,7 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
     private static double normalizeThreshold(BigDecimal v) {
         if (v == null) return 0.65;
         double d = v.doubleValue();
-        // если хранишь в процентах 65 вместо 0.65
+        // если вдруг хранишь как 65 вместо 0.65
         if (d > 1.0 && d <= 100.0) d = d / 100.0;
         if (d < 0.50) d = 0.50;
         if (d > 0.95) d = 0.95;
@@ -442,6 +520,6 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
     }
 
     private static String round2(double d) {
-        return String.format(java.util.Locale.US, "%.2f", d);
+        return String.format(Locale.US, "%.2f", d);
     }
 }
