@@ -24,13 +24,7 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.ArrayDeque;
-import java.util.Deque;
-import java.util.HashMap;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 @StrategyBinding(StrategyType.WINDOW_SCALPING)
@@ -56,9 +50,9 @@ public class WindowScalpingStrategyV4 implements
     private boolean mlEnabled;
 
     /**
-     * ✅ КЛЮЧЕВОЕ: если ML недоступен — не блокируем торговлю.
-     * true  -> ML "fail-open": если predict недоступен, продолжаем без ML-гейта
-     * false -> ML "fail-closed": predict_failed => HOLD и запрет входа
+     * ✅ Если ML недоступен — не блокируем торговлю.
+     * true  -> fail-open: если predict недоступен, продолжаем без ML-гейта
+     * false -> fail-closed: predict_failed => HOLD и запрет входа
      */
     @Value("${strategy.window.mlFailOpen:true}")
     private boolean mlFailOpen;
@@ -108,6 +102,16 @@ public class WindowScalpingStrategyV4 implements
     private final PositionStore positionStore;
 
     private final Map<Long, LocalState> states = new ConcurrentHashMap<>();
+
+    // =====================================================
+    // ✅ КЭШИ (чтобы не сканировать контекст/не парсить строки по кругу)
+    // =====================================================
+
+    private volatile Object cachedMlBean;
+    private volatile boolean mlBeanResolved;
+
+    private volatile String cachedHoldReasonsRaw;
+    private volatile Set<String> cachedHoldReasonsSet;
 
     private static class LocalState {
         boolean active;
@@ -189,11 +193,13 @@ public class WindowScalpingStrategyV4 implements
 
         st.inPosition = false;
         st.isLong = true;
+
         st.entryPrice = null;
         st.tp = null;
         st.sl = null;
         st.entryQty = null;
         st.entryOrderId = null;
+
         st.lastTradeClosedAt = null;
         st.lastEntryAt = null;
         st.lastAutoTuneRequestAt = null;
@@ -205,7 +211,6 @@ public class WindowScalpingStrategyV4 implements
 
         ensureRuntimeContext(st, ss);
 
-        // ✅ FIX: авто-тюн стартуем только когда точно известны exchange+network
         if (st.exchange != null && st.network != null) {
             safeAutoTune(() -> autoTuneRuntime.onStrategyStarted(chatId, StrategyType.WINDOW_SCALPING, st.exchange, st.network));
         } else {
@@ -214,43 +219,37 @@ public class WindowScalpingStrategyV4 implements
         }
 
         if (ss != null) {
-            log.info("[WINDOW] 🎯 Выбраны StrategySettings: id={} active={} биржа={} сеть={} символ={} updatedAt={}",
-                    ss.getId(),
-                    ss.isActive(),
+            log.info("[WINDOW] ▶ START chatId={} ex={} net={} symbol={} window={} entryLow%={} minRange%={} TP%={} SL%={} ML={} failOpen={} mlMinFallback={} coarseAdjust={}",
+                    chatId,
                     ss.getExchangeName(),
                     ss.getNetworkType(),
                     ss.getSymbol(),
-                    ss.getUpdatedAt()
+                    cfg != null ? cfg.getWindowSize() : null,
+                    cfg != null ? cfg.getEntryFromLowPct() : null,
+                    cfg != null ? cfg.getMinRangePct() : null,
+                    cfg != null ? cfg.getTakeProfitPct() : null,
+                    cfg != null ? cfg.getStopLossPct() : null,
+                    mlEnabled,
+                    mlFailOpen,
+                    fmt(mlMinProba),
+                    coarseAdjustEnabled
             );
         } else {
-            log.warn("[WINDOW] ⚠ StrategySettings не найден/не загружен (chatId={}) — стратегия будет стоять в HOLD до появления настроек.", chatId);
+            log.warn("[WINDOW] ▶ START chatId={} ex={} net={} symbol={} (StrategySettings не найден — будет HOLD до появления настроек)",
+                    chatId, st.exchange, st.network, st.symbol);
         }
 
-        log.info("[WINDOW] ▶ СТАРТ chatId={} биржа={} сеть={} символ={} окно={} вход_от_низа%={} мин_диапазон%={} TP%={} SL%={} ML={} ML_failOpen={} ML_min(fallback)={} autoTuneOnHold={} holdTuneCooldownSec={} coarseAdjustEnabled={} coarseAfter={} coarseCdSec={} coarseFactor={} coarseMinFloorPct={}",
-                chatId,
-                st.exchange,
-                st.network,
-                st.symbol,
-                cfg != null ? cfg.getWindowSize() : null,
-                cfg != null ? cfg.getEntryFromLowPct() : null,
-                cfg != null ? cfg.getMinRangePct() : null,
-                cfg != null ? cfg.getTakeProfitPct() : null,
-                cfg != null ? cfg.getStopLossPct() : null,
-                mlEnabled,
-                mlFailOpen,
-                fmt(mlMinProba),
-                autoTuneOnHold,
-                autoTuneHoldCooldownSeconds,
-                coarseAdjustEnabled,
-                coarseAdjustAfterConsecutive,
-                coarseAdjustCooldownSeconds,
-                fmt(coarseAdjustFactor),
-                fmt(coarseAdjustMinFloorPct)
-        );
-
         if (st.symbol != null) {
-            safeLive(() -> live.pushState(chatId, StrategyType.WINDOW_SCALPING, st.symbol, true));
-            safeLive(() -> live.pushSignal(chatId, StrategyType.WINDOW_SCALPING, st.symbol, null, Signal.hold("Стратегия запущена")));
+            final String symFinal = st.symbol;
+            safeLive(() -> live.pushState(chatId, StrategyType.WINDOW_SCALPING, symFinal, true));
+            safeLive(() -> live.pushSignal(chatId, StrategyType.WINDOW_SCALPING, symFinal, null, Signal.hold("Стратегия запущена")));
+        }
+
+        // ✅ восстановим позицию после рестарта/перезапуска (без конфликтов с TradeExecutionService)
+        if (st.symbol != null) {
+            synchronized (st) {
+                maybeRestorePositionFromStore(chatId, st, st.symbol, Instant.now());
+            }
         }
     }
 
@@ -268,9 +267,10 @@ public class WindowScalpingStrategyV4 implements
         ensureRuntimeContext(st, st.ss);
         st.lastEntryAt = null;
 
-        safePositionStoreClose(chatId, st);
+        // ❗ ВАЖНО:
+        // stop() НЕ должен чистить PositionStore, иначе при остановке/рестарте ты "забываешь" открытую позицию.
+        // Позицию должен закрывать только TradeExecutionService по факту SELL (или отдельный emergency close).
 
-        // ✅ FIX: стоп авто-тюна тоже только если контекст валидный
         if (st.exchange != null && st.network != null) {
             safeAutoTune(() -> autoTuneRuntime.onStrategyStopped(chatId, StrategyType.WINDOW_SCALPING, st.exchange, st.network));
         }
@@ -283,7 +283,7 @@ public class WindowScalpingStrategyV4 implements
             safeLive(() -> live.pushState(chatId, StrategyType.WINDOW_SCALPING, sym, false));
         }
 
-        log.info("[WINDOW] ⏹ СТОП chatId={} биржа={} сеть={} символ={} тики={} прогрев={} входы={} выходы={} в_позиции={}",
+        log.info("[WINDOW] ⏹ STOP chatId={} ex={} net={} symbol={} ticks={} warmups={} entries={} exits={} inPos={}",
                 chatId, st.exchange, st.network, sym, st.ticks, st.warmups, st.entries, st.exits, st.inPosition);
     }
 
@@ -325,10 +325,7 @@ public class WindowScalpingStrategyV4 implements
             if (sym != null) st.symbol = sym;
         }
 
-        Instant ts = (tradeTsMs > 0)
-                ? Instant.ofEpochMilli(tradeTsMs)
-                : Instant.now();
-
+        Instant ts = (tradeTsMs > 0) ? Instant.ofEpochMilli(tradeTsMs) : Instant.now();
         onPriceUpdate(chatId, symbol, price, ts);
     }
 
@@ -380,7 +377,7 @@ public class WindowScalpingStrategyV4 implements
 
         if (price == null || price.signum() <= 0) {
             if (st.ticks % logEvery == 0) {
-                log.warn("[WINDOW] ⚠ Некорректная цена: chatId={} price={}", chatId, price);
+                log.warn("[WINDOW] ⚠ invalid price chatId={} price={}", chatId, price);
             }
             return;
         }
@@ -428,7 +425,7 @@ public class WindowScalpingStrategyV4 implements
                 st.warmups++;
                 pushHoldThrottled(chatId, sym, st, "warming_up", time, holdMs);
                 if (st.ticks % logEvery == 0) {
-                    log.info("[WINDOW] ⏳ Прогрев окна: chatId={} символ={} размер_окна={}/{} цена={}",
+                    log.info("[WINDOW] ⏳ warmup chatId={} sym={} window={}/{} price={}",
                             chatId, sym, st.window.size(), windowSize, price.stripTrailingZeros().toPlainString());
                 }
                 return;
@@ -464,14 +461,13 @@ public class WindowScalpingStrategyV4 implements
             if (rangePct + 1e-12 < minRangePct) {
                 pushHoldThrottled(chatId, sym, st, "range_too_small", time, holdMs);
                 if (st.ticks % logEvery == 0) {
-                    log.info("[WINDOW] 💤 Диапазон слишком мал: chatId={} символ={} rangePct={} < minRangePct={} (consecutive={}/{})",
+                    log.info("[WINDOW] 💤 range too small chatId={} sym={} rangePct={} < minRangePct={} consecutive={}/{}",
                             chatId, sym, fmt(rangePct), fmt(minRangePct),
                             st.consecutiveRangeTooSmall, Math.max(2, coarseAdjustAfterConsecutive));
                 }
                 return;
             }
 
-            // ✅ если диапазон ок — сбрасываем счётчик проблемного холда
             st.consecutiveRangeTooSmall = 0;
 
             double pos = price.subtract(low)
@@ -491,7 +487,7 @@ public class WindowScalpingStrategyV4 implements
             double highZone = clamp01(1.0 - (entryHighPct / 100.0));
 
             if (log.isDebugEnabled() && st.ticks % logEvery == 0) {
-                log.debug("[WINDOW] tick chatId={} символ={} цена={} low={} high={} rangePct={} posPct={}",
+                log.debug("[WINDOW] tick chatId={} sym={} price={} low={} high={} rangePct={} posPct={}",
                         chatId,
                         sym,
                         price.stripTrailingZeros().toPlainString(),
@@ -529,7 +525,7 @@ public class WindowScalpingStrategyV4 implements
                 }
 
                 // =====================================================
-                // ✅ ML gate (fail-open)
+                // ✅ ML gate (fail-open / fail-closed)
                 // =====================================================
                 if (mlEnabled) {
                     double threshold = resolveMlThreshold(ss);
@@ -543,22 +539,18 @@ public class WindowScalpingStrategyV4 implements
                     Prediction pred = tryPredict(feats);
 
                     if (!pred.ok) {
-                        if (mlFailOpen) {
-                            if (st.ticks % logEvery == 0) {
-                                log.warn("[WINDOW] 🤖 ML недоступен (fail-open): chatId={} символ={} причина={} => продолжаю без ML-гейта",
-                                        chatId, sym, pred.reason);
-                            }
-                        } else {
-                            log.warn("[WINDOW] 🤖 ML-прогноз недоступен (fail-closed): chatId={} символ={} причина={}", chatId, sym, pred.reason);
+                        if (!mlFailOpen) {
                             pushHoldThrottled(chatId, sym, st, "predict_failed", time, holdMs);
                             return;
+                        } else if (st.ticks % logEvery == 0) {
+                            log.warn("[WINDOW] 🤖 ML недоступен (fail-open) chatId={} sym={} reason={}",
+                                    chatId, sym, pred.reason);
                         }
                     } else {
                         if (st.ticks % logEvery == 0) {
-                            log.info("[WINDOW] 🤖 ML-прогноз: chatId={} символ={} модель={} вероятность_покупки={}",
+                            log.info("[WINDOW] 🤖 ML proba chatId={} sym={} model={} proba={}",
                                     chatId, sym, pred.modelKey, fmt(pred.proba));
                         }
-
                         if (pred.proba + 1e-12 < threshold) {
                             pushHoldThrottled(chatId, sym, st, "ml_below_threshold", time, holdMs);
                             return;
@@ -597,7 +589,9 @@ public class WindowScalpingStrategyV4 implements
                     st.lastEntryAt = time;
 
                     ensureRuntimeContext(st, ss);
-                    safePositionStoreOpen(chatId, st);
+
+                    // ❗ НЕ пишем PositionStore тут.
+                    // PositionStore snapshot уже записан внутри TradeExecutionServiceImpl после успешного BUY.
 
                     if (st.tp != null && st.sl != null) {
                         safeLive(() -> live.pushTpSl(chatId, StrategyType.WINDOW_SCALPING, sym, st.tp, st.sl));
@@ -611,7 +605,7 @@ public class WindowScalpingStrategyV4 implements
                     st.consecutiveRangeTooSmall = 0;
 
                 } catch (Exception e) {
-                    log.error("[WINDOW] ❌ Ошибка входа: chatId={} символ={} err={}", chatId, sym, e.getMessage(), e);
+                    log.error("[WINDOW] ❌ ENTRY error chatId={} sym={} err={}", chatId, sym, e.getMessage(), e);
                     pushHoldThrottled(chatId, sym, st, "entry_failed", time, holdMs);
                     return;
                 }
@@ -620,6 +614,10 @@ public class WindowScalpingStrategyV4 implements
             // =====================================================
             // EXIT: TP/SL
             // =====================================================
+
+            // ✅ если состояние позиции потерялось — восстановим из PositionStore
+            maybeRestorePositionFromStore(chatId, st, sym, time);
+
             if (st.inPosition && st.entryQty != null && st.tp != null && st.sl != null) {
 
                 if (st.lastEntryAt != null && Duration.between(st.lastEntryAt, time).toMillis() < 500) {
@@ -627,8 +625,7 @@ public class WindowScalpingStrategyV4 implements
                 }
 
                 try {
-                    // ✅ у тебя в TradeExecutionServiceImpl метод принимает exchange+network
-                    var ex = tradeExecutionService.executeExitIfHit(
+                    var exRes = tradeExecutionService.executeExitIfHit(
                             chatId,
                             StrategyType.WINDOW_SCALPING,
                             sym,
@@ -642,7 +639,7 @@ public class WindowScalpingStrategyV4 implements
                             st.network
                     );
 
-                    if (ex.executed()) {
+                    if (exRes.executed()) {
                         st.exits++;
 
                         st.inPosition = false;
@@ -657,7 +654,8 @@ public class WindowScalpingStrategyV4 implements
 
                         ensureRuntimeContext(st, ss);
 
-                        safePositionStoreClose(chatId, st);
+                        // ❗ НЕ чистим PositionStore тут.
+                        // PositionStore чистится внутри TradeExecutionServiceImpl после успешного SELL.
 
                         if (st.exchange != null && st.network != null) {
                             safeAutoTune(() -> autoTuneRuntime.onPositionClosed(
@@ -680,12 +678,12 @@ public class WindowScalpingStrategyV4 implements
                     }
 
                 } catch (Exception e) {
-                    log.error("[WINDOW] ❌ Ошибка выхода: chatId={} символ={} err={}", chatId, sym, e.getMessage(), e);
+                    log.error("[WINDOW] ❌ EXIT error chatId={} sym={} err={}", chatId, sym, e.getMessage(), e);
                 }
             }
 
             if (st.ticks % logEvery == 0) {
-                log.info("[WINDOW] 📋 Диагностика: chatId={} символ={} биржа={} сеть={} тики={} окно={}/{} в_позиции={} входы={} выходы={} последний_HOLD={}",
+                log.info("[WINDOW] 📋 chatId={} sym={} ex={} net={} ticks={} window={}/{} inPos={} entries={} exits={} lastHOLD={}",
                         chatId,
                         sym,
                         st.exchange,
@@ -705,7 +703,7 @@ public class WindowScalpingStrategyV4 implements
     private void diagLogOccasionally(Long chatId, LocalState st, String symbol, BigDecimal price, String msg, long logEvery, Instant now) {
         if (logEvery <= 0) return;
         if (st.ticks % logEvery != 0) return;
-        log.info("[WINDOW] 🩺 Диагностика: chatId={} символ={} цена={} => {}",
+        log.info("[WINDOW] 🩺 chatId={} sym={} price={} => {}",
                 chatId,
                 symbol,
                 price != null ? price.stripTrailingZeros().toPlainString() : "null",
@@ -740,8 +738,9 @@ public class WindowScalpingStrategyV4 implements
             if (cfg != null) st.cfg = cfg;
 
             if (loaded != null) {
+                // ⚠️ Если позиция открыта — не меняем символ "на лету", иначе ты потеряешь контекст.
                 String loadedSymbol = normalizeSymbolOrNull(loaded.getSymbol());
-                if (loadedSymbol != null) st.symbol = loadedSymbol;
+                if (!st.inPosition && loadedSymbol != null) st.symbol = loadedSymbol;
 
                 if (loaded.getExchangeName() != null) st.exchange = normalizeExchangeOrNull(loaded.getExchangeName());
                 if (loaded.getNetworkType() != null) st.network = loaded.getNetworkType();
@@ -752,42 +751,32 @@ public class WindowScalpingStrategyV4 implements
             if (changed) {
                 st.lastFingerprint = fp;
 
-                log.info("[WINDOW] ⚙️ Обновлены настройки: chatId={} биржа={} сеть={} символ={} окно={} вход_от_низа%={} мин_диапазон%={} TP%={} SL%={}",
-                        chatId,
-                        st.exchange,
-                        st.network,
-                        st.symbol,
-                        cfg != null ? cfg.getWindowSize() : null,
-                        cfg != null ? cfg.getEntryFromLowPct() : null,
-                        cfg != null ? cfg.getMinRangePct() : null,
-                        cfg != null ? cfg.getTakeProfitPct() : null,
-                        cfg != null ? cfg.getStopLossPct() : null
-                );
+                if (st.ticks % Math.max(1, tickLogEveryTicks) == 0) {
+                    log.info("[WINDOW] ⚙️ settings refreshed chatId={} ex={} net={} sym={} window={} minRange%={} TP%={} SL%={}",
+                            chatId,
+                            st.exchange,
+                            st.network,
+                            st.symbol,
+                            cfg != null ? cfg.getWindowSize() : null,
+                            cfg != null ? cfg.getMinRangePct() : null,
+                            cfg != null ? cfg.getTakeProfitPct() : null,
+                            cfg != null ? cfg.getStopLossPct() : null
+                    );
+                }
 
                 String newSymbol = normalizeSymbolOrNull(st.symbol);
-                if (oldSymbol != null && newSymbol != null && !oldSymbol.equals(newSymbol)) {
+                if (!st.inPosition && oldSymbol != null && newSymbol != null && !oldSymbol.equals(newSymbol)) {
                     st.window.clear();
                     st.lastHoldReason = null;
-
-                    st.lastEntryAt = null;
-                    st.inPosition = false;
-                    st.entryQty = null;
-                    st.entryOrderId = null;
-                    st.entryPrice = null;
-                    st.tp = null;
-                    st.sl = null;
-
                     st.consecutiveRangeTooSmall = 0;
 
-                    safePositionStoreClose(chatId, st);
-
-                    log.info("[WINDOW] 🔄 Символ изменился: {} -> {}, очищаю окно и сбрасываю позицию.", oldSymbol, newSymbol);
+                    log.info("[WINDOW] 🔄 symbol changed {} -> {} (not in position) => clear window", oldSymbol, newSymbol);
                 }
             }
 
         } catch (Exception e) {
             st.lastSettingsLoadAt = now;
-            log.warn("[WINDOW] ⚠️ Не удалось обновить настройки: chatId={} msg={}", chatId, e.toString());
+            log.warn("[WINDOW] ⚠️ settings refresh failed chatId={} msg={}", chatId, e.toString());
         }
     }
 
@@ -795,7 +784,7 @@ public class WindowScalpingStrategyV4 implements
         String symbol = ss != null ? normalizeSymbolOrNull(ss.getSymbol()) : null;
         String ex     = ss != null ? String.valueOf(ss.getExchangeName()) : "null";
         String net    = ss != null ? String.valueOf(ss.getNetworkType()) : "null";
-        String tf     = ss != null ? safe(ss.getTimeframe()) : "null";
+        String tf     = ss != null ? safeNullable(ss.getTimeframe()) : "null";
         String candles = ss != null && ss.getCachedCandlesLimit() != null ? String.valueOf(ss.getCachedCandlesLimit()) : "null";
         String cooldown = ss != null && ss.getCooldownSeconds() != null ? String.valueOf(ss.getCooldownSeconds()) : "null";
 
@@ -813,7 +802,7 @@ public class WindowScalpingStrategyV4 implements
     }
 
     // =====================================================
-    // STRATEGY SETTINGS LOAD (AUTO, NO HARDCODE)
+    // ✅ STRATEGY SETTINGS LOAD (AUTO, NO HARDCODE)
     // =====================================================
 
     private StrategySettings loadStrategySettingsAuto(Long chatId, String exchange, NetworkType network) {
@@ -826,11 +815,11 @@ public class WindowScalpingStrategyV4 implements
         StrategySettings viaReflection = tryCallSettingsServiceFallback(chatId);
         if (viaReflection != null) return viaReflection;
 
-        throw new IllegalStateException(
-                "Нельзя загрузить StrategySettings для WINDOW_SCALPING без exchange/network. " +
-                "Передай exchange+network в start(), либо добавь StrategySettingsService.getOrCreate(chatId, type). " +
-                "(chatId=" + chatId + ")"
-        );
+        // ✅ НЕ ПАДАЕМ. Возвращаем null -> стратегия уйдёт в HOLD "no_settings"
+        if (log.isDebugEnabled()) {
+            log.debug("[WINDOW] loadStrategySettingsAuto: no exchange/network and no fallback methods (chatId={}) -> return null", chatId);
+        }
+        return null;
     }
 
     private StrategySettings tryCallSettingsServiceFallback(Long chatId) {
@@ -840,7 +829,7 @@ public class WindowScalpingStrategyV4 implements
             return (r instanceof StrategySettings ss) ? ss : null;
         } catch (NoSuchMethodException ignored) {
         } catch (Exception e) {
-            log.warn("[WINDOW] ⚠ fallback getOrCreate(chatId,type) упал: {}", e.toString());
+            log.warn("[WINDOW] ⚠ fallback getOrCreate(chatId,type) failed: {}", e.toString());
         }
 
         try {
@@ -849,7 +838,7 @@ public class WindowScalpingStrategyV4 implements
             return (r instanceof StrategySettings ss) ? ss : null;
         } catch (NoSuchMethodException ignored) {
         } catch (Exception e) {
-            log.warn("[WINDOW] ⚠ fallback getSettingsOrThrow(chatId,type) упал: {}", e.toString());
+            log.warn("[WINDOW] ⚠ fallback getSettingsOrThrow(chatId,type) failed: {}", e.toString());
         }
 
         return null;
@@ -895,9 +884,7 @@ public class WindowScalpingStrategyV4 implements
         }
 
         double factor = coarseAdjustFactor;
-        if (Double.isNaN(factor) || Double.isInfinite(factor) || factor <= 0 || factor >= 1.0) {
-            factor = 0.85;
-        }
+        if (Double.isNaN(factor) || Double.isInfinite(factor) || factor <= 0 || factor >= 1.0) factor = 0.85;
 
         double floor = coarseAdjustMinFloorPct;
         if (Double.isNaN(floor) || Double.isInfinite(floor) || floor <= 0) floor = 0.02;
@@ -907,7 +894,6 @@ public class WindowScalpingStrategyV4 implements
         if (oldMin <= 0) oldMin = 0.10;
 
         double newMin = Math.max(floor, oldMin * factor);
-
         if (Math.abs(newMin - oldMin) < 1e-12) return;
 
         try {
@@ -926,16 +912,11 @@ public class WindowScalpingStrategyV4 implements
             st.consecutiveRangeTooSmall = 0;
             st.lastCoarseAdjustAt = now;
 
-            log.warn("[WINDOW] 🛠️ COARSE-ADJUST применён: chatId={} символ={} minRangePct {} -> {} (afterConsecutive={} cooldown={}s)",
-                    chatId,
-                    symbol,
-                    fmt(oldMin),
-                    fmt(newMin),
-                    afterN,
-                    cd
-            );
+            log.warn("[WINDOW] 🛠️ COARSE-ADJUST chatId={} sym={} minRangePct {} -> {} (after={} cooldown={}s)",
+                    chatId, symbol, fmt(oldMin), fmt(newMin), afterN, cd);
+
         } catch (Exception e) {
-            log.warn("[WINDOW] ⚠️ COARSE-ADJUST не применился: chatId={} символ={} err={}", chatId, symbol, e.toString());
+            log.warn("[WINDOW] ⚠️ COARSE-ADJUST failed chatId={} sym={} err={}", chatId, symbol, e.toString());
         }
     }
 
@@ -1056,23 +1037,40 @@ public class WindowScalpingStrategyV4 implements
     }
 
     private Object findMlBean() {
-        if (appContext.containsBean("mlPredictionService")) return appContext.getBean("mlPredictionService");
-        if (appContext.containsBean("mlService")) return appContext.getBean("mlService");
+        if (mlBeanResolved) return cachedMlBean;
 
-        String[] names = appContext.getBeanDefinitionNames();
-        for (String n : names) {
-            Object b;
-            try { b = appContext.getBean(n); } catch (Exception ignored) { continue; }
-            if (b == null) continue;
-            if (hasSupportedPredictMethod(b.getClass())) return b;
+        synchronized (this) {
+            if (mlBeanResolved) return cachedMlBean;
+
+            Object bean = null;
+
+            try {
+                if (appContext.containsBean("mlPredictionService")) bean = appContext.getBean("mlPredictionService");
+                else if (appContext.containsBean("mlService")) bean = appContext.getBean("mlService");
+            } catch (Exception ignored) {}
+
+            if (bean == null) {
+                try {
+                    String[] names = appContext.getBeanDefinitionNames();
+                    for (String n : names) {
+                        Object b;
+                        try { b = appContext.getBean(n); } catch (Exception ignored) { continue; }
+                        if (hasSupportedPredictMethod(b.getClass())) { bean = b; break; }
+                    }
+                } catch (Exception ignored) {}
+            }
+
+            cachedMlBean = bean;
+            mlBeanResolved = true;
+            return cachedMlBean;
         }
-        return null;
     }
 
     private boolean hasSupportedPredictMethod(Class<?> c) {
         for (Method m : c.getMethods()) {
             String name = m.getName().toLowerCase(Locale.ROOT);
             if (!name.contains("predict")) continue;
+
             int pc = m.getParameterCount();
             Class<?>[] pt = m.getParameterTypes();
 
@@ -1133,14 +1131,13 @@ public class WindowScalpingStrategyV4 implements
         Object v = readAny(obj, gettersOrFields);
         if (v == null) return null;
         if (v instanceof Number n) return n.doubleValue();
-        if (v instanceof BigDecimal bd) return bd.doubleValue();
         try { return Double.parseDouble(String.valueOf(v)); } catch (Exception ignored) {}
         return null;
     }
 
     private Method findNoArgMethod(Class<?> c, String name) {
         try { return c.getMethod(name); } catch (Exception ignored) {}
-        String cap = name.length() > 0 ? Character.toUpperCase(name.charAt(0)) + name.substring(1) : name;
+        String cap = !name.isEmpty() ? Character.toUpperCase(name.charAt(0)) + name.substring(1) : name;
         try { return c.getMethod("get" + cap); } catch (Exception ignored) {}
         try { return c.getMethod("is" + cap); } catch (Exception ignored) {}
         return null;
@@ -1158,45 +1155,34 @@ public class WindowScalpingStrategyV4 implements
         try { r.run(); } catch (Exception ignored) {}
     }
 
-    private void safePositionStoreOpen(Long chatId, LocalState st) {
-        try {
-            if (chatId == null) return;
-            if (st == null) return;
-
-            String ex = normalizeExchangeOrNull(st.exchange);
-            if (ex == null || st.network == null) return;
-
-            st.exchange = ex;
-            positionStore.markOpened(chatId, StrategyType.WINDOW_SCALPING, ex, st.network);
-        } catch (Exception ignored) {}
-    }
-
-    private void safePositionStoreClose(Long chatId, LocalState st) {
-        try {
-            if (chatId == null) return;
-            if (st == null) return;
-
-            String ex = normalizeExchangeOrNull(st.exchange);
-            if (ex == null || st.network == null) return;
-
-            st.exchange = ex;
-            positionStore.markClosed(chatId, StrategyType.WINDOW_SCALPING, ex, st.network);
-        } catch (Exception ignored) {}
-    }
-
     private Set<String> parsedAutoTuneHoldReasons() {
+        String raw = (autoTuneHoldReasons == null ? "" : autoTuneHoldReasons.trim());
+        if (raw.equals(cachedHoldReasonsRaw) && cachedHoldReasonsSet != null) {
+            return cachedHoldReasonsSet;
+        }
+
         try {
-            String s = (autoTuneHoldReasons == null ? "" : autoTuneHoldReasons.trim());
-            if (s.isEmpty()) return Set.of();
-            String[] parts = s.split(",");
-            java.util.Set<String> out = new java.util.HashSet<>();
+            if (raw.isEmpty()) {
+                cachedHoldReasonsRaw = raw;
+                cachedHoldReasonsSet = Set.of();
+                return cachedHoldReasonsSet;
+            }
+
+            String[] parts = raw.split(",");
+            Set<String> out = new HashSet<>();
             for (String p : parts) {
                 String v = p.trim();
                 if (!v.isEmpty()) out.add(v);
             }
-            return out;
+
+            cachedHoldReasonsRaw = raw;
+            cachedHoldReasonsSet = Set.copyOf(out);
+            return cachedHoldReasonsSet;
+
         } catch (Exception ignored) {
-            return Set.of();
+            cachedHoldReasonsRaw = raw;
+            cachedHoldReasonsSet = Set.of();
+            return cachedHoldReasonsSet;
         }
     }
 
@@ -1221,7 +1207,7 @@ public class WindowScalpingStrategyV4 implements
 
         st.lastAutoTuneRequestAt = now;
 
-        log.warn("[WINDOW] 🧠 AUTO-TUNE (HOLD): chatId={} символ={} причина={} => triggerTuneDebounced (cooldown={}s)",
+        log.warn("[WINDOW] 🧠 AUTO-TUNE(HOLD) chatId={} sym={} reason={} cooldown={}s",
                 chatId, symbol, reason, cdSec);
 
         safeAutoTune(() -> autoTuneRuntime.triggerTuneDebounced(
@@ -1234,22 +1220,14 @@ public class WindowScalpingStrategyV4 implements
         ));
     }
 
-    /**
-     * ✅ FIX: больше НЕ выходим, если symbol == null.
-     *  - live-сигнал пушим только если есть куда (symbol != null)
-     *  - но coarse-adjust и auto-tune должны работать даже без symbol
-     */
     private void pushHoldThrottled(Long chatId, String symbol, LocalState st, String reason, Instant now, long holdMs) {
         if (st == null) return;
 
-        // symbol-safe: сначала аргумент, потом st.symbol
         String sym = normalizeSymbolOrNull(symbol);
         if (sym == null) sym = normalizeSymbolOrNull(st.symbol);
 
-        // ✅ FIX: финальная копия для лямбд
         final String symFinal = sym;
 
-        // ✅ считаем подряд range_too_small (для coarse-adjust)
         if ("range_too_small".equals(reason)) {
             st.consecutiveRangeTooSmall = Math.max(0, st.consecutiveRangeTooSmall) + 1;
         } else if (!"warming_up".equals(reason)) {
@@ -1273,12 +1251,10 @@ public class WindowScalpingStrategyV4 implements
         String ru = holdReasonRu(reason);
         String msg = (ru != null ? (ru + " [" + reason + "]") : ("HOLD: " + reason));
 
-        // live пушим только если есть символ
         if (symFinal != null) {
             safeLive(() -> live.pushSignal(chatId, StrategyType.WINDOW_SCALPING, symFinal, null, Signal.hold(msg)));
         }
 
-        // ✅ сначала coarse-adjust, потом внешний тюнер
         if ("range_too_small".equals(reason)) {
             maybeCoarseAdjustOnRangeTooSmall(chatId, symFinal, st, now);
         }
@@ -1304,14 +1280,8 @@ public class WindowScalpingStrategyV4 implements
             case "ml_below_threshold" -> "ML-прогноз ниже порога (вход запрещён)";
             case "entry_failed" -> "Ошибка при входе в сделку";
             case "in_high_zone_wait_tp" -> "Цена у верхней границы — ждём TP";
-            default -> {
-                String lc = code.toLowerCase(Locale.ROOT);
-                if (lc.contains("balance")) yield "Недостаточно баланса";
-                if (lc.contains("notional")) yield "Слишком маленький объём (NOTIONAL)";
-                if (lc.contains("min")) yield "Нарушено минимальное ограничение биржи";
-                if (lc.contains("spread")) yield "Слишком большой спред";
-                yield null;
-            }
+            case "pos_snapshot_missing" -> "Позиция есть, но нет данных (qty/tp/sl) в PositionStore";
+            default -> null;
         };
     }
 
@@ -1320,11 +1290,10 @@ public class WindowScalpingStrategyV4 implements
     // =====================================================
 
     private BigDecimal extractClosePriceSafe(UnifiedKline kline) {
-        Object v =
-                tryInvokeNoArg(kline, "getClose")
-                        .or(() -> tryInvokeNoArg(kline, "close"))
-                        .or(() -> tryInvokeNoArg(kline, "getC"))
-                        .orElse(null);
+        Object v = tryInvokeNoArg(kline, "getClose")
+                .or(() -> tryInvokeNoArg(kline, "close"))
+                .or(() -> tryInvokeNoArg(kline, "getC"))
+                .orElse(null);
 
         if (v == null) return null;
         if (v instanceof BigDecimal bd) return bd;
@@ -1334,12 +1303,11 @@ public class WindowScalpingStrategyV4 implements
     }
 
     private long extractKlineCloseTimeMsSafe(UnifiedKline kline) {
-        Object v =
-                tryInvokeNoArg(kline, "getCloseTimeMs")
-                        .or(() -> tryInvokeNoArg(kline, "getCloseTime"))
-                        .or(() -> tryInvokeNoArg(kline, "getEndTimeMs"))
-                        .or(() -> tryInvokeNoArg(kline, "getT"))
-                        .orElse(null);
+        Object v = tryInvokeNoArg(kline, "getCloseTimeMs")
+                .or(() -> tryInvokeNoArg(kline, "getCloseTime"))
+                .or(() -> tryInvokeNoArg(kline, "getEndTimeMs"))
+                .or(() -> tryInvokeNoArg(kline, "getT"))
+                .orElse(null);
 
         if (v == null) return 0L;
         if (v instanceof Number n) return n.longValue();
@@ -1347,12 +1315,76 @@ public class WindowScalpingStrategyV4 implements
         return 0L;
     }
 
-    private java.util.Optional<Object> tryInvokeNoArg(Object target, String method) {
+    private Optional<Object> tryInvokeNoArg(Object target, String method) {
         try {
             Method m = target.getClass().getMethod(method);
-            return java.util.Optional.ofNullable(m.invoke(target));
+            return Optional.ofNullable(m.invoke(target));
         } catch (Exception ignored) {
-            return java.util.Optional.empty();
+            return Optional.empty();
+        }
+    }
+
+    // =====================================================
+    // ✅ RESTORE POSITION FROM PositionStore
+    // =====================================================
+
+    private void maybeRestorePositionFromStore(Long chatId, LocalState st, String symbol, Instant now) {
+        if (chatId == null || st == null) return;
+
+        // уже восстановлено
+        if (st.inPosition && st.entryQty != null && st.tp != null && st.sl != null) return;
+
+        String ex = normalizeExchangeOrNull(st.exchange);
+        NetworkType net = st.network;
+        String sym = normalizeSymbolOrNull(symbol);
+        if (sym == null) sym = normalizeSymbolOrNull(st.symbol);
+
+        if (ex == null || net == null || sym == null) return;
+
+        if (!positionStore.isInPosition(chatId, StrategyType.WINDOW_SCALPING, ex, net, sym)) return;
+
+        Optional<PositionStore.PositionSnapshot> opt =
+                positionStore.getPosition(chatId, StrategyType.WINDOW_SCALPING, ex, net, sym);
+
+        if (opt.isEmpty()) {
+            st.inPosition = true;
+            st.isLong = true;
+            pushHoldThrottled(chatId, sym, st, "pos_snapshot_missing", now, Math.max(200, holdThrottleMs));
+            if (st.ticks % Math.max(1, tickLogEveryTicks) == 0) {
+                log.warn("[WINDOW] ⚠ PositionStore IN_POSITION but snapshot missing chatId={} ex={} net={} sym={}",
+                        chatId, ex, net, sym);
+            }
+            return;
+        }
+
+        PositionStore.PositionSnapshot snap = opt.get();
+
+        st.inPosition = true;
+        st.isLong = true;
+
+        st.entryPrice = (st.entryPrice != null ? st.entryPrice : snap.entryPrice());
+        st.entryQty   = (st.entryQty   != null ? st.entryQty   : snap.qty());
+        st.tp         = (st.tp         != null ? st.tp         : snap.tp());
+        st.sl         = (st.sl         != null ? st.sl         : snap.sl());
+        st.entryOrderId = (st.entryOrderId != null ? st.entryOrderId : snap.entryOrderId());
+
+        if (st.lastEntryAt == null) st.lastEntryAt = (snap.openedAt() != null ? snap.openedAt() : now);
+
+        if (st.tp != null && st.sl != null) {
+            final String symFinal = sym;
+            safeLive(() -> live.pushTpSl(chatId, StrategyType.WINDOW_SCALPING, symFinal, st.tp, st.sl));
+        }
+
+        if (st.ticks % Math.max(1, tickLogEveryTicks) == 0) {
+            log.info("[WINDOW] ♻️ RESTORED chatId={} sym={} qty={} tp={} sl={} entryPrice={} orderId={}",
+                    chatId,
+                    sym,
+                    st.entryQty != null ? st.entryQty.stripTrailingZeros().toPlainString() : "null",
+                    st.tp != null ? st.tp.stripTrailingZeros().toPlainString() : "null",
+                    st.sl != null ? st.sl.stripTrailingZeros().toPlainString() : "null",
+                    st.entryPrice != null ? st.entryPrice.stripTrailingZeros().toPlainString() : "null",
+                    st.entryOrderId
+            );
         }
     }
 
@@ -1360,8 +1392,10 @@ public class WindowScalpingStrategyV4 implements
     // UTILS
     // =====================================================
 
-    private static String safe(String s) {
-        return s == null ? "null" : s.trim();
+    private static String safeNullable(String s) {
+        if (s == null) return null;
+        String t = s.trim();
+        return t.isEmpty() ? null : t;
     }
 
     private static String normalizeSymbolOrNull(String symbol) {

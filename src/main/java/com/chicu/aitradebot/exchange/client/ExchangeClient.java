@@ -13,10 +13,14 @@ import java.util.Map;
 
 /**
  * 🌐 ExchangeClient — унифицированный, STATELESS интерфейс биржи.
-
- * ❗ Клиент НЕ хранит network.
- * ❗ Network ВСЕГДА передаётся явно.
-
+ *
+ * Принципы (под прод):
+ * 1) ❗ Клиент НЕ хранит network, сеть ВСЕГДА передаётся явно.
+ * 2) ❗ Метод placeMarketOrder поддерживает две схемы количества:
+ *    - BASE_QTY  (base quantity)  — сколько базовой монеты купить/продать
+ *    - QUOTE_QTY (quote amount)   — сколько котируемой монеты потратить (особенно важно для BUY)
+ * 3) extraParams — расширение без хардкода (timeInForce, clientOrderId, reduceOnly, etc.)
+ *
  * Реализации:
  *  - BinanceExchangeClient
  *  - BybitExchangeClient
@@ -38,7 +42,7 @@ public interface ExchangeClient {
     // =====================================================================
 
     /**
-     * Получение свечей (REST).
+     * Получение свечей (REST). Публичные ручки обычно не зависят от ключей.
      */
     List<Kline> getKlines(
             String symbol,
@@ -46,7 +50,10 @@ public interface ExchangeClient {
             int limit
     ) throws Exception;
 
-    // в ExchangeClient
+    /**
+     * Диапазонные свечи (если биржа поддерживает start/end).
+     * Fallback: старое поведение "последние limit".
+     */
     default List<Kline> getKlines(
             String symbol,
             String interval,
@@ -54,10 +61,8 @@ public interface ExchangeClient {
             long endTimeMs,
             int limit
     ) throws Exception {
-        // fallback: старое поведение "последние limit"
         return getKlines(symbol, interval, limit);
     }
-
 
     /**
      * Последняя цена (REST).
@@ -65,35 +70,86 @@ public interface ExchangeClient {
     double getPrice(String symbol) throws Exception;
 
     // =====================================================================
-    // ORDERS
+    // ORDERS (❗ network всегда явный)
     // =====================================================================
 
     /**
      * Универсальный ордер.
+     *
+     * quantity — ВСЕГДА BASE qty (кол-во базовой монеты), как принято у большинства бирж.
+     * price — используется для LIMIT (для MARKET обычно null).
+     *
+     * extraParams — безопасный механизм расширения без хардкода:
+     *  - Binance: timeInForce, quoteOrderQty, newClientOrderId, etc.
+     *  - Bybit:  timeInForce, orderLinkId, etc.
      */
     OrderResult placeOrder(
             Long chatId,
+            NetworkType network,
             String symbol,
             String side,
             String type,
-            double qty,
-            Double price
+            BigDecimal quantity,
+            BigDecimal price,
+            Map<String, String> extraParams
     ) throws Exception;
 
     /**
+     * Упрощённый overload: без extraParams.
+     */
+    default OrderResult placeOrder(
+            Long chatId,
+            NetworkType network,
+            String symbol,
+            String side,
+            String type,
+            BigDecimal quantity,
+            BigDecimal price
+    ) throws Exception {
+        return placeOrder(chatId, network, symbol, side, type, quantity, price, Map.of());
+    }
+
+    /**
      * MARKET ордер.
+     *
+     * amountType:
+     *  - BASE_QTY  => amount = base quantity (BTC/ETH/...)
+     *  - QUOTE_QTY => amount = quote amount (USDT/...) (особенно важно для BUY)
+     *
+     * priceHint — необязательная подсказка текущей цены:
+     *  - может использоваться для валидации minNotional / фильтров / расчётов при QUOTE_QTY
+     *  - если не передан — реализация может сама получить цену
      */
     Order placeMarketOrder(
+            Long chatId,
+            NetworkType network,
             String symbol,
             OrderSide side,
-            BigDecimal qty
+            BigDecimal amount,
+            OrderAmountType amountType,
+            BigDecimal priceHint
     ) throws Exception;
+
+    /**
+     * Упрощённый overload: без priceHint.
+     */
+    default Order placeMarketOrder(
+            Long chatId,
+            NetworkType network,
+            String symbol,
+            OrderSide side,
+            BigDecimal amount,
+            OrderAmountType amountType
+    ) throws Exception {
+        return placeMarketOrder(chatId, network, symbol, side, amount, amountType, null);
+    }
 
     /**
      * Отмена ордера.
      */
     boolean cancelOrder(
             Long chatId,
+            NetworkType network,
             String symbol,
             String orderId
     ) throws Exception;
@@ -148,13 +204,24 @@ public interface ExchangeClient {
             double volume
     ) {}
 
+    /**
+     * Единый DTO результата ордера.
+     *
+     * qty:
+     *  - для BUY/SELL MARKET лучше возвращать исполненный BASE qty (executed qty),
+     *    даже если вход был через QUOTE_QTY.
+     *
+     * price:
+     *  - средняя/фактическая цена исполнения (если биржа вернула),
+     *    иначе допускается null.
+     */
     record OrderResult(
             String orderId,
             String symbol,
             String side,
             String type,
-            double qty,
-            double price,
+            BigDecimal qty,
+            BigDecimal price,
             String status,
             long timestamp
     ) {}
@@ -163,5 +230,13 @@ public interface ExchangeClient {
         public double total() {
             return free + locked;
         }
+    }
+
+    /**
+     * Тип количества для MARKET (чтобы не путать BUY через quoteAmount и SELL через baseQty).
+     */
+    enum OrderAmountType {
+        BASE_QTY,
+        QUOTE_QTY
     }
 }

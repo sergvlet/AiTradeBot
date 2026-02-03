@@ -1,4 +1,4 @@
-package com.chicu.aitradebot.service;
+package com.chicu.aitradebot.service.impl;
 
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;

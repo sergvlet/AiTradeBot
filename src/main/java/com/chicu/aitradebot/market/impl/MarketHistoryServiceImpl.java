@@ -10,6 +10,7 @@ import org.springframework.stereotype.Service;
 
 import java.time.Instant;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 
 @Slf4j
@@ -24,25 +25,24 @@ public class MarketHistoryServiceImpl implements MarketHistoryService {
                                                    String symbol,
                                                    String timeframe,
                                                    int limit) {
+        if (chatId == null || limit <= 0) return Collections.emptyList();
+
+        String sym = normalizeSymbol(symbol);
+        String tf  = normalizeTimeframe(timeframe);
 
         try {
             ExchangeClient client = exchangeClientFactory.getByChat(chatId);
 
-            List<ExchangeClient.Kline> klines = client.getKlines(symbol, timeframe, limit);
+            List<ExchangeClient.Kline> klines = client.getKlines(sym, tf, limit);
 
+            // ✅ стабильный порядок времени ↑
             return klines.stream()
-                    .map(k -> new CandleProvider.Candle(
-                            k.openTime(),
-                            k.open(),
-                            k.high(),
-                            k.low(),
-                            k.close(),
-                            k.volume()
-                    ))
+                    .map(MarketHistoryServiceImpl::toCandle)
+                    .sorted(Comparator.comparingLong(CandleProvider.Candle::time))
                     .toList();
 
         } catch (Exception e) {
-            log.error("❌ Ошибка loadInitial(): {}", e.getMessage(), e);
+            logWarn("loadInitial", chatId, sym, tf, limit, null, e);
             return Collections.emptyList();
         }
     }
@@ -53,30 +53,68 @@ public class MarketHistoryServiceImpl implements MarketHistoryService {
                                                 String timeframe,
                                                 Instant to,
                                                 int limit) {
+        if (chatId == null || limit <= 0 || to == null) return Collections.emptyList();
+
+        String sym = normalizeSymbol(symbol);
+        String tf  = normalizeTimeframe(timeframe);
 
         try {
             ExchangeClient client = exchangeClientFactory.getByChat(chatId);
 
-            List<ExchangeClient.Kline> klines =
-                    client.getKlines(symbol, timeframe, limit + 50);
+            long endExclusive = to.toEpochMilli();
+            // ✅ делаем endInclusive, чтобы точно было "до to"
+            long endInclusive = Math.max(0L, endExclusive - 1);
+
+            // startTimeMs=0 → "с начала времён", но клиент обязан уважать endTimeMs
+            List<ExchangeClient.Kline> klines = client.getKlines(sym, tf, 0L, endInclusive, limit);
 
             return klines.stream()
-                    .filter(k -> k.openTime() < to.toEpochMilli())
-                    .sorted((a, b) -> Long.compare(b.openTime(), a.openTime()))
-                    .limit(limit)
-                    .map(k -> new CandleProvider.Candle(
-                            k.openTime(),
-                            k.open(),
-                            k.high(),
-                            k.low(),
-                            k.close(),
-                            k.volume()
-                    ))
+                    .map(MarketHistoryServiceImpl::toCandle)
+                    .sorted(Comparator.comparingLong(CandleProvider.Candle::time))
                     .toList();
 
         } catch (Exception e) {
-            log.error("❌ Ошибка loadMore(): {}", e.getMessage(), e);
+            logWarn("loadMore", chatId, sym, tf, limit, to, e);
             return Collections.emptyList();
+        }
+    }
+
+    private static CandleProvider.Candle toCandle(ExchangeClient.Kline k) {
+        return new CandleProvider.Candle(
+                k.openTime(),
+                k.open(),
+                k.high(),
+                k.low(),
+                k.close(),
+                k.volume()
+        );
+    }
+
+    private static String normalizeSymbol(String symbol) {
+        return symbol == null ? "" : symbol.trim().toUpperCase();
+    }
+
+    private static String normalizeTimeframe(String timeframe) {
+        return timeframe == null ? "" : timeframe.trim().toLowerCase();
+    }
+
+    private static void logWarn(String op,
+                                Long chatId,
+                                String symbol,
+                                String timeframe,
+                                int limit,
+                                Instant to,
+                                Exception e) {
+        if (to != null) {
+            log.warn("⚠️ MarketHistory {} failed: chatId={}, symbol={}, tf={}, limit={}, to={}, msg={}",
+                    op, chatId, symbol, timeframe, limit, to, e.getMessage());
+        } else {
+            log.warn("⚠️ MarketHistory {} failed: chatId={}, symbol={}, tf={}, limit={}, msg={}",
+                    op, chatId, symbol, timeframe, limit, e.getMessage());
+        }
+
+        if (log.isDebugEnabled()) {
+            log.debug("Stacktrace ({})", op, e);
         }
     }
 }

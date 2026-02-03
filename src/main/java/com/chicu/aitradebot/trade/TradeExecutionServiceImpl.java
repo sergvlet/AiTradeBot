@@ -6,6 +6,7 @@ import com.chicu.aitradebot.ai.runtime.MlAutoTuneRuntime;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
+import com.chicu.aitradebot.exchange.enums.OrderSide;
 import com.chicu.aitradebot.exchange.model.Order;
 import com.chicu.aitradebot.service.OrderService;
 import com.chicu.aitradebot.service.StrategySettingsService;
@@ -15,11 +16,13 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Locale;
+import java.util.Optional;
 
 @Slf4j
 @Service
@@ -33,11 +36,16 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
     private static final String PHASE_BACKTEST = "BACKTEST";
     private static final String PHASE_PAPER    = "PAPER";
 
+    /**
+     * ✅ Мини-буфер сверх комиссий (в процентах), чтобы TP не был "в ноль".
+     */
+    private static final BigDecimal TP_FEE_BUFFER_PCT = new BigDecimal("0.02"); // 0.02%
+
     private final OrderService orderService;
     private final StrategyLivePublisher live;
     private final AccountBalanceService accountBalanceService;
 
-    // ✅ настройки стратегии (для autotune по флагу)
+    // ✅ настройки стратегии (для autotune по флагу) — вызываем reflection-safe
     private final StrategySettingsService settingsService;
 
     // ✅ анти-спам входа при фейле
@@ -54,8 +62,13 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                                     BigDecimal price,
                                     BigDecimal diffPct,
                                     Instant time,
-                                    StrategySettings strategySettings) {
-        return EntryResult.fail("TP/SL должны приходить из настроек конкретной стратегии. Используй executeEntry(..., tpPct, slPct).");
+                                    StrategySettings ss) {
+        // ✅ В V4 TP/SL живут ТОЛЬКО в настройках конкретной стратегии (отдельные таблицы),
+        // поэтому этот overload использовать нельзя.
+        return EntryResult.fail(
+                "executeEntry(chatId,type,symbol,price,diffPct,time,ss) запрещён: TP/SL должны приходить из таблицы конкретной стратегии. " +
+                "Используй executeEntry(..., tpPct, slPct)."
+        );
     }
 
     @Override
@@ -114,14 +127,14 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             if (minProb != null && minProb.signum() > 0) {
                 BigDecimal conf = (ss.getMlConfidence() != null ? ss.getMlConfidence() : BigDecimal.ZERO);
                 if (conf.compareTo(minProb) < 0) {
-                    safeLive(() -> live.pushSignal(chatId, strategyType, sym, null,
-                            Signal.buy(price.doubleValue(), "ml_gate_reject")));
+                    safeLive(() -> live.pushSignal(chatId, strategyType, sym, null, Signal.hold("ml_gate_reject")));
                     return EntryResult.fail("ml_gate_reject");
                 }
             }
         }
 
-        if (positionStore.isInPosition(chatId, strategyType, ex, net)) {
+        // ✅ FIX: проверка позиции должна учитывать symbol
+        if (positionStore.isInPosition(chatId, strategyType, ex, net, sym)) {
             return EntryResult.fail("already_in_position");
         }
 
@@ -140,10 +153,29 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             return EntryResult.fail("no_budget");
         }
 
-        // Плановый qty (только для UI/логов/collectMode). Реальный qty вернёт OrderService после AI-GUARD.
+        // Плановый qty (только для UI/логов/collectMode)
         BigDecimal plannedQty = quoteAmount.divide(price, QTY_SCALE, RoundingMode.DOWN);
         if (plannedQty.signum() <= 0) return EntryResult.fail("qty=0");
 
+        // =====================================================
+        // ✅ FIX: защита от "TP меньше комиссий" (гарантированный минус)
+        // =====================================================
+        BigDecimal commissionPct = resolveCommissionPctOrNull(ss);
+        if (commissionPct != null && commissionPct.signum() > 0) {
+            BigDecimal minTpToNotLose = commissionPct.multiply(BigDecimal.valueOf(2)).add(TP_FEE_BUFFER_PCT);
+            if (tpPct.compareTo(minTpToNotLose) < 0) {
+                log.debug("[TRADE] TP too small for fees: tpPct={} < minTp={} (feePct={} x2 + buffer={}) chatId={} {} {} {}",
+                        tpPct.stripTrailingZeros().toPlainString(),
+                        minTpToNotLose.stripTrailingZeros().toPlainString(),
+                        commissionPct.stripTrailingZeros().toPlainString(),
+                        TP_FEE_BUFFER_PCT.stripTrailingZeros().toPlainString(),
+                        chatId, strategyType, ex, sym
+                );
+                return EntryResult.fail("tp_too_small_for_fees");
+            }
+        }
+
+        // TP/SL пока считаем от тик-цены, но после исполнения пересчитаем от executedPrice
         BigDecimal tp = calcTp(price, tpPct);
         BigDecimal sl = calcSl(price, slPct);
 
@@ -180,31 +212,48 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         }
 
         try {
-            // ✅ ВАЖНО: BUY -> передаём quoteAmount (USDT), а не qty
-            Order order = orderService.placeMarket(ctx, "BUY", quoteAmount, price);
+            Order order = orderService.placeMarket(ctx, OrderSide.BUY, quoteAmount, price);
             Long orderId = (order != null ? order.getId() : null);
 
-            BigDecimal executedQty = (order != null && order.getQuantity() != null && order.getQuantity().signum() > 0)
-                    ? order.getQuantity()
-                    : plannedQty;
+            BigDecimal executedQty = pickExecutedQty(order, plannedQty);
+            BigDecimal executedPrice = pickExecutedPrice(order, price);
+
+            BigDecimal tpExec = calcTp(executedPrice, tpPct);
+            BigDecimal slExec = calcSl(executedPrice, slPct);
 
             failCooldown.clear(key);
-            positionStore.markOpened(chatId, strategyType, ex, net, sym);
 
-            log.info("[TRADE] ENTRY SPOT BUY {} executedQty={} plannedQty={} price={} quoteAmount={} tpPct={} slPct={} tp={} sl={} chatId={} ex={} net={} phase={}",
+            // ✅ ЕДИНСТВЕННЫЙ ИСТОЧНИК ПРАВДЫ: TradeExecution сохраняет snapshot позиции
+            positionStore.markOpened(
+                    chatId,
+                    strategyType,
+                    ex,
+                    net,
+                    sym,
+                    executedPrice,
+                    executedQty,
+                    tpExec,
+                    slExec,
+                    quoteAmount,
+                    orderId,
+                    (time != null ? time : Instant.now())
+            );
+
+            log.info("[TRADE] ENTRY SPOT BUY {} executedQty={} plannedQty={} entryPrice={} tickPrice={} quoteAmount={} tpPct={} slPct={} tp={} sl={} chatId={} ex={} net={} phase={}",
                     sym,
                     executedQty.stripTrailingZeros().toPlainString(),
                     plannedQty.stripTrailingZeros().toPlainString(),
+                    executedPrice.stripTrailingZeros().toPlainString(),
                     price.stripTrailingZeros().toPlainString(),
                     quoteAmount.stripTrailingZeros().toPlainString(),
                     tpPct.stripTrailingZeros().toPlainString(),
                     slPct.stripTrailingZeros().toPlainString(),
-                    tp.stripTrailingZeros().toPlainString(),
-                    sl.stripTrailingZeros().toPlainString(),
+                    tpExec.stripTrailingZeros().toPlainString(),
+                    slExec.stripTrailingZeros().toPlainString(),
                     chatId, ex, net, phase
             );
 
-            return EntryResult.ok(true, "BUY", executedQty.stripTrailingZeros(), price, tp, sl, orderId);
+            return EntryResult.ok(true, "BUY", executedQty.stripTrailingZeros(), executedPrice, tpExec, slExec, orderId);
 
         } catch (Exception e) {
             String code = mapTradeErrorCode(e);
@@ -237,8 +286,6 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         if (sym == null) return ExitResult.fail("symbol пустой");
 
         if (price == null || price.signum() <= 0) return ExitResult.fail("price invalid");
-        if (entryQty == null || entryQty.signum() <= 0) return ExitResult.fail("entryQty invalid");
-        if (tp == null || sl == null) return ExitResult.fail("tp/sl null");
         if (!isLong) return ExitResult.fail("spot_short_forbidden");
 
         String ex = safeExchange(exchange);
@@ -246,8 +293,33 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         if (ex == null) return ExitResult.fail("exchange=null");
         if (net == null) return ExitResult.fail("network=null");
 
-        boolean tpHit = price.compareTo(tp) >= 0;
-        boolean slHit = price.compareTo(sl) <= 0;
+        // =====================================================
+        // ✅ FIX: берём tp/sl/qty из PositionStore (если есть)
+        // =====================================================
+        BigDecimal effQty = entryQty;
+        BigDecimal effTp  = tp;
+        BigDecimal effSl  = sl;
+
+        try {
+            Optional<PositionStore.PositionSnapshot> posOpt =
+                    positionStore.getPosition(chatId, strategyType, ex, net, sym);
+
+            if (posOpt.isPresent()) {
+                PositionStore.PositionSnapshot p = posOpt.get();
+
+                if (p.qty() != null && p.qty().signum() > 0) effQty = p.qty();
+                if (p.tp() != null && p.tp().signum() > 0) effTp = p.tp();
+                if (p.sl() != null && p.sl().signum() > 0) effSl = p.sl();
+            }
+        } catch (Exception ignored) {
+            // если PositionStore не умеет снапшоты — просто работаем по параметрам метода
+        }
+
+        if (effQty == null || effQty.signum() <= 0) return ExitResult.fail("entryQty invalid");
+        if (effTp == null || effSl == null) return ExitResult.fail("tp/sl null");
+
+        boolean tpHit = price.compareTo(effTp) >= 0;
+        boolean slHit = price.compareTo(effSl) <= 0;
         if (!tpHit && !slHit) return ExitResult.fail("not_hit");
 
         OrderService.OrderContext ctx = new OrderService.OrderContext(
@@ -262,17 +334,19 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         );
 
         try {
-            // SELL по SPOT — это baseQty (как было)
-            orderService.placeMarket(ctx, "SELL", entryQty, price);
+            Order order = orderService.placeMarket(ctx, OrderSide.SELL, effQty, price);
+
+            BigDecimal executedExitPrice = pickExecutedPrice(order, price);
 
             safeLive(() -> live.clearTpSl(chatId, strategyType, sym));
             safeLive(() -> live.clearPriceLines(chatId, strategyType, sym));
             safeLive(() -> live.pushSignal(chatId, strategyType, sym, null,
-                    Signal.sell(price.doubleValue(), tpHit ? "TP" : "SL")));
+                    Signal.sell(executedExitPrice.doubleValue(), tpHit ? "TP" : "SL")));
 
-            log.info("[TRADE] EXIT SPOT SELL {} qty={} price={} tpHit={} slHit={} chatId={} ex={} net={}",
+            log.info("[TRADE] EXIT SPOT SELL {} qty={} exitPrice={} tickPrice={} tpHit={} slHit={} chatId={} ex={} net={}",
                     sym,
-                    entryQty.stripTrailingZeros().toPlainString(),
+                    effQty.stripTrailingZeros().toPlainString(),
+                    executedExitPrice.stripTrailingZeros().toPlainString(),
                     price.stripTrailingZeros().toPlainString(),
                     tpHit,
                     slHit,
@@ -281,20 +355,13 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                     net
             );
 
-            positionStore.markClosed(chatId, strategyType, ex, net, sym);
+            // ✅ чистим позицию полностью (факт + snapshot)
+            positionStore.clearPosition(chatId, strategyType, ex, net, sym);
 
             // =====================================================
-            // ✅ AUTO-TUNE: только если включено в StrategySettings
+            // ✅ AUTO-TUNE (reflection-safe)
             // =====================================================
-            boolean allowTune = false;
-            try {
-                StrategySettings s = settingsService.getSettings(chatId, strategyType, ex, net);
-                if (s != null) {
-                    String phase = normalizeUpperNullable(s.getRunPhase());
-                    boolean phaseBlocks = PHASE_BACKTEST.equals(phase) || PHASE_COLLECT.equals(phase);
-                    allowTune = s.isAutoTuneEnabled() && !phaseBlocks;
-                }
-            } catch (Exception ignored) {}
+            boolean allowTune = allowAutoTune(chatId, strategyType, ex, net);
 
             if (allowTune) {
                 mlAutoTuneRuntime.triggerTuneDebounced(
@@ -310,7 +377,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                         chatId, strategyType, ex, net);
             }
 
-            return ExitResult.ok(tpHit, slHit, price, BigDecimal.ZERO);
+            return ExitResult.ok(tpHit, slHit, executedExitPrice, BigDecimal.ZERO);
 
         } catch (Exception e) {
             String code = mapTradeErrorCode(e);
@@ -323,6 +390,69 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
 
     private void safeLive(Runnable r) {
         try { r.run(); } catch (Exception ignored) {}
+    }
+
+    /**
+     * ✅ Reflection-safe проверка авто-тюнинга:
+     * - не зависит от конкретного набора методов в StrategySettingsService
+     * - НЕ ломает компиляцию, если у тебя нет getSettings(...)
+     */
+    private boolean allowAutoTune(Long chatId, StrategyType type, String ex, NetworkType net) {
+        try {
+            StrategySettings s = tryLoadSettings(chatId, type, ex, net);
+            if (s == null) return false;
+
+            String phase = normalizeUpperNullable(s.getRunPhase());
+            boolean phaseBlocks = PHASE_BACKTEST.equals(phase) || PHASE_COLLECT.equals(phase);
+
+            return s.isAutoTuneEnabled() && !phaseBlocks;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private StrategySettings tryLoadSettings(Long chatId, StrategyType type, String ex, NetworkType net) {
+        if (settingsService == null) return null;
+        try {
+            // 1) getSettings(chatId,type,ex,net)
+            try {
+                Method m = settingsService.getClass().getMethod(
+                        "getSettings", Long.class, StrategyType.class, String.class, NetworkType.class
+                );
+                Object r = m.invoke(settingsService, chatId, type, ex, net);
+                if (r instanceof StrategySettings ss) return ss;
+            } catch (NoSuchMethodException ignored) {}
+
+            // 2) getOrCreate(chatId,type,ex,net)
+            try {
+                Method m = settingsService.getClass().getMethod(
+                        "getOrCreate", Long.class, StrategyType.class, String.class, NetworkType.class
+                );
+                Object r = m.invoke(settingsService, chatId, type, ex, net);
+                if (r instanceof StrategySettings ss) return ss;
+            } catch (NoSuchMethodException ignored) {}
+
+            // 3) getSettingsOrThrow(chatId,type,ex,net)
+            try {
+                Method m = settingsService.getClass().getMethod(
+                        "getSettingsOrThrow", Long.class, StrategyType.class, String.class, NetworkType.class
+                );
+                Object r = m.invoke(settingsService, chatId, type, ex, net);
+                if (r instanceof StrategySettings ss) return ss;
+            } catch (NoSuchMethodException ignored) {}
+
+            // 4) getOrCreate(chatId,type)
+            try {
+                Method m = settingsService.getClass().getMethod(
+                        "getOrCreate", Long.class, StrategyType.class
+                );
+                Object r = m.invoke(settingsService, chatId, type);
+                if (r instanceof StrategySettings ss) return ss;
+            } catch (NoSuchMethodException ignored) {}
+
+        } catch (Exception ignored) {}
+
+        return null;
     }
 
     private static String safe(String s) {
@@ -440,5 +570,80 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         if (s.contains("rejected") || s.contains("reject") || s.contains("filter failure")) return "exchange_reject";
 
         return "trade_error";
+    }
+
+    // =====================================================
+    // ✅ EXECUTION DATA HELPERS (не завязаны на поля Order)
+    // =====================================================
+
+    private BigDecimal pickExecutedQty(Order order, BigDecimal fallbackPlannedQty) {
+        if (order == null) return fallbackPlannedQty;
+
+        try {
+            BigDecimal q = order.getQuantity();
+            if (q != null && q.signum() > 0) return q;
+        } catch (Exception ignored) {}
+
+        BigDecimal fromOrder = readBd(order,
+                "getExecutedQty",
+                "getFilledQty",
+                "getOrigQty",
+                "getQty",
+                "getQuantity"
+        );
+        if (fromOrder != null && fromOrder.signum() > 0) return fromOrder;
+
+        return fallbackPlannedQty;
+    }
+
+    private BigDecimal pickExecutedPrice(Order order, BigDecimal fallbackTickPrice) {
+        if (order == null) return fallbackTickPrice;
+
+        BigDecimal fromOrder = readBd(order,
+                "getAvgPrice",
+                "getAveragePrice",
+                "getExecutedPrice",
+                "getFillPrice",
+                "getLastFillPrice",
+                "getPrice"
+        );
+        if (fromOrder != null && fromOrder.signum() > 0) {
+            return fromOrder.setScale(PRICE_SCALE, RoundingMode.HALF_UP);
+        }
+
+        return fallbackTickPrice;
+    }
+
+    private BigDecimal resolveCommissionPctOrNull(StrategySettings ss) {
+        if (ss == null) return null;
+
+        BigDecimal v = null;
+        try {
+            Method m = ss.getClass().getMethod("getCommissionPct");
+            Object r = m.invoke(ss);
+            if (r instanceof BigDecimal bd) v = bd;
+            else if (r != null) v = new BigDecimal(String.valueOf(r));
+        } catch (Exception ignored) {}
+
+        if (v != null && v.signum() > 0) return v;
+
+        return null;
+    }
+
+    private BigDecimal readBd(Object obj, String... methods) {
+        if (obj == null) return null;
+        for (String m : methods) {
+            try {
+                Method mm = obj.getClass().getMethod(m);
+                Object v = mm.invoke(obj);
+                if (v == null) continue;
+                if (v instanceof BigDecimal bd) return bd;
+                if (v instanceof Number n) return BigDecimal.valueOf(n.doubleValue());
+                String s = String.valueOf(v).trim();
+                if (s.isEmpty() || "null".equalsIgnoreCase(s)) continue;
+                return new BigDecimal(s);
+            } catch (Exception ignored) {}
+        }
+        return null;
     }
 }

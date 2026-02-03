@@ -6,6 +6,7 @@ import lombok.Builder;
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
+
 @Builder
 public record GuardResult(
 
@@ -33,14 +34,31 @@ public record GuardResult(
     // =====================================================
 
     public GuardResult {
-        warnings = warnings != null ? warnings : new ArrayList<>();
-        errors   = errors   != null ? errors   : new ArrayList<>();
+        // --- списки ---
+        warnings = warnings != null ? List.copyOf(warnings) : List.of();
+        errors   = errors   != null ? List.copyOf(errors)   : List.of();
+
+        // --- scopes (никогда не null) ---
+        minNotionalScope = minNotionalScope != null ? minNotionalScope : ExchangeLimitScope.UNKNOWN;
+        stepSizeScope    = stepSizeScope    != null ? stepSizeScope    : ExchangeLimitScope.UNKNOWN;
+        tickSizeScope    = tickSizeScope    != null ? tickSizeScope    : ExchangeLimitScope.UNKNOWN;
+        maxOrdersScope   = maxOrdersScope   != null ? maxOrdersScope   : ExchangeLimitScope.UNKNOWN;
+
+        // computedNotional: если не задан, но qty/price есть — считаем
+        if (computedNotional == null && finalQty != null && finalPrice != null) {
+            computedNotional = finalPrice.multiply(finalQty);
+        }
 
         // ❗ защита от логической ошибки
         if (ok && !errors.isEmpty()) {
             throw new IllegalStateException(
                     "GuardResult: ok=true but errors not empty: " + errors
             );
+        }
+        if (!ok && errors.isEmpty()) {
+            // не жёстко валим, но подсветим, чтобы не было "ok=false без причин"
+            // если не хочешь — убери
+            // throw new IllegalStateException("GuardResult: ok=false but errors empty");
         }
     }
 
@@ -55,8 +73,13 @@ public record GuardResult(
                 .adjusted(false)
                 .finalQty(qty)
                 .finalPrice(price)
-                .warnings(new ArrayList<>())
-                .errors(new ArrayList<>())
+                .computedNotional(computeNotional(qty, price))
+                .minNotionalScope(ExchangeLimitScope.UNKNOWN)
+                .stepSizeScope(ExchangeLimitScope.UNKNOWN)
+                .tickSizeScope(ExchangeLimitScope.UNKNOWN)
+                .maxOrdersScope(ExchangeLimitScope.UNKNOWN)
+                .warnings(List.of())
+                .errors(List.of())
                 .build();
     }
 
@@ -71,8 +94,13 @@ public record GuardResult(
                 .adjusted(false)
                 .finalQty(qty)
                 .finalPrice(price)
-                .warnings(warnings)
-                .errors(new ArrayList<>())
+                .computedNotional(computeNotional(qty, price))
+                .minNotionalScope(ExchangeLimitScope.UNKNOWN)
+                .stepSizeScope(ExchangeLimitScope.UNKNOWN)
+                .tickSizeScope(ExchangeLimitScope.UNKNOWN)
+                .maxOrdersScope(ExchangeLimitScope.UNKNOWN)
+                .warnings(warnings != null ? warnings : List.of())
+                .errors(List.of())
                 .build();
     }
 
@@ -87,15 +115,20 @@ public record GuardResult(
                 .adjusted(false)
                 .finalQty(qty)
                 .finalPrice(price)
-                .warnings(new ArrayList<>())
-                .errors(errors)
+                .computedNotional(computeNotional(qty, price))
+                .minNotionalScope(ExchangeLimitScope.UNKNOWN)
+                .stepSizeScope(ExchangeLimitScope.UNKNOWN)
+                .tickSizeScope(ExchangeLimitScope.UNKNOWN)
+                .maxOrdersScope(ExchangeLimitScope.UNKNOWN)
+                .warnings(List.of())
+                .errors(errors != null ? errors : List.of("UNKNOWN_ERROR"))
                 .build();
     }
 
     /** Быстрый fail с одной ошибкой */
     public static GuardResult fail(BigDecimal qty, BigDecimal price, String error) {
         List<String> errs = new ArrayList<>();
-        errs.add(error);
+        errs.add(error != null ? error : "UNKNOWN_ERROR");
         return block(qty, price, errs);
     }
 
@@ -117,5 +150,10 @@ public record GuardResult(
 
     public String warningsAsText() {
         return warnings == null ? "" : String.join("; ", warnings);
+    }
+
+    private static BigDecimal computeNotional(BigDecimal qty, BigDecimal price) {
+        if (qty == null || price == null) return null;
+        return price.multiply(qty);
     }
 }
