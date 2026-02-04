@@ -24,6 +24,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Instant;
@@ -53,51 +54,415 @@ public class OrderServiceImpl implements OrderService {
     private final TradeJournalGateway tradeJournalGateway;
 
     // =====================================================
-    // ✅ НОВОЕ API (OrderContext)
+    // ✅ НОВОЕ API (строгое, из интерфейса)
     // =====================================================
 
-    /**
-     * MARKET (String side).
-     * BUY  -> amount = quoteAmount (USDT budget)
-     * SELL -> amount = baseQty
-     */
-
+    @Override
     @Transactional
     public Order placeMarket(OrderContext ctx,
-                             String side,
+                             OrderSide side,
                              BigDecimal amount,
                              BigDecimal executionPrice) {
 
-        if (ctx == null) throw new IllegalArgumentException("OrderContext is null");
+        if (side == null) throw new IllegalArgumentException("side is null");
+        return doPlaceMarket(ctx, side.name(), amount, executionPrice);
+    }
+
+    @Override
+    @Transactional
+    public Order placeLimit(OrderContext ctx,
+                            OrderSide side,
+                            BigDecimal quantity,
+                            BigDecimal limitPrice,
+                            String timeInForce) {
+
+        if (side == null) throw new IllegalArgumentException("side is null");
+        return doPlaceLimit(ctx, side.name(), quantity, limitPrice, timeInForce);
+    }
+
+    /**
+     * ✅ OCO:
+     * 1) Если биржа поддерживает OCO — реально ставим на биржу.
+     * 2) Если не поддерживает — сохраняем локально как "виртуальный OCO" (под твой fallback/монитор).
+     */
+    @Override
+    @Transactional
+    public Order placeOco(OrderContext ctx,
+                          BigDecimal quantity,
+                          BigDecimal takeProfitPrice,
+                          BigDecimal stopPrice,
+                          BigDecimal stopLimitPrice) {
+
+        requireCtx(ctx);
 
         Long chatId = ctx.chatId();
-        String symbolRaw = ctx.symbol();
+        StrategyType st = requireStrategy(ctx.strategyType());
+        String symbol = normalizeSymbolOrThrow(ctx.symbol());
+
+        String exchangeName = safeUpper(ctx.exchangeName());
+        NetworkType networkType = ctx.networkType() != null ? ctx.networkType() : NetworkType.MAINNET;
+        if (exchangeName.isBlank()) exchangeName = resolveDefaultExchange(chatId);
+
+        ExchangeClient client = resolveClientOrThrow(exchangeName);
+
+        String timeframe = defaultTimeframe(ctx.timeframe());
+        String role = defaultRole(ctx.role(), "OCO");
+
+        if (quantity == null || quantity.signum() <= 0) throw new IllegalArgumentException("quantity invalid");
+        if (takeProfitPrice != null && takeProfitPrice.signum() <= 0) throw new IllegalArgumentException("takeProfitPrice invalid");
+        if (stopPrice != null && stopPrice.signum() <= 0) throw new IllegalArgumentException("stopPrice invalid");
+        if (stopLimitPrice != null && stopLimitPrice.signum() <= 0) throw new IllegalArgumentException("stopLimitPrice invalid");
+
+        if (takeProfitPrice == null && stopPrice == null && stopLimitPrice == null) {
+            throw new IllegalArgumentException("OCO requires at least one price (tp/stop/stopLimit)");
+        }
+
+        // если stopLimit не задан, часто достаточно stopPrice
+        BigDecimal slPrice = (stopLimitPrice != null ? stopLimitPrice : stopPrice);
+
+        GuardResult guard = GuardResult.builder()
+                .ok(true)
+                .adjusted(false)
+                .finalQty(quantity)
+                .finalPrice(takeProfitPrice != null ? takeProfitPrice : slPrice)
+                .warnings(List.of())
+                .errors(List.of())
+                .build();
+
+        String correlationId = ensureCorrelationId(
+                ctx, chatId, st, exchangeName, networkType, symbol, timeframe, "SELL", guard
+        );
+
+        String clientOrderId = OrderCorrelation.clientOrderId(correlationId, chatId, st, symbol, role);
+        try {
+            tradeJournalGateway.attachClientOrderId(correlationId, clientOrderId);
+            tradeJournalGateway.linkClientOrder(chatId, st, exchangeName, networkType, symbol, timeframe, correlationId, clientOrderId, role);
+        } catch (Exception e) {
+            log.debug("TradeJournal link skipped: {}", e.toString());
+        }
+
+        // =====================================================
+        // ✅ Пытаемся поставить OCO на бирже
+        // =====================================================
+        ExchangeClient.OcoResult ocoResult = null;
+        boolean ocoPlacedOnExchange = false;
+
+        try {
+            Map<String, String> extra = new LinkedHashMap<>();
+            // ключ универсальный; в реализации биржи маппишь на newClientOrderId/orderLinkId и т.д.
+            extra.put("clientOrderId", clientOrderId);
+
+            log.info("📤 [OCO->EXCHANGE] chatId={} ex={} net={} sym={} qty={} tp={} stop={} stopLimit={} st={} cid={} role={}",
+                    chatId, exchangeName, networkType, symbol,
+                    strip(quantity), strip(takeProfitPrice), strip(stopPrice), strip(stopLimitPrice),
+                    st, correlationId, role);
+
+            ocoResult = client.placeOcoOrder(
+                    chatId,
+                    networkType,
+                    symbol,
+                    quantity,
+                    takeProfitPrice,
+                    stopPrice,
+                    stopLimitPrice,
+                    extra
+            );
+            ocoPlacedOnExchange = true;
+
+            log.info("✅ [OCO PLACED] chatId={} ex={} net={} sym={} listId={} status={} tpOrderId={} slOrderId={} cid={}",
+                    chatId, exchangeName, networkType, symbol,
+                    (ocoResult != null ? ocoResult.orderListId() : "null"),
+                    (ocoResult != null ? ocoResult.status() : "null"),
+                    (ocoResult != null ? ocoResult.orderIdTp() : "null"),
+                    (ocoResult != null ? ocoResult.orderIdSl() : "null"),
+                    correlationId);
+
+        } catch (UnsupportedOperationException uoe) {
+            // Нормально: не все биржи имеют OCO (Bybit spot часто нет, OKX зависит)
+            log.warn("⚠️ OCO NOT SUPPORTED -> fallback-local chatId={} ex={} net={} sym={} msg={} cid={}",
+                    chatId, exchangeName, networkType, symbol, uoe.getMessage(), correlationId);
+        } catch (Exception e) {
+            // Если биржа “умеет”, но упала — это уже ошибка (чтобы не думать что риск закрыт)
+            log.error("❌ [OCO EXCHANGE FAILED] chatId={} ex={} net={} sym={} err={} cid={}",
+                    chatId, exchangeName, networkType, symbol, e.toString(), correlationId, e);
+            throw (e instanceof RuntimeException) ? (RuntimeException) e : new RuntimeException(e);
+        }
+
+        // =====================================================
+        // ✅ Сохраняем в БД (и для биржевого OCO, и для fallback)
+        // =====================================================
+
+        OrderEntity entity = new OrderEntity();
+        entity.setChatId(chatId);
+        entity.setUserId(chatId);
+        entity.setSymbol(symbol);
+        entity.setSide("SELL");
+        entity.setQuantity(quantity);
+        entity.setStrategyType(st.name());
+        entity.setTimestamp(System.currentTimeMillis());
+        entity.setCreatedAt(LocalDateTime.now());
+
+        entity.setTakeProfitPrice(takeProfitPrice);
+        entity.setStopLossPrice(slPrice);
+
+        BigDecimal ref = (takeProfitPrice != null) ? takeProfitPrice : slPrice;
+        entity.setPrice(ref);
+        if (ref != null) entity.setTotal(ref.multiply(quantity));
+
+        // статус: если реально поставили на биржу — NEW/OPEN, если fallback — NEW (виртуальный)
+        String status = "NEW";
+        if (ocoPlacedOnExchange && ocoResult != null && ocoResult.status() != null && !ocoResult.status().isBlank()) {
+            status = ocoResult.status().trim().toUpperCase(Locale.ROOT);
+        }
+        entity.setStatus(status);
+        entity.setFilled(false);
+
+        orderRepository.save(entity);
+
+        return mapToDto(entity);
+    }
+
+    // =====================================================
+    // ⚠️ Старое API — делегируем в новое
+    // =====================================================
+
+    @Override
+    @Transactional
+    public Order placeMarket(Long chatId,
+                             String symbol,
+                             String side,
+                             BigDecimal quantity,
+                             BigDecimal executionPrice,
+                             String strategyType) {
 
         if (chatId == null) throw new IllegalArgumentException("chatId is null");
-        if (symbolRaw == null || symbolRaw.isBlank()) throw new IllegalArgumentException("symbol is blank");
 
-        String symbol = normalizeSymbol(symbolRaw);
+        StrategyType st = parseStrategyOrThrow(strategyType);
+
+        String ex = resolveDefaultExchange(chatId);
+        NetworkType net = resolveDefaultNetwork(chatId, ex);
+
+        String sym = normalizeSymbolOrThrow(symbol);
+
+        OrderContext ctx = new OrderContext(
+                chatId,
+                st,
+                sym,
+                "1m",
+                null,
+                "ENTRY",
+                ex,
+                net
+        );
+
+        // Legacy: раньше BUY.quantity означал baseQty
+        // Новый API: BUY.amount = quoteAmount -> baseQty*price
+        String sideNorm = normalizeSide(side);
+
+        BigDecimal amount;
+        if ("BUY".equals(sideNorm)) {
+            BigDecimal px = (executionPrice != null && executionPrice.signum() > 0) ? executionPrice : null;
+            if (px == null) throw new IllegalArgumentException("executionPrice required for BUY (legacy)");
+            amount = safeMul(quantity, px);
+        } else {
+            amount = quantity;
+        }
+
+        return doPlaceMarket(ctx, sideNorm, amount, executionPrice);
+    }
+
+    @Override
+    @Transactional
+    public Order placeLimit(Long chatId,
+                            String symbol,
+                            String side,
+                            BigDecimal quantity,
+                            BigDecimal limitPrice,
+                            String timeInForce,
+                            String strategyType) {
+
+        if (chatId == null) throw new IllegalArgumentException("chatId is null");
+
+        StrategyType st = parseStrategyOrThrow(strategyType);
+
+        String ex = resolveDefaultExchange(chatId);
+        NetworkType net = resolveDefaultNetwork(chatId, ex);
+
+        OrderContext ctx = new OrderContext(
+                chatId,
+                st,
+                normalizeSymbolOrThrow(symbol),
+                "1m",
+                null,
+                "ENTRY",
+                ex,
+                net
+        );
+
+        return doPlaceLimit(ctx, side, quantity, limitPrice, timeInForce);
+    }
+
+    @Override
+    @Transactional
+    public Order placeOco(Long chatId,
+                          String symbol,
+                          BigDecimal quantity,
+                          BigDecimal takeProfitPrice,
+                          BigDecimal stopPrice,
+                          BigDecimal stopLimitPrice,
+                          String strategyType) {
+
+        if (chatId == null) throw new IllegalArgumentException("chatId is null");
+
+        StrategyType st = parseStrategyOrThrow(strategyType);
+
+        String ex = resolveDefaultExchange(chatId);
+        NetworkType net = resolveDefaultNetwork(chatId, ex);
+
+        OrderContext ctx = new OrderContext(
+                chatId,
+                st,
+                normalizeSymbolOrThrow(symbol),
+                "1m",
+                null,
+                "OCO",
+                ex,
+                net
+        );
+
+        return placeOco(ctx, quantity, takeProfitPrice, stopPrice, stopLimitPrice);
+    }
+
+    // =====================================================
+    // CANCEL / OPEN / HISTORY / CREATE
+    // =====================================================
+
+    @Override
+    @Transactional
+    public boolean cancelOrder(Long chatId, Long orderId) {
+        if (chatId == null || orderId == null) return false;
+
+        return orderRepository.findById(orderId)
+                .filter(o -> chatId.equals(o.getChatId()))
+                .map(o -> {
+                    o.setStatus("CANCELED");
+                    o.setFilled(false);
+                    o.setUpdatedAt(LocalDateTime.now());
+                    orderRepository.save(o);
+                    return true;
+                })
+                .orElse(false);
+    }
+
+    @Override
+    @Transactional
+    public int cancelAllOpen(Long chatId, String symbol) {
+        if (chatId == null) return 0;
+
+        String sym = normalizeSymbolOrThrow(symbol);
+        List<String> openStatuses = List.of("NEW", "OPEN", "PARTIALLY_FILLED");
+
+        List<OrderEntity> list = orderRepository.findByChatIdAndSymbolAndStatusIn(chatId, sym, openStatuses);
+
+        list.forEach(o -> {
+            o.setStatus("CANCELED");
+            o.setFilled(false);
+            o.setUpdatedAt(LocalDateTime.now());
+        });
+
+        orderRepository.saveAll(list);
+        return list.size();
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<Order> getOpenOrders(Long chatId, String symbol) {
+        if (chatId == null) return List.of();
+
+        String sym = normalizeSymbolOrThrow(symbol);
+
+        return orderRepository
+                .findByChatIdAndSymbolAndStatusIn(chatId, sym, List.of("NEW", "OPEN", "PARTIALLY_FILLED"))
+                .stream()
+                .map(this::mapToDto)
+                .collect(Collectors.toList());
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<Order> getOrdersByChatIdAndSymbol(long chatId, String symbol) {
+        String sym = normalizeSymbolOrThrow(symbol);
+
+        return orderRepository
+                .findByChatIdAndSymbolOrderByTimestampAsc(chatId, sym)
+                .stream()
+                .map(this::mapToDto)
+                .collect(Collectors.toList());
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<OrderEntity> getOrderEntitiesByChatIdAndSymbol(long chatId, String symbol) {
+        return orderRepository.findByChatIdAndSymbolOrderByTimestampAsc(chatId, normalizeSymbolOrThrow(symbol));
+    }
+
+    @Override
+    @Transactional
+    public Order createOrder(Order order) {
+        if (order == null) throw new IllegalArgumentException("order is null");
+
+        OrderEntity e = new OrderEntity();
+        e.setChatId(order.getChatId());
+        e.setUserId(order.getChatId());
+        e.setSymbol(normalizeSymbolOrThrow(order.getSymbol()));
+        e.setSide(normalizeSide(order.getSide()));
+        e.setPrice(order.getPrice());
+        e.setQuantity(order.getQuantity());
+        e.setStatus(order.getStatus());
+        e.setFilled(order.isFilled());
+        e.setTimestamp(order.getTime());
+        e.setCreatedAt(LocalDateTime.now());
+
+        if (order.getStrategyType() != null) {
+            e.setStrategyType(order.getStrategyType().name());
+        }
+
+        if (e.getPrice() != null && e.getQuantity() != null) {
+            e.setTotal(e.getPrice().multiply(e.getQuantity()));
+        }
+
+        orderRepository.save(e);
+        return mapToDto(e);
+    }
+
+    // =====================================================
+    // INTERNAL: MARKET / LIMIT (строгая логика)
+    // =====================================================
+
+    private Order doPlaceMarket(OrderContext ctx,
+                                String side,
+                                BigDecimal amount,
+                                BigDecimal executionPrice) {
+
+        requireCtx(ctx);
+
+        Long chatId = ctx.chatId();
+        StrategyType st = requireStrategy(ctx.strategyType());
+
+        String symbol = normalizeSymbolOrThrow(ctx.symbol());
         String sideNorm = normalizeSide(side);
 
         if (amount == null || amount.signum() <= 0) {
-            throw new IllegalArgumentException("amount/qty must be > 0");
+            throw new IllegalArgumentException("amount must be > 0");
         }
 
-        // price hint
         BigDecimal priceHint = (executionPrice != null && executionPrice.signum() > 0)
                 ? executionPrice
                 : fetchPriceHintOrThrow(ctx, symbol);
 
-        StrategyType st = ctx.strategyType();
-        if (st == null) throw new IllegalArgumentException("strategyType is null in OrderContext");
-
-        // exchange/network из контекста
         String exchangeName = safeUpper(ctx.exchangeName());
-        NetworkType networkType = (ctx.networkType() != null) ? ctx.networkType() : NetworkType.MAINNET;
-
-        if (exchangeName.isBlank()) {
-            exchangeName = resolveDefaultExchange(chatId);
-        }
+        NetworkType networkType = ctx.networkType() != null ? ctx.networkType() : NetworkType.MAINNET;
+        if (exchangeName.isBlank()) exchangeName = resolveDefaultExchange(chatId);
 
         ExchangeClient client = resolveClientOrThrow(exchangeName);
 
@@ -106,10 +471,8 @@ public class OrderServiceImpl implements OrderService {
 
         SymbolDescriptor descriptor = resolveSymbolDescriptor(exchangeName, networkType, symbol);
 
-        // =====================================================
-        // BUY: amount = quoteAmount -> requestedQty = quote/price
-        // SELL: amount = baseQty
-        // =====================================================
+        // BUY: amount=quote, requestedQty=quote/price
+        // SELL: amount=baseQty
         final BigDecimal quoteAmount = "BUY".equals(sideNorm) ? amount : null;
 
         final BigDecimal requestedQty = "BUY".equals(sideNorm)
@@ -120,15 +483,15 @@ public class OrderServiceImpl implements OrderService {
             throw new IllegalArgumentException("calculated qty <= 0");
         }
 
-        // MARKET BUY: qty вверх не поднимаем (бюджет важнее)
-        GuardResult guard = aiGuard.validateAndAdjust(
-                exchangeName,
-                descriptor,
-                requestedQty,
-                priceHint,
-                true,
-                false
-        );
+        GuardResult guard = (descriptor != null)
+                ? aiGuard.validateAndAdjust(exchangeName, descriptor, requestedQty, priceHint, true, false)
+                : GuardResult.builder()
+                .ok(true).adjusted(false)
+                .finalQty(requestedQty)
+                .finalPrice(priceHint)
+                .warnings(List.of("SYMBOL_DESCRIPTOR_NULL"))
+                .errors(List.of())
+                .build();
 
         String correlationId = ensureCorrelationId(
                 ctx, chatId, st, exchangeName, networkType, symbol, timeframe, sideNorm, guard
@@ -144,21 +507,13 @@ public class OrderServiceImpl implements OrderService {
         BigDecimal finalQty = guard.finalQty();
         BigDecimal finalPrice = guard.finalPrice();
 
-        if (finalQty == null || finalQty.signum() <= 0) {
-            throw new IllegalArgumentException("finalQty invalid after guard");
-        }
-        if (finalPrice == null || finalPrice.signum() <= 0) {
-            finalPrice = priceHint;
-        }
+        if (finalQty == null || finalQty.signum() <= 0) throw new IllegalArgumentException("finalQty invalid after guard");
+        if (finalPrice == null || finalPrice.signum() <= 0) finalPrice = priceHint;
 
-        // =====================================================
-        // ✅ BUY не может превысить budget (pre-check)
-        // =====================================================
+        // BUY budget pre-check
         if ("BUY".equals(sideNorm)) {
             BigDecimal notional = safeMul(finalQty, finalPrice);
-            if (notional == null || notional.signum() <= 0) {
-                throw new IllegalArgumentException("notional invalid after guard");
-            }
+            if (notional == null || notional.signum() <= 0) throw new IllegalArgumentException("notional invalid after guard");
 
             BigDecimal maxAllowed = quoteAmount.multiply(BUY_BUDGET_EPS);
             if (notional.compareTo(maxAllowed) > 0) {
@@ -169,9 +524,7 @@ public class OrderServiceImpl implements OrderService {
             }
         }
 
-        // =====================================================
-        // ✅ clientOrderId + journal link
-        // =====================================================
+        // clientOrderId + journal link
         String clientOrderId = OrderCorrelation.clientOrderId(correlationId, chatId, st, symbol, role);
         try {
             tradeJournalGateway.attachClientOrderId(correlationId, clientOrderId);
@@ -180,11 +533,7 @@ public class OrderServiceImpl implements OrderService {
             log.debug("TradeJournal link skipped: {}", e.toString());
         }
 
-        // =====================================================
-        // ✅ Реальный MARKET на биржу
-        // BUY  -> QUOTE_QTY (amount=quoteAmount)
-        // SELL -> BASE_QTY  (amount=finalQty)
-        // =====================================================
+        // Реальный MARKET на биржу
         Order exec;
         try {
             OrderSide os = "BUY".equals(sideNorm) ? OrderSide.BUY : OrderSide.SELL;
@@ -202,7 +551,7 @@ public class OrderServiceImpl implements OrderService {
 
             log.info("📤 [MARKET->EXCHANGE] chatId={} ex={} net={} sym={} side={} amount={} amountType={} priceHint={} st={} cid={} role={} minNotional={}",
                     chatId, exchangeName, networkType, symbol, sideNorm,
-                    strip(amountToSend), amountType, strip(finalPrice), st, correlationId, role, strip(guard.minNotional()));
+                    strip(amountToSend), amountType, strip(finalPrice), st, correlationId, role, strip(minNotionalSafe(guard)));
 
             exec = client.placeMarketOrder(
                     chatId,
@@ -220,9 +569,6 @@ public class OrderServiceImpl implements OrderService {
             throw (e instanceof RuntimeException) ? (RuntimeException) e : new RuntimeException(e);
         }
 
-        // =====================================================
-        // ✅ Запись в БД: берём фактическое исполнение, если биржа вернула
-        // =====================================================
         BigDecimal executedQty = (exec != null && exec.getQuantity() != null && exec.getQuantity().signum() > 0)
                 ? exec.getQuantity()
                 : finalQty;
@@ -249,7 +595,10 @@ public class OrderServiceImpl implements OrderService {
         entity.setFilled(filled);
         entity.setTimestamp(System.currentTimeMillis());
         entity.setCreatedAt(LocalDateTime.now());
-        entity.setTotal(executedPrice.multiply(executedQty));
+
+        if (executedPrice != null && executedQty != null) {
+            entity.setTotal(executedPrice.multiply(executedQty));
+        }
 
         orderRepository.save(entity);
 
@@ -262,71 +611,26 @@ public class OrderServiceImpl implements OrderService {
         return mapToDto(entity);
     }
 
-    /**
-     * MARKET overload на enum (если где-то удобнее звать enum-ом).
-     * Не ломает ничего и помогает, если интерфейс/код где-то уже перешёл на OrderSide.
-     */
-    @Transactional
-    public Order placeMarket(OrderContext ctx,
-                             OrderSide side,
-                             BigDecimal amount,
-                             BigDecimal executionPrice) {
-        String s = (side != null ? side.name() : "BUY");
-        return placeMarket(ctx, s, amount, executionPrice);
-    }
+    private Order doPlaceLimit(OrderContext ctx,
+                               String side,
+                               BigDecimal quantity,
+                               BigDecimal limitPrice,
+                               String timeInForce) {
 
-    // -----------------------------------------------------
-    // ✅ LIMIT — ВАЖНО: интерфейс требует метод с OrderSide!
-    // -----------------------------------------------------
-
-    /**
-     * LIMIT (enum side) — ЭТО ТО, ЧЕГО НЕ ХВАТАЛО ИЗ-ЗА ЧЕГО БЫЛА ОШИБКА КОМПИЛЯЦИИ.
-     */
-    @Override
-    @Transactional
-    public Order placeLimit(OrderContext ctx,
-                            OrderSide side,
-                            BigDecimal quantity,
-                            BigDecimal limitPrice,
-                            String timeInForce) {
-        if (side == null) throw new IllegalArgumentException("side is null");
-        return placeLimit(ctx, side.name(), quantity, limitPrice, timeInForce);
-    }
-
-    /**
-     * LIMIT (String side) — удобный overload + совместимость.
-     */
-
-    @Transactional
-    public Order placeLimit(OrderContext ctx,
-                            String side,
-                            BigDecimal quantity,
-                            BigDecimal limitPrice,
-                            String timeInForce) {
-
-        if (ctx == null) throw new IllegalArgumentException("OrderContext is null");
+        requireCtx(ctx);
 
         Long chatId = ctx.chatId();
-        String symbolRaw = ctx.symbol();
+        StrategyType st = requireStrategy(ctx.strategyType());
 
-        if (chatId == null) throw new IllegalArgumentException("chatId is null");
-        if (symbolRaw == null || symbolRaw.isBlank()) throw new IllegalArgumentException("symbol is blank");
-
-        String symbol = normalizeSymbol(symbolRaw);
+        String symbol = normalizeSymbolOrThrow(ctx.symbol());
         String sideNorm = normalizeSide(side);
 
         if (quantity == null || quantity.signum() <= 0) throw new IllegalArgumentException("quantity invalid");
         if (limitPrice == null || limitPrice.signum() <= 0) throw new IllegalArgumentException("limitPrice invalid");
 
-        StrategyType st = ctx.strategyType();
-        if (st == null) throw new IllegalArgumentException("strategyType is null in OrderContext");
-
         String exchangeName = safeUpper(ctx.exchangeName());
-        NetworkType networkType = (ctx.networkType() != null) ? ctx.networkType() : NetworkType.MAINNET;
-
-        if (exchangeName.isBlank()) {
-            exchangeName = resolveDefaultExchange(chatId);
-        }
+        NetworkType networkType = ctx.networkType() != null ? ctx.networkType() : NetworkType.MAINNET;
+        if (exchangeName.isBlank()) exchangeName = resolveDefaultExchange(chatId);
 
         ExchangeClient client = resolveClientOrThrow(exchangeName);
 
@@ -335,14 +639,15 @@ public class OrderServiceImpl implements OrderService {
 
         SymbolDescriptor descriptor = resolveSymbolDescriptor(exchangeName, networkType, symbol);
 
-        GuardResult guard = aiGuard.validateAndAdjust(
-                exchangeName,
-                descriptor,
-                quantity,
-                limitPrice,
-                false,
-                false
-        );
+        GuardResult guard = (descriptor != null)
+                ? aiGuard.validateAndAdjust(exchangeName, descriptor, quantity, limitPrice, false, false)
+                : GuardResult.builder()
+                .ok(true).adjusted(false)
+                .finalQty(quantity)
+                .finalPrice(limitPrice)
+                .warnings(List.of("SYMBOL_DESCRIPTOR_NULL"))
+                .errors(List.of())
+                .build();
 
         String correlationId = ensureCorrelationId(
                 ctx, chatId, st, exchangeName, networkType, symbol, timeframe, sideNorm, guard
@@ -365,9 +670,6 @@ public class OrderServiceImpl implements OrderService {
                 ? "GTC"
                 : timeInForce.trim().toUpperCase(Locale.ROOT);
 
-        // =====================================================
-        // ✅ clientOrderId + journal link
-        // =====================================================
         String clientOrderId = OrderCorrelation.clientOrderId(correlationId, chatId, st, symbol, role);
         try {
             tradeJournalGateway.attachClientOrderId(correlationId, clientOrderId);
@@ -376,10 +678,7 @@ public class OrderServiceImpl implements OrderService {
             log.debug("TradeJournal link skipped: {}", e.toString());
         }
 
-        // =====================================================
-        // ✅ Реальный LIMIT на биржу
-        // =====================================================
-        ExchangeClient.OrderResult or;
+        ExchangeClient.OrderResult placed;
         try {
             Map<String, String> extra = new LinkedHashMap<>();
             extra.put("timeInForce", tf);
@@ -389,7 +688,7 @@ public class OrderServiceImpl implements OrderService {
                     chatId, exchangeName, networkType, symbol, sideNorm,
                     strip(finalQty), strip(finalPrice), tf, st, correlationId);
 
-            or = client.placeOrder(
+            placed = client.placeOrder(
                     chatId,
                     networkType,
                     symbol,
@@ -402,14 +701,14 @@ public class OrderServiceImpl implements OrderService {
 
         } catch (Exception e) {
             log.error("❌ [LIMIT EXCHANGE FAILED] chatId={} ex={} net={} sym={} side={} err={} cid={}",
-                    chatId, exchangeName, networkType, symbol, sideNorm, e, correlationId, e);
+                    chatId, exchangeName, networkType, symbol, sideNorm, e.toString(), correlationId, e);
             throw (e instanceof RuntimeException) ? (RuntimeException) e : new RuntimeException(e);
         }
 
-        String status = (or != null && or.status() != null && !or.status().isBlank())
-                ? or.status().trim().toUpperCase(Locale.ROOT)
-                : "NEW";
-
+        String status = "NEW";
+        if (placed != null && placed.status() != null && !placed.status().isBlank()) {
+            status = placed.status().trim().toUpperCase(Locale.ROOT);
+        }
         boolean filled = "FILLED".equalsIgnoreCase(status);
 
         OrderEntity entity = new OrderEntity();
@@ -424,6 +723,7 @@ public class OrderServiceImpl implements OrderService {
         entity.setFilled(filled);
         entity.setTimestamp(System.currentTimeMillis());
         entity.setCreatedAt(LocalDateTime.now());
+
         entity.setTotal(finalPrice.multiply(finalQty));
 
         orderRepository.save(entity);
@@ -435,293 +735,20 @@ public class OrderServiceImpl implements OrderService {
         return mapToDto(entity);
     }
 
-    @Override
-    @Transactional
-    public Order placeOco(OrderContext ctx,
-                          BigDecimal quantity,
-                          BigDecimal takeProfitPrice,
-                          BigDecimal stopPrice,
-                          BigDecimal stopLimitPrice) {
-
-        if (ctx == null) throw new IllegalArgumentException("OrderContext is null");
-
-        Long chatId = ctx.chatId();
-        String symbolRaw = ctx.symbol();
-
-        if (chatId == null) throw new IllegalArgumentException("chatId is null");
-        if (symbolRaw == null || symbolRaw.isBlank()) throw new IllegalArgumentException("symbol is blank");
-
-        String symbol = normalizeSymbol(symbolRaw);
-        StrategyType st = ctx.strategyType();
-        if (st == null) throw new IllegalArgumentException("strategyType is null in OrderContext");
-
-        String exchangeName = safeUpper(ctx.exchangeName());
-        NetworkType networkType = (ctx.networkType() != null) ? ctx.networkType() : NetworkType.MAINNET;
-
-        if (exchangeName.isBlank()) {
-            exchangeName = resolveDefaultExchange(chatId);
-        }
-
-        String timeframe = defaultTimeframe(ctx.timeframe());
-        String role = defaultRole(ctx.role(), "OCO");
-
-        if (quantity == null || quantity.signum() <= 0) throw new IllegalArgumentException("quantity invalid");
-        if (takeProfitPrice != null && takeProfitPrice.signum() <= 0) throw new IllegalArgumentException("takeProfitPrice invalid");
-        if (stopPrice != null && stopPrice.signum() <= 0) throw new IllegalArgumentException("stopPrice invalid");
-        if (stopLimitPrice != null && stopLimitPrice.signum() <= 0) throw new IllegalArgumentException("stopLimitPrice invalid");
-        if (takeProfitPrice == null && stopPrice == null && stopLimitPrice == null) {
-            throw new IllegalArgumentException("OCO requires at least one price (tp/stop/stopLimit)");
-        }
-
-        GuardResult guard = GuardResult.builder()
-                .ok(true)
-                .adjusted(false)
-                .finalQty(quantity)
-                .finalPrice(takeProfitPrice)
-                .warnings(List.of())
-                .errors(List.of())
-                .build();
-
-        String correlationId = ensureCorrelationId(
-                ctx, chatId, st, exchangeName, networkType, symbol, timeframe, "SELL", guard
-        );
-
-        String clientOrderId = OrderCorrelation.clientOrderId(correlationId, chatId, st, symbol, role);
-        try {
-            tradeJournalGateway.attachClientOrderId(correlationId, clientOrderId);
-            tradeJournalGateway.linkClientOrder(chatId, st, exchangeName, networkType, symbol, timeframe, correlationId, clientOrderId, role);
-        } catch (Exception e) {
-            log.debug("TradeJournal link skipped: {}", e.toString());
-        }
-
-        OrderEntity entity = new OrderEntity();
-        entity.setChatId(chatId);
-        entity.setUserId(chatId);
-        entity.setSymbol(symbol);
-        entity.setSide("SELL");
-        entity.setQuantity(quantity);
-        entity.setStrategyType(st.name());
-        entity.setStatus("NEW");
-        entity.setFilled(false);
-        entity.setTimestamp(System.currentTimeMillis());
-        entity.setCreatedAt(LocalDateTime.now());
-
-        entity.setTakeProfitPrice(takeProfitPrice);
-        entity.setStopLossPrice(stopLimitPrice != null ? stopLimitPrice : stopPrice);
-
-        BigDecimal ref = takeProfitPrice != null ? takeProfitPrice : (stopLimitPrice != null ? stopLimitPrice : stopPrice);
-        entity.setPrice(ref);
-        entity.setTotal(ref.multiply(quantity));
-
-        orderRepository.save(entity);
-        return mapToDto(entity);
-    }
-
-    // =====================================================
-    // ⚠️ Старое API — делегируем в новое
-    // =====================================================
-
-    @Override
-    @Transactional
-    public Order placeMarket(Long chatId,
-                             String symbol,
-                             String side,
-                             BigDecimal quantity,
-                             BigDecimal executionPrice,
-                             String strategyType) {
-
-        StrategyType st = normalizeStrategy(strategyType);
-
-        String ex = resolveDefaultExchange(chatId);
-        NetworkType net = resolveDefaultNetwork(chatId, ex);
-
-        OrderContext ctx = new OrderContext(
-                chatId,
-                st,
-                normalizeSymbol(symbol),
-                "1m",
-                null,
-                "ENTRY",
-                ex,
-                net
-        );
-
-        // Legacy: раньше BUY.quantity означал baseQty
-        // Новый API: BUY.amount = quoteAmount -> baseQty*price
-        String sideNorm = normalizeSide(side);
-
-        BigDecimal amount;
-        if ("BUY".equals(sideNorm)) {
-            BigDecimal px = (executionPrice != null && executionPrice.signum() > 0) ? executionPrice : null;
-            if (px == null) throw new IllegalArgumentException("executionPrice required for BUY (legacy)");
-            amount = safeMul(quantity, px);
-        } else {
-            amount = quantity;
-        }
-
-        return placeMarket(ctx, sideNorm, amount, executionPrice);
-    }
-
-    @Override
-    @Transactional
-    public Order placeLimit(Long chatId,
-                            String symbol,
-                            String side,
-                            BigDecimal quantity,
-                            BigDecimal limitPrice,
-                            String timeInForce,
-                            String strategyType) {
-
-        StrategyType st = normalizeStrategy(strategyType);
-
-        String ex = resolveDefaultExchange(chatId);
-        NetworkType net = resolveDefaultNetwork(chatId, ex);
-
-        OrderContext ctx = new OrderContext(
-                chatId,
-                st,
-                normalizeSymbol(symbol),
-                "1m",
-                null,
-                "ENTRY",
-                ex,
-                net
-        );
-
-        // Сохраняем совместимость: вызов через String делегирует в placeLimit(ctx, String,...)
-        return placeLimit(ctx, side, quantity, limitPrice, timeInForce);
-    }
-
-    @Override
-    @Transactional
-    public Order placeOco(Long chatId,
-                          String symbol,
-                          BigDecimal quantity,
-                          BigDecimal takeProfitPrice,
-                          BigDecimal stopPrice,
-                          BigDecimal stopLimitPrice,
-                          String strategyType) {
-
-        StrategyType st = normalizeStrategy(strategyType);
-
-        String ex = resolveDefaultExchange(chatId);
-        NetworkType net = resolveDefaultNetwork(chatId, ex);
-
-        OrderContext ctx = new OrderContext(
-                chatId,
-                st,
-                normalizeSymbol(symbol),
-                "1m",
-                null,
-                "OCO",
-                ex,
-                net
-        );
-
-        return placeOco(ctx, quantity, takeProfitPrice, stopPrice, stopLimitPrice);
-    }
-
-    // =====================================================
-    // CANCEL / OPEN / HISTORY / CREATE
-    // =====================================================
-
-    @Override
-    @Transactional
-    public boolean cancelOrder(Long chatId, Long orderId) {
-        return orderRepository.findById(orderId)
-                .filter(o -> chatId.equals(o.getChatId()))
-                .map(o -> {
-                    o.setStatus("CANCELED");
-                    o.setFilled(false);
-                    o.setUpdatedAt(LocalDateTime.now());
-                    orderRepository.save(o);
-                    return true;
-                })
-                .orElse(false);
-    }
-
-    @Override
-    @Transactional
-    public int cancelAllOpen(Long chatId, String symbol) {
-        List<String> openStatuses = List.of("NEW", "OPEN", "PARTIALLY_FILLED");
-
-        String sym = normalizeSymbol(symbol);
-
-        List<OrderEntity> list =
-                orderRepository.findByChatIdAndSymbolAndStatusIn(chatId, sym, openStatuses);
-
-        list.forEach(o -> {
-            o.setStatus("CANCELED");
-            o.setFilled(false);
-            o.setUpdatedAt(LocalDateTime.now());
-        });
-
-        orderRepository.saveAll(list);
-        return list.size();
-    }
-
-    @Override
-    @Transactional(readOnly = true)
-    public List<Order> getOpenOrders(Long chatId, String symbol) {
-        String sym = normalizeSymbol(symbol);
-        return orderRepository
-                .findByChatIdAndSymbolAndStatusIn(
-                        chatId,
-                        sym,
-                        List.of("NEW", "OPEN", "PARTIALLY_FILLED")
-                )
-                .stream()
-                .map(this::mapToDto)
-                .collect(Collectors.toList());
-    }
-
-    @Override
-    @Transactional(readOnly = true)
-    public List<Order> getOrdersByChatIdAndSymbol(long chatId, String symbol) {
-        String sym = normalizeSymbol(symbol);
-        return orderRepository
-                .findByChatIdAndSymbolOrderByTimestampAsc(chatId, sym)
-                .stream()
-                .map(this::mapToDto)
-                .collect(Collectors.toList());
-    }
-
-    @Override
-    @Transactional(readOnly = true)
-    public List<OrderEntity> getOrderEntitiesByChatIdAndSymbol(long chatId, String symbol) {
-        return orderRepository.findByChatIdAndSymbolOrderByTimestampAsc(chatId, normalizeSymbol(symbol));
-    }
-
-    @Override
-    @Transactional
-    public Order createOrder(Order order) {
-        OrderEntity e = new OrderEntity();
-        e.setChatId(order.getChatId());
-        e.setUserId(order.getChatId());
-        e.setSymbol(normalizeSymbol(order.getSymbol()));
-        e.setSide(normalizeSide(order.getSide()));
-        e.setPrice(order.getPrice());
-        e.setQuantity(order.getQuantity());
-        e.setStatus(order.getStatus());
-        e.setFilled(order.isFilled());
-        e.setTimestamp(order.getTime());
-        e.setCreatedAt(LocalDateTime.now());
-
-        if (order.getStrategyType() != null) {
-            e.setStrategyType(order.getStrategyType().name());
-        }
-
-        if (e.getPrice() != null && e.getQuantity() != null) {
-            e.setTotal(e.getPrice().multiply(e.getQuantity()));
-        }
-
-        orderRepository.save(e);
-        return mapToDto(e);
-    }
-
     // =====================================================
     // HELPERS
     // =====================================================
+
+    private static void requireCtx(OrderContext ctx) {
+        if (ctx == null) throw new IllegalArgumentException("OrderContext is null");
+        if (ctx.chatId() == null) throw new IllegalArgumentException("chatId is null");
+        if (ctx.symbol() == null || ctx.symbol().isBlank()) throw new IllegalArgumentException("symbol is blank");
+    }
+
+    private static StrategyType requireStrategy(StrategyType st) {
+        if (st == null) throw new IllegalArgumentException("strategyType is null in OrderContext");
+        return st;
+    }
 
     private ExchangeClient resolveClientOrThrow(String exchangeName) {
         String ex = safeUpper(exchangeName);
@@ -736,12 +763,12 @@ public class OrderServiceImpl implements OrderService {
         }
 
         String available = exchangeClients.stream()
-                        .filter(Objects::nonNull)
-                        .map(ExchangeClient::getExchangeName)
-                        .filter(Objects::nonNull)
-                        .map(String::trim)
-                        .distinct()
-                        .collect(Collectors.joining(", "));
+                .filter(Objects::nonNull)
+                .map(ExchangeClient::getExchangeName)
+                .filter(Objects::nonNull)
+                .map(String::trim)
+                .distinct()
+                .collect(Collectors.joining(", "));
 
         throw new IllegalStateException("ExchangeClient not found for exchange=" + ex + ". Available: " + available);
     }
@@ -872,7 +899,6 @@ public class OrderServiceImpl implements OrderService {
                 o.setStrategyType(StrategyType.valueOf(st.trim().toUpperCase(Locale.ROOT)));
             } catch (Exception ignored) { }
         }
-
         return o;
     }
 
@@ -881,12 +907,14 @@ public class OrderServiceImpl implements OrderService {
         return ("SELL".equals(s)) ? "SELL" : "BUY";
     }
 
-    private static StrategyType normalizeStrategy(String strategyType) {
-        if (strategyType == null || strategyType.isBlank()) return StrategyType.values()[0];
+    private static StrategyType parseStrategyOrThrow(String strategyType) {
+        if (strategyType == null || strategyType.isBlank()) {
+            throw new IllegalArgumentException("strategyType is blank (legacy call)");
+        }
         try {
             return StrategyType.valueOf(strategyType.trim().toUpperCase(Locale.ROOT));
         } catch (Exception e) {
-            return StrategyType.values()[0];
+            throw new IllegalArgumentException("Unknown strategyType=" + strategyType, e);
         }
     }
 
@@ -898,9 +926,11 @@ public class OrderServiceImpl implements OrderService {
         return v == null ? "null" : v.stripTrailingZeros().toPlainString();
     }
 
-    private static String normalizeSymbol(String symbol) {
-        if (symbol == null) return "";
-        return symbol.trim().toUpperCase(Locale.ROOT);
+    private static String normalizeSymbolOrThrow(String symbol) {
+        if (symbol == null) throw new IllegalArgumentException("symbol is null");
+        String s = symbol.trim().toUpperCase(Locale.ROOT);
+        if (s.isEmpty()) throw new IllegalArgumentException("symbol is blank");
+        return s;
     }
 
     private static String defaultTimeframe(String tf) {
@@ -921,5 +951,19 @@ public class OrderServiceImpl implements OrderService {
 
     private static BigDecimal safeMul(BigDecimal a, BigDecimal b) {
         return QtyMath.mul(a, b);
+    }
+
+    /**
+     * ✅ Защита от компиляции: если у GuardResult нет minNotional() — просто вернём null.
+     */
+    private static BigDecimal minNotionalSafe(GuardResult guard) {
+        if (guard == null) return null;
+        try {
+            Method m = guard.getClass().getMethod("minNotional");
+            Object v = m.invoke(guard);
+            return (v instanceof BigDecimal) ? (BigDecimal) v : null;
+        } catch (Exception ignore) {
+            return null;
+        }
     }
 }

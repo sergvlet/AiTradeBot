@@ -89,6 +89,11 @@ public class BinanceKlineParser {
         }
     }
 
+    public UnifiedKline parseKline(String jsonText) {
+        if (jsonText == null || jsonText.isBlank()) return null;
+        return parse(new org.json.JSONObject(jsonText));
+    }
+
     private static long optLong(JSONObject o, String key) {
         if (o == null || key == null || !o.has(key) || o.isNull(key)) return 0L;
         Object v = o.get(key);

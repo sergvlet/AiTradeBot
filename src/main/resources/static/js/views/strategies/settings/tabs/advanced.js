@@ -4,6 +4,25 @@ window.SettingsTabAdvanced = (function () {
 
     let _inited = false;
 
+    function readCsrf() {
+        const token = document.querySelector('meta[name="_csrf"]')?.getAttribute("content") || "";
+        const header = document.querySelector('meta[name="_csrf_header"]')?.getAttribute("content") || "";
+        if (!token || !header) return null;
+        return { token, header };
+    }
+
+    function withCsrfHeaders(base) {
+        const h = Object.assign({}, base || {});
+        const csrf = readCsrf();
+        if (csrf) h[csrf.header] = csrf.token;
+        return h;
+    }
+
+    function normalizeUpper(v, fallback) {
+        const s = (v === null || v === undefined) ? "" : String(v).trim();
+        return (s ? s.toUpperCase() : (fallback || ""));
+    }
+
     function init() {
         if (_inited) return;
         _inited = true;
@@ -47,6 +66,9 @@ window.SettingsTabAdvanced = (function () {
 
         let lastServer = null;
 
+        // чтобы не было “дёрганья” на смене режима
+        let lastReloadAt = 0;
+
         let saveTimer = null;
         function scheduleAutosave() {
             if (!lastServer) return;
@@ -54,18 +76,19 @@ window.SettingsTabAdvanced = (function () {
             if (lastServer.canSubmit === false) return;
 
             if (saveTimer) clearTimeout(saveTimer);
-            saveTimer = setTimeout(() => submit(), 450);
+            saveTimer = setTimeout(() => submit(), 500);
         }
 
         let reloadTimer = null;
         function scheduleReload(delayMs) {
             clearTimeout(reloadTimer);
-            reloadTimer = setTimeout(() => load(), typeof delayMs === "number" ? delayMs : 200);
+            reloadTimer = setTimeout(() => load(), typeof delayMs === "number" ? delayMs : 220);
         }
 
         function isAdvancedTabActive() {
             const pane = document.getElementById("tab-advanced");
-            return !!pane && pane.classList.contains("active") && pane.classList.contains("show");
+            // ✅ у тебя табы переключаются классом "active" + CSS display
+            return !!pane && pane.classList.contains("active");
         }
 
         // =========================================================
@@ -73,6 +96,11 @@ window.SettingsTabAdvanced = (function () {
         // =========================================================
         async function load() {
             try {
+                // защита от “пилы”
+                const now = Date.now();
+                if (now - lastReloadAt < 120) return;
+                lastReloadAt = now;
+
                 setLoadState("Загрузка…", "secondary");
 
                 const url = new URL(ENDPOINT, window.location.origin);
@@ -81,7 +109,11 @@ window.SettingsTabAdvanced = (function () {
                 url.searchParams.set("exchange", ctx.exchange);
                 url.searchParams.set("network", ctx.network);
 
-                const res = await fetch(url.toString(), { method: "GET" });
+                const res = await fetch(url.toString(), {
+                    method: "GET",
+                    credentials: "same-origin",
+                    headers: withCsrfHeaders({ "Accept": "application/json", "X-Requested-With": "fetch" })
+                });
 
                 if (res.status === 404) {
                     lastServer = null;
@@ -126,7 +158,7 @@ window.SettingsTabAdvanced = (function () {
 
         function normalizeAdvancedDto(d) {
             const modeRaw = (d && (d.controlMode || d.advancedControlMode || d.mode)) || "MANUAL";
-            const mode = String(modeRaw).trim().toUpperCase() || "MANUAL";
+            const mode = normalizeUpper(modeRaw, "MANUAL");
 
             const active = !!(d && d.active);
 
@@ -165,28 +197,29 @@ window.SettingsTabAdvanced = (function () {
         // MODE SYNC
         // =========================================================
         function publishControlModeIfNeeded(mode) {
-            const m = String(mode || "").trim().toUpperCase();
+            const m = normalizeUpper(mode, "");
             if (!m) return;
 
-            // ✅ если режим уже такой — НИЧЕГО не делаем (важно, чтобы не плодить событий)
             if (window.__StrategyControlMode === m) return;
-
             window.__StrategyControlMode = m;
 
             const controlModeSelect = document.getElementById("advancedControlMode");
             if (controlModeSelect) {
-                const cur = String(controlModeSelect.value || "").trim().toUpperCase();
+                const cur = normalizeUpper(controlModeSelect.value, "");
+                // ✅ не дёргаем DOM, если уже совпадает
                 if (cur !== m) {
                     controlModeSelect.value = m;
                     controlModeSelect.dataset.prevValue = m;
                 }
             }
 
-            window.dispatchEvent(new CustomEvent("strategy:controlModeChanged", { detail: { mode: m } }));
+            try {
+                window.dispatchEvent(new CustomEvent("strategy:controlModeChanged", { detail: { mode: m } }));
+            } catch (_) {}
         }
 
         window.addEventListener("strategy:controlModeChanged", (e) => {
-            const m = String(e?.detail?.mode || "").trim().toUpperCase();
+            const m = normalizeUpper(e?.detail?.mode, "");
             if (!m) return;
 
             window.__StrategyControlMode = m;
@@ -198,8 +231,9 @@ window.SettingsTabAdvanced = (function () {
                 updateReadonlyUiOnly(lastServer);
             }
 
+            // ✅ перезагружаем advanced только если вкладка реально открыта
             if (isAdvancedTabActive()) {
-                scheduleReload(120);
+                scheduleReload(160);
             }
         });
 
@@ -208,9 +242,10 @@ window.SettingsTabAdvanced = (function () {
         // =========================================================
         function renderHeader(d) {
             if (modeBadge) {
-                const m = (d.controlMode || "—").toUpperCase();
+                const m = normalizeUpper(d.controlMode, "—");
                 modeBadge.textContent = m;
-                modeBadge.className = "badge " + (m === "AI" ? "bg-info" : "bg-secondary");
+                // AI лучше выделять “warning” (не info), чтобы было понятно “ограничено”
+                modeBadge.className = "badge " + (m === "AI" ? "bg-warning text-dark" : "bg-secondary");
             }
             if (activeBadge) {
                 const a = !!d.active;
@@ -250,21 +285,27 @@ window.SettingsTabAdvanced = (function () {
                     ? ""
                     : "MANUAL / HYBRID: параметры применяются сразу (автосохранение).";
             }
+
+            if (readonlyNote) {
+                readonlyNote.classList.toggle("d-none", !d.readOnly);
+            }
+
             toggleBlockInputsDisabled(!!d.readOnly);
         }
 
         function toggleBlockInputsDisabled(disable) {
             try {
-                const inputs = blockEl.querySelectorAll("input,select,textarea,button");
+                // ✅ отключаем только поля ввода и submit-кнопки
+                const inputs = blockEl.querySelectorAll("input,select,textarea");
                 inputs.forEach(el => {
-                    if (el.matches("input,select,textarea")) {
-                        el.disabled = !!disable;
-                        if (disable) el.setAttribute("aria-readonly", "true");
-                        else el.removeAttribute("aria-readonly");
-                    } else if (el.matches("button[type='submit']")) {
-                        el.disabled = !!disable;
-                    }
+                    el.disabled = !!disable;
+                    if (disable) el.setAttribute("aria-readonly", "true");
+                    else el.removeAttribute("aria-readonly");
                 });
+
+                const submitButtons = blockEl.querySelectorAll("button[type='submit'], input[type='submit']");
+                submitButtons.forEach(el => { el.disabled = !!disable; });
+
             } catch (_) {}
         }
 
@@ -286,13 +327,12 @@ window.SettingsTabAdvanced = (function () {
         }
 
         function renderMetric(v) {
-            if (v === null || typeof v === "undefined") return "0";
+            if (v === null || typeof v === "undefined" || String(v).trim() === "") return "—";
             return String(v);
         }
 
         // =========================================================
         // SUBMIT
-        // ✅ отправляем также advancedControlMode
         // =========================================================
         async function submit() {
             if (!lastServer) return;
@@ -309,21 +349,26 @@ window.SettingsTabAdvanced = (function () {
                 fd.set("exchange", ctx.exchange);
                 fd.set("network", ctx.network);
 
-                // ✅ ВАЖНО: режим берём из селекта или глобала
+                // ✅ режим берём из селекта/глобала/lastServer
                 const sel = document.getElementById("advancedControlMode");
                 const mode =
-                    (sel && sel.value ? String(sel.value) : null) ||
-                    (window.__StrategyControlMode ? String(window.__StrategyControlMode) : null) ||
-                    (lastServer?.controlMode ? String(lastServer.controlMode) : null);
+                    (sel && sel.value ? String(sel.value) : "") ||
+                    (window.__StrategyControlMode ? String(window.__StrategyControlMode) : "") ||
+                    (lastServer?.controlMode ? String(lastServer.controlMode) : "");
 
-                if (mode) fd.set("advancedControlMode", String(mode).trim().toUpperCase());
+                if (mode) fd.set("advancedControlMode", normalizeUpper(mode, "MANUAL"));
 
                 const body = new URLSearchParams();
                 for (const [k, v] of fd.entries()) body.set(k, String(v));
 
                 const res = await fetch(SUBMIT_ENDPOINT, {
                     method: "POST",
-                    headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
+                    credentials: "same-origin",
+                    headers: withCsrfHeaders({
+                        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                        "X-Requested-With": "fetch",
+                        "Accept": "application/json"
+                    }),
                     body: body.toString()
                 });
 
@@ -332,7 +377,7 @@ window.SettingsTabAdvanced = (function () {
                     return;
                 }
 
-                scheduleReload(150);
+                scheduleReload(220);
 
             } catch (e) {
                 console.error("ADVANCED submit error", e);
@@ -340,6 +385,7 @@ window.SettingsTabAdvanced = (function () {
             }
         }
 
+        // первичная загрузка
         load();
     }
 

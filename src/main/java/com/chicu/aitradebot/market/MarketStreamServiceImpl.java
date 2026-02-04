@@ -28,20 +28,56 @@ public class MarketStreamServiceImpl implements MarketStreamService {
     private final StrategyLivePublisher livePublisher;
     private final AiStrategyOrchestrator orchestrator;
 
+    /**
+     * Минимальный интервал диспатча в оркестратор (ms).
+     * 0 = без троттлинга.
+     */
     @Value("${market.dispatch.min-interval-ms:0}")
     private long minDispatchIntervalMs;
 
-    @Value("${market.dispatch.logEverySeq:200}")
-    private long logEverySeq;
-
+    /**
+     * Диагностика: логировать первые N сообщений по каждому ключу.
+     */
     @Value("${market.dispatch.logFirstSeq:5}")
     private long logFirstSeq;
 
+    /**
+     * Диагностика: логировать каждое N-ое сообщение по seq (если seq доступен).
+     */
+    @Value("${market.dispatch.logEverySeq:200}")
+    private long logEverySeq;
+
+    /**
+     * TTL для очистки ключей, если стратегия не работает/не диспатчит.
+     */
     @Value("${market.dispatch.inactiveTtlMs:60000}")
     private long inactiveTtlMs;
 
+    /**
+     * Анти-спам: лог SKIP не чаще 1 раза в X ms на StreamKey
+     */
+    @Value("${market.dispatch.skip-log-cooldown-ms:30000}")
+    private long skipLogCooldownMs;
+
+    /**
+     * ✅ Единственный троттлер диспатча
+     * last успешный DISPATCH в оркестратор по StreamKey (eventTs)
+     */
     private final ConcurrentMap<StreamKey, Long> lastDispatchAtMs = new ConcurrentHashMap<>();
+
+    /**
+     * ✅ Анти-спам SKIP логов по StreamKey
+     */
+    private final ConcurrentMap<StreamKey, Long> lastSkipLogAtMs = new ConcurrentHashMap<>();
+
+    /**
+     * Диагностический счётчик на случай, если push.seq() == 0
+     */
     private final AtomicLong diagCounter = new AtomicLong(0);
+
+    // ============================================================
+    // SUBSCRIBE
+    // ============================================================
 
     @Override
     public void ensureSubscribed(long chatId,
@@ -70,6 +106,10 @@ public class MarketStreamServiceImpl implements MarketStreamService {
                     chatId, type, ex, networkType, sym, tf, e.getMessage(), e);
         }
     }
+
+    // ============================================================
+    // AGG TRADE (TICK)
+    // ============================================================
 
     @Override
     public void onAggTrade(long chatId,
@@ -100,10 +140,12 @@ public class MarketStreamServiceImpl implements MarketStreamService {
             return;
         }
 
+        // ✅ live тик
         try {
             livePublisher.publishAggTick(chatId, type, sym, tf, price, qty, tradeTsMs);
         } catch (Exception ignored) {}
 
+        // ✅ live свеча (если закрылась внутри pushAggTrade)
         if (push.candleClosed() != null) {
             try {
                 livePublisher.publishCandle(chatId, type, push.candleClosed());
@@ -112,26 +154,33 @@ public class MarketStreamServiceImpl implements MarketStreamService {
 
         final StreamKey key = new StreamKey(chatId, type, ex, networkType, sym, tf);
 
-        final long nowMs = System.currentTimeMillis();
+        // ✅ используем ts события (важно для sinceLastDispatchMs)
+        final long eventMs = tradeTsMs;
+
         final boolean running = orchestrator.isRunning(chatId, type);
+
+        // prev ДО put()
+        final Long prevDispatchMs = lastDispatchAtMs.get(key);
+        final long sinceLastDispatchMs = (prevDispatchMs == null) ? -1L : (eventMs - prevDispatchMs);
 
         boolean dispatched = false;
         String reason;
 
         if (!running) {
             reason = "Пропуск: стратегия НЕ запущена в оркестраторе";
-            cleanupKeyIfOld(key, nowMs);
+            cleanupKeyIfOld(key, eventMs);
         } else {
-            long last = lastDispatchAtMs.getOrDefault(key, 0L);
-            long dt = nowMs - last;
+            final long minInterval = Math.max(0L, minDispatchIntervalMs);
+            final boolean allowedByThrottle = (sinceLastDispatchMs < 0) || (sinceLastDispatchMs >= minInterval);
 
-            long minInterval = Math.max(0, minDispatchIntervalMs);
-
-            if (dt >= minInterval) {
-                lastDispatchAtMs.put(key, nowMs);
-
+            if (allowedByThrottle) {
                 try {
+                    // ✅ сначала диспатчим
                     orchestrator.onPriceUpdate(chatId, type, ex, networkType, sym, tf, price, tradeTsMs);
+
+                    // ✅ фиксируем диспатч ТОЛЬКО после успеха
+                    lastDispatchAtMs.put(key, eventMs);
+
                     dispatched = true;
                     reason = "Диспатч: отправлено в оркестратор (ok)";
                 } catch (Exception e) {
@@ -140,44 +189,37 @@ public class MarketStreamServiceImpl implements MarketStreamService {
                             chatId, type, ex, networkType, sym, tf, e.getMessage(), e);
                 }
             } else {
-                reason = "Пропуск: троттлинг (прошло " + dt + "ms, минимум " + minInterval + "ms)";
+                reason = "Пропуск: троттлинг (прошло " + sinceLastDispatchMs + "ms, минимум " + minInterval + "ms)";
             }
         }
 
-        long seq = push.seq();
-        boolean shouldLog = false;
+        // ===========================
+        // ЛОГИ (без спама)
+        // ===========================
+        final long seq = safeSeq(push);
 
-        if (seq > 0) {
-            if (seq <= Math.max(0, logFirstSeq)) shouldLog = true;
-            else if (seq % Math.max(1, logEverySeq) == 0) shouldLog = true;
-        } else {
-            long n = diagCounter.incrementAndGet();
-            if (n <= Math.max(0, logFirstSeq)) shouldLog = true;
+        if (dispatched) {
+            logAggInfo(seq, chatId, type, ex, networkType, sym, tf, price, qty, tradeTsMs,
+                    sinceLastDispatchMs, push);
+            return;
         }
 
-        if (shouldLog) {
-            String priceStr = price.stripTrailingZeros().toPlainString();
-            String qtyStr   = qty != null ? qty.stripTrailingZeros().toPlainString() : "null";
+        // ✅ редкий лог пропуска
+        final long lastSkip = lastSkipLogAtMs.getOrDefault(key, 0L);
+        final long dtSkip = eventMs - lastSkip;
 
-            Long lastTs = lastDispatchAtMs.get(key);
-            long sinceLast = (lastTs == null) ? -1 : (nowMs - lastTs);
+        if (dtSkip >= Math.max(1000L, skipLogCooldownMs)) {
+            lastSkipLogAtMs.put(key, eventMs);
 
-            log.info("📈 [MARKET] AGG_TICK[{}] chatId={} type={} ex={} net={} {} {} price={} qty={} ts={} | running={} dispatched={} | {} | sinceLastDispatchMs={} cache: tick={} candle={} createdCandle={}",
-                    seq,
-                    chatId, type, ex, networkType, sym, tf,
-                    priceStr, qtyStr, tradeTsMs,
-                    running, dispatched,
-                    reason,
-                    sinceLast,
-                    push.pushedTick(), push.pushedCandle(), push.createdCandle()
-            );
+            logSkipInfo(seq, chatId, type, ex, networkType, sym, tf, price, qty, tradeTsMs,
+                    sinceLastDispatchMs, reason, push);
         }
     }
 
-    /**
-     * ✅ СТРОГИЙ вход: symbol + timeframe приходят явно от WS-клиента.
-     * ✅ СТРОГИЙ кэш: кладём в MarketDataStreamService.pushKline(strict).
-     */
+    // ============================================================
+    // KLINE (CANDLE)
+    // ============================================================
+
     @Override
     public void onKline(long chatId,
                         StrategyType type,
@@ -195,13 +237,13 @@ public class MarketStreamServiceImpl implements MarketStreamService {
 
         if (ex == null || networkType == null || sym == null || tf == null) return;
 
-        // ✅ гарантируем заполнение для UI (и на всякий случай для сторонних потребителей)
+        // ✅ страховка для UI/потребителей
         try {
             if (kline.getSymbol() == null || kline.getSymbol().isBlank()) kline.setSymbol(sym);
             if (kline.getTimeframe() == null || kline.getTimeframe().isBlank()) kline.setTimeframe(tf);
         } catch (Exception ignored) {}
 
-        // 1) ✅ КЛЮЧЕВОЕ: кладём kline в кэш СТРОГО по (sym,tf)
+        // 1) кладём свечу в кэш строго по (sym, tf)
         try {
             marketDataStreamService.pushKline(ex, networkType, chatId, type, sym, tf, kline);
         } catch (Exception e) {
@@ -210,16 +252,13 @@ public class MarketStreamServiceImpl implements MarketStreamService {
             return;
         }
 
-        // 2) публикуем свечу в UI
+        // 2) публикуем в UI
         try {
             livePublisher.publishCandle(chatId, type, kline);
         } catch (Exception ignored) {}
 
-        // 3) если свеча закрыта — уведомляем оркестратор строго с контекстом
-        boolean closed = tryBool(kline, "isClosed")
-                .or(() -> tryBool(kline, "getClosed"))
-                .or(() -> tryBool(kline, "closed"))
-                .orElse(false);
+        // 3) если свеча закрыта — отправляем в оркестратор
+        boolean closed = isKlineClosed(kline);
 
         if (closed && orchestrator.isRunning(chatId, type)) {
             try {
@@ -231,17 +270,131 @@ public class MarketStreamServiceImpl implements MarketStreamService {
         }
     }
 
-    // ======================================================================
-    // helpers
-    // ======================================================================
+    // ============================================================
+    // HELPERS
+    // ============================================================
 
     private void cleanupKeyIfOld(StreamKey key, long nowMs) {
         Long last = lastDispatchAtMs.get(key);
         if (last == null) return;
 
-        long ttl = Math.max(1, inactiveTtlMs);
+        long ttl = Math.max(1L, inactiveTtlMs);
         if (nowMs - last >= ttl) {
             lastDispatchAtMs.remove(key);
+            lastSkipLogAtMs.remove(key);
+        }
+    }
+
+    private long safeSeq(MarketDataStreamService.MarketPushResult push) {
+        long seq = 0L;
+        try {
+            seq = push != null ? push.seq() : 0L;
+        } catch (Exception ignored) {}
+
+        if (seq > 0) return seq;
+
+        // fallback если seq не ведётся
+        return diagCounter.incrementAndGet();
+    }
+
+    private void logAggInfo(long seq,
+                            long chatId,
+                            StrategyType type,
+                            String ex,
+                            NetworkType net,
+                            String sym,
+                            String tf,
+                            BigDecimal price,
+                            BigDecimal qty,
+                            long ts,
+                            long sinceLastDispatchMs,
+                            MarketDataStreamService.MarketPushResult push) {
+
+        String priceStr = price.stripTrailingZeros().toPlainString();
+        String qtyStr   = qty != null ? qty.stripTrailingZeros().toPlainString() : "null";
+
+        boolean shouldLog = shouldLog(seq);
+        if (!shouldLog) return;
+
+        log.info("📈 [MARKET] AGG_TICK[{}] chatId={} type={} ex={} net={} {} {} price={} qty={} ts={} sinceLastDispatchMs={} cache: tick={} candle={} createdCandle={}",
+                seq,
+                chatId, type, ex, net, sym, tf,
+                priceStr, qtyStr, ts,
+                sinceLastDispatchMs,
+                safeBool(() -> push.pushedTick()),
+                safeBool(() -> push.pushedCandle()),
+                safeBool(() -> push.createdCandle())
+        );
+    }
+
+    private void logSkipInfo(long seq,
+                             long chatId,
+                             StrategyType type,
+                             String ex,
+                             NetworkType net,
+                             String sym,
+                             String tf,
+                             BigDecimal price,
+                             BigDecimal qty,
+                             long ts,
+                             long sinceLastDispatchMs,
+                             String reason,
+                             MarketDataStreamService.MarketPushResult push) {
+
+        String priceStr = price.stripTrailingZeros().toPlainString();
+        String qtyStr   = qty != null ? qty.stripTrailingZeros().toPlainString() : "null";
+
+        boolean shouldLog = shouldLog(seq);
+        if (!shouldLog) return;
+
+        log.info("⏭️ [MARKET] SKIP[{}] chatId={} type={} ex={} net={} {} {} price={} qty={} ts={} | {} | sinceLastDispatchMs={} cache: tick={} candle={} createdCandle={} (cooldown={}ms)",
+                seq,
+                chatId, type, ex, net, sym, tf,
+                priceStr, qtyStr, ts,
+                reason,
+                sinceLastDispatchMs,
+                safeBool(() -> push.pushedTick()),
+                safeBool(() -> push.pushedCandle()),
+                safeBool(() -> push.createdCandle()),
+                skipLogCooldownMs
+        );
+    }
+
+    private boolean shouldLog(long seq) {
+        if (seq <= 0) return true;
+
+        long first = Math.max(0L, logFirstSeq);
+        long every = Math.max(1L, logEverySeq);
+
+        if (seq <= first) return true;
+        return (seq % every) == 0;
+    }
+
+    private boolean isKlineClosed(UnifiedKline kline) {
+        // 1) нормальные варианты
+        try {
+            // если у тебя есть isClosed() / getClosed() в модели — будет работать
+            Optional<Boolean> a = tryBool(kline, "isClosed");
+            if (a.isPresent()) return a.get();
+            Optional<Boolean> b = tryBool(kline, "getClosed");
+            if (b.isPresent()) return b.get();
+        } catch (Exception ignored) {}
+
+        // 2) fallback: иногда поле/метод называется иначе
+        try {
+            Optional<Boolean> c = tryBool(kline, "closed");
+            return c.orElse(false);
+        } catch (Exception ignored) {}
+
+        return false;
+    }
+
+    private static boolean safeBool(java.util.concurrent.Callable<Boolean> c) {
+        try {
+            Boolean v = c.call();
+            return v != null && v;
+        } catch (Exception e) {
+            return false;
         }
     }
 

@@ -2,575 +2,526 @@
 
 window.SettingsTabRisk = (function () {
 
-    function init() {
-        const ctx = window.StrategySettingsContext;
-        if (!ctx) return;
+    let started = false;
 
-        const form = document.getElementById("riskForm");
+    function byId(id) { return document.getElementById(id); }
+
+    function isBlank(s) {
+        return s === null || s === undefined || String(s).trim() === "";
+    }
+
+    function numOrNull(v) {
+        if (v == null) return null;
+        const s = String(v).trim().replace(",", ".");
+        if (!s) return null;
+        const n = Number(s);
+        return Number.isFinite(n) ? n : null;
+    }
+
+    function nowHHmm() {
+        const d = new Date();
+        const hh = String(d.getHours()).padStart(2, "0");
+        const mm = String(d.getMinutes()).padStart(2, "0");
+        return `${hh}:${mm}`;
+    }
+
+    function getCtx() {
+        return window.StrategySettingsContext || null;
+    }
+
+    function ctxQuery() {
+        const ctx = getCtx();
+        if (!ctx) return "";
+        const q = new URLSearchParams();
+        if (ctx.chatId) q.set("chatId", String(ctx.chatId));
+        if (ctx.exchange) q.set("exchange", String(ctx.exchange));
+        if (ctx.network) q.set("network", String(ctx.network));
+        return q.toString();
+    }
+
+    function getControlMode(ctx) {
+        const sel = byId("advancedControlMode");
+        const v = (sel?.value || ctx?.advancedControlMode || "MANUAL").trim().toUpperCase();
+        return v || "MANUAL";
+    }
+
+    // ---------- UI ----------
+    function setModeUi(mode) {
+        const badge = byId("riskModeBadge");
+        const help = byId("riskModeHelp");
+
+        if (badge) {
+            badge.textContent = mode;
+            badge.className = "badge " + (mode === "AI"
+                ? "bg-warning text-dark"
+                : (mode === "HYBRID" ? "bg-info text-dark" : "bg-secondary"));
+        }
+
+        if (help) {
+            help.textContent = (mode === "AI")
+                ? "AI режим: поля заблокированы, значения задаёт система."
+                : (mode === "HYBRID")
+                    ? "HYBRID: изменения сохраняются после подтверждения."
+                    : "MANUAL: изменения сохраняются автоматически.";
+        }
+
+        const form = byId("riskForm");
         if (!form) return;
 
-        // =====================================================
-        // UI
-        // =====================================================
-        const riskModeBadge = document.getElementById("riskModeBadge");
-        const riskModeHelp  = document.getElementById("riskModeHelp");
+        const disable = (mode === "AI");
+        form.querySelectorAll("input, select, textarea, button").forEach(el => {
+            // ничего лишнего не блокируем, если вдруг появится кнопка
+            if (el.id === "advancedControlMode") return;
+            if (el.type === "hidden") return;
+            el.disabled = disable;
+        });
+    }
 
-        const saveState   = document.getElementById("riskSaveState");
-        const saveMeta    = document.getElementById("riskSaveMeta");
-        const changedList = document.getElementById("riskChangedList");
-        const dirtyBadge  = document.getElementById("riskDirtyBadge");
+    function setSaveUi(kind, meta) {
+        const state = byId("riskSaveState");
+        const saveMeta = byId("riskSaveMeta");
+        const dirtyBadge = byId("riskDirtyBadge");
+        const changedList = byId("riskChangedList");
 
-        // confirm modal (используем общий, если он уже есть на странице)
-        const confirmModalEl = document.getElementById("generalConfirmModal");
-        const confirmTitleEl = document.getElementById("generalConfirmTitle");
-        const confirmTextEl  = document.getElementById("generalConfirmText");
-        const confirmOkBtn   = document.getElementById("generalConfirmOk");
-
-        // режим управления — берём из вкладки general
-        const controlModeSelect = document.getElementById("advancedControlMode");
-
-        // general (для валюты и free)
-        const accountAssetSelect   = document.getElementById("accountAssetSelect");
-        const selectedAssetView    = document.getElementById("selectedAssetView");
-        const availableBalanceView = document.getElementById("availableBalanceView");
-
-        // =====================================================
-        // Inputs (risk)
-        // =====================================================
-        const riskPerTradePctInput       = document.getElementById("riskPerTradePctInput");
-        const minRiskRewardInput         = document.getElementById("minRiskRewardInput");
-        const leverageInput              = document.getElementById("leverageInput");
-
-        const allowAveragingInput        = document.getElementById("allowAveragingInput");
-        const cooldownSecondsInput       = document.getElementById("cooldownSecondsInput");
-        const maxTradesPerDayInput       = document.getElementById("maxTradesPerDayInput");
-
-        const maxDrawdownPctInput        = document.getElementById("maxDrawdownPctInput");
-        const maxDrawdownUsdInput        = document.getElementById("maxDrawdownUsdInput");
-        const drawdownPreview            = document.getElementById("drawdownPreview");
-
-        const maxPositionPctInput        = document.getElementById("maxPositionPctInput");
-        const maxPositionUsdInput        = document.getElementById("maxPositionUsdInput");
-        const positionPreview            = document.getElementById("positionPreview");
-
-        const cooldownAfterLossSecondsInput = document.getElementById("cooldownAfterLossSecondsInput");
-        const maxConsecutiveLossesInput     = document.getElementById("maxConsecutiveLossesInput");
-        const maxOpenOrdersInput            = document.getElementById("maxOpenOrdersInput");
-
-        // =====================================================
-        // API endpoints
-        // =====================================================
-        const AUTOSAVE_ENDPOINT = "/api/strategy/settings/autosave";
-
-        // =====================================================
-        // Autosave helper (без кнопок)
-        // =====================================================
-        function nowHHmm() {
-            const d = new Date();
-            const hh = String(d.getHours()).padStart(2, "0");
-            const mm = String(d.getMinutes()).padStart(2, "0");
-            return `${hh}:${mm}`;
+        if (kind === "saving") {
+            if (state) { state.className = "badge bg-secondary"; state.textContent = "Сохранение…"; }
+            return;
         }
 
-        function setSavingUi() {
-            if (saveState) {
-                saveState.classList.remove("bg-success");
-                saveState.classList.add("bg-secondary");
-                saveState.textContent = "Сохранение…";
-            }
-        }
-
-        function setSavedUi(metaText) {
+        if (kind === "ok") {
             if (dirtyBadge) dirtyBadge.classList.add("d-none");
-            if (saveState) {
-                saveState.classList.remove("bg-secondary");
-                saveState.classList.add("bg-success");
-                saveState.textContent = "Сохранено ✓";
-            }
-            if (saveMeta) saveMeta.textContent = metaText || nowHHmm();
+            if (changedList) changedList.textContent = "";
+            if (state) { state.className = "badge bg-success"; state.textContent = "Сохранено ✓"; }
+            if (saveMeta) saveMeta.textContent = meta || nowHHmm();
+            return;
         }
 
-        function setErrorUi() {
-            if (saveState) {
-                saveState.classList.remove("bg-success");
-                saveState.classList.add("bg-secondary");
-                saveState.textContent = "Ошибка";
-            }
+        if (kind === "err") {
+            if (state) { state.className = "badge bg-danger"; state.textContent = "Ошибка"; }
             if (saveMeta) saveMeta.textContent = "проверь API";
+            return;
         }
 
-        function markChanged(key) {
-            if (dirtyBadge) dirtyBadge.classList.remove("d-none");
-            if (changedList) {
-                const t = (changedList.textContent || "").trim();
-                const next = key && !t.includes(key) ? (t ? (t + ", " + key) : key) : t;
-                changedList.textContent = next;
+        // idle
+        if (state) { state.className = "badge bg-secondary"; state.textContent = "Готово"; }
+        if (saveMeta) saveMeta.textContent = "";
+    }
+
+    function markChanged(label) {
+        const dirtyBadge = byId("riskDirtyBadge");
+        const changedList = byId("riskChangedList");
+
+        if (dirtyBadge) dirtyBadge.classList.remove("d-none");
+
+        if (changedList && label) {
+            const cur = (changedList.textContent || "").trim();
+            if (!cur.includes(label)) changedList.textContent = cur ? (cur + ", " + label) : label;
+        }
+    }
+
+    // ---------- confirm ----------
+    function showConfirm(title, text) {
+        return new Promise((resolve) => {
+            const modalEl = byId("generalConfirmModal");
+            const titleEl = byId("generalConfirmTitle");
+            const textEl  = byId("generalConfirmText");
+            const okBtn   = byId("generalConfirmOk");
+
+            // если bootstrap нет — не блокируем UX
+            if (!modalEl || !window.bootstrap?.Modal || !okBtn) {
+                resolve(true);
+                return;
             }
-        }
 
-        // =====================================================
-        // Helpers (numbers, asset, free)
-        // =====================================================
-        function parseNumberLoose(v) {
-            if (v == null) return null;
-            const s = String(v).trim().replace(",", ".");
-            if (!s) return null;
-            const n = Number(s);
-            return Number.isFinite(n) ? n : null;
-        }
+            if (titleEl) titleEl.textContent = title || "Подтверждение";
+            if (textEl)  textEl.textContent  = text  || "Сохранить изменения?";
 
-        function fmt(n, decimals = 8) {
-            if (!Number.isFinite(n)) return "—";
-            return n.toFixed(decimals).replace(/\.?0+$/, "");
-        }
-
-        function getAssetForUi() {
-            const a1 = (accountAssetSelect?.value || "").trim();
-            if (a1) return a1;
-
-            const a2 = (selectedAssetView?.textContent || "").trim();
-            if (a2 && a2 !== "—") return a2;
-
-            return null;
-        }
-
-        function getFreeBalanceNumber() {
-            const raw = (availableBalanceView?.value || "").trim();
-            return parseNumberLoose(raw);
-        }
-
-        // =====================================================
-        // Confirm modal (только когда надо, и не мешает вводить)
-        // =====================================================
-        function showConfirm(title, text) {
-            return new Promise((resolve) => {
-                if (!confirmModalEl || !window.bootstrap?.Modal) {
-                    resolve(true);
-                    return;
-                }
-
-                if (confirmTitleEl) confirmTitleEl.textContent = title || "Подтверждение";
-                if (confirmTextEl) confirmTextEl.textContent = text || "Сохранить изменения?";
-
-                const modal = window.bootstrap.Modal.getOrCreateInstance(confirmModalEl, {
-                    backdrop: "static",
-                    keyboard: false
-                });
-
-                let done = false;
-
-                const cleanup = () => {
-                    confirmOkBtn?.removeEventListener("click", onOk);
-                    confirmModalEl.removeEventListener("hidden.bs.modal", onHide);
-                };
-
-                const onOk = () => {
-                    if (done) return;
-                    done = true;
-                    cleanup();
-                    modal.hide();
-                    resolve(true);
-                };
-
-                const onHide = () => {
-                    if (done) return;
-                    done = true;
-                    cleanup();
-                    resolve(false);
-                };
-
-                confirmOkBtn?.addEventListener("click", onOk, { once: true });
-                confirmModalEl.addEventListener("hidden.bs.modal", onHide);
-                modal.show();
+            const modal = window.bootstrap.Modal.getOrCreateInstance(modalEl, {
+                backdrop: "static",
+                keyboard: false
             });
-        }
 
-        // Gate: input → дебаунс, blur/change → мгновенно
-        const ConfirmGate = (function () {
-            let timer = null;
-            let inFlight = false;
+            let done = false;
 
-            function clear() {
-                if (timer) {
-                    clearTimeout(timer);
-                    timer = null;
-                }
-            }
-
-            async function runHybridConfirm() {
-                const mode = getControlMode();
-                if (mode !== "HYBRID") return true;
-                return await showConfirm(
-                    "Подтверждение",
-                    "Изменение параметров риска влияет на объём сделок. Сохранить?"
-                );
-            }
-
-            async function commit(action, rollback) {
-                if (inFlight) return;
-                inFlight = true;
-                try {
-                    const ok = await runHybridConfirm();
-                    if (!ok) {
-                        if (typeof rollback === "function") rollback();
-                        return;
-                    }
-                    await action();
-                } finally {
-                    inFlight = false;
-                }
-            }
-
-            function schedule(delayMs, action, rollback) {
-                clear();
-                timer = setTimeout(() => {
-                    timer = null;
-                    commit(action, rollback);
-                }, Math.max(0, delayMs | 0));
-            }
-
-            return { clear, schedule, commit };
-        })();
-
-        // =====================================================
-        // Mode badge + enable/disable
-        // =====================================================
-        function getControlMode() {
-            const v = (controlModeSelect?.value || ctx.advancedControlMode || "MANUAL").trim().toUpperCase();
-            return v || "MANUAL";
-        }
-
-        function setModeUi(mode) {
-            if (riskModeBadge) {
-                riskModeBadge.textContent = mode;
-                riskModeBadge.classList.remove("bg-success", "bg-warning", "bg-secondary");
-                if (mode === "AI") riskModeBadge.classList.add("bg-warning");
-                else if (mode === "HYBRID") riskModeBadge.classList.add("bg-secondary");
-                else riskModeBadge.classList.add("bg-success");
-            }
-
-            if (riskModeHelp) {
-                if (mode === "AI") {
-                    riskModeHelp.textContent = "AI режим: значения задаёт система. Поля только для просмотра.";
-                } else if (mode === "HYBRID") {
-                    riskModeHelp.textContent = "HYBRID: изменения сохраняются автоматически после подтверждения.";
-                } else {
-                    riskModeHelp.textContent = "MANUAL: изменения сохраняются автоматически.";
-                }
-            }
-
-            const disable = (mode === "AI");
-            const allInputs = form.querySelectorAll("input, select, textarea");
-            allInputs.forEach(el => {
-                if (el.id === "advancedControlMode") return;
-                el.disabled = disable;
-            });
-        }
-
-        // =====================================================
-        // Preview + взаимное исключение полей
-        // =====================================================
-        function updateDrawdownPreview() {
-            if (!drawdownPreview) return;
-
-            const asset = getAssetForUi();
-            const free = getFreeBalanceNumber();
-
-            const pct = parseNumberLoose(maxDrawdownPctInput?.value);
-            const usd = parseNumberLoose(maxDrawdownUsdInput?.value);
-
-            if (pct != null) {
-                if (free != null && asset) {
-                    const abs = (free * pct) / 100.0;
-                    drawdownPreview.textContent = `Просадка: ${fmt(pct, 2)}% ≈ ${fmt(abs)} ${asset}`;
-                } else {
-                    drawdownPreview.textContent = `Просадка: ${fmt(pct, 2)}%`;
-                }
-                return;
-            }
-
-            if (usd != null) {
-                drawdownPreview.textContent = asset ? `Просадка: ${fmt(usd)} ${asset}` : `Просадка: ${fmt(usd)}`;
-                return;
-            }
-
-            drawdownPreview.textContent = "Просадка: —";
-        }
-
-        function updatePositionPreview() {
-            if (!positionPreview) return;
-
-            const asset = getAssetForUi();
-            const free = getFreeBalanceNumber();
-
-            const pct = parseNumberLoose(maxPositionPctInput?.value);
-            const usd = parseNumberLoose(maxPositionUsdInput?.value);
-
-            if (pct != null) {
-                if (free != null && asset) {
-                    const abs = (free * pct) / 100.0;
-                    positionPreview.textContent = `Позиция: ${fmt(pct, 2)}% ≈ ${fmt(abs)} ${asset}`;
-                } else {
-                    positionPreview.textContent = `Позиция: ${fmt(pct, 2)}%`;
-                }
-                return;
-            }
-
-            if (usd != null) {
-                positionPreview.textContent = asset ? `Позиция: ${fmt(usd)} ${asset}` : `Позиция: ${fmt(usd)}`;
-                return;
-            }
-
-            positionPreview.textContent = "Позиция: —";
-        }
-
-        function clearPairIfFilled(primaryEl, secondaryEl) {
-            const p = parseNumberLoose(primaryEl?.value);
-            if (p == null) return;
-            if (secondaryEl && String(secondaryEl.value || "").trim() !== "") {
-                secondaryEl.value = "";
-            }
-        }
-
-        // =====================================================
-        // Payload (scope=risk) — НЕ затираем поля, если инпута нет
-        // =====================================================
-        function buildPayloadRisk() {
-            return {
-                chatId: ctx.chatId,
-                type: ctx.type,
-                exchange: ctx.exchange,
-                network: ctx.network,
-                scope: "risk",
-
-                riskPerTradePct: (riskPerTradePctInput?.value || "").trim() || null,
-                minRiskReward: (minRiskRewardInput?.value || "").trim() || null,
-                leverage: (leverageInput?.value || "").trim() || null,
-
-                allowAveraging: allowAveragingInput ? !!allowAveragingInput.checked : null,
-                cooldownSeconds: (cooldownSecondsInput?.value || "").trim() || null,
-                maxTradesPerDay: (maxTradesPerDayInput?.value || "").trim() || null,
-
-                maxDrawdownPct: (maxDrawdownPctInput?.value || "").trim() || null,
-                maxDrawdownUsd: (maxDrawdownUsdInput?.value || "").trim() || null,
-
-                maxPositionPct: (maxPositionPctInput?.value || "").trim() || null,
-                maxPositionUsd: (maxPositionUsdInput?.value || "").trim() || null,
-
-                cooldownAfterLossSeconds: (cooldownAfterLossSecondsInput?.value || "").trim() || null,
-                maxConsecutiveLosses: (maxConsecutiveLossesInput?.value || "").trim() || null,
-
-                maxOpenOrders: (maxOpenOrdersInput?.value || "").trim() || null
+            const cleanup = () => {
+                okBtn.removeEventListener("click", onOk);
+                modalEl.removeEventListener("hidden.bs.modal", onHide);
             };
+
+            const onOk = () => {
+                if (done) return;
+                done = true;
+                cleanup();
+                modal.hide();
+                resolve(true);
+            };
+
+            const onHide = () => {
+                if (done) return;
+                done = true;
+                cleanup();
+                resolve(false);
+            };
+
+            okBtn.addEventListener("click", onOk);
+            modalEl.addEventListener("hidden.bs.modal", onHide);
+            modal.show();
+        });
+    }
+
+    // ---------- save ----------
+    async function saveRisk(scopePayload) {
+        const ctx = getCtx();
+        if (!ctx?.type) return;
+
+        const url = `/strategies/${encodeURIComponent(String(ctx.type))}/config?${ctxQuery()}`;
+
+        // ⚠️ отправляем только реально существующие поля
+        const payload = Object.assign({
+            saveScope: "risk",
+            tab: "risk"
+        }, scopePayload || {});
+
+        // используем общий API если есть, иначе fetch
+        if (window.SettingsApi?.postForm) {
+            await window.SettingsApi.postForm(url, payload);
+            return;
         }
 
-        async function saveNow() {
-            const payload = buildPayloadRisk();
-            setSavingUi();
+        const body = new URLSearchParams();
+        Object.entries(payload).forEach(([k, v]) => {
+            if (v !== undefined && v !== null) body.append(k, String(v));
+        });
+
+        const resp = await fetch(url, {
+            method: "POST",
+            credentials: "same-origin",
+            headers: {
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "X-Requested-With": "fetch"
+            },
+            body
+        });
+
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+    }
+
+    // ---------- bind ----------
+    function init() {
+        if (started) return;
+        started = true;
+
+        const ctx = getCtx();
+        if (!ctx) return;
+
+        const form = byId("riskForm");
+        if (!form) return;
+
+        // элементы из твоего текущего “минимального risk”
+        const budgetMode = byId("strategyBudgetMode");
+        const budgetValue = byId("strategyBudgetValue");
+        const budgetPreview = byId("strategyBudgetPreview");
+        const budgetValueHint = byId("strategyBudgetValueHint");
+        const budgetValueLabel = byId("strategyBudgetValueLabel");
+
+        const initialModeEl = byId("strategyBudgetInitialMode");
+        const maxExposureUsd = byId("maxExposureUsd");
+        const maxExposurePct = byId("maxExposurePct");
+
+        const riskPerTrade = byId("riskPerTradePctInput");
+
+        // чтобы при HYBRID “откатывать”
+        const prev = {
+            budgetMode: (initialModeEl?.value || "NONE"),
+            budgetValue: "",
+            riskPerTrade: (riskPerTrade?.value || "")
+        };
+
+        // ----- budget UI helpers -----
+        function setBudgetUi(mode) {
+            const m = (mode || "NONE").toUpperCase();
+
+            if (budgetValueLabel) {
+                budgetValueLabel.textContent = (m === "USD")
+                    ? "Сумма"
+                    : (m === "PCT" ? "Процент" : "Значение");
+            }
+
+            if (budgetValueHint) {
+                budgetValueHint.textContent = (m === "USD")
+                    ? "Максимальная сумма в валюте счёта."
+                    : (m === "PCT"
+                        ? "Процент от доступного баланса."
+                        : "Лимит не используется.");
+            }
+
+            // в NONE value можно скрыть/заблокировать
+            if (budgetValue) {
+                const disable = (m === "NONE" || getControlMode(ctx) === "AI");
+                budgetValue.disabled = disable;
+                if (m === "NONE") budgetValue.value = "";
+            }
+
+            updateBudgetPreview();
+        }
+
+        function updateBudgetPreview() {
+            if (!budgetPreview) return;
+
+            const m = (budgetMode?.value || "NONE").toUpperCase();
+            const v = numOrNull(budgetValue?.value);
+
+            if (m === "NONE") {
+                budgetPreview.textContent = "Будет использован весь доступный баланс (без лимита).";
+                return;
+            }
+
+            if (m === "USD") {
+                budgetPreview.textContent = (v != null)
+                    ? `Лимит: ${v} (фиксированная сумма).`
+                    : "Лимит: укажи сумму.";
+                return;
+            }
+
+            if (m === "PCT") {
+                budgetPreview.textContent = (v != null)
+                    ? `Лимит: ${v}% от доступного баланса.`
+                    : "Лимит: укажи процент.";
+                return;
+            }
+
+            budgetPreview.textContent = "Лимит: —";
+        }
+
+        // ----- save pipeline -----
+        let timer = null;
+        let inFlight = false;
+
+        async function commitSave(payloadBuilder, rollback) {
+            if (inFlight) return;
+            inFlight = true;
+
+            setSaveUi("saving");
 
             try {
-                const res = await fetch(AUTOSAVE_ENDPOINT, {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                        "Accept": "application/json"
-                    },
-                    body: JSON.stringify(payload)
-                });
-
-                if (!res.ok) throw new Error(`autosave http ${res.status}`);
-
-                // если бек вернул JSON — ок, но нам не обязателен
-                await res.text().catch(() => "");
-                setSavedUi();
+                await saveRisk(payloadBuilder());
+                setSaveUi("ok", nowHHmm());
             } catch (e) {
-                console.error("risk autosave failed", e);
-                setErrorUi();
+                console.error("[risk] save failed:", e);
+                setSaveUi("err");
+                if (typeof rollback === "function") rollback();
+            } finally {
+                inFlight = false;
+                clearTimeout(timer);
+                timer = setTimeout(() => setSaveUi("idle"), 900);
             }
         }
 
-        // =====================================================
-        // Bind helpers (чтобы модалка не мешала)
-        // =====================================================
-        function bindNumberInput(el, key, opts) {
-            if (!el) return;
-
-            const delay = opts?.delayMs ?? 900;
-            const onInput = opts?.onInput;
-            const onBeforeSave = opts?.onBeforeSave;
-            const confirmRollback = opts?.rollback;
-
-            el.dataset.prevValue = el.value || "";
-
-            el.addEventListener("input", () => {
-                // ✅ AI: игнорируем (на всякий случай, если инпут не disabled)
-                if (getControlMode() === "AI") return;
-
-                markChanged(key);
-                if (typeof onInput === "function") onInput();
-
-                const prev = el.dataset.prevValue ?? "";
-                ConfirmGate.schedule(delay, async () => {
-                    if (getControlMode() === "AI") return;
-
-                    if (typeof onBeforeSave === "function") onBeforeSave();
-                    el.dataset.prevValue = el.value || "";
-                    await saveNow();
-                }, () => {
-                    el.value = prev;
-                    if (typeof confirmRollback === "function") confirmRollback();
-                });
-            });
-
-            el.addEventListener("change", async () => {
-                ConfirmGate.clear();
-
-                // ✅ AI: откатываем и выходим
-                if (getControlMode() === "AI") {
-                    el.value = el.dataset.prevValue ?? "";
-                    if (typeof confirmRollback === "function") confirmRollback();
-                    return;
-                }
-
-                markChanged(key);
-
-                const prev = el.dataset.prevValue ?? "";
-                const next = el.value || "";
-
-                const n = parseNumberLoose(next);
-                if (next.trim() !== "" && n == null) {
-                    el.value = prev;
-                    if (typeof confirmRollback === "function") confirmRollback();
-                    return;
-                }
-
-                await ConfirmGate.commit(async () => {
-                    if (typeof onBeforeSave === "function") onBeforeSave();
-                    el.dataset.prevValue = el.value || "";
-                    await saveNow();
-                }, () => {
-                    el.value = prev;
-                    if (typeof confirmRollback === "function") confirmRollback();
-                });
-            });
+        function scheduleSave(ms, payloadBuilder, rollback) {
+            clearTimeout(timer);
+            timer = setTimeout(() => {
+                timer = null;
+                commitSave(payloadBuilder, rollback);
+            }, Math.max(0, ms | 0));
         }
 
-        function bindCheckbox(el, key, opts) {
-            if (!el) return;
-
-            el.dataset.prevChecked = el.checked ? "1" : "0";
-
-            el.addEventListener("change", async () => {
-                // ✅ AI: откат
-                if (getControlMode() === "AI") {
-                    el.checked = (el.dataset.prevChecked === "1");
-                    return;
-                }
-
-                markChanged(key);
-                const prev = el.dataset.prevChecked === "1";
-                const next = !!el.checked;
-
-                await ConfirmGate.commit(async () => {
-                    el.dataset.prevChecked = next ? "1" : "0";
-                    await saveNow();
-                }, () => {
-                    el.checked = prev;
-                });
-            });
+        async function maybeConfirmIfHybrid() {
+            const mode = getControlMode(ctx);
+            if (mode !== "HYBRID") return true;
+            return await showConfirm(
+                "Подтверждение",
+                "Изменение параметров риска влияет на объём сделок. Сохранить?"
+            );
         }
 
-        // =====================================================
-        // Binds
-        // =====================================================
-        bindNumberInput(riskPerTradePctInput, "riskPerTradePct");
-        bindNumberInput(minRiskRewardInput, "minRiskReward");
-        bindNumberInput(leverageInput, "leverage", {
-            onBeforeSave: () => {
-                const n = parseNumberLoose(leverageInput.value);
-                if (n != null && n < 1) leverageInput.value = "1";
+        // ----- binds: budget mode/value -----
+        if (budgetMode) {
+            // init from server flags (maxExposureUsd/maxExposurePct)
+            if (initialModeEl && initialModeEl.value) {
+                budgetMode.value = initialModeEl.value;
             }
-        });
+            prev.budgetMode = budgetMode.value || "NONE";
 
-        bindCheckbox(allowAveragingInput, "allowAveraging");
-        bindNumberInput(cooldownSecondsInput, "cooldownSeconds");
-        bindNumberInput(maxTradesPerDayInput, "maxTradesPerDay");
+            budgetMode.addEventListener("change", async () => {
+                const modeNow = getControlMode(ctx);
+                if (modeNow === "AI") {
+                    budgetMode.value = prev.budgetMode;
+                    return;
+                }
 
-        // drawdown pair
-        bindNumberInput(maxDrawdownPctInput, "maxDrawdownPct", {
-            onInput: () => {
-                clearPairIfFilled(maxDrawdownPctInput, maxDrawdownUsdInput);
-                updateDrawdownPreview();
-            },
-            onBeforeSave: () => {
-                clearPairIfFilled(maxDrawdownPctInput, maxDrawdownUsdInput);
-                updateDrawdownPreview();
-            },
-            rollback: updateDrawdownPreview
-        });
+                const nextMode = (budgetMode.value || "NONE").toUpperCase();
+                markChanged("лимит капитала");
+                setBudgetUi(nextMode);
 
-        bindNumberInput(maxDrawdownUsdInput, "maxDrawdownUsd", {
-            onInput: () => {
-                clearPairIfFilled(maxDrawdownUsdInput, maxDrawdownPctInput);
-                updateDrawdownPreview();
-            },
-            onBeforeSave: () => {
-                clearPairIfFilled(maxDrawdownUsdInput, maxDrawdownPctInput);
-                updateDrawdownPreview();
-            },
-            rollback: updateDrawdownPreview
-        });
+                const ok = await maybeConfirmIfHybrid();
+                if (!ok) {
+                    budgetMode.value = prev.budgetMode;
+                    setBudgetUi(prev.budgetMode);
+                    return;
+                }
 
-        // position pair
-        bindNumberInput(maxPositionPctInput, "maxPositionPct", {
-            onInput: () => {
-                clearPairIfFilled(maxPositionPctInput, maxPositionUsdInput);
-                updatePositionPreview();
-            },
-            onBeforeSave: () => {
-                clearPairIfFilled(maxPositionPctInput, maxPositionUsdInput);
-                updatePositionPreview();
-            },
-            rollback: updatePositionPreview
-        });
+                // сохраняем: записываем только одно поле (USD или PCT), второе чистим
+                await commitSave(() => {
+                    const payload = {};
+                    if (nextMode === "USD") {
+                        payload.maxExposureUsd = (budgetValue?.value || "").trim() || null;
+                        payload.maxExposurePct = null;
+                        if (maxExposureUsd) maxExposureUsd.value = payload.maxExposureUsd || "";
+                        if (maxExposurePct) maxExposurePct.value = "";
+                    } else if (nextMode === "PCT") {
+                        payload.maxExposurePct = (budgetValue?.value || "").trim() || null;
+                        payload.maxExposureUsd = null;
+                        if (maxExposurePct) maxExposurePct.value = payload.maxExposurePct || "";
+                        if (maxExposureUsd) maxExposureUsd.value = "";
+                    } else {
+                        payload.maxExposureUsd = null;
+                        payload.maxExposurePct = null;
+                        if (maxExposureUsd) maxExposureUsd.value = "";
+                        if (maxExposurePct) maxExposurePct.value = "";
+                    }
+                    return payload;
+                }, () => {
+                    budgetMode.value = prev.budgetMode;
+                    setBudgetUi(prev.budgetMode);
+                });
 
-        bindNumberInput(maxPositionUsdInput, "maxPositionUsd", {
-            onInput: () => {
-                clearPairIfFilled(maxPositionUsdInput, maxPositionPctInput);
-                updatePositionPreview();
-            },
-            onBeforeSave: () => {
-                clearPairIfFilled(maxPositionUsdInput, maxPositionPctInput);
-                updatePositionPreview();
-            },
-            rollback: updatePositionPreview
-        });
+                prev.budgetMode = budgetMode.value || "NONE";
+            });
+        }
 
-        bindNumberInput(cooldownAfterLossSecondsInput, "cooldownAfterLossSeconds");
-        bindNumberInput(maxConsecutiveLossesInput, "maxConsecutiveLosses");
-        bindNumberInput(maxOpenOrdersInput, "maxOpenOrders");
+        if (budgetValue) {
+            prev.budgetValue = budgetValue.value || "";
 
-        // =====================================================
-        // Sync mode badge on change + слушаем глобальный эвент из General
-        // =====================================================
+            budgetValue.addEventListener("input", () => {
+                const modeNow = getControlMode(ctx);
+                if (modeNow === "AI") return;
+
+                markChanged("значение лимита");
+                updateBudgetPreview();
+
+                // debounce save
+                scheduleSave(650, () => {
+                    const m = (budgetMode?.value || "NONE").toUpperCase();
+                    const payload = {};
+                    if (m === "USD") payload.maxExposureUsd = (budgetValue.value || "").trim() || null;
+                    else if (m === "PCT") payload.maxExposurePct = (budgetValue.value || "").trim() || null;
+                    return payload;
+                }, () => {
+                    budgetValue.value = prev.budgetValue;
+                    updateBudgetPreview();
+                });
+            });
+
+            budgetValue.addEventListener("change", async () => {
+                clearTimeout(timer);
+
+                const modeNow = getControlMode(ctx);
+                if (modeNow === "AI") {
+                    budgetValue.value = prev.budgetValue;
+                    updateBudgetPreview();
+                    return;
+                }
+
+                // валидация числа
+                const v = budgetValue.value;
+                if (!isBlank(v) && numOrNull(v) == null) {
+                    budgetValue.value = prev.budgetValue;
+                    updateBudgetPreview();
+                    return;
+                }
+
+                markChanged("значение лимита");
+                updateBudgetPreview();
+
+                const ok = await maybeConfirmIfHybrid();
+                if (!ok) {
+                    budgetValue.value = prev.budgetValue;
+                    updateBudgetPreview();
+                    return;
+                }
+
+                await commitSave(() => {
+                    const m = (budgetMode?.value || "NONE").toUpperCase();
+                    const payload = {};
+                    if (m === "USD") payload.maxExposureUsd = (budgetValue.value || "").trim() || null;
+                    if (m === "PCT") payload.maxExposurePct = (budgetValue.value || "").trim() || null;
+                    return payload;
+                }, () => {
+                    budgetValue.value = prev.budgetValue;
+                    updateBudgetPreview();
+                });
+
+                prev.budgetValue = budgetValue.value || "";
+            });
+        }
+
+        // ----- bind: riskPerTradePct -----
+        if (riskPerTrade) {
+            prev.riskPerTrade = riskPerTrade.value || "";
+
+            riskPerTrade.addEventListener("input", () => {
+                const modeNow = getControlMode(ctx);
+                if (modeNow === "AI") return;
+
+                markChanged("риск на сделку");
+                scheduleSave(650, () => ({
+                    riskPerTradePct: (riskPerTrade.value || "").trim() || null
+                }), () => {
+                    riskPerTrade.value = prev.riskPerTrade;
+                });
+            });
+
+            riskPerTrade.addEventListener("change", async () => {
+                clearTimeout(timer);
+
+                const modeNow = getControlMode(ctx);
+                if (modeNow === "AI") {
+                    riskPerTrade.value = prev.riskPerTrade;
+                    return;
+                }
+
+                const v = riskPerTrade.value;
+                if (!isBlank(v) && numOrNull(v) == null) {
+                    riskPerTrade.value = prev.riskPerTrade;
+                    return;
+                }
+
+                markChanged("риск на сделку");
+
+                const ok = await maybeConfirmIfHybrid();
+                if (!ok) {
+                    riskPerTrade.value = prev.riskPerTrade;
+                    return;
+                }
+
+                await commitSave(() => ({
+                    riskPerTradePct: (riskPerTrade.value || "").trim() || null
+                }), () => {
+                    riskPerTrade.value = prev.riskPerTrade;
+                });
+
+                prev.riskPerTrade = riskPerTrade.value || "";
+            });
+        }
+
+        // ----- sync mode changes from Control tab -----
         function syncMode() {
-            const mode = getControlMode();
+            const mode = getControlMode(ctx);
+            ctx.advancedControlMode = mode;
             setModeUi(mode);
+            setBudgetUi(budgetMode?.value || "NONE");
 
-            // ✅ если режим стал AI — сбросим in-flight confirm/debounce
+            // если AI — сбрасываем “грязь”
             if (mode === "AI") {
-                ConfirmGate.clear();
-                setSavedUi(nowHHmm());
+                setSaveUi("ok", nowHHmm());
             }
         }
 
+        const controlModeSelect = byId("advancedControlMode");
         if (controlModeSelect) {
-            controlModeSelect.addEventListener("change", () => {
-                syncMode();
-            });
+            controlModeSelect.addEventListener("change", syncMode);
         }
 
-        // ✅ общий сигнал от General (мы его диспатчим там)
         window.addEventListener("strategy:controlModeChanged", (e) => {
             const m = String(e?.detail?.mode || "").toUpperCase();
             if (m) {
@@ -579,20 +530,17 @@ window.SettingsTabRisk = (function () {
             }
         });
 
-        // =====================================================
-        // First render
-        // =====================================================
+        // first render
+        setSaveUi("idle");
         syncMode();
-        updateDrawdownPreview();
-        updatePositionPreview();
+        updateBudgetPreview();
+    }
 
-        // если актив/баланс меняется в general — превью тоже обновим
-        if (accountAssetSelect) {
-            accountAssetSelect.addEventListener("change", () => {
-                updateDrawdownPreview();
-                updatePositionPreview();
-            });
-        }
+    // safe boot
+    if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", init);
+    } else {
+        init();
     }
 
     return { init };

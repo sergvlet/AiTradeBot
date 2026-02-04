@@ -31,10 +31,10 @@ public interface OrderService {
 
     /**
      * MARKET ордер.
-     *
+
      * Семантика amount:
-     * - BUY (SPOT): amount = quoteAmount (например, USDT budget), который готов потратить.
-     * - SELL (SPOT): amount = baseQty (количество базовой монеты), которое продаёшь.
+     * - BUY (SPOT): amount = quoteAmount (например, USDT budget), который готов потратить
+     * - SELL (SPOT): amount = baseQty (количество базовой монеты), которое продаёшь
      */
     Order placeMarket(OrderContext ctx,
                       OrderSide side,
@@ -103,7 +103,7 @@ public interface OrderService {
 
     int cancelAllOpen(Long chatId, String symbol);
 
-    // ====== OPEN ORDERS ======
+    // ====== OPEN ORDERS (пока DB; синхронизацию с биржей добавим следующим шагом) ======
     List<Order> getOpenOrders(Long chatId, String symbol);
 
     // ====== CREATE (generic) ======

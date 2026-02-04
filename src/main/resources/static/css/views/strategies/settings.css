@@ -1,11 +1,26 @@
 /* ========================================================================
-   STRATEGY SETTINGS — SAFE UI (BOOTSTRAP SAFE)
+   STRATEGY SETTINGS — PREMIUM DASHBOARD UI (BOOTSTRAP SAFE)
    ======================================================================== */
+
+/* ========================================================================
+   TOKENS (не ломают bootstrap, только локально внутри страницы)
+   ======================================================================== */
+.strategy-settings-page {
+    --radius: 14px;
+    --radius-sm: 10px;
+    --shadow-soft: 0 10px 30px rgba(0,0,0,.22);
+    --shadow-lite: 0 8px 22px rgba(0,0,0,.16);
+
+    --outline-dark: rgba(148,163,184,0.25);
+    --outline-light: #e5e7eb;
+
+    --muted-dark: #9ca3af;
+    --muted-light: #6b7280;
+}
 
 /* ========================================================================
    🌙 DARK THEME
    ======================================================================== */
-
 body[data-theme="dark"] .strategy-settings-page {
     background: #0b0d10;
     color: #e5e7eb;
@@ -13,76 +28,319 @@ body[data-theme="dark"] .strategy-settings-page {
 
 body[data-theme="dark"] .strategy-settings-page .card,
 body[data-theme="dark"] .strategy-settings-page .card-theme {
-    background: #15171a;
-    border: 1px solid rgba(148,163,184,0.25);
-    border-radius: 14px;
+    background: linear-gradient(180deg, #15171a 0%, #121418 100%);
+    border: 1px solid var(--outline-dark);
+    border-radius: var(--radius);
     padding: 20px;
+    box-shadow: 0 0 0 rgba(0,0,0,0);
+    transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease;
 }
 
-/* tabs */
-body[data-theme="dark"] .strategy-settings-page .nav-tabs {
-    border-bottom: 1px solid rgba(148,163,184,0.25);
+body[data-theme="dark"] .strategy-settings-page .card:hover,
+body[data-theme="dark"] .strategy-settings-page .card-theme:hover {
+    border-color: rgba(56,189,248,.35);
+    box-shadow: var(--shadow-lite);
 }
 
+/* Typography polish */
+.strategy-settings-page .section-title {
+    font-weight: 700;
+    letter-spacing: .2px;
+    margin-bottom: 10px;
+}
+
+.strategy-settings-page .form-text,
+.strategy-settings-page .text-secondary.small,
+.strategy-settings-page .small.text-secondary {
+    opacity: .92;
+}
+
+/* hr */
+body[data-theme="dark"] .strategy-settings-page hr {
+    border-color: #2a2e35;
+    opacity: .85;
+}
+
+/* alerts */
+body[data-theme="dark"] .strategy-settings-page .alert {
+    background: rgba(255,255,255,.03);
+    border: 1px solid #2a2e35;
+    color: #e5e7eb;
+    border-radius: var(--radius-sm);
+}
+
+/* ========================================================================
+   ☀️ LIGHT THEME
+   ======================================================================== */
+body[data-theme="light"] .strategy-settings-page {
+    background: #f8fafc;
+    color: #111827;
+}
+
+body[data-theme="light"] .strategy-settings-page .card,
+body[data-theme="light"] .strategy-settings-page .card-theme {
+    background: #ffffff;
+    border: 1px solid var(--outline-light);
+    border-radius: var(--radius);
+    padding: 20px;
+    box-shadow: 0 0 0 rgba(0,0,0,0);
+    transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease;
+}
+
+body[data-theme="light"] .strategy-settings-page .card:hover,
+body[data-theme="light"] .strategy-settings-page .card-theme:hover {
+    border-color: rgba(37,99,235,.25);
+    box-shadow: 0 12px 28px rgba(17,24,39,.10);
+}
+
+body[data-theme="light"] .strategy-settings-page hr {
+    border-color: #e5e7eb;
+    opacity: .9;
+}
+
+body[data-theme="light"] .strategy-settings-page .alert {
+    background: #f9fafb;
+    border: 1px solid #e5e7eb;
+    color: #111827;
+    border-radius: var(--radius-sm);
+}
+
+/* ========================================================================
+   TAB SYSTEM (premium tabs with pill-ish feel)
+   ======================================================================== */
+.strategy-settings-page .nav-tabs {
+    border-bottom: none !important;
+    gap: 6px;
+    margin-bottom: 14px;
+}
+
+.strategy-settings-page .nav-tabs .nav-link {
+    border: 1px solid transparent !important;
+    border-radius: 12px 12px 12px 12px;
+    padding: 10px 14px;
+    font-weight: 600;
+    letter-spacing: .15px;
+    user-select: none;
+    cursor: pointer;
+    transition: background-color .15s ease, border-color .15s ease, color .15s ease, transform .1s ease;
+}
+
+.strategy-settings-page .nav-tabs .nav-link:active {
+    transform: translateY(1px);
+}
+
+/* Dark tabs */
 body[data-theme="dark"] .strategy-settings-page .nav-tabs .nav-link {
     color: #9ca3af;
+    background: rgba(255,255,255,.02);
+    border-color: rgba(148,163,184,.18) !important;
+}
+
+body[data-theme="dark"] .strategy-settings-page .nav-tabs .nav-link:hover {
+    background: rgba(255,255,255,.04);
+    border-color: rgba(56,189,248,.25) !important;
+    color: #e5e7eb;
 }
 
 body[data-theme="dark"] .strategy-settings-page .nav-tabs .nav-link.active {
     color: #38bdf8;
-    border-bottom: 2px solid #38bdf8;
-    background: transparent;
+    background: rgba(56,189,248,.08);
+    border-color: rgba(56,189,248,.35) !important;
+    box-shadow: 0 8px 18px rgba(0,0,0,.18);
 }
 
-/* tab content fix */
-.strategy-settings-page .tab-pane {
-    display: none;
-}
-.strategy-settings-page .tab-pane.active {
-    display: block;
+/* Light tabs */
+body[data-theme="light"] .strategy-settings-page .nav-tabs .nav-link {
+    color: #6b7280;
+    background: #ffffff;
+    border-color: #e5e7eb !important;
 }
 
-/* inputs */
+body[data-theme="light"] .strategy-settings-page .nav-tabs .nav-link:hover {
+    border-color: rgba(37,99,235,.25) !important;
+    color: #111827;
+    background: #f9fafb;
+}
+
+body[data-theme="light"] .strategy-settings-page .nav-tabs .nav-link.active {
+    color: #2563eb;
+    background: rgba(37,99,235,.06);
+    border-color: rgba(37,99,235,.25) !important;
+    box-shadow: 0 10px 24px rgba(37,99,235,.12);
+}
+
+/* tab content fix — оставляем твою логику */
+.strategy-settings-page .tab-pane { display: none; }
+.strategy-settings-page .tab-pane.active { display: block; }
+
+/* ========================================================================
+   INPUTS / SELECTS (premium focus + hover)
+   ======================================================================== */
 body[data-theme="dark"] .strategy-settings-page input,
 body[data-theme="dark"] .strategy-settings-page select,
 body[data-theme="dark"] .strategy-settings-page textarea {
     background-color: #0e0f11;
     color: #e5e7eb;
     border: 1px solid #2a2e35;
+    border-radius: 12px;
+    transition: border-color .15s ease, box-shadow .15s ease, background-color .15s ease;
 }
 
-body[data-theme="dark"] .strategy-settings-page input::placeholder {
-    color: #9ca3af;
+body[data-theme="dark"] .strategy-settings-page input::placeholder { color: #9ca3af; }
+
+body[data-theme="dark"] .strategy-settings-page input:hover,
+body[data-theme="dark"] .strategy-settings-page select:hover,
+body[data-theme="dark"] .strategy-settings-page textarea:hover {
+    border-color: rgba(56,189,248,.22);
 }
 
-/* disabled */
+body[data-theme="dark"] .strategy-settings-page input:focus,
+body[data-theme="dark"] .strategy-settings-page select:focus,
+body[data-theme="dark"] .strategy-settings-page textarea:focus {
+    border-color: rgba(56,189,248,.55);
+    box-shadow: 0 0 0 .2rem rgba(56,189,248,.15);
+    outline: none;
+}
+
+/* disabled / readonly */
 body[data-theme="dark"] .strategy-settings-page input:disabled,
 body[data-theme="dark"] .strategy-settings-page select:disabled,
 body[data-theme="dark"] .strategy-settings-page input[readonly] {
     background-color: #15171a !important;
     color: #9ca3af !important;
+    opacity: .9;
 }
 
-/* alerts */
-body[data-theme="dark"] .strategy-settings-page .alert {
-    background: #15171a;
-    border: 1px solid #2a2e35;
-    color: #e5e7eb;
+/* Light inputs */
+body[data-theme="light"] .strategy-settings-page input,
+body[data-theme="light"] .strategy-settings-page select,
+body[data-theme="light"] .strategy-settings-page textarea {
+    background-color: #ffffff;
+    color: #111827;
+    border: 1px solid #d1d5db;
+    border-radius: 12px;
+    transition: border-color .15s ease, box-shadow .15s ease, background-color .15s ease;
 }
 
-/* hr */
-body[data-theme="dark"] .strategy-settings-page hr {
-    border-color: #2a2e35;
+body[data-theme="light"] .strategy-settings-page input::placeholder { color: #9ca3af; }
+
+body[data-theme="light"] .strategy-settings-page input:hover,
+body[data-theme="light"] .strategy-settings-page select:hover,
+body[data-theme="light"] .strategy-settings-page textarea:hover {
+    border-color: rgba(37,99,235,.28);
+}
+
+body[data-theme="light"] .strategy-settings-page input:focus,
+body[data-theme="light"] .strategy-settings-page select:focus,
+body[data-theme="light"] .strategy-settings-page textarea:focus {
+    border-color: rgba(37,99,235,.55);
+    box-shadow: 0 0 0 .2rem rgba(37,99,235,.12);
+    outline: none;
+}
+
+body[data-theme="light"] .strategy-settings-page input:disabled,
+body[data-theme="light"] .strategy-settings-page select:disabled,
+body[data-theme="light"] .strategy-settings-page input[readonly] {
+    background-color: #f3f4f6 !important;
+    color: #9ca3af !important;
+}
+
+/* input-group */
+.strategy-settings-page .input-group .input-group-text {
+    border-radius: 12px;
 }
 
 /* ========================================================================
-   🔥 SYMBOL PICKER — DARK
+   BUTTONS / BADGES — subtle polish
    ======================================================================== */
+.strategy-settings-page .btn {
+    border-radius: 12px;
+    transition: transform .08s ease, box-shadow .15s ease, border-color .15s ease;
+}
 
+.strategy-settings-page .btn:active {
+    transform: translateY(1px);
+}
+
+body[data-theme="dark"] .strategy-settings-page .btn-outline-secondary {
+    border-color: rgba(148,163,184,.28);
+    color: #e5e7eb;
+}
+
+body[data-theme="dark"] .strategy-settings-page .btn-outline-secondary:hover {
+    border-color: rgba(56,189,248,.35);
+    box-shadow: 0 10px 20px rgba(0,0,0,.18);
+}
+
+.strategy-settings-page .badge {
+    border-radius: 999px;
+    padding: .45rem .65rem;
+    font-weight: 700;
+    letter-spacing: .1px;
+}
+
+/* ========================================================================
+   ACCORDION (Network tab looks дорогой)
+   ======================================================================== */
+.strategy-settings-page .accordion-item {
+    border-radius: var(--radius);
+    overflow: hidden;
+    border: none;
+    margin-bottom: 10px;
+}
+
+body[data-theme="dark"] .strategy-settings-page .accordion-button {
+    background: rgba(255,255,255,.02);
+    color: #e5e7eb;
+    border: 1px solid rgba(148,163,184,.18);
+    border-radius: var(--radius);
+    font-weight: 700;
+    letter-spacing: .15px;
+}
+
+body[data-theme="dark"] .strategy-settings-page .accordion-button:not(.collapsed) {
+    background: rgba(56,189,248,.08);
+    border-color: rgba(56,189,248,.35);
+    box-shadow: 0 12px 26px rgba(0,0,0,.20);
+}
+
+body[data-theme="dark"] .strategy-settings-page .accordion-body {
+    background: rgba(255,255,255,.015);
+    border: 1px solid rgba(148,163,184,.18);
+    border-top: none;
+    border-radius: 0 0 var(--radius) var(--radius);
+}
+
+body[data-theme="light"] .strategy-settings-page .accordion-button {
+    background: #ffffff;
+    color: #111827;
+    border: 1px solid #e5e7eb;
+    border-radius: var(--radius);
+    font-weight: 700;
+}
+
+body[data-theme="light"] .strategy-settings-page .accordion-button:not(.collapsed) {
+    background: rgba(37,99,235,.06);
+    border-color: rgba(37,99,235,.25);
+    box-shadow: 0 12px 26px rgba(17,24,39,.10);
+}
+
+body[data-theme="light"] .strategy-settings-page .accordion-body {
+    background: #ffffff;
+    border: 1px solid #e5e7eb;
+    border-top: none;
+    border-radius: 0 0 var(--radius) var(--radius);
+}
+
+/* ========================================================================
+   🔥 SYMBOL PICKER (Dropdown) — keep твою логику, улучшаем вид
+   ======================================================================== */
 body[data-theme="dark"] .strategy-settings-page .strategy-input {
     background-color: #0e0f11 !important;
     color: #e5e7eb !important;
     border: 1px solid #2a2e35 !important;
+    border-radius: 12px;
+    padding: 10px 12px;
 }
 
 body[data-theme="dark"] .strategy-settings-page .strategy-input.dropdown-toggle::after {
@@ -92,10 +350,15 @@ body[data-theme="dark"] .strategy-settings-page .strategy-input.dropdown-toggle:
 body[data-theme="dark"] .strategy-settings-page .strategy-dropdown {
     background-color: #15171a;
     border: 1px solid #2a2e35;
+    border-radius: 12px;
+    padding: 6px;
+    box-shadow: var(--shadow-soft);
 }
 
 body[data-theme="dark"] .strategy-settings-page .strategy-dropdown .dropdown-item {
     color: #e5e7eb;
+    border-radius: 10px;
+    padding: 10px 10px;
 }
 
 body[data-theme="dark"] .strategy-settings-page .strategy-dropdown .dropdown-item:hover {
@@ -107,92 +370,27 @@ body[data-theme="dark"] .strategy-settings-page .strategy-dropdown .text-muted {
     color: #9ca3af !important;
 }
 
-/* ========================================================================
-   ☀️ LIGHT THEME — ИСПРАВЛЕНО
-   ======================================================================== */
-
-body[data-theme="light"] .strategy-settings-page {
-    background: #f8fafc;
-    color: #111827;
-}
-
-body[data-theme="light"] .strategy-settings-page .card,
-body[data-theme="light"] .strategy-settings-page .card-theme {
-    background: #ffffff;
-    border: 1px solid #e5e7eb;
-    border-radius: 14px;
-    padding: 20px;
-}
-
-/* tabs */
-body[data-theme="light"] .strategy-settings-page .nav-tabs {
-    border-bottom: 1px solid #e5e7eb;
-}
-
-body[data-theme="light"] .strategy-settings-page .nav-tabs .nav-link {
-    color: #6b7280;
-}
-
-body[data-theme="light"] .strategy-settings-page .nav-tabs .nav-link.active {
-    color: #2563eb;
-    border-bottom: 2px solid #2563eb;
-    background: transparent;
-}
-
-/* inputs */
-body[data-theme="light"] .strategy-settings-page input,
-body[data-theme="light"] .strategy-settings-page select,
-body[data-theme="light"] .strategy-settings-page textarea {
-    background-color: #ffffff;
-    color: #111827;
-    border: 1px solid #d1d5db;
-}
-
-body[data-theme="light"] .strategy-settings-page input::placeholder {
-    color: #9ca3af;
-}
-
-/* disabled */
-body[data-theme="light"] .strategy-settings-page input:disabled,
-body[data-theme="light"] .strategy-settings-page select:disabled,
-body[data-theme="light"] .strategy-settings-page input[readonly] {
-    background-color: #f3f4f6 !important;
-    color: #9ca3af !important;
-}
-
-/* alerts */
-body[data-theme="light"] .strategy-settings-page .alert {
-    background: #f9fafb;
-    border: 1px solid #e5e7eb;
-    color: #111827;
-}
-
-/* hr */
-body[data-theme="light"] .strategy-settings-page hr {
-    border-color: #e5e7eb;
-}
-
-/* ========================================================================
-   🔥 SYMBOL PICKER — LIGHT
-   ======================================================================== */
-
+/* light */
 body[data-theme="light"] .strategy-settings-page .strategy-input {
     background-color: #ffffff !important;
     color: #111827 !important;
     border: 1px solid #d1d5db !important;
-}
-
-body[data-theme="light"] .strategy-settings-page .strategy-input.dropdown-toggle::after {
-    filter: none;
+    border-radius: 12px;
+    padding: 10px 12px;
 }
 
 body[data-theme="light"] .strategy-settings-page .strategy-dropdown {
     background-color: #ffffff;
     border: 1px solid #d1d5db;
+    border-radius: 12px;
+    padding: 6px;
+    box-shadow: 0 18px 40px rgba(17,24,39,.12);
 }
 
 body[data-theme="light"] .strategy-settings-page .strategy-dropdown .dropdown-item {
     color: #111827;
+    border-radius: 10px;
+    padding: 10px 10px;
 }
 
 body[data-theme="light"] .strategy-settings-page .strategy-dropdown .dropdown-item:hover {
@@ -208,4 +406,82 @@ body[data-theme="light"] .strategy-settings-page .strategy-dropdown .text-muted 
 .strategy-settings-page [data-symbol-mode].active {
     background-color: #2563eb;
     color: #ffffff;
+    border-color: rgba(37,99,235,.35);
+    box-shadow: 0 12px 22px rgba(37,99,235,.18);
+}
+
+/* ========================================================================
+   TABLES (Diagnostics) — красиво и читаемо
+   ======================================================================== */
+body[data-theme="dark"] .strategy-settings-page .table {
+    color: #e5e7eb;
+}
+
+body[data-theme="dark"] .strategy-settings-page .table-bordered > :not(caption) > * {
+    border-color: rgba(148,163,184,.22);
+}
+
+body[data-theme="dark"] .strategy-settings-page .table td,
+body[data-theme="dark"] .strategy-settings-page .table th {
+    background: rgba(255,255,255,.02);
+}
+
+body[data-theme="light"] .strategy-settings-page .table td,
+body[data-theme="light"] .strategy-settings-page .table th {
+    background: #ffffff;
+}
+
+.strategy-settings-page .table {
+    border-radius: 12px;
+    overflow: hidden;
+}
+
+/* ========================================================================
+   LITTLE DETAILS
+   ======================================================================== */
+.strategy-settings-page .form-label {
+    font-weight: 700;
+    letter-spacing: .12px;
+}
+
+.strategy-settings-page .spinner-border {
+    vertical-align: -0.12em;
+}
+/* =========================================================
+   ✅ POLISH: buttons/tabs consistent in dark/light
+   ========================================================= */
+
+/* active mode buttons (POPULAR/GAINERS/LOSERS) — both themes */
+.strategy-settings-page [data-symbol-mode].active {
+    background-color: rgba(37, 99, 235, 0.18) !important;
+    border-color: rgba(37, 99, 235, 0.45) !important;
+    color: #fff !important;
+}
+body[data-theme="light"] .strategy-settings-page [data-symbol-mode].active {
+    background-color: #2563eb !important;
+    border-color: #2563eb !important;
+    color: #fff !important;
+}
+
+/* nicer focus */
+.strategy-settings-page .form-control:focus,
+.strategy-settings-page .form-select:focus {
+    box-shadow: 0 0 0 0.2rem rgba(56, 189, 248, 0.18);
+    border-color: rgba(56, 189, 248, 0.65);
+}
+
+/* tabs hover */
+.strategy-settings-page .nav-tabs .nav-link {
+    cursor: pointer;
+}
+.strategy-settings-page .nav-tabs .nav-link:not(.active):hover {
+    opacity: 0.95;
+    transform: translateY(-1px);
+}
+
+/* section title if you use it a lot */
+.strategy-settings-page .section-title {
+    font-weight: 700;
+    letter-spacing: 0.2px;
+    margin-bottom: 14px;
 }

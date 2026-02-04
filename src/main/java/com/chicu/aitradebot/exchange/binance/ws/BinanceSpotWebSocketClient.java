@@ -5,8 +5,6 @@ import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.exchange.parser.BinanceKlineParser;
 import com.chicu.aitradebot.market.MarketStreamService;
 import com.chicu.aitradebot.market.model.UnifiedKline;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import okhttp3.*;
@@ -19,483 +17,334 @@ import java.math.BigDecimal;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicLong;
 
 @Slf4j
 @Component
 @RequiredArgsConstructor
 public class BinanceSpotWebSocketClient {
 
-    /**
-     * MAINNET (SPOT)
-     */
-    private static final String WS_URL_MAINNET =
+    // ✅ MAINNET
+    private static final String WS_MAIN_STREAM_TEMPLATE =
             "wss://stream.binance.com:9443/stream?streams=%s";
 
-    /**
-     * TESTNET/DEMO (SPOT Demo Mode)
-     * Важно: testnet.binance.vision не отдаёт нормальный WS upgrade (получишь 404).
-     */
-    private static final String WS_URL_TESTNET =
-            "wss://demo-stream.binance.com:9443/stream?streams=%s";
-
-    private static final long LOG_EVERY_N = 200;
+    // ✅ TESTNET
+    private static final String WS_TEST_STREAM_TEMPLATE =
+            "wss://stream.testnet.binance.vision/stream?streams=%s";
 
     private final OkHttpClient client;
-    private final BinanceKlineParser parser;
+    private final BinanceKlineParser klineParser;
     private final MarketStreamService marketStream;
-    private final ObjectMapper objectMapper;
 
     /**
-     * key = chatId:strategy:EXCHANGE:NETWORK:symbol:timeframe[:aggTrade]
+     * key = BINANCE:NET:chatId:TYPE:symbol:tf:CHANNEL
      */
     private final Map<String, WebSocket> sockets = new ConcurrentHashMap<>();
-    private final Map<String, AtomicLong> counters = new ConcurrentHashMap<>();
 
-    // =====================================================================
-    // SUBSCRIBE KLINE
-    // =====================================================================
+    // =====================================================
+    // PUBLIC API (используется твоим MarketDataStreamService)
+    // =====================================================
 
-    public synchronized void subscribeKline(
-            NetworkType networkType,
-            String symbol,
-            String timeframe,
-            long chatId,
-            StrategyType strategyType
-    ) {
-        String sym = normSymbol(symbol);
-        String tf  = normTf(timeframe);
+    public void subscribeAggTrade(NetworkType networkType,
+                                  String symbol,
+                                  String timeframe,
+                                  long chatId,
+                                  StrategyType strategyType) {
+        NetworkType net = (networkType != null) ? networkType : NetworkType.MAINNET;
 
-        if (sym == null || tf == null || networkType == null || strategyType == null) {
-            log.warn("⚠️ [BINANCE] subscribeKline пропуск: chatId={} type={} net={} sym='{}' tf='{}'",
-                    chatId, strategyType, networkType, symbol, timeframe);
-            return;
-        }
+        String sym = normSymbolLower(symbol);
+        String tf  = normTfLower(timeframe);
 
-        String key = buildKey(chatId, strategyType, "BINANCE", networkType, sym, tf);
+        String key = buildKey(chatId, strategyType, sym, tf, net, "AGG_TRADE");
+        if (sockets.containsKey(key)) return;
 
-        WebSocket existing = sockets.get(key);
+        String streams = sym + "@aggTrade";
+        String wsUrl = buildWsUrl(net, streams);
 
-        // ✅ если сокет есть и счётчик есть — значит уже подписаны
-        if (existing != null && counters.containsKey(key)) {
-            log.debug("⏭ [BINANCE] KLINE уже подписан {}", key);
-            return;
-        }
+        Request request = new Request.Builder().url(wsUrl).build();
 
-        // ✅ если сокет есть, а счётчика нет — состояние битое (например, после failure) -> закрываем и пересоздаём
-        if (existing != null) {
-            try { existing.close(1000, "recreate broken state"); } catch (Exception ignored) {}
-            sockets.remove(key);
-            counters.remove(key);
-        }
+        log.info("🔌 WS CONNECT BINANCE chatId={} type={} sym={} tf={} net={} channel=AGG_TRADE url={}",
+                chatId, strategyType, sym.toUpperCase(Locale.ROOT), tf, net, wsUrl);
 
-        String stream = buildKlineStream(sym, tf);
-        String url = String.format(resolveWsTemplate(networkType), stream);
-
-        log.info("🔌 [BINANCE] CONNECT KLINE key={} net={} stream={}", key, networkType, stream);
-
-        Request request = new Request.Builder().url(url).build();
-        WebSocket ws = client.newWebSocket(
-                request,
-                new SpotKlineListener(key, chatId, strategyType, networkType, sym, tf)
-        );
+        WebSocket ws = client.newWebSocket(request,
+                new AggTradeListener(key, chatId, strategyType, sym, tf, net));
 
         sockets.put(key, ws);
-        counters.put(key, new AtomicLong(0));
     }
 
-    // =====================================================================
-    // SUBSCRIBE AGG TRADE
-    // =====================================================================
+    public void unsubscribeAggTrade(NetworkType networkType,
+                                    String symbol,
+                                    String timeframe,
+                                    long chatId,
+                                    StrategyType strategyType) {
+        NetworkType net = (networkType != null) ? networkType : NetworkType.MAINNET;
 
-    public synchronized void subscribeAggTrade(
-            NetworkType networkType,
-            String symbol,
-            String timeframe,
-            long chatId,
-            StrategyType strategyType
-    ) {
-        String sym = normSymbol(symbol);
-        String tf  = normTf(timeframe);
+        String sym = normSymbolLower(symbol);
+        String tf  = normTfLower(timeframe);
 
-        if (sym == null || tf == null || networkType == null || strategyType == null) {
-            log.warn("⚠️ [BINANCE] subscribeAggTrade пропуск: chatId={} type={} net={} sym='{}' tf='{}'",
-                    chatId, strategyType, networkType, symbol, timeframe);
-            return;
-        }
+        String key = buildKey(chatId, strategyType, sym, tf, net, "AGG_TRADE");
+        closeAndRemove(key, "unsubscribe");
+    }
 
-        String key = buildAggKey(chatId, strategyType, "BINANCE", networkType, sym, tf);
+    public void subscribeKline(NetworkType networkType,
+                               String symbol,
+                               String timeframe,
+                               long chatId,
+                               StrategyType strategyType) {
+        NetworkType net = (networkType != null) ? networkType : NetworkType.MAINNET;
 
-        WebSocket existing = sockets.get(key);
+        String sym = normSymbolLower(symbol);
+        String tf  = normTfLower(timeframe);
 
-        if (existing != null && counters.containsKey(key)) {
-            log.debug("⏭ [BINANCE] AGGTRADE уже подписан {}", key);
-            return;
-        }
+        String key = buildKey(chatId, strategyType, sym, tf, net, "KLINE");
+        if (sockets.containsKey(key)) return;
 
-        // битое состояние — чистим и создаём заново
-        if (existing != null) {
-            try { existing.close(1000, "recreate broken state"); } catch (Exception ignored) {}
-            sockets.remove(key);
-            counters.remove(key);
-        }
+        String streams = sym + "@kline_" + tf;
+        String wsUrl = buildWsUrl(net, streams);
 
-        String stream = buildAggTradeStream(sym);
-        String url = String.format(resolveWsTemplate(networkType), stream);
+        Request request = new Request.Builder().url(wsUrl).build();
 
-        log.info("🔌 [BINANCE] CONNECT AGGTRADE key={} net={} stream={}", key, networkType, stream);
+        log.info("🔌 WS CONNECT BINANCE chatId={} type={} sym={} tf={} net={} channel=KLINE url={}",
+                chatId, strategyType, sym.toUpperCase(Locale.ROOT), tf, net, wsUrl);
 
-        Request request = new Request.Builder().url(url).build();
-        WebSocket ws = client.newWebSocket(
-                request,
-                new SpotAggTradeListener(key, chatId, strategyType, networkType, sym, tf)
-        );
+        WebSocket ws = client.newWebSocket(request,
+                new KlineListener(key, chatId, strategyType, sym, tf, net));
 
         sockets.put(key, ws);
-        counters.put(key, new AtomicLong(0));
     }
 
-    // =====================================================================
-    // UNSUBSCRIBE
-    // =====================================================================
+    public void unsubscribeKline(NetworkType networkType,
+                                 String symbol,
+                                 String timeframe,
+                                 long chatId,
+                                 StrategyType strategyType) {
+        NetworkType net = (networkType != null) ? networkType : NetworkType.MAINNET;
 
-    public synchronized void unsubscribeKline(
-            NetworkType networkType,
-            String symbol,
-            String timeframe,
-            long chatId,
-            StrategyType strategyType
-    ) {
-        String sym = normSymbol(symbol);
-        String tf  = normTf(timeframe);
+        String sym = normSymbolLower(symbol);
+        String tf  = normTfLower(timeframe);
 
-        if (sym == null || tf == null || networkType == null || strategyType == null) return;
-
-        String key = buildKey(chatId, strategyType, "BINANCE", networkType, sym, tf);
-
-        WebSocket ws = sockets.remove(key);
-        counters.remove(key);
-
-        if (ws != null) {
-            log.info("🧹 [BINANCE] KLINE UNSUBSCRIBE {}", key);
-            try { ws.close(1000, "client unsubscribe kline"); } catch (Exception ignored) {}
-        }
+        String key = buildKey(chatId, strategyType, sym, tf, net, "KLINE");
+        closeAndRemove(key, "unsubscribe");
     }
 
-    public synchronized void unsubscribeAggTrade(
-            NetworkType networkType,
-            String symbol,
-            String timeframe,
-            long chatId,
-            StrategyType strategyType
-    ) {
-        String sym = normSymbol(symbol);
-        String tf  = normTf(timeframe);
-
-        if (sym == null || tf == null || networkType == null || strategyType == null) return;
-
-        String key = buildAggKey(chatId, strategyType, "BINANCE", networkType, sym, tf);
-
-        WebSocket ws = sockets.remove(key);
-        counters.remove(key);
-
-        if (ws != null) {
-            log.info("🧹 [BINANCE] AGGTRADE UNSUBSCRIBE {}", key);
-            try { ws.close(1000, "client unsubscribe aggTrade"); } catch (Exception ignored) {}
-        }
-    }
-
-    // =====================================================================
+    // =====================================================
     // LISTENERS
-    // =====================================================================
+    // =====================================================
 
-    private class SpotKlineListener extends WebSocketListener {
-
+    private final class AggTradeListener extends WebSocketListener {
         private final String key;
         private final long chatId;
-        private final StrategyType strategyType;
-        private final NetworkType networkType;
+        private final StrategyType type;
+        private final String symLower;
+        private final String tfLower;
+        private final NetworkType net;
 
-        /** ✅ уже нормализованные */
-        private final String sym;
-        private final String tf;
-
-        SpotKlineListener(String key,
-                          long chatId,
-                          StrategyType strategyType,
-                          NetworkType networkType,
-                          String sym,
-                          String tf) {
+        private AggTradeListener(String key,
+                                 long chatId,
+                                 StrategyType type,
+                                 String symLower,
+                                 String tfLower,
+                                 NetworkType net) {
             this.key = key;
             this.chatId = chatId;
-            this.strategyType = strategyType;
-            this.networkType = networkType;
-            this.sym = sym;
-            this.tf = tf;
+            this.type = type;
+            this.symLower = symLower;
+            this.tfLower = tfLower;
+            this.net = net;
         }
 
         @Override
         public void onOpen(@NotNull WebSocket webSocket, @NotNull Response response) {
-            log.info("🟢 [BINANCE] KLINE WS OPEN {} (net={} http={})", key, networkType, response.code());
+            log.info("✅ WS OPEN BINANCE key={}", key);
         }
 
         @Override
         public void onMessage(@NotNull WebSocket webSocket, @NotNull String text) {
-
-            long n = counters.computeIfAbsent(key, k -> new AtomicLong(0)).incrementAndGet();
-
-            String stream = "?";
-            JSONObject dataObj;
-
-            try {
-                JsonNode root = objectMapper.readTree(text);
-                if (root.hasNonNull("stream")) stream = root.get("stream").asText();
-
-                JsonNode data = root.hasNonNull("data") ? root.get("data") : root;
-                dataObj = new JSONObject(data.toString());
-
-            } catch (Exception e) {
-                try {
-                    dataObj = new JSONObject(text);
-                } catch (Exception ex) {
-                    if (n % LOG_EVERY_N == 0) {
-                        log.warn("⚠️ [BINANCE] KLINE_IN[{}] key={} stream={} плохой json: {}",
-                                n, key, stream, ex.getMessage());
-                    }
-                    return;
-                }
-            }
-
-            if (n == 1) {
-                log.info("🟢 [BINANCE] KLINE FIRST MSG key={} net={} sym={} tf={} stream={}",
-                        key, networkType, sym, tf, stream);
-            }
-
-            if (n % LOG_EVERY_N == 0) {
-                log.info("📌 [BINANCE] KLINE_IN[{}] key={} net={} sym={} tf={} stream={}",
-                        n, key, networkType, sym, tf, stream);
-            }
-
-            try {
-                UnifiedKline kline;
-
-                try {
-                    kline = parser.parse(dataObj);
-                } catch (Exception first) {
-                    if (dataObj.has("k") && dataObj.get("k") instanceof JSONObject kObj) {
-                        kline = parser.parse(kObj);
-                    } else {
-                        throw first;
-                    }
-                }
-
-                if (kline == null) return;
-
-                // ✅ гарантируем, что kline заполнен (на всякий)
-                if (kline.getSymbol() == null || kline.getSymbol().isBlank()) kline.setSymbol(sym);
-                if (kline.getTimeframe() == null || kline.getTimeframe().isBlank()) kline.setTimeframe(tf);
-
-                // ✅ СТРОГО: symbol+timeframe в контексте
-                marketStream.onKline(chatId, strategyType, "BINANCE", networkType, sym, tf, kline);
-
-            } catch (Exception e) {
-                log.error("❌ [BINANCE] KLINE parse error key={} : {}", key, e.getMessage(), e);
-            }
+            handleAggTrade(text);
         }
 
         @Override
         public void onMessage(@NotNull WebSocket webSocket, @NotNull ByteString bytes) {
-            onMessage(webSocket, bytes.utf8());
+            handleAggTrade(bytes.utf8());
         }
 
         @Override
-        public void onFailure(@NotNull WebSocket webSocket, @NotNull Throwable t, Response response) {
-            String resp = response != null ? (response.code() + " " + response.message()) : "null";
-            log.warn("⚠️ [BINANCE] KLINE WS failure {} (resp={}): {}", key, resp, t.getMessage(), t);
-
-            sockets.remove(key, webSocket);
-            counters.remove(key);
-
-            try { webSocket.cancel(); } catch (Exception ignored) {}
+        public void onClosing(@NotNull WebSocket webSocket, int code, @NotNull String reason) {
+            log.warn("⚠️ WS CLOSING BINANCE key={} code={} reason={}", key, code, reason);
         }
 
         @Override
         public void onClosed(@NotNull WebSocket webSocket, int code, @NotNull String reason) {
-            log.warn("⚠️ [BINANCE] KLINE WS closed {} code={} reason={}", key, code, reason);
-
-            sockets.remove(key, webSocket);
-            counters.remove(key);
-        }
-    }
-
-    private class SpotAggTradeListener extends WebSocketListener {
-
-        private final String key;
-        private final long chatId;
-        private final StrategyType strategyType;
-        private final NetworkType networkType;
-
-        /** ✅ уже нормализованные */
-        private final String sym;
-        private final String tf;
-
-        SpotAggTradeListener(String key,
-                             long chatId,
-                             StrategyType strategyType,
-                             NetworkType networkType,
-                             String sym,
-                             String tf) {
-            this.key = key;
-            this.chatId = chatId;
-            this.strategyType = strategyType;
-            this.networkType = networkType;
-            this.sym = sym;
-            this.tf = tf;
+            log.warn("❌ WS CLOSED BINANCE key={} code={} reason={}", key, code, reason);
+            sockets.remove(key);
         }
 
         @Override
-        public void onOpen(@NotNull WebSocket webSocket, @NotNull Response response) {
-            log.info("🟢 [BINANCE] AGGTRADE WS OPEN {} (net={} http={})", key, networkType, response.code());
+        public void onFailure(@NotNull WebSocket webSocket, @NotNull Throwable t, Response response) {
+            String resp = (response != null) ? (response.code() + " " + response.message()) : "no-response";
+            log.error("💥 WS FAIL BINANCE key={} resp={} err={}", key, resp, t.toString());
+            sockets.remove(key);
         }
 
-        @Override
-        public void onMessage(@NotNull WebSocket webSocket, @NotNull String text) {
-
-            long n = counters.computeIfAbsent(key, k -> new AtomicLong(0)).incrementAndGet();
-
-            BigDecimal price = null;
-            BigDecimal qty = null;
-            long tradeTsMs = 0L;
-
-            String stream = "?";
-            String pStr = "?";
-            String qStr = "?";
-            String tStr = "?";
-
+        private void handleAggTrade(String raw) {
             try {
-                JsonNode root = objectMapper.readTree(text);
-                if (root.hasNonNull("stream")) stream = root.get("stream").asText();
+                JSONObject root = new JSONObject(raw);
+                JSONObject data = root.has("data") ? root.getJSONObject("data") : root;
 
-                JsonNode data = root.has("data") ? root.get("data") : root;
-                if (data != null) {
-                    if (data.hasNonNull("p")) {
-                        pStr = data.get("p").asText();
-                        price = new BigDecimal(pStr);
-                    }
-                    if (data.hasNonNull("q")) {
-                        qStr = data.get("q").asText();
-                        qty = new BigDecimal(qStr);
-                    }
-                    if (data.hasNonNull("T")) {
-                        tStr = data.get("T").asText();
-                        tradeTsMs = data.get("T").asLong();
-                    }
-                    if (tradeTsMs <= 0 && data.hasNonNull("E")) {
-                        tradeTsMs = data.get("E").asLong();
-                    }
-                }
-            } catch (Exception ignored) {
-                // ниже общий выход по price/tradeTsMs
-            }
+                String eventType = data.optString("e", "");
+                if (!"aggTrade".equalsIgnoreCase(eventType)) return;
 
-            if (n % LOG_EVERY_N == 0) {
-                log.info("📌 [BINANCE] AGGTRADE_IN[{}] key={} net={} sym={} tf={} stream={} p={} q={} T={}",
-                        n, key, networkType, sym, tf, stream, pStr, qStr, tStr);
-            }
+                String symUpper = symLower.toUpperCase(Locale.ROOT);
 
-            try {
-                if (price == null || tradeTsMs <= 0) return;
+                BigDecimal price = new BigDecimal(data.getString("p"));
+                BigDecimal qty   = new BigDecimal(data.getString("q"));
+
+                // Binance aggTrade: T = trade time
+                long ts = data.has("T") ? data.getLong("T")
+                        : (data.has("E") ? data.getLong("E") : System.currentTimeMillis());
 
                 marketStream.onAggTrade(
                         chatId,
-                        strategyType,
+                        type,
                         "BINANCE",
-                        networkType,
-                        sym,
-                        tf,
+                        net,
+                        symUpper,
+                        tfLower,
                         price,
                         qty,
-                        tradeTsMs
+                        ts
                 );
 
             } catch (Exception e) {
-                log.error("❌ [BINANCE] AGGTRADE error key={} : {}", key, e.getMessage(), e);
+                if (log.isDebugEnabled()) log.debug("WS aggTrade parse error: {}", e.toString());
             }
+        }
+    }
+
+    private final class KlineListener extends WebSocketListener {
+        private final String key;
+        private final long chatId;
+        private final StrategyType type;
+        private final String symLower;
+        private final String tfLower;
+        private final NetworkType net;
+
+        private KlineListener(String key,
+                              long chatId,
+                              StrategyType type,
+                              String symLower,
+                              String tfLower,
+                              NetworkType net) {
+            this.key = key;
+            this.chatId = chatId;
+            this.type = type;
+            this.symLower = symLower;
+            this.tfLower = tfLower;
+            this.net = net;
+        }
+
+        @Override
+        public void onOpen(@NotNull WebSocket webSocket, @NotNull Response response) {
+            log.info("✅ WS OPEN BINANCE key={}", key);
+        }
+
+        @Override
+        public void onMessage(@NotNull WebSocket webSocket, @NotNull String text) {
+            handleKline(text);
         }
 
         @Override
         public void onMessage(@NotNull WebSocket webSocket, @NotNull ByteString bytes) {
-            onMessage(webSocket, bytes.utf8());
+            handleKline(bytes.utf8());
         }
 
         @Override
-        public void onFailure(@NotNull WebSocket webSocket, @NotNull Throwable t, Response response) {
-            String resp = response != null ? (response.code() + " " + response.message()) : "null";
-            log.warn("⚠️ [BINANCE] AGGTRADE WS failure {} (resp={}): {}", key, resp, t.getMessage(), t);
-
-            sockets.remove(key, webSocket);
-            counters.remove(key);
-
-            try { webSocket.cancel(); } catch (Exception ignored) {}
+        public void onClosing(@NotNull WebSocket webSocket, int code, @NotNull String reason) {
+            log.warn("⚠️ WS CLOSING BINANCE key={} code={} reason={}", key, code, reason);
         }
 
         @Override
         public void onClosed(@NotNull WebSocket webSocket, int code, @NotNull String reason) {
-            log.warn("⚠️ [BINANCE] AGGTRADE WS closed {} code={} reason={}", key, code, reason);
+            log.warn("❌ WS CLOSED BINANCE key={} code={} reason={}", key, code, reason);
+            sockets.remove(key);
+        }
 
-            sockets.remove(key, webSocket);
-            counters.remove(key);
+        @Override
+        public void onFailure(@NotNull WebSocket webSocket, @NotNull Throwable t, Response response) {
+            String resp = (response != null) ? (response.code() + " " + response.message()) : "no-response";
+            log.error("💥 WS FAIL BINANCE key={} resp={} err={}", key, resp, t.toString());
+            sockets.remove(key);
+        }
+
+        private void handleKline(String raw) {
+            try {
+                JSONObject root = new JSONObject(raw);
+                JSONObject data = root.has("data") ? root.getJSONObject("data") : root;
+
+                String eventType = data.optString("e", "");
+                if (!"kline".equalsIgnoreCase(eventType)) return;
+
+                UnifiedKline kline = klineParser.parse(data);
+                if (kline == null) return;
+
+                String symUpper = symLower.toUpperCase(Locale.ROOT);
+
+                marketStream.onKline(
+                        chatId,
+                        type,
+                        "BINANCE",
+                        net,
+                        symUpper,
+                        tfLower,
+                        kline
+                );
+
+            } catch (Exception e) {
+                if (log.isDebugEnabled()) log.debug("WS kline parse error: {}", e.toString());
+            }
         }
     }
 
-    // =====================================================================
-    // utils
-    // =====================================================================
+    // =====================================================
+    // INTERNAL
+    // =====================================================
 
-    private static String resolveWsTemplate(NetworkType networkType) {
-        return networkType == NetworkType.TESTNET ? WS_URL_TESTNET : WS_URL_MAINNET;
-    }
+    private void closeAndRemove(String key, String reason) {
+        WebSocket ws = sockets.remove(key);
+        if (ws == null) return;
 
-    private static String buildKlineStream(String sym, String tf) {
-        return sym.toLowerCase(Locale.ROOT) + "@kline_" + tf.toLowerCase(Locale.ROOT);
-    }
+        try {
+            ws.close(1000, reason);
+        } catch (Exception ignored) {
+        }
 
-    private static String buildAggTradeStream(String sym) {
-        return sym.toLowerCase(Locale.ROOT) + "@aggTrade";
+        log.info("🔌 WS DISCONNECT BINANCE key={} reason={}", key, reason);
     }
 
     private static String buildKey(long chatId,
                                    StrategyType strategyType,
-                                   String exchange,
-                                   NetworkType networkType,
-                                   String symbol,
-                                   String timeframe) {
-        return chatId + ":" +
-               strategyType.name() + ":" +
-               exchange.toUpperCase(Locale.ROOT) + ":" +
-               networkType.name() + ":" +
-               symbol.toUpperCase(Locale.ROOT) + ":" +
-               timeframe.toLowerCase(Locale.ROOT);
+                                   String symLower,
+                                   String tfLower,
+                                   NetworkType net,
+                                   String channel) {
+        return "BINANCE:" + net + ":" + chatId + ":" + strategyType.name() + ":" + symLower + ":" + tfLower + ":" + channel;
     }
 
-    private static String buildAggKey(long chatId,
-                                      StrategyType strategyType,
-                                      String exchange,
-                                      NetworkType networkType,
-                                      String symbol,
-                                      String timeframe) {
-        return buildKey(chatId, strategyType, exchange, networkType, symbol, timeframe) + ":aggTrade";
+    private static String buildWsUrl(NetworkType networkType, String streams) {
+        String tpl = (networkType == NetworkType.TESTNET) ? WS_TEST_STREAM_TEMPLATE : WS_MAIN_STREAM_TEMPLATE;
+        return String.format(tpl, streams);
     }
 
-    private static String normSymbol(String symbol) {
-        if (symbol == null) return null;
-        String s = symbol.trim().toUpperCase(Locale.ROOT);
-        return s.isEmpty() ? null : s;
+    private static String normSymbolLower(String symbol) {
+        if (symbol == null) throw new IllegalArgumentException("symbol is null");
+        String s = symbol.trim().toLowerCase(Locale.ROOT).replace("/", "");
+        if (s.isEmpty()) throw new IllegalArgumentException("symbol is blank");
+        return s;
     }
 
-    private static String normTf(String timeframe) {
-        if (timeframe == null) return null;
+    private static String normTfLower(String timeframe) {
+        if (timeframe == null) throw new IllegalArgumentException("timeframe is null");
         String s = timeframe.trim().toLowerCase(Locale.ROOT);
-        return s.isEmpty() ? null : s;
+        if (s.isEmpty()) throw new IllegalArgumentException("timeframe is blank");
+        return s;
     }
 }

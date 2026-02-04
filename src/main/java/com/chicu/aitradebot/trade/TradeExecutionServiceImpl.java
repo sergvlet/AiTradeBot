@@ -12,6 +12,7 @@ import com.chicu.aitradebot.service.OrderService;
 import com.chicu.aitradebot.service.StrategySettingsService;
 import com.chicu.aitradebot.strategy.core.signal.Signal;
 import com.chicu.aitradebot.strategy.live.StrategyLivePublisher;
+import com.chicu.aitradebot.trade.math.QtyMath;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -41,14 +42,19 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
      */
     private static final BigDecimal TP_FEE_BUFFER_PCT = new BigDecimal("0.02"); // 0.02%
 
+    /**
+     * ✅ Анти-спам для EXIT, если биржа/guard блокирует (lot_step / min_notional и т.п.)
+     */
+    private static final String EXIT_KEY_SUFFIX = ":EXIT";
+
     private final OrderService orderService;
     private final StrategyLivePublisher live;
     private final AccountBalanceService accountBalanceService;
 
-    // ✅ настройки стратегии (для autotune по флагу) — вызываем reflection-safe
+    // ✅ настройки стратегии (для autotune/phase) — вызываем reflection-safe
     private final StrategySettingsService settingsService;
 
-    // ✅ анти-спам входа при фейле
+    // ✅ анти-спам входа/выхода при фейле
     private final TradeFailCooldownService failCooldown;
 
     // ✅ позиции + автотюнинг
@@ -133,7 +139,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             }
         }
 
-        // ✅ FIX: проверка позиции должна учитывать symbol
+        // ✅ позиция должна учитывать symbol
         if (positionStore.isInPosition(chatId, strategyType, ex, net, sym)) {
             return EntryResult.fail("already_in_position");
         }
@@ -197,6 +203,8 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         safeLive(() -> live.pushSignal(chatId, strategyType, sym, null, Signal.buy(price.doubleValue(), "entry")));
 
         if (collectMode) {
+            // ⚠️ В COLLECT мы НЕ делаем реальный BUY и НЕ открываем позицию в positionStore.
+            // Если стратегия сама помечает inPos=true — это баг в стратегии, но тут мы хотя бы НЕ создаём реальных ордеров.
             log.info("[TRADE] COLLECT ENTRY {} plannedQty={} price={} quoteAmount={} tpPct={} slPct={} tp={} sl={} chatId={} ex={} net={} phase={}",
                     sym,
                     plannedQty.stripTrailingZeros().toPlainString(),
@@ -222,6 +230,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             BigDecimal slExec = calcSl(executedPrice, slPct);
 
             failCooldown.clear(key);
+            failCooldown.clear(key + EXIT_KEY_SUFFIX);
 
             // ✅ ЕДИНСТВЕННЫЙ ИСТОЧНИК ПРАВДЫ: TradeExecution сохраняет snapshot позиции
             positionStore.markOpened(
@@ -294,25 +303,53 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         if (net == null) return ExitResult.fail("network=null");
 
         // =====================================================
+        // ✅ Важная защита: если стратегия работает в COLLECT/BACKTEST — EXIT запрещён
+        // (иначе будет спам “SELL blocked stepSize” как в твоих логах)
+        // =====================================================
+        StrategySettings ss = tryLoadSettings(chatId, strategyType, ex, net);
+        if (ss != null) {
+            String phase = normalizeUpperNullable(ss.getRunPhase());
+            boolean collectMode = ss.isCollectEnabled() || PHASE_COLLECT.equals(phase);
+            if (PHASE_BACKTEST.equals(phase)) return ExitResult.fail("runPhase=BACKTEST");
+            if (collectMode) {
+                // если вдруг positionStore держит фейковую позу — вычистим, чтобы не пытаться SELL бесконечно
+                try {
+                    positionStore.clearPosition(chatId, strategyType, ex, net, sym);
+                } catch (Exception ignored) {}
+                return ExitResult.fail("collect_mode");
+            }
+            if (PHASE_PAPER.equals(phase) && net != NetworkType.TESTNET) {
+                return ExitResult.fail("paper_requires_testnet");
+            }
+        }
+
+        final String exitKey = entryKey(chatId, strategyType, ex, net, sym) + EXIT_KEY_SUFFIX;
+        if (failCooldown.isBlocked(exitKey)) {
+            long leftMs = failCooldown.remainingMs(exitKey);
+            if (leftMs > 0) log.debug("[TRADE] EXIT SKIP (cooldown) key={} leftMs={}", exitKey, leftMs);
+            return ExitResult.fail("cooldown");
+        }
+
+        // =====================================================
         // ✅ FIX: берём tp/sl/qty из PositionStore (если есть)
         // =====================================================
         BigDecimal effQty = entryQty;
         BigDecimal effTp  = tp;
         BigDecimal effSl  = sl;
 
+        PositionStore.PositionSnapshot snap = null;
         try {
             Optional<PositionStore.PositionSnapshot> posOpt =
                     positionStore.getPosition(chatId, strategyType, ex, net, sym);
 
             if (posOpt.isPresent()) {
-                PositionStore.PositionSnapshot p = posOpt.get();
-
-                if (p.qty() != null && p.qty().signum() > 0) effQty = p.qty();
-                if (p.tp() != null && p.tp().signum() > 0) effTp = p.tp();
-                if (p.sl() != null && p.sl().signum() > 0) effSl = p.sl();
+                snap = posOpt.get();
+                if (snap.qty() != null && snap.qty().signum() > 0) effQty = snap.qty();
+                if (snap.tp() != null && snap.tp().signum() > 0) effTp = snap.tp();
+                if (snap.sl() != null && snap.sl().signum() > 0) effSl = snap.sl();
             }
         } catch (Exception ignored) {
-            // если PositionStore не умеет снапшоты — просто работаем по параметрам метода
+            // если PositionStore не умеет снапшоты — работаем по аргументам
         }
 
         if (effQty == null || effQty.signum() <= 0) return ExitResult.fail("entryQty invalid");
@@ -332,6 +369,34 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                 ex,
                 net
         );
+
+        // =====================================================
+        // ✅ Главный FIX против твоей ошибки:
+        // если qty меньше stepSize — НЕ пытаемся SELL, иначе будет бесконечный спам.
+        // Пытаемся вытащить stepSize рефлексией (если у тебя есть такой метод),
+        // иначе просто делаем мягкую защиту через обработку lot_step.
+        // =====================================================
+        BigDecimal stepSize = tryResolveStepSize(ex, net, sym);
+        if (QtyMath.isPositive(stepSize)) {
+            BigDecimal floored = QtyMath.floorToStepOrZero(effQty, stepSize);
+
+            if (!QtyMath.isPositive(floored)) {
+                // Это DUST: продать нельзя. Чтобы не спамить — ставим cooldown и выходим.
+                String msg = "qty меньше stepSize (" + QtyMath.strip(stepSize) + ")";
+                failCooldown.recordFailure(exitKey, "lot_step", msg);
+
+                log.warn("[TRADE] EXIT BLOCKED (DUST) {} chatId={} ex={} net={} qty={} stepSize={} tpHit={} slHit={}",
+                        sym, chatId, ex, net, QtyMath.strip(effQty), QtyMath.strip(stepSize), tpHit, slHit
+                );
+
+                // Если позиция в store есть — оставим её (это реальный dust),
+                // но стратегия не должна пытаться продавать каждую секунду.
+                return ExitResult.fail("lot_step");
+            }
+
+            // ✅ SELL только тем, что реально кратно шагу
+            effQty = floored;
+        }
 
         try {
             Order order = orderService.placeMarket(ctx, OrderSide.SELL, effQty, price);
@@ -356,7 +421,11 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             );
 
             // ✅ чистим позицию полностью (факт + snapshot)
-            positionStore.clearPosition(chatId, strategyType, ex, net, sym);
+            try {
+                positionStore.clearPosition(chatId, strategyType, ex, net, sym);
+            } catch (Exception ignored) {}
+
+            failCooldown.clear(exitKey);
 
             // =====================================================
             // ✅ AUTO-TUNE (reflection-safe)
@@ -381,6 +450,12 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
 
         } catch (Exception e) {
             String code = mapTradeErrorCode(e);
+
+            // ✅ анти-спам: если это lot_step/min_notional — ставим cooldown по EXIT ключу
+            if ("lot_step".equals(code) || "min_notional".equals(code)) {
+                failCooldown.recordFailure(exitKey, code, e.getMessage());
+            }
+
             log.error("[TRADE] EXIT FAILED {} chatId={} code={} err={}", sym, chatId, code, e.toString(), e);
             return ExitResult.fail(code);
         }
@@ -453,6 +528,57 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         } catch (Exception ignored) {}
 
         return null;
+    }
+
+    /**
+     * ✅ Пытаемся получить stepSize для symbol, чтобы не спамить AI-GUARD.
+     * Если в твоих сервисах нет такого метода — просто вернёт null.
+     *
+     * Поддерживаем несколько популярных сигнатур через reflection.
+     */
+    private BigDecimal tryResolveStepSize(String ex, NetworkType net, String symbol) {
+        if (orderService == null) return null;
+
+        // Вариант 1: orderService.getStepSize(exchange, network, symbol)
+        BigDecimal v = reflectBd(orderService, "getStepSize",
+                new Class<?>[]{String.class, NetworkType.class, String.class},
+                new Object[]{ex, net, symbol});
+        if (QtyMath.isPositive(v)) return v;
+
+        // Вариант 2: orderService.getLotStepSize(exchange, network, symbol)
+        v = reflectBd(orderService, "getLotStepSize",
+                new Class<?>[]{String.class, NetworkType.class, String.class},
+                new Object[]{ex, net, symbol});
+        if (QtyMath.isPositive(v)) return v;
+
+        // Вариант 3: orderService.getQtyStep(exchange, network, symbol)
+        v = reflectBd(orderService, "getQtyStep",
+                new Class<?>[]{String.class, NetworkType.class, String.class},
+                new Object[]{ex, net, symbol});
+        if (QtyMath.isPositive(v)) return v;
+
+        // Вариант 4: orderService.getSymbolStepSize(exchange, network, symbol)
+        v = reflectBd(orderService, "getSymbolStepSize",
+                new Class<?>[]{String.class, NetworkType.class, String.class},
+                new Object[]{ex, net, symbol});
+        if (QtyMath.isPositive(v)) return v;
+
+        return null;
+    }
+
+    private BigDecimal reflectBd(Object target, String method, Class<?>[] sig, Object[] args) {
+        try {
+            Method m = target.getClass().getMethod(method, sig);
+            Object r = m.invoke(target, args);
+            if (r == null) return null;
+            if (r instanceof BigDecimal bd) return bd;
+            if (r instanceof Number n) return BigDecimal.valueOf(n.doubleValue());
+            String s = String.valueOf(r).trim();
+            if (s.isEmpty() || "null".equalsIgnoreCase(s)) return null;
+            return new BigDecimal(s);
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     private static String safe(String s) {

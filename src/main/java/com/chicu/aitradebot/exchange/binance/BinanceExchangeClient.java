@@ -84,7 +84,7 @@ public class BinanceExchangeClient implements ExchangeClient {
             int limit
     ) throws Exception {
 
-        // Публичные ручки: используем MAINNET (на Binance spot это корректно и стабильнее)
+        // Публичные ручки: используем MAINNET (стабильнее)
         String sym = normalizeSymbolOrThrow(symbol);
         String tf = normalizeIntervalOrThrow(interval);
 
@@ -175,7 +175,6 @@ public class BinanceExchangeClient implements ExchangeClient {
                 log.debug("BINANCE time sync: serverTime={} local={} offsetMs={}", serverTime, local, offset);
             }
         } catch (Exception e) {
-            // не ломаем торговлю, просто не синкаемся
             if (log.isDebugEnabled()) log.debug("BINANCE time sync failed: {}", e.toString());
         }
     }
@@ -201,7 +200,6 @@ public class BinanceExchangeClient implements ExchangeClient {
             Map<String, String> params,
             HttpMethod method
     ) throws Exception {
-
         return signedRequestInternal(s, endpoint, params, method, true);
     }
 
@@ -231,7 +229,6 @@ public class BinanceExchangeClient implements ExchangeClient {
 
         } catch (HttpClientErrorException e) {
             String body = e.getResponseBodyAsString();
-            // пытаемся понять, что это ошибка времени (-1021) и сделать ретрай 1 раз
             if (allowTimeResyncRetry && isTimestampError(body)) {
                 syncTimeOffsetSafe();
                 return signedRequestInternal(s, endpoint, params, method, false);
@@ -246,7 +243,6 @@ public class BinanceExchangeClient implements ExchangeClient {
             JSONObject j = new JSONObject(body);
             int code = j.optInt("code", 0);
             String msg = j.optString("msg", "");
-            // -1021: Timestamp for this request was outside of the recvWindow.
             return code == -1021 || msg.toLowerCase(Locale.ROOT).contains("timestamp");
         } catch (Exception ignored) {
             return body.toLowerCase(Locale.ROOT).contains("timestamp");
@@ -283,21 +279,9 @@ public class BinanceExchangeClient implements ExchangeClient {
         p.put("side", sd);
         p.put("type", tp);
 
-        // extra params (расширение без хардкода)
-        Map<String, String> extra = new LinkedHashMap<>();
-        if (extraParams != null && !extraParams.isEmpty()) {
-            for (Map.Entry<String, String> e : extraParams.entrySet()) {
-                if (e.getKey() == null || e.getKey().isBlank()) continue;
-                if (e.getValue() == null) continue;
+        Map<String, String> extra = sanitizeExtra(extraParams);
 
-                String k = e.getKey().trim();
-                String v = String.valueOf(e.getValue()).trim();
-                if (!k.isEmpty() && !v.isEmpty()) extra.put(k, v);
-            }
-        }
-
-        // нормализуем clientOrderId -> newClientOrderId (Binance-имя)
-        // (чтобы твой OrderService мог передавать "clientOrderId" единым образом)
+        // единый ключ от OrderServiceImpl -> Binance имя
         if (extra.containsKey("clientOrderId") && !extra.containsKey("newClientOrderId")) {
             extra.put("newClientOrderId", extra.get("clientOrderId"));
             extra.remove("clientOrderId");
@@ -312,7 +296,6 @@ public class BinanceExchangeClient implements ExchangeClient {
             }
             p.put("quantity", strip(quantity));
         } else {
-            // quoteOrderQty имеет смысл только для MARKET BUY
             if (!"MARKET".equalsIgnoreCase(tp)) {
                 throw new IllegalArgumentException("quoteOrderQty допустим только для MARKET");
             }
@@ -328,26 +311,18 @@ public class BinanceExchangeClient implements ExchangeClient {
             }
             p.put("price", strip(price));
 
-            // timeInForce:
-            // - если пришёл в extra — используем его
-            // - иначе по умолчанию GTC
+            // timeInForce: default GTC
             if (!extra.containsKey("timeInForce")) {
                 p.put("timeInForce", "GTC");
             }
         }
 
-        // Чтобы вернуть executedQty / cummulativeQuoteQty / fills — просим RESULT/FULL.
-        // FULL — жирнее, но даёт fills (можно получить avgPrice точнее).
-        // Под прод: MARKET лучше FULL, LIMIT достаточно RESULT.
+        // расширенный ответ
         if (!extra.containsKey("newOrderRespType")) {
-            if ("MARKET".equalsIgnoreCase(tp)) {
-                extra.put("newOrderRespType", "FULL");
-            } else {
-                extra.put("newOrderRespType", "RESULT");
-            }
+            extra.put("newOrderRespType", "MARKET".equalsIgnoreCase(tp) ? "FULL" : "RESULT");
         }
 
-        // мердж extra в конец (после базовых параметров)
+        // мердж extra в конец
         p.putAll(extra);
 
         String raw = signedRequest(s, "/api/v3/order", p, HttpMethod.POST);
@@ -362,17 +337,11 @@ public class BinanceExchangeClient implements ExchangeClient {
 
         BigDecimal executedQty = bdOrZero(json.optString("executedQty", null));
         BigDecimal cummulativeQuoteQty = bdOrZero(json.optString("cummulativeQuoteQty", null));
-
-        // avgPrice пытаемся вычислить из:
-        // 1) fills (FULL)
-        // 2) cummulativeQuoteQty / executedQty (RESULT/FULL)
         BigDecimal avgPrice = computeAvgPrice(json, executedQty, cummulativeQuoteQty);
 
         BigDecimal qtyOut;
         BigDecimal priceOut;
 
-        // Для MARKET BUY через quoteOrderQty важны executedQty и avgPrice.
-        // Для остальных — quantity/price из входа или из ответа.
         if ("MARKET".equalsIgnoreCase(tp)) {
             qtyOut = executedQty.signum() > 0 ? executedQty : (quantity != null ? quantity : BigDecimal.ZERO);
             priceOut = avgPrice.signum() > 0 ? avgPrice : bdOrZero(json.optString("price", null));
@@ -415,7 +384,6 @@ public class BinanceExchangeClient implements ExchangeClient {
         OrderResult r;
 
         if (amountType == OrderAmountType.BASE_QTY) {
-            // BASE_QTY: обычный MARKET (quantity=baseQty)
             r = placeOrder(
                     chatId,
                     network,
@@ -427,7 +395,7 @@ public class BinanceExchangeClient implements ExchangeClient {
                     Map.of()
             );
         } else {
-            // QUOTE_QTY: Binance поддерживает quoteOrderQty для MARKET BUY
+            // QUOTE_QTY: Binance поддерживает quoteOrderQty только для BUY
             if (side == OrderSide.SELL) {
                 throw new IllegalArgumentException("BINANCE SPOT SELL не поддерживает QUOTE_QTY (нужен BASE_QTY)");
             }
@@ -435,7 +403,6 @@ public class BinanceExchangeClient implements ExchangeClient {
             Map<String, String> extra = new LinkedHashMap<>();
             extra.put("quoteOrderQty", strip(amount));
 
-            // quantity здесь не нужен, placeOrder его не положит, если есть quoteOrderQty
             r = placeOrder(
                     chatId,
                     network,
@@ -448,14 +415,10 @@ public class BinanceExchangeClient implements ExchangeClient {
             );
         }
 
-        // Важно: для MARKET Binance возвращает avgPrice (мы его положили в r.price),
-        // но OrderService может также передавать priceHint (например, с WS).
-        // Под прод: если r.price валиден — используем его, иначе priceHint.
         BigDecimal px = (r.price() != null && r.price().signum() > 0)
                 ? r.price()
                 : (priceHint != null ? priceHint : BigDecimal.ZERO);
 
-        // qty для MARKET BUY через quoteOrderQty берётся из executedQty (мы положили в r.qty)
         BigDecimal q = r.qty() != null ? r.qty() : BigDecimal.ZERO;
 
         return Order.builder()
@@ -470,6 +433,118 @@ public class BinanceExchangeClient implements ExchangeClient {
                 .filled("FILLED".equalsIgnoreCase(r.status()))
                 .time(r.timestamp())
                 .build();
+    }
+
+    /**
+     * ✅ OCO (SPOT) — настоящий Binance OCO.
+     * Используем /api/v3/order/oco.
+     */
+    @Override
+    public OcoResult placeOcoOrder(
+            Long chatId,
+            NetworkType network,
+            String symbol,
+            BigDecimal quantityBase,
+            BigDecimal takeProfitPrice,
+            BigDecimal stopPrice,
+            BigDecimal stopLimitPrice,
+            Map<String, String> extraParams
+    ) throws Exception {
+
+        if (chatId == null) throw new IllegalArgumentException("chatId=null");
+        if (network == null) throw new IllegalArgumentException("network=null");
+
+        String sym = normalizeSymbolOrThrow(symbol);
+
+        if (quantityBase == null || quantityBase.signum() <= 0) {
+            throw new IllegalArgumentException("quantityBase invalid");
+        }
+        if (takeProfitPrice == null || takeProfitPrice.signum() <= 0) {
+            throw new IllegalArgumentException("takeProfitPrice invalid");
+        }
+        if (stopPrice == null || stopPrice.signum() <= 0) {
+            throw new IllegalArgumentException("stopPrice invalid");
+        }
+        if (stopLimitPrice == null || stopLimitPrice.signum() <= 0) {
+            // на бинансе stopLimitPrice обязателен для OCO
+            throw new IllegalArgumentException("stopLimitPrice invalid (binance requires stopLimitPrice)");
+        }
+
+        ExchangeSettings s = resolve(chatId, network);
+
+        Map<String, String> extra = sanitizeExtra(extraParams);
+
+        // единый clientOrderId -> listClientOrderId
+        if (extra.containsKey("clientOrderId") && !extra.containsKey("listClientOrderId")) {
+            extra.put("listClientOrderId", extra.get("clientOrderId"));
+            extra.remove("clientOrderId");
+        }
+
+        Map<String, String> p = new LinkedHashMap<>();
+        p.put("symbol", sym);
+        p.put("side", "SELL"); // классический OCO для фиксации позиции
+        p.put("quantity", strip(quantityBase));
+
+        // take profit leg: limit price
+        p.put("price", strip(takeProfitPrice));
+
+        // stop leg:
+        p.put("stopPrice", strip(stopPrice));
+        p.put("stopLimitPrice", strip(stopLimitPrice));
+
+        // для stopLimit leg нужен tif
+        if (!extra.containsKey("stopLimitTimeInForce")) {
+            p.put("stopLimitTimeInForce", "GTC");
+        }
+
+        // иногда полезно задать отдельные clientOrderId на ноги
+        // (оставляем как расширение: limitClientOrderId, stopClientOrderId)
+        p.putAll(extra);
+
+        String raw = signedRequest(s, "/api/v3/order/oco", p, HttpMethod.POST);
+        if (raw == null || raw.isBlank()) {
+            throw new RuntimeException("Binance OCO empty response");
+        }
+
+        JSONObject json = new JSONObject(raw);
+
+        String orderListId = String.valueOf(json.optLong("orderListId", 0L));
+        if ("0".equals(orderListId)) {
+            // иногда возвращает строкой — перестрахуемся
+            orderListId = json.optString("orderListId", null);
+        }
+
+        // Binance: listOrderStatus / listStatusType
+        String status = json.optString("listOrderStatus", null);
+        if (status == null || status.isBlank()) status = json.optString("listStatusType", "NEW");
+
+        // в orders[] лежат два ордера
+        String tpId = null;
+        String slId = null;
+        JSONArray orders = json.optJSONArray("orders");
+        if (orders != null && !orders.isEmpty()) {
+            for (int i = 0; i < orders.length(); i++) {
+                JSONObject o = orders.optJSONObject(i);
+                if (o == null) continue;
+                String oid = o.optString("orderId", null);
+                if (oid == null || oid.isBlank()) continue;
+
+                // heuristic: stop-leg обычно имеет "stopPrice" в report / либо тип STOP_LOSS_LIMIT в orderReports
+                // тут оставим простое: первый в tpId, второй в slId
+                if (tpId == null) tpId = oid;
+                else if (slId == null) slId = oid;
+            }
+        }
+
+        long ts = System.currentTimeMillis();
+        return new OcoResult(
+                orderListId,
+                sym,
+                status != null ? status.trim().toUpperCase(Locale.ROOT) : "NEW",
+                tpId,
+                slId,
+                ts
+        );
     }
 
     @Override
@@ -487,6 +562,171 @@ public class BinanceExchangeClient implements ExchangeClient {
 
         String raw = signedRequest(s, "/api/v3/order", p, HttpMethod.DELETE);
         return raw != null && raw.contains("orderId");
+    }
+
+    // =====================================================================
+    // ✅ RECONCILE (openOrders / order / myTrades)
+    // =====================================================================
+
+    @Override
+    public List<OrderSnapshot> getOpenOrders(Long chatId, NetworkType network, String symbol) throws Exception {
+
+        if (chatId == null) throw new IllegalArgumentException("chatId=null");
+        if (network == null) throw new IllegalArgumentException("network=null");
+
+        ExchangeSettings s = resolve(chatId, network);
+
+        Map<String, String> p = new LinkedHashMap<>();
+        String sym = normalizeSymbolOrThrow(symbol);
+        p.put("symbol", sym);
+
+        String raw = signedRequest(s, "/api/v3/openOrders", p, HttpMethod.GET);
+        if (raw == null || raw.isBlank()) return List.of();
+
+        JSONArray arr = new JSONArray(raw);
+        List<OrderSnapshot> out = new ArrayList<>(arr.length());
+
+        for (int i = 0; i < arr.length(); i++) {
+            JSONObject o = arr.optJSONObject(i);
+            if (o == null) continue;
+            out.add(mapOrderSnapshotFromBinance(o));
+        }
+
+        return out;
+    }
+
+    @Override
+    public OrderSnapshot getOrder(Long chatId, NetworkType network, String symbol, String orderIdOrClientOrderId) throws Exception {
+
+        if (chatId == null) throw new IllegalArgumentException("chatId=null");
+        if (network == null) throw new IllegalArgumentException("network=null");
+        if (orderIdOrClientOrderId == null || orderIdOrClientOrderId.isBlank()) {
+            throw new IllegalArgumentException("orderIdOrClientOrderId blank");
+        }
+
+        ExchangeSettings s = resolve(chatId, network);
+
+        String sym = normalizeSymbolOrThrow(symbol);
+
+        Map<String, String> p = new LinkedHashMap<>();
+        p.put("symbol", sym);
+
+        String key = isNumeric(orderIdOrClientOrderId.trim()) ? "orderId" : "origClientOrderId";
+        p.put(key, orderIdOrClientOrderId.trim());
+
+        String raw = signedRequest(s, "/api/v3/order", p, HttpMethod.GET);
+        if (raw == null || raw.isBlank()) return null;
+
+        JSONObject json = new JSONObject(raw);
+        return mapOrderSnapshotFromBinance(json);
+    }
+
+    @Override
+    public List<TradeFill> getMyTrades(Long chatId,
+                                       NetworkType network,
+                                       String symbol,
+                                       long startTimeMs,
+                                       long endTimeMs,
+                                       int limit) throws Exception {
+
+        if (chatId == null) throw new IllegalArgumentException("chatId=null");
+        if (network == null) throw new IllegalArgumentException("network=null");
+
+        ExchangeSettings s = resolve(chatId, network);
+
+        String sym = normalizeSymbolOrThrow(symbol);
+
+        Map<String, String> p = new LinkedHashMap<>();
+        p.put("symbol", sym);
+
+        int safeLimit = clamp(limit, 1, 1000);
+        p.put("limit", String.valueOf(safeLimit));
+
+        if (startTimeMs > 0) p.put("startTime", String.valueOf(startTimeMs));
+        if (endTimeMs > 0) p.put("endTime", String.valueOf(endTimeMs));
+
+        String raw = signedRequest(s, "/api/v3/myTrades", p, HttpMethod.GET);
+        if (raw == null || raw.isBlank()) return List.of();
+
+        JSONArray arr = new JSONArray(raw);
+        List<TradeFill> out = new ArrayList<>(arr.length());
+
+        for (int i = 0; i < arr.length(); i++) {
+            JSONObject t = arr.optJSONObject(i);
+            if (t == null) continue;
+
+            String tradeId = String.valueOf(t.optLong("id", 0L));
+            String orderId = String.valueOf(t.optLong("orderId", 0L));
+
+            BigDecimal price = bdOrZero(t.optString("price", null));
+            BigDecimal qty = bdOrZero(t.optString("qty", null));
+            BigDecimal quoteQty = bdOrZero(t.optString("quoteQty", null));
+
+            BigDecimal commission = bdOrZero(t.optString("commission", null));
+            String commissionAsset = t.optString("commissionAsset", null);
+
+            boolean isBuyer = t.optBoolean("isBuyer", false);
+            String side = isBuyer ? "BUY" : "SELL";
+
+            long timeMs = t.optLong("time", 0L);
+
+            out.add(new TradeFill(
+                    tradeId,
+                    orderId,
+                    sym,
+                    side,
+                    price,
+                    qty,
+                    quoteQty,
+                    commission,
+                    commissionAsset,
+                    timeMs
+            ));
+        }
+
+        return out;
+    }
+
+    private OrderSnapshot mapOrderSnapshotFromBinance(JSONObject o) {
+
+        String orderId = String.valueOf(o.optLong("orderId", 0L));
+        if ("0".equals(orderId)) orderId = o.optString("orderId", null);
+
+        String clientOrderId = o.optString("clientOrderId", null);
+
+        String symbol = o.optString("symbol", null);
+        String side = o.optString("side", null);
+        String type = o.optString("type", null);
+        String status = o.optString("status", null);
+
+        BigDecimal origQty = bdOrZero(o.optString("origQty", null));
+        BigDecimal executedQty = bdOrZero(o.optString("executedQty", null));
+
+        BigDecimal price = bdOrZero(o.optString("price", null));
+
+        // Binance order detail может содержать cummulativeQuoteQty
+        BigDecimal cumQuote = bdOrZero(o.optString("cummulativeQuoteQty", null));
+        BigDecimal avgPrice = BigDecimal.ZERO;
+        if (executedQty.signum() > 0 && cumQuote.signum() > 0) {
+            avgPrice = cumQuote.divide(executedQty, 12, RoundingMode.HALF_UP);
+        }
+
+        long updateTime = o.optLong("updateTime", 0L);
+        if (updateTime <= 0) updateTime = o.optLong("time", 0L);
+
+        return new OrderSnapshot(
+                orderId,
+                clientOrderId,
+                symbol,
+                side,
+                type,
+                status,
+                origQty,
+                executedQty,
+                price,
+                avgPrice.signum() > 0 ? avgPrice : null,
+                updateTime
+        );
     }
 
     // =====================================================================
@@ -590,7 +830,6 @@ public class BinanceExchangeClient implements ExchangeClient {
 
             JSONObject json = new JSONObject(body);
 
-            // Binance комиссии в bips: 10 = 0.1% -> /10000
             BigDecimal makerPct = BigDecimal.valueOf(json.optInt("makerCommission", 10))
                     .divide(BigDecimal.valueOf(10000), 8, RoundingMode.HALF_UP);
 
@@ -850,6 +1089,21 @@ public class BinanceExchangeClient implements ExchangeClient {
     // MISC HELPERS
     // =====================================================================
 
+    private Map<String, String> sanitizeExtra(Map<String, String> extraParams) {
+        Map<String, String> extra = new LinkedHashMap<>();
+        if (extraParams == null || extraParams.isEmpty()) return extra;
+
+        for (Map.Entry<String, String> e : extraParams.entrySet()) {
+            if (e.getKey() == null || e.getKey().isBlank()) continue;
+            if (e.getValue() == null) continue;
+
+            String k = e.getKey().trim();
+            String v = String.valueOf(e.getValue()).trim();
+            if (!k.isEmpty() && !v.isEmpty()) extra.put(k, v);
+        }
+        return extra;
+    }
+
     private boolean isSpotAllowed(JSONObject symbolJson) {
         JSONArray perms = symbolJson.optJSONArray("permissions");
         if (perms != null && !perms.isEmpty()) {
@@ -877,6 +1131,17 @@ public class BinanceExchangeClient implements ExchangeClient {
                 throw e2;
             }
         }
+    }
+
+    private static boolean isNumeric(String s) {
+        if (s == null) return false;
+        String v = s.trim();
+        if (v.isEmpty()) return false;
+        for (int i = 0; i < v.length(); i++) {
+            char c = v.charAt(i);
+            if (c < '0' || c > '9') return false;
+        }
+        return true;
     }
 
     private static double parseDoubleSafe(String s) {

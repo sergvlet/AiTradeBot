@@ -7,14 +7,16 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
+import java.lang.reflect.Method;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Универсальный менеджер WebSocket-подписок.
  *
- * ГЛАВНОЕ ПРАВИЛО:
+ * ПРАВИЛО:
  * - Подписка ВСЕГДА должна быть в контексте (exchange + network + chatId).
  * - Никаких chatId=-1 и network=null.
  */
@@ -29,14 +31,26 @@ public class StreamConnectionManager {
     private record ConnKey(String exchange, NetworkType network, long chatId) {}
 
     /**
-     * Текущий подписанный символ на ключ подключения.
-     * Ключ: (exchange, network, chatId) -> symbol
+     * (exchange, network, chatId) -> symbol
      */
     private final Map<ConnKey, String> currentSymbol = new ConcurrentHashMap<>();
 
     /**
+     * Lock per ConnKey (чтобы не блокировать все чаты одновременно)
+     */
+    private final Map<ConnKey, Object> locks = new ConcurrentHashMap<>();
+
+    private Object lockFor(ConnKey key) {
+        return locks.computeIfAbsent(key, k -> new Object());
+    }
+
+    // ============================================================
+    // Legacy method (compile only)
+    // ============================================================
+
+    /**
      * Старый метод оставляем только чтобы компилилось.
-     * ✅ БОЛЬШЕ НИЧЕГО НЕ ДЕЛАЕТ, чтобы не было смешения потоков.
+     * ✅ БОЛЬШЕ НИЧЕГО НЕ ДЕЛАЕТ.
      */
     @Deprecated
     public void subscribeSymbol(String exchangeName, String rawSymbol) {
@@ -48,8 +62,11 @@ public class StreamConnectionManager {
                 "Вызов проигнорирован. ex={} symbol={}",
                 ex, sym
         );
-        // НИЧЕГО НЕ ДЕЛАЕМ!
     }
+
+    // ============================================================
+    // Public API
+    // ============================================================
 
     /**
      * Новый безопасный метод.
@@ -61,7 +78,7 @@ public class StreamConnectionManager {
             return;
         }
         if (networkType == null) {
-            log.error("❌ subscribeSymbol: networkType == null → ПРОПУСК (нельзя подписываться без сети)");
+            log.error("❌ subscribeSymbol: networkType == null → ПРОПУСК");
             return;
         }
         if (chatId <= 0) {
@@ -71,33 +88,35 @@ public class StreamConnectionManager {
 
         String symbol = normalizeSymbol(rawSymbol);
         if (symbol.isEmpty()) {
-            log.warn("⚠ subscribeSymbol: пустой символ → ПРОПУСК (chatId={}, ex={}, net={})", chatId, exchangeName, networkType);
+            log.warn("⚠ subscribeSymbol: пустой символ → ПРОПУСК (chatId={}, ex={}, net={})",
+                    chatId, exchangeName, networkType);
             return;
         }
 
         String ex = exchangeName.trim().toUpperCase(Locale.ROOT);
         ConnKey key = new ConnKey(ex, networkType, chatId);
 
-        String prev = currentSymbol.get(key);
-        if (symbol.equals(prev)) {
-            log.debug("⏭ Уже подписаны: chatId={} ex={} net={} symbol={}", chatId, ex, networkType, symbol);
-            return;
-        }
+        synchronized (lockFor(key)) {
+            String prev = currentSymbol.get(key);
+            if (symbol.equals(prev)) {
+                log.debug("⏭ Уже подписаны: chatId={} ex={} net={} symbol={}", chatId, ex, networkType, symbol);
+                return;
+            }
 
-        log.info("📡 subscribeSymbol(chatId={}, ex={}, net={}, symbol={}, prev={})",
-                chatId, ex, networkType, symbol, prev);
+            log.info("📡 subscribeSymbol(chatId={}, ex={}, net={}, symbol={}, prev={})",
+                    chatId, ex, networkType, symbol, prev);
 
-        switch (ex) {
-            case "BINANCE" -> switchSymbolBinance(key, prev, symbol);
-            case "BYBIT"   -> switchSymbolBybit(key, prev, symbol);
-            default -> log.warn("⚠ Неизвестная биржа '{}': подписка пропущена (chatId={}, net={}, symbol={})",
-                    ex, chatId, networkType, symbol);
+            switch (ex) {
+                case "BINANCE" -> switchSymbolBinance(key, prev, symbol);
+                case "BYBIT"   -> switchSymbolBybit(key, prev, symbol);
+                default -> log.warn("⚠ Неизвестная биржа '{}': подписка пропущена (chatId={}, net={}, symbol={})",
+                        ex, chatId, networkType, symbol);
+            }
         }
     }
 
     /**
-     * Отписать текущий символ для конкретного контекста (exchange+network+chatId).
-     * Удобно при остановке стратегии.
+     * Отписать текущий символ для конкретного контекста.
      */
     public void unsubscribeCurrent(String exchangeName, NetworkType networkType, long chatId) {
         if (exchangeName == null || exchangeName.isBlank() || networkType == null || chatId <= 0) return;
@@ -105,69 +124,122 @@ public class StreamConnectionManager {
         String ex = exchangeName.trim().toUpperCase(Locale.ROOT);
         ConnKey key = new ConnKey(ex, networkType, chatId);
 
-        String prev = currentSymbol.remove(key);
-        if (prev == null) return;
+        synchronized (lockFor(key)) {
+            String prev = currentSymbol.remove(key);
+            if (prev == null) return;
 
-        log.info("🧹 unsubscribeCurrent(chatId={}, ex={}, net={}, symbol={})", chatId, ex, networkType, prev);
+            log.info("🧹 unsubscribeCurrent(chatId={}, ex={}, net={}, symbol={})", chatId, ex, networkType, prev);
 
-        switch (ex) {
-            case "BINANCE" -> safeUnsubscribeBinance(prev);
-            case "BYBIT"   -> safeUnsubscribeBybit(prev);
-            default -> { /* ignore */ }
+            switch (ex) {
+                case "BINANCE" -> safeUnsubscribeBinance(networkType, prev);
+                case "BYBIT"   -> safeUnsubscribeBybit(prev);
+                default -> { /* ignore */ }
+            }
         }
     }
 
-    // =====================================================================
+    // ============================================================
     // BINANCE
-    // =====================================================================
+    // ============================================================
 
-    private synchronized void switchSymbolBinance(ConnKey key, String prevSymbol, String nextSymbol) {
-        ensureBinanceConnected();
+    /**
+     * ✅ Лучший порядок:
+     * 1) subscribe(next)
+     * 2) если успешно → unsubscribe(prev)
+     * 3) currentSymbol = next
+     */
+    private void switchSymbolBinance(ConnKey key, String prevSymbol, String nextSymbol) {
 
-        if (prevSymbol != null && !prevSymbol.equals(nextSymbol)) {
-            safeUnsubscribeBinance(prevSymbol);
-        }
+        boolean subscribed = false;
 
         try {
-            binance.subscribeTicker(nextSymbol);
-            currentSymbol.put(key, nextSymbol);
-            log.info("✅ Binance WS subscribed → {} (chatId={}, net={})", nextSymbol, key.chatId(), key.network());
+            // ✅ поддерживаем оба варианта сигнатур:
+            // - subscribeTicker(NetworkType, String)
+            // - subscribeTicker(String)
+            subscribed = invokeBinanceSubscribe(key.network(), nextSymbol);
+
+            if (subscribed) {
+                currentSymbol.put(key, nextSymbol);
+                log.info("✅ Binance WS subscribed → {} (chatId={}, net={})", nextSymbol, key.chatId(), key.network());
+            } else {
+                log.error("❌ Binance subscribe skipped (no matching method) chatId={} net={} symbol={}",
+                        key.chatId(), key.network(), nextSymbol);
+                return;
+            }
         } catch (Exception ex) {
             log.error("❌ Binance subscribe error (chatId={}, net={}, symbol={}): {}",
                     key.chatId(), key.network(), nextSymbol, ex.getMessage(), ex);
+            return;
+        }
+
+        // ✅ только после успешной подписки — отписываем прошлый
+        if (prevSymbol != null && !Objects.equals(prevSymbol, nextSymbol)) {
+            safeUnsubscribeBinance(key.network(), prevSymbol);
         }
     }
 
-    private void safeUnsubscribeBinance(String symbol) {
+    private void safeUnsubscribeBinance(NetworkType net, String symbol) {
         try {
-            binance.unsubscribeTicker(symbol);
-            log.info("🔌 Binance unsubscribed: {}", symbol);
+            boolean ok = invokeBinanceUnsubscribe(net, symbol);
+            if (ok) {
+                log.info("🔌 Binance unsubscribed: {} (net={})", symbol, net);
+            } else {
+                log.warn("⚠ Binance unsubscribe skipped (no matching method) net={} symbol={}", net, symbol);
+            }
         } catch (Exception ex) {
             log.warn("⚠ Binance unsubscribe error: {}", ex.getMessage());
         }
     }
 
-    private void ensureBinanceConnected() {
-        try {
-            if (!binance.isConnected()) {
-                binance.connect();
-                log.info("🔌 Binance WS подключён (lazy connect)");
-            }
-        } catch (Exception ex) {
-            log.error("❌ Binance connect error: {}", ex.getMessage(), ex);
+    /**
+     * Reflection-адаптер, чтобы класс компилился при любой сигнатуре адаптера Binance.
+     */
+    private boolean invokeBinanceSubscribe(NetworkType net, String symbol) throws Exception {
+        // 1) subscribeTicker(NetworkType, String)
+        Method m1 = findMethod(binance.getClass(), "subscribeTicker", NetworkType.class, String.class);
+        if (m1 != null) {
+            m1.invoke(binance, net, symbol);
+            return true;
         }
+        // 2) subscribeTicker(String)
+        Method m2 = findMethod(binance.getClass(), "subscribeTicker", String.class);
+        if (m2 != null) {
+            m2.invoke(binance, symbol);
+            return true;
+        }
+        return false;
     }
 
-    // =====================================================================
-    // BYBIT
-    // =====================================================================
-
-    private synchronized void switchSymbolBybit(ConnKey key, String prevSymbol, String nextSymbol) {
-        ensureBybitConnected();
-
-        if (prevSymbol != null && !prevSymbol.equals(nextSymbol)) {
-            safeUnsubscribeBybit(prevSymbol);
+    private boolean invokeBinanceUnsubscribe(NetworkType net, String symbol) throws Exception {
+        // 1) unsubscribeTicker(NetworkType, String)
+        Method m1 = findMethod(binance.getClass(), "unsubscribeTicker", NetworkType.class, String.class);
+        if (m1 != null) {
+            m1.invoke(binance, net, symbol);
+            return true;
         }
+        // 2) unsubscribeTicker(String)
+        Method m2 = findMethod(binance.getClass(), "unsubscribeTicker", String.class);
+        if (m2 != null) {
+            m2.invoke(binance, symbol);
+            return true;
+        }
+        return false;
+    }
+
+    // ============================================================
+    // BYBIT
+    // ============================================================
+
+    /**
+     * BybitMarketStreamAdapter сейчас ticker-only и без network overload.
+     * В контексте мы network держим для чистоты, но вызов идёт по symbol.
+     *
+     * ✅ Лучший порядок:
+     * 1) subscribe(next)
+     * 2) currentSymbol = next
+     * 3) unsubscribe(prev)
+     */
+    private void switchSymbolBybit(ConnKey key, String prevSymbol, String nextSymbol) {
 
         try {
             bybit.subscribeTicker(nextSymbol);
@@ -176,6 +248,11 @@ public class StreamConnectionManager {
         } catch (Exception ex) {
             log.error("❌ Bybit subscribe error (chatId={}, net={}, symbol={}): {}",
                     key.chatId(), key.network(), nextSymbol, ex.getMessage(), ex);
+            return;
+        }
+
+        if (prevSymbol != null && !Objects.equals(prevSymbol, nextSymbol)) {
+            safeUnsubscribeBybit(prevSymbol);
         }
     }
 
@@ -188,23 +265,20 @@ public class StreamConnectionManager {
         }
     }
 
-    private void ensureBybitConnected() {
-        try {
-            if (!bybit.isConnected()) {
-                bybit.connect();
-                log.info("🔌 Bybit WS подключён (lazy connect)");
-            }
-        } catch (Exception ex) {
-            log.error("❌ Bybit connect error: {}", ex.getMessage(), ex);
-        }
-    }
-
-    // =====================================================================
+    // ============================================================
     // HELPERS
-    // =====================================================================
+    // ============================================================
 
     private String normalizeSymbol(String s) {
         if (s == null) return "";
         return s.trim().replace("/", "").toUpperCase(Locale.ROOT);
+    }
+
+    private static Method findMethod(Class<?> cls, String name, Class<?>... params) {
+        try {
+            return cls.getMethod(name, params);
+        } catch (NoSuchMethodException e) {
+            return null;
+        }
     }
 }

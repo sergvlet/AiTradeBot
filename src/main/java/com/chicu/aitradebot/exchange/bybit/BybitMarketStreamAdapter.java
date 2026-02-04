@@ -1,5 +1,6 @@
 package com.chicu.aitradebot.exchange.bybit;
 
+import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.market.stream.MarketStreamRouter;
 import com.chicu.aitradebot.market.stream.Tick;
 import lombok.RequiredArgsConstructor;
@@ -11,6 +12,7 @@ import org.json.JSONObject;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -19,81 +21,144 @@ import java.util.concurrent.ConcurrentHashMap;
 @RequiredArgsConstructor
 public class BybitMarketStreamAdapter {
 
-    private static final String WS_URL = "wss://stream.bybit.com/v5/public/spot";
+    // Bybit V5 WS public spot:
+    // mainnet: wss://stream.bybit.com/v5/public/spot
+    // testnet: wss://stream-testnet.bybit.com/v5/public/spot
+    private static final String WS_URL_MAINNET = "wss://stream.bybit.com/v5/public/spot";
+    private static final String WS_URL_TESTNET = "wss://stream-testnet.bybit.com/v5/public/spot";
 
     private final MarketStreamRouter router;
-    private final OkHttpClient client; // ✅ DI, БЕЗ new
+    private final OkHttpClient client; // ✅ DI
 
-    private WebSocket webSocket;
+    /**
+     * ✅ Раздельные подключения по сети (MAINNET/TESTNET), чтобы не было каши.
+     */
+    private final Map<NetworkType, WebSocket> sockets = new ConcurrentHashMap<>();
 
-    /** ✔ thread-safe set */
-    private final Set<String> subscribedTopics =
-            ConcurrentHashMap.newKeySet();
+    /**
+     * ✅ Раздельные подписки по сети.
+     */
+    private final Map<NetworkType, Set<String>> subscribedTopicsByNet = new ConcurrentHashMap<>();
 
     // ============================================================
     // 🔌 CONNECT / DISCONNECT
     // ============================================================
 
-    public synchronized void connect() {
-        if (webSocket != null) {
-            log.info("🔁 Bybit WS уже подключён");
+    public synchronized void connect(NetworkType networkType) {
+        NetworkType net = (networkType == null) ? NetworkType.MAINNET : networkType;
+
+        if (sockets.get(net) != null) {
+            log.info("🔁 Bybit WS уже подключён (net={})", net);
             return;
         }
 
-        Request req = new Request.Builder()
-                .url(WS_URL)
-                .build();
+        String url = wsUrl(net);
+        Request req = new Request.Builder().url(url).build();
 
-        webSocket = client.newWebSocket(req, new BybitListener());
-        log.info("🔌 Bybit WS подключен (TICKER ONLY)");
+        WebSocket ws = client.newWebSocket(req, new BybitListener(net));
+        sockets.put(net, ws);
+
+        subscribedTopicsByNet.computeIfAbsent(net, __ -> ConcurrentHashMap.newKeySet());
+
+        log.info("🔌 Bybit WS подключен (TICKER ONLY) net={} url={}", net, url);
+    }
+
+    public synchronized void disconnect(NetworkType networkType) {
+        NetworkType net = (networkType == null) ? NetworkType.MAINNET : networkType;
+
+        WebSocket ws = sockets.remove(net);
+        if (ws != null) {
+            try {
+                ws.close(1000, "shutdown");
+            } catch (Exception ignored) {}
+        }
+
+        Set<String> topics = subscribedTopicsByNet.remove(net);
+        if (topics != null) topics.clear();
+
+        log.info("🔌 Bybit WS отключен (net={})", net);
+    }
+
+    public boolean isConnected(NetworkType networkType) {
+        NetworkType net = (networkType == null) ? NetworkType.MAINNET : networkType;
+        return sockets.get(net) != null;
+    }
+
+    // ============================================================
+    // ✅ BACKWARD COMPAT (старые методы без сети)
+    // ============================================================
+
+    public synchronized void connect() {
+        connect(NetworkType.MAINNET);
     }
 
     public synchronized void disconnect() {
-        if (webSocket != null) {
-            webSocket.close(1000, "shutdown");
-            webSocket = null;
-            subscribedTopics.clear();
-            log.info("🔌 Bybit WS отключен");
-        }
+        disconnect(NetworkType.MAINNET);
     }
 
     public boolean isConnected() {
-        return webSocket != null;
+        return isConnected(NetworkType.MAINNET);
     }
 
     // ============================================================
     // 📡 SUBSCRIBE / UNSUBSCRIBE (TICKER ONLY)
     // ============================================================
 
-    public synchronized void subscribeTicker(String symbol) {
+    /**
+     * ✅ Новый метод (как у тебя в StreamConnectionManager): с networkType
+     */
+    public synchronized void subscribeTicker(NetworkType networkType, String symbol) {
+        NetworkType net = (networkType == null) ? NetworkType.MAINNET : networkType;
+
         String sym = normalize(symbol);
         if (sym.isEmpty()) return;
 
-        if (webSocket == null) connect();
+        if (sockets.get(net) == null) connect(net);
 
         String topic = "tickers." + sym;
-        if (!subscribedTopics.add(topic)) return;
 
-        send("subscribe", topic);
+        Set<String> topics = subscribedTopicsByNet.computeIfAbsent(net, __ -> ConcurrentHashMap.newKeySet());
+        if (!topics.add(topic)) return;
+
+        send(net, "subscribe", topic);
+    }
+
+    /**
+     * ✅ Новый метод (как у тебя в StreamConnectionManager): с networkType
+     */
+    public synchronized void unsubscribeTicker(NetworkType networkType, String symbol) {
+        NetworkType net = (networkType == null) ? NetworkType.MAINNET : networkType;
+
+        String sym = normalize(symbol);
+        if (sym.isEmpty()) return;
+
+        String topic = "tickers." + sym;
+
+        Set<String> topics = subscribedTopicsByNet.computeIfAbsent(net, __ -> ConcurrentHashMap.newKeySet());
+        if (!topics.remove(topic)) return;
+
+        send(net, "unsubscribe", topic);
+    }
+
+    /**
+     * Старые методы оставляем — делегируем в MAINNET
+     */
+    public synchronized void subscribeTicker(String symbol) {
+        subscribeTicker(NetworkType.MAINNET, symbol);
     }
 
     public synchronized void unsubscribeTicker(String symbol) {
-        String sym = normalize(symbol);
-        if (sym.isEmpty()) return;
-
-        String topic = "tickers." + sym;
-        if (!subscribedTopics.remove(topic)) return;
-
-        send("unsubscribe", topic);
+        unsubscribeTicker(NetworkType.MAINNET, symbol);
     }
 
     // ============================================================
     // 📨 SEND
     // ============================================================
 
-    private void send(String op, String topic) {
-        if (webSocket == null) {
-            log.warn("⚠️ Bybit WS send skipped — ws == null, topic={}", topic);
+    private void send(NetworkType net, String op, String topic) {
+        WebSocket ws = sockets.get(net);
+        if (ws == null) {
+            log.warn("⚠️ Bybit WS send skipped — ws == null (net={}), topic={}", net, topic);
             return;
         }
 
@@ -101,8 +166,8 @@ public class BybitMarketStreamAdapter {
                 .put("op", op)
                 .put("args", new JSONArray().put(topic));
 
-        webSocket.send(req.toString());
-        log.info("📡 [BYBIT] {} {}", op.toUpperCase(), topic);
+        ws.send(req.toString());
+        log.info("📡 [BYBIT] {} {} (net={})", op.toUpperCase(), topic, net);
     }
 
     // ============================================================
@@ -111,9 +176,15 @@ public class BybitMarketStreamAdapter {
 
     private class BybitListener extends WebSocketListener {
 
+        private final NetworkType net;
+
+        private BybitListener(NetworkType net) {
+            this.net = (net == null) ? NetworkType.MAINNET : net;
+        }
+
         @Override
         public void onOpen(WebSocket ws, Response response) {
-            log.info("✅ Bybit WS onOpen");
+            log.info("✅ Bybit WS onOpen (net={})", net);
         }
 
         @Override
@@ -121,6 +192,7 @@ public class BybitMarketStreamAdapter {
             try {
                 JSONObject obj = new JSONObject(text);
 
+                // ping/pong/ack
                 if ("pong".equalsIgnoreCase(obj.optString("op"))) return;
                 if (obj.optBoolean("success")) return;
 
@@ -130,7 +202,7 @@ public class BybitMarketStreamAdapter {
                 }
 
             } catch (Exception e) {
-                log.error("❌ Bybit WS parse error: {}", e.getMessage(), e);
+                log.error("❌ Bybit WS parse error (net={}): {}", net, e.getMessage(), e);
             }
         }
 
@@ -141,8 +213,13 @@ public class BybitMarketStreamAdapter {
 
         @Override
         public void onFailure(WebSocket ws, Throwable t, Response response) {
-            log.error("❌ Bybit WS failure: {}", t.getMessage(), t);
-            webSocket = null;
+            log.error("❌ Bybit WS failure (net={}): {}", net, t.getMessage(), t);
+
+            // ✅ сбрасываем сокет для этой сети (и подписки), чтобы следующий subscribe сделал reconnect
+            sockets.remove(net);
+
+            Set<String> topics = subscribedTopicsByNet.remove(net);
+            if (topics != null) topics.clear();
         }
     }
 
@@ -171,6 +248,8 @@ public class BybitMarketStreamAdapter {
             BigDecimal price = new BigDecimal(priceStr);
             long ts = obj.optLong("ts", System.currentTimeMillis());
 
+            // ⚠️ В Tick у тебя сейчас нет networkType/chatId.
+            // Если будешь одновременно держать MAINNET и TESTNET по BYBIT — лучше расширить Tick.
             router.route(new Tick(
                     "BYBIT",
                     symbol,
@@ -183,7 +262,15 @@ public class BybitMarketStreamAdapter {
         }
     }
 
-    private String normalize(String s) {
+    // ============================================================
+    // HELPERS
+    // ============================================================
+
+    private static String wsUrl(NetworkType net) {
+        return net == NetworkType.TESTNET ? WS_URL_TESTNET : WS_URL_MAINNET;
+    }
+
+    private static String normalize(String s) {
         return s == null ? "" : s.replace("/", "").trim().toUpperCase();
     }
 }

@@ -1,150 +1,168 @@
 "use strict";
 
 /**
- * Мини-обёртка над fetch:
- * - JSON POST
- * - form-urlencoded POST
- *
- * ✅ FIX (чтобы сохранение работало стабильно):
- * 1) Добавлен GET JSON (нужен вкладкам: balance/advanced/symbols если захочешь через SettingsApi)
- * 2) Добавлен авто-парсинг ошибок (пытаемся прочитать JSON/text и показать полезное в консоли)
- * 3) Добавлен таймаут (по умолчанию 20с) + AbortController
- * 4) postForm теперь отправляет корректную строку (URLSearchParams(...).toString())
- * 5) Всегда ставим Accept: application/json
+ * SettingsApi
+ * - CSRF friendly (meta + hidden input)
+ * - same-origin cookies
+ * - safe error parsing (JSON/HTML/text)
  */
 window.SettingsApi = (function () {
 
-    const DEFAULT_TIMEOUT_MS = 20000;
-
-    function buildTimeoutSignal(timeoutMs) {
-        const controller = new AbortController();
-        const t = setTimeout(() => controller.abort("timeout"), Math.max(1, timeoutMs | 0));
-        return { controller, signal: controller.signal, cleanup: () => clearTimeout(t) };
+    function isBlank(s) {
+        return s === null || s === undefined || String(s).trim() === "";
     }
 
-    async function readErrorPayload(res) {
-        // пытаемся разобрать JSON, если нет — текст
-        const ct = (res.headers.get("content-type") || "").toLowerCase();
-        try {
-            if (ct.includes("application/json")) {
-                return await res.json();
+    function readCsrf() {
+        const tokenMeta = document.querySelector('meta[name="_csrf"]');
+        const headerMeta = document.querySelector('meta[name="_csrf_header"]');
+
+        const token = tokenMeta?.getAttribute("content") || "";
+        const header = headerMeta?.getAttribute("content") || "";
+
+        if (token && header) return { token, header, paramName: "_csrf" };
+
+        // fallback: hidden input
+        const input = document.querySelector('input[type="hidden"][name="_csrf"]');
+        if (input?.value) return { token: input.value, header: "X-CSRF-TOKEN", paramName: "_csrf" };
+
+        const any = document.querySelector('input[type="hidden"][name*="csrf" i]');
+        if (any?.value) return { token: any.value, header: "X-CSRF-TOKEN", paramName: any.name || "_csrf" };
+
+        return null;
+    }
+
+    async function readBodySafe(resp) {
+        const ct = (resp.headers.get("content-type") || "").toLowerCase();
+        const text = await resp.text().catch(() => "");
+        if (!text) return { kind: "empty", text: "" };
+
+        if (ct.includes("application/json")) {
+            try { return { kind: "json", json: JSON.parse(text), text }; } catch (_) {}
+        } else {
+            // иногда сервер отдаёт JSON как text/plain
+            const trimmed = text.trim();
+            if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+                try { return { kind: "json", json: JSON.parse(trimmed), text }; } catch (_) {}
             }
-        } catch (_) { /* ignore */ }
-
-        try {
-            const text = await res.text();
-            return text ? { message: text } : {};
-        } catch (_) {
-            return {};
         }
+        return { kind: "text", text };
     }
 
-    async function ensureJsonOrEmpty(res) {
-        // иногда у тебя может быть пустой ответ
-        const ct = (res.headers.get("content-type") || "").toLowerCase();
-        if (!ct.includes("application/json")) {
-            // если не json — попробуем текст, но не падаем
-            try {
-                const t = await res.text();
-                return t ? { message: t } : {};
-            } catch (_) {
-                return {};
-            }
+    function prettifyError(status, body) {
+        if (!body) return `HTTP ${status}`;
+
+        // если это JSON с полями message/error/path/code — красиво соберём
+        if (body.kind === "json" && body.json && typeof body.json === "object") {
+            const obj = body.json;
+            const msg = obj.message || obj.error || obj.details || `HTTP ${status}`;
+            const path = obj.path ? `\nПуть: ${obj.path}` : "";
+            const code = obj.code ? `\nКод: ${obj.code}` : "";
+            return `${msg}${path}${code}`;
         }
-        try {
-            return await res.json();
-        } catch (_) {
-            return {};
+
+        // если это HTML — режем
+        if (body.kind === "text") {
+            const t = String(body.text || "");
+            const cut = t.replace(/\s+/g, " ").trim().slice(0, 240);
+            return `HTTP ${status}: ${cut}`;
         }
+
+        return `HTTP ${status}`;
     }
 
-    async function getJson(url, opts) {
-        const timeoutMs = (opts && Number.isFinite(opts.timeoutMs)) ? opts.timeoutMs : DEFAULT_TIMEOUT_MS;
-        const { signal, cleanup } = buildTimeoutSignal(timeoutMs);
-
-        try {
-            const res = await fetch(url, {
-                method: "GET",
-                headers: {
-                    "Accept": "application/json",
-                    "X-Requested-With": "XMLHttpRequest"
-                },
-                signal
-            });
-
-            if (!res.ok) {
-                const payload = await readErrorPayload(res);
-                console.error("SettingsApi GET failed", { url, status: res.status, payload });
-                const msg = payload?.message || payload?.error || ("HTTP " + res.status);
-                throw new Error(msg);
-            }
-
-            return await ensureJsonOrEmpty(res);
-        } finally {
-            cleanup();
-        }
+    function withCsrfHeaders(headers) {
+        const csrf = readCsrf();
+        if (csrf?.token && csrf?.header) headers[csrf.header] = csrf.token;
+        return headers;
     }
 
-    async function postJson(url, payload, opts) {
-        const timeoutMs = (opts && Number.isFinite(opts.timeoutMs)) ? opts.timeoutMs : DEFAULT_TIMEOUT_MS;
-        const { signal, cleanup } = buildTimeoutSignal(timeoutMs);
-
-        try {
-            const res = await fetch(url, {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                    "X-Requested-With": "XMLHttpRequest"
-                },
-                body: JSON.stringify(payload || {}),
-                signal
-            });
-
-            if (!res.ok) {
-                const err = await readErrorPayload(res);
-                console.error("SettingsApi POST JSON failed", { url, status: res.status, err, payload });
-                const msg = err?.message || err?.error || ("HTTP " + res.status);
-                throw new Error(msg);
-            }
-
-            return await ensureJsonOrEmpty(res);
-        } finally {
-            cleanup();
+    function withCsrfParam(params) {
+        const csrf = readCsrf();
+        if (csrf?.token && csrf?.paramName && !params.has(csrf.paramName)) {
+            params.append(csrf.paramName, csrf.token);
         }
+        return params;
     }
 
-    async function postForm(url, form, opts) {
-        const timeoutMs = (opts && Number.isFinite(opts.timeoutMs)) ? opts.timeoutMs : DEFAULT_TIMEOUT_MS;
-        const { signal, cleanup } = buildTimeoutSignal(timeoutMs);
+    async function getJson(url) {
+        const headers = withCsrfHeaders({
+            "Accept": "application/json",
+            "X-Requested-With": "fetch"
+        });
 
-        // важно: body должен быть строкой или URLSearchParams
-        const params = new URLSearchParams(form || {});
+        const resp = await fetch(url, {
+            method: "GET",
+            credentials: "same-origin",
+            headers
+        });
 
-        try {
-            const res = await fetch(url, {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                    "Accept": "application/json",
-                    "X-Requested-With": "XMLHttpRequest"
-                },
-                body: params.toString(),
-                signal
-            });
-
-            if (!res.ok) {
-                const err = await readErrorPayload(res);
-                console.error("SettingsApi POST FORM failed", { url, status: res.status, err, form });
-                const msg = err?.message || err?.error || ("HTTP " + res.status);
-                throw new Error(msg);
-            }
-
-            return await ensureJsonOrEmpty(res);
-        } finally {
-            cleanup();
+        if (!resp.ok) {
+            const body = await readBodySafe(resp);
+            throw new Error(prettifyError(resp.status, body));
         }
+
+        const body = await readBodySafe(resp);
+        if (body.kind === "json") return body.json;
+        // fallback: пусто / текст
+        return {};
     }
 
-    return { getJson, postJson, postForm };
+    async function postForm(url, data) {
+        const params = new URLSearchParams();
+
+        Object.entries(data || {}).forEach(([k, v]) => {
+            if (v === undefined || v === null) return;
+            params.append(k, String(v));
+        });
+
+        withCsrfParam(params);
+
+        const headers = withCsrfHeaders({
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Accept": "application/json",
+            "X-Requested-With": "fetch"
+        });
+
+        const resp = await fetch(url, {
+            method: "POST",
+            credentials: "same-origin",
+            headers,
+            body: params.toString()
+        });
+
+        if (!resp.ok) {
+            const body = await readBodySafe(resp);
+            throw new Error(prettifyError(resp.status, body));
+        }
+
+        const body = await readBodySafe(resp);
+        if (body.kind === "json") return body.json;
+        return true;
+    }
+
+    async function postJson(url, payload) {
+        const headers = withCsrfHeaders({
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-Requested-With": "fetch"
+        });
+
+        const resp = await fetch(url, {
+            method: "POST",
+            credentials: "same-origin",
+            headers,
+            body: JSON.stringify(payload || {})
+        });
+
+        if (!resp.ok) {
+            const body = await readBodySafe(resp);
+            throw new Error(prettifyError(resp.status, body));
+        }
+
+        const body = await readBodySafe(resp);
+        if (body.kind === "json") return body.json;
+        return {};
+    }
+
+    return { getJson, postForm, postJson };
 })();

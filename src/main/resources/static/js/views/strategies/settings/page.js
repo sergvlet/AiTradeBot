@@ -1,227 +1,153 @@
 "use strict";
 
 /**
- * Главный файл страницы:
- * - собирает контекст (chatId/type/exchange/network/baseUrl)
- * - табы (переключение + сохранение)
- * - вызывает init вкладок (строго один раз на вкладку)
- * - ✅ синхронизирует AdvancedControlMode между вкладками (MANUAL/HYBRID/AI)
- *
- * FIX: SettingsTabAdvanced может называться иначе — делаем алиас + безопасный вызов.
+ * Strategy Settings Page Bootstrap
+ * - tabs persistence (per chatId/type/exchange/network)
+ * - lazy init per-tab scripts
+ * - safe + no spam
  */
 (function () {
 
-    if (window.__StrategySettingsPageInited) return;
-    window.__StrategySettingsPageInited = true;
+    function $(sel) { return document.querySelector(sel); }
+    function $all(sel) { return Array.from(document.querySelectorAll(sel)); }
 
-    function cssEscapeSafe(v) {
-        const s = String(v ?? "");
-        if (window.CSS && typeof window.CSS.escape === "function") return window.CSS.escape(s);
-        return s.replace(/["\\]/g, "\\$&");
+    function getRoot() {
+        return $(".strategy-settings-page");
     }
 
-    function safeLsGet(key) {
-        try { return window.localStorage.getItem(key); } catch (_) { return null; }
-    }
-    function safeLsSet(key, val) {
-        try { window.localStorage.setItem(key, val); } catch (_) {}
-    }
+    function getCtx() {
+        const root = getRoot();
+        if (!root) return null;
 
-    // ✅ Алиасы: если где-то осталось другое имя advanced-вкладки
-    function resolveAdvancedTab() {
-        // приоритет: новое имя
-        if (window.SettingsTabAdvanced) return window.SettingsTabAdvanced;
-        // возможные старые/другие имена
-        if (window.SettingsAdvancedTab) return window.SettingsAdvancedTab;
-        if (window.SettingsTabAdv) return window.SettingsTabAdv;
-        if (window.AdvancedTab) return window.AdvancedTab;
+        const chatId = root.getAttribute("data-chat-id") || "";
+        const type = root.getAttribute("data-type") || "";
+        const exchange = root.getAttribute("data-exchange") || "";
+        const network = root.getAttribute("data-network") || "";
 
-        // если скрипт advanced подключён как IIFE без экспорта — вернём null
-        return null;
+        return {
+            chatId: String(chatId),
+            type: String(type),
+            exchange: String(exchange),
+            network: String(network),
+            baseUrl: window.location.pathname
+        };
     }
 
-    function boot() {
-        const root = document.querySelector(".strategy-settings-page");
-        if (!root) {
-            console.warn("settings/page.js: .strategy-settings-page не найден");
+    function storageKey(ctx) {
+        const a = (ctx?.chatId || "0");
+        const b = (ctx?.type || "NA");
+        const c = (ctx?.exchange || "NA");
+        const d = (ctx?.network || "NA");
+        return `strategy_settings_active_tab::${a}::${b}::${c}::${d}`;
+    }
+
+    function normalizeTabName(name) {
+        const allowed = new Set(["network", "control", "trade", "risk", "advanced"]);
+        if (!name) return "network";
+        const n = String(name).trim().toLowerCase();
+        return allowed.has(n) ? n : "network";
+    }
+
+    function setActiveTab(tabName) {
+        const buttons = $all(".tab-btn");
+        const panes = $all(".tab-pane");
+
+        buttons.forEach(btn => {
+            const isActive = (btn.dataset.tab === "tab-" + tabName);
+            btn.classList.toggle("active", isActive);
+            btn.setAttribute("aria-selected", isActive ? "true" : "false");
+        });
+
+        panes.forEach(p => {
+            const on = (p.id === "tab-" + tabName);
+            p.classList.toggle("active", on);
+
+            // ✅ на всякий случай (если где-то включены bootstrap-классы)
+            p.classList.toggle("show", on);
+        });
+
+        try { window.scrollTo({ top: 0, behavior: "smooth" }); } catch (_) {}
+    }
+
+    function initTabOnce(tabName) {
+        const key = "__init_settings_tab_" + tabName;
+        if (window[key]) return;
+        window[key] = true;
+
+        if (tabName === "network") {
+            window.SettingsTabNetwork?.init?.();
             return;
         }
 
-        const chatId = Number(
-            root.dataset.chatId ||
-            document.querySelector("input[name='chatId']")?.value ||
-            0
-        );
-
-        const type = String(
-            root.dataset.type ||
-            document.querySelector("input[name='type']")?.value ||
-            ""
-        ).trim();
-
-        const exchange = String(
-            root.dataset.exchange ||
-            document.querySelector("input[name='exchange']")?.value ||
-            ""
-        ).trim();
-
-        const network = String(
-            root.dataset.network ||
-            document.querySelector("input[name='network']")?.value ||
-            ""
-        ).trim();
-
-        const baseUrl = `/strategies/${encodeURIComponent(type)}/config`;
-
-        window.StrategySettingsContext = { chatId, type, exchange, network, baseUrl };
-
-        // =====================================================
-        // CONTROL MODE SYNC
-        // =====================================================
-        const controlModeSelect = document.getElementById("advancedControlMode");
-
-        function setCtxControlMode(mode) {
-            const m = String(mode || "").trim().toUpperCase();
-            if (!m) return;
-            window.StrategySettingsContext.advancedControlMode = m;
+        if (tabName === "control") {
+            // ✅ если у тебя контрольный таб реализован как SettingsTabGeneral — поддержим
+            window.SettingsTabControl?.init?.();
+            window.SettingsTabGeneral?.init?.();
+            return;
         }
 
-        function emitControlModeChanged(mode) {
-            const m = String(mode || "").trim().toUpperCase();
-            if (!m) return;
-            setCtxControlMode(m);
-            window.dispatchEvent(new CustomEvent("strategy:controlModeChanged", { detail: { mode: m } }));
+        if (tabName === "trade") {
+            window.SettingsTabTrade?.init?.();
+            window.SettingsTabMarket?.init?.(); // совместимость, если где-то осталось старое имя
+            return;
         }
 
-        if (controlModeSelect) {
-            const cur = String(controlModeSelect.value || "").trim().toUpperCase();
-            if (cur) setCtxControlMode(cur);
-
-            controlModeSelect.addEventListener("change", () => {
-                const next = String(controlModeSelect.value || "").trim().toUpperCase() || "MANUAL";
-                controlModeSelect.dataset.prevValue = next;
-                emitControlModeChanged(next);
-            });
+        if (tabName === "risk") {
+            window.SettingsTabRisk?.init?.();
+            return;
         }
 
-        window.addEventListener("strategy:controlModeChanged", (e) => {
-            const m = String(e?.detail?.mode || "").trim().toUpperCase();
-            if (!m) return;
-
-            setCtxControlMode(m);
-
-            if (controlModeSelect) {
-                const cur = String(controlModeSelect.value || "").trim().toUpperCase();
-                if (cur !== m) {
-                    controlModeSelect.value = m;
-                    controlModeSelect.dataset.prevValue = m;
-                }
-            }
-        });
-
-        // ----------------------------
-        // Tabs
-        // ----------------------------
-        const tabButtons = Array.from(document.querySelectorAll(".tab-btn"));
-        const tabPanes = Array.from(document.querySelectorAll(".tab-pane"));
-
-        const storageKey = `strategy_settings_active_tab:${type}:${exchange || "X"}:${network || "X"}`;
-        const initedTabs = new Set();
-
-        function getPane(tabId) {
-            return tabId ? document.getElementById(tabId) : null;
+        if (tabName === "advanced") {
+            window.SettingsTabAdvanced?.init?.();
+            return;
         }
+    }
 
-        function setActive(btn, isActive) {
-            if (!btn) return;
-            btn.classList.toggle("active", !!isActive);
-            btn.setAttribute("aria-selected", isActive ? "true" : "false");
-        }
+    function boot() {
+        const ctx = getCtx();
+        if (!ctx) return;
 
-        function setPaneActive(pane, isActive) {
-            if (!pane) return;
-            pane.classList.toggle("active", !!isActive);
-            pane.classList.toggle("show", !!isActive);
-            pane.setAttribute("aria-hidden", isActive ? "false" : "true");
-        }
+        // expose ctx for other scripts
+        window.StrategySettingsContext = ctx;
 
-        function initTabOnce(tabId) {
-            if (!tabId) return;
-            if (initedTabs.has(tabId)) return;
-            initedTabs.add(tabId);
+        const buttons = $all(".tab-btn");
+        if (!buttons.length) return;
 
-            const advancedTab = resolveAdvancedTab();
+        buttons.forEach(btn => {
+            btn.setAttribute("role", "tab");
+            btn.setAttribute("tabindex", "0");
 
-            const map = {
-                "tab-network":  () => window.SettingsTabNetwork?.init?.(),
-                "tab-general":  () => window.SettingsTabGeneral?.init?.(),
-                "tab-risk":     () => window.SettingsTabRisk?.init?.(),
-                "tab-trade":    () => window.SettingsTabTrade?.init?.(),
-                "tab-advanced": () => window.SettingsTabAdvanced?.init?.()
-            };
-
-            try {
-                map[tabId]?.();
-            } catch (e) {
-                console.error(`settings/page.js: init failed for ${tabId}`, e);
-            }
-        }
-
-        function activateTab(tabId) {
-            if (!tabId) return;
-
-            const pane = getPane(tabId);
-            if (!pane) return;
-
-            tabButtons.forEach(b => setActive(b, false));
-            tabPanes.forEach(p => setPaneActive(p, false));
-
-            const sel = `.tab-btn[data-tab="${cssEscapeSafe(tabId)}"]`;
-            const btn = document.querySelector(sel);
-
-            setActive(btn, true);
-            setPaneActive(pane, true);
-
-            initTabOnce(tabId);
-
-            safeLsSet(storageKey, tabId);
-
-            // прокидываем актуальный режим при открытии вкладки
-            if (controlModeSelect) {
-                const m = String(controlModeSelect.value || "").trim().toUpperCase();
-                if (m) emitControlModeChanged(m);
-            } else if (window.StrategySettingsContext?.advancedControlMode) {
-                emitControlModeChanged(window.StrategySettingsContext.advancedControlMode);
-            }
-        }
-
-        const savedTab = safeLsGet(storageKey);
-        if (savedTab && getPane(savedTab)) {
-            activateTab(savedTab);
-        } else {
-            const first = tabButtons[0]?.dataset?.tab;
-            if (first) activateTab(first);
-        }
-
-        tabButtons.forEach(btn => {
             btn.addEventListener("click", () => {
-                const tabId = btn.dataset.tab;
-                activateTab(tabId);
+                const tabId = btn.dataset.tab || "";
+                const tabName = normalizeTabName(tabId.replace("tab-", ""));
+                setActiveTab(tabName);
+                initTabOnce(tabName);
+                try { localStorage.setItem(storageKey(ctx), tabName); } catch (_) {}
+            });
+
+            btn.addEventListener("keydown", (e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    btn.click();
+                }
             });
         });
 
-        document.querySelectorAll("[data-open-tab]").forEach(el => {
-            el.addEventListener("click", () => {
-                const tabId = el.getAttribute("data-open-tab");
-                activateTab(tabId);
-            });
-        });
+        // initial tab: query > localStorage > default
+        const url = new URL(window.location.href);
+        const fromQuery = normalizeTabName(url.searchParams.get("tab"));
+
+        let saved = "network";
+        try { saved = normalizeTabName(localStorage.getItem(storageKey(ctx))); } catch (_) {}
+
+        const initial = fromQuery || saved || "network";
+        setActiveTab(initial);
+        initTabOnce(initial);
     }
 
     if (document.readyState === "loading") {
-        document.addEventListener("DOMContentLoaded", boot, { once: true });
+        document.addEventListener("DOMContentLoaded", boot);
     } else {
         boot();
     }
-
 })();
