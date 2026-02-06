@@ -29,13 +29,13 @@ import java.util.Locale;
 @Builder
 public class StrategySettings {
 
+    // =====================================================
+    // ИДЕНТИФИКАЦИЯ / КОНТЕКСТ
+    // =====================================================
+
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
-
-    // =====================================================================
-    // ИДЕНТИФИКАЦИЯ / КОНТЕКСТ
-    // =====================================================================
 
     @Column(name = "chat_id", nullable = false)
     private Long chatId;
@@ -51,9 +51,9 @@ public class StrategySettings {
     @Column(name = "network_type", nullable = false, length = 16)
     private NetworkType networkType;
 
-    // =====================================================================
+    // =====================================================
     // ИНСТРУМЕНТ / ДАННЫЕ
-    // =====================================================================
+    // =====================================================
 
     @Column(nullable = false, length = 32)
     private String symbol;
@@ -65,107 +65,55 @@ public class StrategySettings {
     @Column(name = "cached_candles_limit", nullable = false)
     private Integer cachedCandlesLimit = 500;
 
-    // =====================================================================
-    // GENERAL
-    // =====================================================================
+    // =====================================================
+    // BALANCE / CAPITAL (ЕДИНЫЙ ИСТОЧНИК РИСКА)
+    // =====================================================
 
+    /**
+     * Актив, по которому берём баланс (например USDT).
+     * Это именно выбор пользователя.
+     */
     @Column(name = "account_asset", length = 16)
     private String accountAsset;
 
-    @Column(name = "max_exposure_usd", precision = 18, scale = 6)
-    private BigDecimal maxExposureUsd;
-
-    @Column(name = "max_exposure_pct", precision = 10, scale = 4)
-    private BigDecimal maxExposurePct;
-
-    @Column(name = "daily_loss_limit_pct", precision = 10, scale = 4)
-    private BigDecimal dailyLossLimitPct;
-
-    // ✅ Совместимость для разных мест в проекте/старого кода
-    @Getter
+    /**
+     * ✅ Режим капитала стратегии:
+     * ALL  - использовать весь доступный free баланс выбранного актива
+     * FIX  - использовать фиксированную сумму (но не больше free баланса)
+     * PCT  - использовать % от free баланса
+     */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "capital_mode", nullable = false, length = 8)
     @Builder.Default
-    @Column(name = "reinvest_profit", nullable = false)
-    private boolean reinvestProfit = false;
+    private CapitalMode capitalMode = CapitalMode.ALL;
 
-    // =====================================================================
-    // RISK
-    // =====================================================================
+    /**
+     * ✅ Значение капитала:
+     * - для FIX: сумма (например 40)
+     * - для PCT: процент (например 20 = 20%)
+     * - для ALL: всегда null
+     */
+    @Column(name = "capital_value", precision = 18, scale = 6)
+    private BigDecimal capitalValue;
 
-    @Column(name = "risk_per_trade_pct", precision = 10, scale = 4)
-    private BigDecimal riskPerTradePct;
+    public enum CapitalMode {
+        ALL, FIX, PCT
+    }
 
-    @Column(name = "min_risk_reward", precision = 10, scale = 4)
-    private BigDecimal minRiskReward;
-
-    @Builder.Default
-    @Column(nullable = false)
-    private int leverage = 1;
-
-    @Column(name = "allow_averaging")
-    private Boolean allowAveraging;
-
-    @Column(name = "cooldown_after_loss_seconds")
-    private Integer cooldownAfterLossSeconds;
-
-    @Column(name = "max_consecutive_losses")
-    private Integer maxConsecutiveLosses;
-
-    @Column(name = "max_drawdown_pct", precision = 10, scale = 4)
-    private BigDecimal maxDrawdownPct;
-
-    @Column(name = "max_drawdown_usd", precision = 18, scale = 6)
-    private BigDecimal maxDrawdownUsd;
-
-    @Column(name = "max_position_pct", precision = 10, scale = 4)
-    private BigDecimal maxPositionPct;
-
-    @Column(name = "max_position_usd", precision = 18, scale = 6)
-    private BigDecimal maxPositionUsd;
-
-    @Column(name = "max_trades_per_day")
-    private Integer maxTradesPerDay;
-
-    // =====================================================================
-    // TRADE
-    // =====================================================================
-
-    @Column(name = "max_open_orders")
-    private Integer maxOpenOrders;
-
-    @Column(name = "cooldown_seconds")
-    private Integer cooldownSeconds;
-
-    // =====================================================================
-    // ADVANCED
-    // =====================================================================
+    // =====================================================
+    // ADVANCED / AI
+    // =====================================================
 
     @Enumerated(EnumType.STRING)
     @Column(name = "advanced_control_mode", nullable = false, length = 16)
     @Builder.Default
     private AdvancedControlMode advancedControlMode = AdvancedControlMode.MANUAL;
 
-    @Builder.Default
-    @Column(name = "ml_confidence", precision = 10, scale = 6, nullable = false)
-    private BigDecimal mlConfidence = BigDecimal.ZERO;
-
-    @Builder.Default
-    @Column(name = "total_profit_pct", precision = 12, scale = 6, nullable = false)
-    private BigDecimal totalProfitPct = BigDecimal.ZERO;
-
-    // =====================================================================
-    // AI / ML / AUTOTUNE (единая точка настройки режимов)
-    // =====================================================================
-
     /**
      * Фаза исполнения (COLLECT / BACKTEST / PAPER / LIVE и т.д.)
-     * Значения задаются снаружи (UI/сервис), тут только хранение.
      */
     @Column(name = "run_phase", length = 24)
     private String runPhase;
-
-    @Builder.Default
-    @Column(name = "collect_enabled", nullable = false)
-    private boolean collectEnabled = false;
 
     @Builder.Default
     @Column(name = "auto_tune_enabled", nullable = false)
@@ -175,34 +123,29 @@ public class StrategySettings {
     @Column(name = "ml_gate_enabled", nullable = false)
     private boolean mlGateEnabled = false;
 
-    /**
-     * Ключ модели (если хочешь фиксировать конкретную модель).
-     * Если null — можно строить ключ на лету через ModelKeyFactory.
-     */
     @Column(name = "ml_model_key", length = 160)
     private String mlModelKey;
 
-    /**
-     * Хэш схемы фич (если ты его используешь в modelKey).
-     */
     @Column(name = "ml_schema_hash", length = 80)
     private String mlSchemaHash;
 
-    /**
-     * Версия модели (последняя использованная/актуальная для UI).
-     */
     @Column(name = "ml_model_version", length = 80)
     private String mlModelVersion;
 
-    /**
-     * Минимальная вероятность (для BUY или SELL) чтобы разрешить вход.
-     */
     @Column(name = "gate_min_prob", precision = 10, scale = 6)
     private BigDecimal gateMinProb;
 
-    // =====================================================================
+    @Builder.Default
+    @Column(name = "ml_confidence", precision = 10, scale = 6, nullable = false)
+    private BigDecimal mlConfidence = BigDecimal.ZERO;
+
+    @Builder.Default
+    @Column(name = "total_profit_pct", precision = 12, scale = 6, nullable = false)
+    private BigDecimal totalProfitPct = BigDecimal.ZERO;
+
+    // =====================================================
     // СОСТОЯНИЕ / ВРЕМЯ
-    // =====================================================================
+    // =====================================================
 
     @Builder.Default
     @Column(nullable = false)
@@ -223,9 +166,23 @@ public class StrategySettings {
     @Version
     private Integer version;
 
-    // =====================================================================
+    // =====================================================
+    // DOMAIN HELPERS (чисто для удобства)
+    // =====================================================
+
+    /**
+     * Возвращает валидное значение capitalValue в зависимости от режима,
+     * либо null если лимит не задан/невалиден.
+     */
+    public BigDecimal getEffectiveCapitalValueOrNull() {
+        CapitalMode m = (capitalMode != null ? capitalMode : CapitalMode.ALL);
+        if (m == CapitalMode.ALL) return null;
+        return capitalValue;
+    }
+
+    // =====================================================
     // LIFECYCLE
-    // =====================================================================
+    // =====================================================
 
     @PrePersist
     protected void onCreate() {
@@ -233,35 +190,20 @@ public class StrategySettings {
         this.createdAt = (this.createdAt != null) ? this.createdAt : now;
         this.updatedAt = (this.updatedAt != null) ? this.updatedAt : now;
 
-        // ✅ FIX: гарантируем NOT NULL поля только при создании записи
-        if (this.symbol == null || this.symbol.trim().isEmpty()) {
-            this.symbol = "BTCUSDT";
-        } else {
-            this.symbol = this.symbol.trim().toUpperCase(Locale.ROOT);
-        }
+        // not-null поля при создании
+        if (this.symbol == null || this.symbol.trim().isEmpty()) this.symbol = "BTCUSDT";
+        this.symbol = this.symbol.trim().toUpperCase(Locale.ROOT);
 
-        if (this.timeframe == null || this.timeframe.trim().isEmpty()) {
-            this.timeframe = "1m";
-        } else {
-            this.timeframe = this.timeframe.trim().toLowerCase(Locale.ROOT);
-        }
+        if (this.timeframe == null || this.timeframe.trim().isEmpty()) this.timeframe = "1m";
+        this.timeframe = this.timeframe.trim().toLowerCase(Locale.ROOT);
 
-        if (this.cachedCandlesLimit == null || this.cachedCandlesLimit < 50) {
-            this.cachedCandlesLimit = 500;
-        }
+        if (this.cachedCandlesLimit == null || this.cachedCandlesLimit < 50) this.cachedCandlesLimit = 500;
 
-        if (this.exchangeName != null) {
-            this.exchangeName = this.exchangeName.trim().toUpperCase(Locale.ROOT);
-        }
+        this.exchangeName = normalizeUpperNullable(this.exchangeName);
+        this.accountAsset = normalizeUpperNullable(this.accountAsset);
 
-        if (this.accountAsset != null) {
-            String a = this.accountAsset.trim().toUpperCase(Locale.ROOT);
-            this.accountAsset = a.isEmpty() ? null : a;
-        }
-
-        if (this.advancedControlMode == null) {
-            this.advancedControlMode = AdvancedControlMode.MANUAL;
-        }
+        if (this.advancedControlMode == null) this.advancedControlMode = AdvancedControlMode.MANUAL;
+        if (this.capitalMode == null) this.capitalMode = CapitalMode.ALL;
 
         // нормализация строк AI/ML
         this.runPhase = normalizeUpperNullable(this.runPhase);
@@ -271,40 +213,30 @@ public class StrategySettings {
 
         if (this.mlConfidence == null) this.mlConfidence = BigDecimal.ZERO;
         if (this.totalProfitPct == null) this.totalProfitPct = BigDecimal.ZERO;
+
+        normalizeCapital();
     }
 
     @PreUpdate
     protected void onUpdate() {
         this.updatedAt = LocalDateTime.now();
 
-        // ✅ лёгкая нормализация без перезатирания значений дефолтами
-        if (this.symbol != null) {
-            String s = this.symbol.trim().toUpperCase(Locale.ROOT);
-            this.symbol = s.isEmpty() ? this.symbol : s;
+        if (this.symbol != null && !this.symbol.trim().isEmpty()) {
+            this.symbol = this.symbol.trim().toUpperCase(Locale.ROOT);
+        }
+        if (this.timeframe != null && !this.timeframe.trim().isEmpty()) {
+            this.timeframe = this.timeframe.trim().toLowerCase(Locale.ROOT);
         }
 
-        if (this.timeframe != null) {
-            String tf = this.timeframe.trim().toLowerCase(Locale.ROOT);
-            this.timeframe = tf.isEmpty() ? this.timeframe : tf;
-        }
-
-        if (this.exchangeName != null) {
-            String ex = this.exchangeName.trim().toUpperCase(Locale.ROOT);
-            this.exchangeName = ex.isEmpty() ? this.exchangeName : ex;
-        }
-
-        if (this.accountAsset != null) {
-            String a = this.accountAsset.trim().toUpperCase(Locale.ROOT);
-            this.accountAsset = a.isEmpty() ? null : a;
-        }
+        this.exchangeName = normalizeUpperNullable(this.exchangeName);
+        this.accountAsset = normalizeUpperNullable(this.accountAsset);
 
         if (this.cachedCandlesLimit != null && this.cachedCandlesLimit < 50) {
             this.cachedCandlesLimit = 50;
         }
 
-        if (this.advancedControlMode == null) {
-            this.advancedControlMode = AdvancedControlMode.MANUAL;
-        }
+        if (this.advancedControlMode == null) this.advancedControlMode = AdvancedControlMode.MANUAL;
+        if (this.capitalMode == null) this.capitalMode = CapitalMode.ALL;
 
         // нормализация строк AI/ML
         this.runPhase = normalizeUpperNullable(this.runPhase);
@@ -314,6 +246,38 @@ public class StrategySettings {
 
         if (this.mlConfidence == null) this.mlConfidence = BigDecimal.ZERO;
         if (this.totalProfitPct == null) this.totalProfitPct = BigDecimal.ZERO;
+
+        normalizeCapital();
+    }
+
+    /**
+     * ✅ Правила:
+     * - ALL => capitalValue=null
+     * - FIX => capitalValue>0 иначе null
+     * - PCT => 0<capitalValue<=100 иначе null
+     */
+    private void normalizeCapital() {
+        CapitalMode m = (this.capitalMode != null ? this.capitalMode : CapitalMode.ALL);
+
+        if (m == CapitalMode.ALL) {
+            this.capitalValue = null;
+            return;
+        }
+
+        if (this.capitalValue == null) return;
+
+        // <=0 => null
+        if (this.capitalValue.signum() <= 0) {
+            this.capitalValue = null;
+            return;
+        }
+
+        if (m == CapitalMode.PCT) {
+            // >100 => 100 (можно и null, но UX лучше clamp)
+            if (this.capitalValue.compareTo(BigDecimal.valueOf(100)) > 0) {
+                this.capitalValue = BigDecimal.valueOf(100);
+            }
+        }
     }
 
     private static String normalizeTrimNullable(String s) {
@@ -327,13 +291,5 @@ public class StrategySettings {
         String v = s.trim();
         if (v.isEmpty()) return null;
         return v.toUpperCase(Locale.ROOT);
-    }
-
-    public boolean getReinvestProfit() {
-        return this.reinvestProfit;
-    }
-
-    public Boolean isReinvestProfit() {
-        return this.reinvestProfit;
     }
 }

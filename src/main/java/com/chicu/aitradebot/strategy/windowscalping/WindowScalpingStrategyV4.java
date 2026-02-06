@@ -57,7 +57,7 @@ public class WindowScalpingStrategyV4 implements
     @Value("${strategy.window.mlFailOpen:true}")
     private boolean mlFailOpen;
 
-    // fallback-порог, если ss.mlConfidence == null
+    // fallback-порог, если gateMinProb не задан
     @Value("${strategy.window.mlMinProba:0.60}")
     private double mlMinProba;
 
@@ -182,7 +182,7 @@ public class WindowScalpingStrategyV4 implements
         st.cfg = cfg;
 
         st.exchange = normalizeExchangeOrNull(ss != null ? ss.getExchangeName() : hintEx);
-        st.network  = ss != null ? ss.getNetworkType() : network;
+        st.network = ss != null ? ss.getNetworkType() : network;
 
         String sym = ss != null ? normalizeSymbolOrNull(ss.getSymbol()) : null;
         if (sym == null) sym = normalizeSymbolOrNull(symbolHint);
@@ -373,7 +373,7 @@ public class WindowScalpingStrategyV4 implements
         st.ticks++;
 
         long logEvery = Math.max(1, tickLogEveryTicks);
-        long holdMs   = Math.max(200, holdThrottleMs);
+        long holdMs = Math.max(200, holdThrottleMs);
 
         if (price == null || price.signum() <= 0) {
             if (st.ticks % logEvery == 0) {
@@ -385,7 +385,7 @@ public class WindowScalpingStrategyV4 implements
         Instant time = (ts != null ? ts : Instant.now());
 
         String tickSymbol = normalizeSymbolOrNull(symbolFromTick);
-        String cfgSymbol  = normalizeSymbolOrNull(st.symbol);
+        String cfgSymbol = normalizeSymbolOrNull(st.symbol);
 
         if (cfgSymbol != null && tickSymbol != null && !cfgSymbol.equals(tickSymbol)) return;
         if (cfgSymbol == null && tickSymbol != null) st.symbol = tickSymbol;
@@ -432,11 +432,11 @@ public class WindowScalpingStrategyV4 implements
             }
 
             BigDecimal high = null;
-            BigDecimal low  = null;
+            BigDecimal low = null;
             for (BigDecimal p : st.window) {
                 if (p == null) continue;
                 high = (high == null) ? p : high.max(p);
-                low  = (low  == null) ? p : low.min(p);
+                low = (low == null) ? p : low.min(p);
             }
 
             if (high == null || low == null || low.signum() <= 0) {
@@ -480,10 +480,10 @@ public class WindowScalpingStrategyV4 implements
                 return;
             }
 
-            double entryLowPct  = (cfg.getEntryFromLowPct()  != null ? cfg.getEntryFromLowPct()  : 0.0);
+            double entryLowPct = (cfg.getEntryFromLowPct() != null ? cfg.getEntryFromLowPct() : 0.0);
             double entryHighPct = (cfg.getEntryFromHighPct() != null ? cfg.getEntryFromHighPct() : 0.0);
 
-            double lowZone  = clamp01(entryLowPct / 100.0);
+            double lowZone = clamp01(entryLowPct / 100.0);
             double highZone = clamp01(1.0 - (entryHighPct / 100.0));
 
             if (log.isDebugEnabled() && st.ticks % logEvery == 0) {
@@ -502,14 +502,6 @@ public class WindowScalpingStrategyV4 implements
             // =====================================================
             if (!st.inPosition && pos <= lowZone) {
 
-                Integer cooldown = ss.getCooldownSeconds();
-                if (cooldown != null && cooldown > 0 && st.lastTradeClosedAt != null) {
-                    long passed = Duration.between(st.lastTradeClosedAt, time).getSeconds();
-                    if (passed < cooldown) {
-                        pushHoldThrottled(chatId, sym, st, "cooldown", time, holdMs);
-                        return;
-                    }
-                }
 
                 final double score = clamp01(
                         (lowZone <= 0.000001) ? 1.0 : (1.0 - (pos / lowZone))
@@ -547,9 +539,12 @@ public class WindowScalpingStrategyV4 implements
                                     chatId, sym, pred.reason);
                         }
                     } else {
+                        // ✅ прокидываем актуальную proba в StrategySettings (чтобы TradeExecution ML-gate видел реальную уверенность)
+                        try { ss.setMlConfidence(BigDecimal.valueOf(pred.proba)); } catch (Exception ignored) {}
+
                         if (st.ticks % logEvery == 0) {
-                            log.info("[WINDOW] 🤖 ML proba chatId={} sym={} model={} proba={}",
-                                    chatId, sym, pred.modelKey, fmt(pred.proba));
+                            log.info("[WINDOW] 🤖 ML proba chatId={} sym={} model={} proba={} threshold={}",
+                                    chatId, sym, pred.modelKey, fmt(pred.proba), fmt(threshold));
                         }
                         if (pred.proba + 1e-12 < threshold) {
                             pushHoldThrottled(chatId, sym, st, "ml_below_threshold", time, holdMs);
@@ -782,11 +777,10 @@ public class WindowScalpingStrategyV4 implements
 
     private String buildFingerprint(StrategySettings ss, WindowScalpingStrategySettings cfg) {
         String symbol = ss != null ? normalizeSymbolOrNull(ss.getSymbol()) : null;
-        String ex     = ss != null ? String.valueOf(ss.getExchangeName()) : "null";
-        String net    = ss != null ? String.valueOf(ss.getNetworkType()) : "null";
-        String tf     = ss != null ? safeNullable(ss.getTimeframe()) : "null";
+        String ex = ss != null ? String.valueOf(ss.getExchangeName()) : "null";
+        String net = ss != null ? String.valueOf(ss.getNetworkType()) : "null";
+        String tf = ss != null ? safeNullable(ss.getTimeframe()) : "null";
         String candles = ss != null && ss.getCachedCandlesLimit() != null ? String.valueOf(ss.getCachedCandlesLimit()) : "null";
-        String cooldown = ss != null && ss.getCooldownSeconds() != null ? String.valueOf(ss.getCooldownSeconds()) : "null";
 
         String w = cfg != null ? String.valueOf(cfg.getWindowSize()) : "null";
         String low = cfg != null ? String.valueOf(cfg.getEntryFromLowPct()) : "null";
@@ -796,9 +790,7 @@ public class WindowScalpingStrategyV4 implements
         String tpPct = cfg != null && cfg.getTakeProfitPct() != null ? cfg.getTakeProfitPct().stripTrailingZeros().toPlainString() : "null";
         String slPct = cfg != null && cfg.getStopLossPct() != null ? cfg.getStopLossPct().stripTrailingZeros().toPlainString() : "null";
 
-        return (symbol != null ? symbol : "null") + "|" + ex + "|" + net + "|" + tf + "|" + candles + "|" + cooldown
-               + "|" + w + "|" + low + "|" + high + "|" + minR
-               + "|" + tpPct + "|" + slPct;
+        return (symbol != null ? symbol : "null") + "|" + ex + "|" + net + "|" + tf + "|" + candles + "|" + tpPct + "|" + slPct;
     }
 
     // =====================================================
@@ -822,23 +814,50 @@ public class WindowScalpingStrategyV4 implements
         return null;
     }
 
+    /**
+     * ✅ FIX: поддерживаем primitive long и Long (у тебя часто long в интерфейсе)
+     */
     private StrategySettings tryCallSettingsServiceFallback(Long chatId) {
+        if (chatId == null) return null;
+
+        // 1) getOrCreate(long, StrategyType)
+        try {
+            Method m = strategySettingsService.getClass().getMethod("getOrCreate", long.class, StrategyType.class);
+            Object r = m.invoke(strategySettingsService, chatId.longValue(), StrategyType.WINDOW_SCALPING);
+            return (r instanceof StrategySettings ss) ? ss : null;
+        } catch (NoSuchMethodException ignored) {
+        } catch (Exception e) {
+            log.warn("[WINDOW] ⚠ fallback getOrCreate(long,type) failed: {}", e.toString());
+        }
+
+        // 2) getOrCreate(Long, StrategyType)
         try {
             Method m = strategySettingsService.getClass().getMethod("getOrCreate", Long.class, StrategyType.class);
             Object r = m.invoke(strategySettingsService, chatId, StrategyType.WINDOW_SCALPING);
             return (r instanceof StrategySettings ss) ? ss : null;
         } catch (NoSuchMethodException ignored) {
         } catch (Exception e) {
-            log.warn("[WINDOW] ⚠ fallback getOrCreate(chatId,type) failed: {}", e.toString());
+            log.warn("[WINDOW] ⚠ fallback getOrCreate(Long,type) failed: {}", e.toString());
         }
 
+        // 3) getSettingsOrThrow(long, StrategyType)
+        try {
+            Method m = strategySettingsService.getClass().getMethod("getSettingsOrThrow", long.class, StrategyType.class);
+            Object r = m.invoke(strategySettingsService, chatId.longValue(), StrategyType.WINDOW_SCALPING);
+            return (r instanceof StrategySettings ss) ? ss : null;
+        } catch (NoSuchMethodException ignored) {
+        } catch (Exception e) {
+            log.warn("[WINDOW] ⚠ fallback getSettingsOrThrow(long,type) failed: {}", e.toString());
+        }
+
+        // 4) getSettingsOrThrow(Long, StrategyType)
         try {
             Method m = strategySettingsService.getClass().getMethod("getSettingsOrThrow", Long.class, StrategyType.class);
             Object r = m.invoke(strategySettingsService, chatId, StrategyType.WINDOW_SCALPING);
             return (r instanceof StrategySettings ss) ? ss : null;
         } catch (NoSuchMethodException ignored) {
         } catch (Exception e) {
-            log.warn("[WINDOW] ⚠ fallback getSettingsOrThrow(chatId,type) failed: {}", e.toString());
+            log.warn("[WINDOW] ⚠ fallback getSettingsOrThrow(Long,type) failed: {}", e.toString());
         }
 
         return null;
@@ -946,10 +965,17 @@ public class WindowScalpingStrategyV4 implements
         }
     }
 
+    /**
+     * ✅ FIX: порог — это gateMinProb (настройка), а не mlConfidence (текущее значение модели).
+     * mlConfidence используется как runtime-значение (мы его выставляем из pred.proba выше).
+     */
     private double resolveMlThreshold(StrategySettings ss) {
-        if (ss != null && ss.getMlConfidence() != null) {
-            double v = ss.getMlConfidence().doubleValue();
-            if (!Double.isNaN(v) && !Double.isInfinite(v) && v > 0) return v;
+        if (ss != null) {
+            BigDecimal gate = ss.getGateMinProb();
+            if (gate != null) {
+                double v = gate.doubleValue();
+                if (!Double.isNaN(v) && !Double.isInfinite(v) && v > 0) return v;
+            }
         }
         return mlMinProba;
     }
@@ -1047,17 +1073,26 @@ public class WindowScalpingStrategyV4 implements
             try {
                 if (appContext.containsBean("mlPredictionService")) bean = appContext.getBean("mlPredictionService");
                 else if (appContext.containsBean("mlService")) bean = appContext.getBean("mlService");
-            } catch (Exception ignored) {}
+            } catch (Exception ignored) {
+            }
 
             if (bean == null) {
                 try {
                     String[] names = appContext.getBeanDefinitionNames();
                     for (String n : names) {
                         Object b;
-                        try { b = appContext.getBean(n); } catch (Exception ignored) { continue; }
-                        if (hasSupportedPredictMethod(b.getClass())) { bean = b; break; }
+                        try {
+                            b = appContext.getBean(n);
+                        } catch (Exception ignored) {
+                            continue;
+                        }
+                        if (hasSupportedPredictMethod(b.getClass())) {
+                            bean = b;
+                            break;
+                        }
                     }
-                } catch (Exception ignored) {}
+                } catch (Exception ignored) {
+                }
             }
 
             cachedMlBean = bean;
@@ -1075,8 +1110,10 @@ public class WindowScalpingStrategyV4 implements
             Class<?>[] pt = m.getParameterTypes();
 
             if (pc == 1 && Map.class.isAssignableFrom(pt[0])) return true;
-            if (pc == 5 && pt[2] == String.class && Map.class.isAssignableFrom(pt[3]) && pt[4] == Instant.class) return true;
-            if (pc == 4 && pt[1] == String.class && Map.class.isAssignableFrom(pt[2]) && pt[3] == Instant.class) return true;
+            if (pc == 5 && pt[2] == String.class && Map.class.isAssignableFrom(pt[3]) && pt[4] == Instant.class)
+                return true;
+            if (pc == 4 && pt[1] == String.class && Map.class.isAssignableFrom(pt[2]) && pt[3] == Instant.class)
+                return true;
         }
         return false;
     }
@@ -1121,9 +1158,11 @@ public class WindowScalpingStrategyV4 implements
                     var f = c.getDeclaredField(n);
                     f.setAccessible(true);
                     return f.get(obj);
-                } catch (Exception ignored) {}
+                } catch (Exception ignored) {
+                }
             }
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {
+        }
         return null;
     }
 
@@ -1131,15 +1170,27 @@ public class WindowScalpingStrategyV4 implements
         Object v = readAny(obj, gettersOrFields);
         if (v == null) return null;
         if (v instanceof Number n) return n.doubleValue();
-        try { return Double.parseDouble(String.valueOf(v)); } catch (Exception ignored) {}
+        try {
+            return Double.parseDouble(String.valueOf(v));
+        } catch (Exception ignored) {
+        }
         return null;
     }
 
     private Method findNoArgMethod(Class<?> c, String name) {
-        try { return c.getMethod(name); } catch (Exception ignored) {}
+        try {
+            return c.getMethod(name);
+        } catch (Exception ignored) {
+        }
         String cap = !name.isEmpty() ? Character.toUpperCase(name.charAt(0)) + name.substring(1) : name;
-        try { return c.getMethod("get" + cap); } catch (Exception ignored) {}
-        try { return c.getMethod("is" + cap); } catch (Exception ignored) {}
+        try {
+            return c.getMethod("get" + cap);
+        } catch (Exception ignored) {
+        }
+        try {
+            return c.getMethod("is" + cap);
+        } catch (Exception ignored) {
+        }
         return null;
     }
 
@@ -1148,11 +1199,17 @@ public class WindowScalpingStrategyV4 implements
     // =====================================================
 
     private void safeLive(Runnable r) {
-        try { r.run(); } catch (Exception ignored) {}
+        try {
+            r.run();
+        } catch (Exception ignored) {
+        }
     }
 
     private void safeAutoTune(Runnable r) {
-        try { r.run(); } catch (Exception ignored) {}
+        try {
+            r.run();
+        } catch (Exception ignored) {
+        }
     }
 
     private Set<String> parsedAutoTuneHoldReasons() {
@@ -1298,7 +1355,10 @@ public class WindowScalpingStrategyV4 implements
         if (v == null) return null;
         if (v instanceof BigDecimal bd) return bd;
         if (v instanceof Number n) return BigDecimal.valueOf(n.doubleValue());
-        try { return new BigDecimal(String.valueOf(v).trim()); } catch (Exception ignored) {}
+        try {
+            return new BigDecimal(String.valueOf(v).trim());
+        } catch (Exception ignored) {
+        }
         return null;
     }
 
@@ -1311,7 +1371,10 @@ public class WindowScalpingStrategyV4 implements
 
         if (v == null) return 0L;
         if (v instanceof Number n) return n.longValue();
-        try { return Long.parseLong(String.valueOf(v).trim()); } catch (Exception ignored) {}
+        try {
+            return Long.parseLong(String.valueOf(v).trim());
+        } catch (Exception ignored) {
+        }
         return 0L;
     }
 
@@ -1347,11 +1410,19 @@ public class WindowScalpingStrategyV4 implements
                 positionStore.getPosition(chatId, StrategyType.WINDOW_SCALPING, ex, net, sym);
 
         if (opt.isEmpty()) {
-            st.inPosition = true;
+            // ✅ FIX: snapshot missing = рассинхрон. Не ставим inPosition=true, иначе стратегия попытается выйти "из воздуха".
+            st.inPosition = false;
             st.isLong = true;
+
+            // чистим store, чтобы не долбило вечным восстановлением
+            try {
+                positionStore.clearPosition(chatId, StrategyType.WINDOW_SCALPING, ex, net, sym);
+            } catch (Exception ignored) {
+            }
+
             pushHoldThrottled(chatId, sym, st, "pos_snapshot_missing", now, Math.max(200, holdThrottleMs));
             if (st.ticks % Math.max(1, tickLogEveryTicks) == 0) {
-                log.warn("[WINDOW] ⚠ PositionStore IN_POSITION but snapshot missing chatId={} ex={} net={} sym={}",
+                log.warn("[WINDOW] ⚠ PositionStore IN_POSITION but snapshot missing => cleared. chatId={} ex={} net={} sym={}",
                         chatId, ex, net, sym);
             }
             return;
@@ -1363,9 +1434,9 @@ public class WindowScalpingStrategyV4 implements
         st.isLong = true;
 
         st.entryPrice = (st.entryPrice != null ? st.entryPrice : snap.entryPrice());
-        st.entryQty   = (st.entryQty   != null ? st.entryQty   : snap.qty());
-        st.tp         = (st.tp         != null ? st.tp         : snap.tp());
-        st.sl         = (st.sl         != null ? st.sl         : snap.sl());
+        st.entryQty = (st.entryQty != null ? st.entryQty : snap.qty());
+        st.tp = (st.tp != null ? st.tp : snap.tp());
+        st.sl = (st.sl != null ? st.sl : snap.sl());
         st.entryOrderId = (st.entryOrderId != null ? st.entryOrderId : snap.entryOrderId());
 
         if (st.lastEntryAt == null) st.lastEntryAt = (snap.openedAt() != null ? snap.openedAt() : now);

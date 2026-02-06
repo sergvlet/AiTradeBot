@@ -365,12 +365,7 @@ public class MlAutoTuneRuntime {
                         return true;
                     }
 
-                    // риск в StrategySettings (если тюнер это отдаёт)
-                    BigDecimal risk = toBigDecimal(map.get("riskPerTradePct"));
-                    if (risk != null) {
-                        strategySettingsService.updateRiskFromAi(chatId, type, exchange, network, risk);
-                        return true;
-                    }
+
                 }
             }
 

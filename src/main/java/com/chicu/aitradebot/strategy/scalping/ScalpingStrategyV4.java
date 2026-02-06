@@ -132,16 +132,6 @@ public class ScalpingStrategyV4 implements TradingStrategy {
 
         states.put(chatId, st);
 
-        log.info("[SCALPING] ▶ START chatId={} symbol={} ex={} net={} windowSize={} thr={} cooldownSec={}",
-                chatId,
-                st.symbol,
-                st.exchange,
-                st.network,
-                cfg != null ? cfg.getWindowSize() : null,
-                cfg != null ? num(cfg.getPriceChangeThreshold()) : null,
-                strategy.getCooldownSeconds()
-        );
-
         safeLive(() -> live.pushState(chatId, StrategyType.SCALPING, st.symbol, true));
         safeLive(() -> live.pushSignal(chatId, StrategyType.SCALPING, st.symbol, null, Signal.hold("started")));
     }
@@ -298,14 +288,7 @@ public class ScalpingStrategyV4 implements TradingStrategy {
 // =====================================================
             if (!st.inPosition && thresholdFrac > 0 && diffFrac >= thresholdFrac) { // ✅ только рост
 
-                Integer cooldown = strategy != null ? strategy.getCooldownSeconds() : null;
-                if (cooldown != null && cooldown > 0 && st.lastTradeClosedAt != null) {
-                    long passed = Duration.between(st.lastTradeClosedAt, time).getSeconds();
-                    if (passed < cooldown) {
-                        pushHoldThrottled(chatId, symbol, st, "cooldown", time);
-                        return;
-                    }
-                }
+
 
                 log.info("[SCALPING] ⚡ ENTRY try (SPOT LONG) chatId={} symbol={} price={} diff={} thr={}",
                         chatId,
@@ -503,9 +486,7 @@ public class ScalpingStrategyV4 implements TradingStrategy {
                 ? String.valueOf(ss.getCachedCandlesLimit())
                 : "null";
 
-        String cooldown = ss != null && ss.getCooldownSeconds() != null
-                ? String.valueOf(ss.getCooldownSeconds())
-                : "null";
+
 
         // ScalpingStrategySettings — локальные параметры
         String window = sc != null && sc.getWindowSize() != null
@@ -516,8 +497,7 @@ public class ScalpingStrategyV4 implements TradingStrategy {
         String spread = sc != null ? num(sc.getSpreadThreshold()) : "null";
 
         return symbol + "|" + ex + "|" + net + "|" + tf
-               + "|" + candles + "|" + cooldown
-               + "|" + window + "|" + thr + "|" + spread;
+               + "|" + candles + "|" + window + "|" + thr + "|" + spread;
     }
 
     // =====================================================

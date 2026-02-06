@@ -560,8 +560,7 @@ public class AiStrategyOrchestrator {
                 .exchangeName(s.getExchangeName())
                 .networkType(s.getNetworkType())
 
-                .riskPerTradePct(s.getRiskPerTradePct())
-                .reinvestProfit(s.getReinvestProfit())
+
                 .version(s.getVersion())
 
                 .startedAt(toInstant(s.getStartedAt()))

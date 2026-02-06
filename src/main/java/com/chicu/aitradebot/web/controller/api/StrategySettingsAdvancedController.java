@@ -103,6 +103,28 @@ public class StrategySettingsAdvancedController {
         );
     }
 
+    private static void applyModeFlagsProd(StrategySettings ss, AdvancedControlMode mode) {
+        if (ss == null || mode == null) return;
+
+        // ✅ ПРОД: не включаем COLLECT/BACKTEST/PAPER автоматически
+        // иначе ты сам себя заблокируешь (у тебя в TradeExecutionServiceImpl collect/backtest режут вход/выход)
+        ss.setRunPhase("LIVE");
+
+        switch (mode) {
+            case MANUAL -> {
+
+                ss.setAutoTuneEnabled(false);
+                ss.setMlGateEnabled(false);
+            }
+            case HYBRID, AI -> {
+
+                ss.setAutoTuneEnabled(true);
+                ss.setMlGateEnabled(true);
+            }
+        }
+    }
+
+
     // =========================================================
     // POST /advanced/submit
     // ✅ теперь также сохраняет advancedControlMode в StrategySettings

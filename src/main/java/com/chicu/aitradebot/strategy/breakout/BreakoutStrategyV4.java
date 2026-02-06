@@ -262,15 +262,6 @@ public class BreakoutStrategyV4 implements TradingStrategy {
             // =====================================================
             if (!st.inPosition) {
 
-                // cooldown из StrategySettings (как у SCALPING)
-                Integer cooldown = strategy != null ? strategy.getCooldownSeconds() : null;
-                if (cooldown != null && cooldown > 0 && st.lastTradeClosedAt != null) {
-                    long passed = Duration.between(st.lastTradeClosedAt, time).getSeconds();
-                    if (passed < cooldown) {
-                        pushHoldThrottled(chatId, symbol, st, "cooldown", time);
-                        return;
-                    }
-                }
 
                 // Условие пробоя:
                 // price > high * (1 + bufferPct/100)
@@ -514,17 +505,14 @@ public class BreakoutStrategyV4 implements TradingStrategy {
                 ? String.valueOf(ss.getCachedCandlesLimit())
                 : "null";
 
-        String cooldown = ss != null && ss.getCooldownSeconds() != null
-                ? String.valueOf(ss.getCooldownSeconds())
-                : "null";
+
 
         String lookback = cfg != null ? String.valueOf(cfg.getRangeLookback()) : "null";
         String buffer   = cfg != null ? String.valueOf(cfg.getBreakoutBufferPct()) : "null";
         String minRange = cfg != null ? String.valueOf(cfg.getMinRangePct()) : "null";
 
         return symbol + "|" + ex + "|" + net + "|" + tf
-               + "|" + candles + "|" + cooldown
-               + "|" + lookback + "|" + buffer + "|" + minRange;
+               + "|" + candles + "|" + lookback + "|" + buffer + "|" + minRange;
     }
 
     // =========================

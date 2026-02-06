@@ -242,17 +242,7 @@ public class GridStrategyV4 implements TradingStrategy {
                 );
             }
 
-            // cooldown
-            if (!st.inPosition && ss != null) {
-                Integer cooldown = ss.getCooldownSeconds();
-                if (cooldown != null && cooldown > 0 && st.lastTradeClosedAt != null) {
-                    long passed = Duration.between(st.lastTradeClosedAt, time).getSeconds();
-                    if (passed < cooldown) {
-                        pushHoldThrottled(chatId, sym, st, "cooldown", time);
-                        return;
-                    }
-                }
-            }
+
 
             BigDecimal entryLevel = calcEntryLevel(st.anchorPrice, stepPct, levels);
 
@@ -433,14 +423,12 @@ public class GridStrategyV4 implements TradingStrategy {
         String net    = ss != null ? String.valueOf(ss.getNetworkType()) : "null";
         String tf     = ss != null ? safe(ss.getTimeframe()) : "null";
         String candles = ss != null && ss.getCachedCandlesLimit() != null ? String.valueOf(ss.getCachedCandlesLimit()) : "null";
-        String cooldown = ss != null && ss.getCooldownSeconds() != null ? String.valueOf(ss.getCooldownSeconds()) : "null";
 
         String levels = cfg != null ? String.valueOf(cfg.getGridLevels()) : "null";
         String step   = cfg != null ? String.valueOf(cfg.getGridStepPct()) : "null";
         String vol    = cfg != null ? String.valueOf(cfg.getOrderVolume()) : "null";
 
-        return symbol + "|" + ex + "|" + net + "|" + tf + "|" + candles + "|" + cooldown
-                + "|" + levels + "|" + step + "|" + vol;
+        return symbol + "|" + ex + "|" + net + "|" + tf + "|" + candles + "|"  + levels + "|" + step + "|" + vol;
     }
 
     // =====================================================

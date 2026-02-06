@@ -404,11 +404,21 @@
 
                         <select class="form-select"
                                 id="advancedControlMode"
-                                th:field="*{advancedControlMode}">
-                            <option value="MANUAL">MANUAL</option>
-                            <option value="HYBRID">HYBRID</option>
-                            <option value="AI">AI</option>
+                                name="advancedControlMode">
+                            <option value="MANUAL"
+                                    th:selected="${strategy != null && strategy.getAdvancedControlMode() != null && strategy.getAdvancedControlMode().name() == 'MANUAL'}">
+                                MANUAL
+                            </option>
+                            <option value="HYBRID"
+                                    th:selected="${strategy != null && strategy.getAdvancedControlMode() != null && strategy.getAdvancedControlMode().name() == 'HYBRID'}">
+                                HYBRID
+                            </option>
+                            <option value="AI"
+                                    th:selected="${strategy != null && strategy.getAdvancedControlMode() != null && strategy.getAdvancedControlMode().name() == 'AI'}">
+                                AI
+                            </option>
                         </select>
+
 
                         <div id="controlModeProgress" class="small text-secondary mt-2 d-none" aria-live="polite">
                             <span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>
@@ -452,6 +462,7 @@
 
             </form>
         </div>
+
         <!-- ===================================================== -->
         <!-- TAB: TRADE -->
         <!-- ===================================================== -->
@@ -485,7 +496,7 @@
 
                             <label class="form-label" for="accountAssetSelect">Актив аккаунта</label>
 
-                            <!-- ✅ ВАЖНО: name="accountAsset" + правильная переменная availableAssets -->
+                            <!-- ✅ name="accountAsset" + availableAssets -->
                             <select class="form-select"
                                     id="accountAssetSelect"
                                     name="accountAsset">
@@ -509,21 +520,22 @@
                         <div class="col-lg-7">
                             <div class="section-title">Баланс выбранного актива</div>
 
-                            <!-- ⚠️ Сейчас контроллер отдаёт только availableBalance (free выбранного актива).
-                                 Поэтому показываем free из модели, а locked/total подтянем через JS (refresh). -->
+                            <!-- ✅ теперь берём из accountAssetBalance (free/locked/total) -->
                             <div class="row g-2">
                                 <div class="col-4">
                                     <div class="small text-secondary">Free</div>
                                     <div class="fw-bold" id="assetFreeView"
-                                         th:text="${availableBalance != null ? availableBalance : '—'}">—</div>
+                                         th:text="${accountAssetBalance != null and accountAssetBalance.free != null ? accountAssetBalance.free : '—'}">—</div>
                                 </div>
                                 <div class="col-4">
                                     <div class="small text-secondary">Locked</div>
-                                    <div class="fw-bold" id="assetLockedView">—</div>
+                                    <div class="fw-bold" id="assetLockedView"
+                                         th:text="${accountAssetBalance != null and accountAssetBalance.locked != null ? accountAssetBalance.locked : '—'}">—</div>
                                 </div>
                                 <div class="col-4">
                                     <div class="small text-secondary">Total</div>
-                                    <div class="fw-bold" id="assetTotalView">—</div>
+                                    <div class="fw-bold" id="assetTotalView"
+                                         th:text="${accountAssetBalance != null and accountAssetBalance.total != null ? accountAssetBalance.total : '—'}">—</div>
                                 </div>
                             </div>
 
@@ -667,10 +679,8 @@
             </div>
         </div>
 
-
-
         <!-- ===================================================== -->
-        <!-- TAB: RISK (MINIMAL) -->
+        <!-- TAB: RISK (ONE CONTROL: ALL / FIX / PCT) -->
         <!-- ===================================================== -->
         <div class="tab-pane" id="tab-risk">
             <div class="card card-theme p-4">
@@ -678,7 +688,10 @@
                 <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
                     <div>
                         <div class="fw-bold">Риск</div>
-                        <div class="text-secondary small">Минимально нужное: лимит капитала и риск на сделку.</div>
+                        <div class="text-secondary small">
+                            Здесь задаёшь, <b>какую сумму стратегия может использовать на один вход</b> из баланса выбранного актива.
+                            Баланс берётся <b>с биржи</b>, а лимит применяется поверх него.
+                        </div>
                     </div>
 
                     <div class="d-flex align-items-center gap-2">
@@ -699,87 +712,392 @@
                     <input type="hidden" name="exchange" th:value="${selectedExchange}"/>
                     <input type="hidden" name="network"  th:value="${selectedNetwork != null ? selectedNetwork.name() : 'TESTNET'}"/>
 
-                    <div class="section-title">Лимит капитала стратегии</div>
+                    <!-- ✅ ВАЖНО: имена должны совпадать с контроллером -->
+                    <input type="hidden" name="capitalMode"  id="capitalMode"  value="ALL"/>
+                    <input type="hidden" name="capitalValue" id="capitalValue" value=""/>
+
+                    <!-- ===================================================== -->
+                    <!-- INFO: exchange balance -->
+                    <!-- ===================================================== -->
+                    <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-2">
+                        <div class="section-title mb-0">Контроль суммы входа</div>
+
+                        <div class="d-flex align-items-center gap-2 small">
+                            <span class="text-secondary">Доступно на бирже:</span>
+                            <span class="fw-bold"
+                                  id="riskFreeBalanceText"
+                                  th:text="${availableBalance != null ? availableBalance : '—'}">—</span>
+                            <span class="text-secondary"
+                                  id="riskAssetText"
+                                  th:text="${selectedAsset != null ? selectedAsset : 'USDT'}">USDT</span>
+                        </div>
+                    </div>
 
                     <div class="row g-3 align-items-end">
-                        <div class="col-md-4">
-                            <label class="form-label" for="strategyBudgetMode">Режим лимита</label>
 
-                            <select class="form-select" id="strategyBudgetMode"
+                        <!-- MODE -->
+                        <div class="col-md-4">
+                            <label class="form-label" for="riskModeSelect">Режим</label>
+
+                            <select class="form-select"
+                                    id="riskModeSelect"
                                     data-confirm="true"
                                     data-confirm-title="Подтверждение"
-                                    data-confirm-text="Изменение лимита влияет на объём сделок. Сохранить?">
-                                <option value="NONE">Без лимита</option>
-                                <option value="USD">Фикс. сумма</option>
-                                <option value="PCT">Процент</option>
+                                    data-confirm-text="Изменение лимита входа влияет на объём ордеров. Сохранить?">
+                                <option value="ALL">Весь доступный баланс</option>
+                                <option value="FIX">Фиксированная сумма</option>
+                                <option value="PCT">Процент от доступного баланса</option>
                             </select>
 
-                            <div class="form-text">Ограничивает максимально используемый капитал.</div>
-                        </div>
-
-                        <div class="col-md-4">
-                            <label class="form-label" id="strategyBudgetValueLabel" for="strategyBudgetValue">Значение</label>
-
-                            <input type="number"
-                                   class="form-control"
-                                   id="strategyBudgetValue"
-                                   step="1"
-                                   min="0"
-                                   placeholder="Напр. 500"
-                                   data-confirm="true"
-                                   data-confirm-title="Подтверждение"
-                                   data-confirm-text="Изменение лимита влияет на объём сделок. Сохранить?"/>
-
-                            <input type="text"
-                                   class="form-control d-none"
-                                   id="strategyBudgetValueReadonly"
-                                   readonly
-                                   value="Весь доступный баланс"/>
-
-                            <div class="form-text" id="strategyBudgetValueHint"></div>
-                        </div>
-
-                        <div class="col-md-4">
-                            <div class="alert alert-info small mt-4 mb-0" id="strategyBudgetPreview">
-                                Выбери режим лимита.
+                            <div class="form-text" id="riskModeHelp">
+                                ALL — стратегия может использовать весь доступный баланс выбранного актива.
                             </div>
                         </div>
 
-                        <input type="hidden"
-                               id="strategyBudgetInitialMode"
-                               th:value="${strategy != null && strategy.maxExposureUsd != null ? 'USD' : (strategy != null && strategy.maxExposurePct != null ? 'PCT' : 'NONE')}" />
-
-                        <input type="hidden" id="maxExposureUsd" th:field="*{maxExposureUsd}"/>
-                        <input type="hidden" id="maxExposurePct" th:field="*{maxExposurePct}"/>
-                    </div>
-
-                    <hr class="my-4"/>
-
-                    <div class="section-title">Риск на сделку</div>
-
-                    <div class="row g-3 align-items-end">
+                        <!-- VALUE -->
                         <div class="col-md-4">
-                            <label class="form-label" for="riskPerTradePctInput" id="riskPerTradeLabel">Риск на сделку (%)</label>
-                            <input type="number"
-                                   class="form-control"
-                                   id="riskPerTradePctInput"
-                                   step="0.1"
-                                   min="0"
-                                   placeholder="Напр. 1.0"
-                                   th:value="${strategy != null ? strategy.riskPerTradePct : ''}">
-                            <div class="form-text">Размер BUY сейчас считается от этого поля.</div>
+                            <label class="form-label" id="riskValueLabel" for="riskValueInput">Значение</label>
+
+                            <div class="input-group">
+                                <input type="number"
+                                       class="form-control"
+                                       id="riskValueInput"
+                                       step="1"
+                                       min="0"
+                                       placeholder="Напр. 40"
+                                       data-confirm="true"
+                                       data-confirm-title="Подтверждение"
+                                       data-confirm-text="Изменение лимита входа влияет на объём ордеров. Сохранить?"/>
+
+                                <span class="input-group-text" id="riskValueUnit">USDT</span>
+                            </div>
+
+                            <div class="form-text" id="riskValueHint">Укажи число.</div>
+
+                            <!-- quick buttons -->
+                            <div class="mt-2 d-flex flex-wrap gap-2" id="riskQuickButtons">
+                                <button type="button" class="btn btn-outline-secondary btn-sm" data-risk-set="20" data-risk-mode="FIX">20</button>
+                                <button type="button" class="btn btn-outline-secondary btn-sm" data-risk-set="40" data-risk-mode="FIX">40</button>
+                                <button type="button" class="btn btn-outline-secondary btn-sm" data-risk-set="100" data-risk-mode="FIX">100</button>
+
+                                <button type="button" class="btn btn-outline-secondary btn-sm" data-risk-set="10" data-risk-mode="PCT">10%</button>
+                                <button type="button" class="btn btn-outline-secondary btn-sm" data-risk-set="25" data-risk-mode="PCT">25%</button>
+                                <button type="button" class="btn btn-outline-secondary btn-sm" data-risk-set="50" data-risk-mode="PCT">50%</button>
+                            </div>
                         </div>
 
-                        <div class="col-md-8">
-                            <div class="alert alert-secondary small mb-0">
-                                В твоём TradeExecutionServiceImpl размер входа = riskPerTradePct от доступного баланса/лимита.
+                        <!-- PREVIEW -->
+                        <div class="col-md-4">
+                            <div class="alert alert-info small mb-0" id="riskPreviewBox">
+                                <div class="fw-bold mb-1">Превью</div>
+
+                                <div class="d-flex justify-content-between gap-2">
+                                    <span class="text-secondary">Будет использовано:</span>
+                                    <span class="fw-bold" id="riskEffectiveAmount">—</span>
+                                </div>
+
+                                <div class="text-secondary mt-2" id="riskPreviewHint">
+                                    Это и будет <b>quoteAmount</b> для BUY (до проверок minNotional/stepSize).
+                                </div>
                             </div>
                         </div>
                     </div>
+
+                    <!-- init from server -->
+                    <input type="hidden" id="riskInitMode"
+                           th:value="${strategy != null && strategy.capitalMode != null ? strategy.capitalMode : 'ALL'}"/>
+                    <input type="hidden" id="riskInitValue"
+                           th:value="${strategy != null && strategy.capitalValue != null ? strategy.capitalValue : ''}"/>
+
+                    <!-- data для JS (баланс с биржи) -->
+                    <input type="hidden" id="riskFreeBalanceValue" th:value="${availableBalance != null ? availableBalance : ''}"/>
+                    <input type="hidden" id="riskSelectedAsset" th:value="${selectedAsset != null ? selectedAsset : 'USDT'}"/>
 
                 </form>
             </div>
         </div>
+
+        <!-- ===================================================== -->
+        <!-- RISK TAB helper script (tiny, no deps) -->
+        <!-- ===================================================== -->
+        <script>
+            (() => {
+                const modeSelect   = document.getElementById("riskModeSelect");
+                const valueInput   = document.getElementById("riskValueInput");
+                const valueLabel   = document.getElementById("riskValueLabel");
+                const valueUnit    = document.getElementById("riskValueUnit");
+                const valueHint    = document.getElementById("riskValueHint");
+                const modeHelp     = document.getElementById("riskModeHelp");
+
+                const effAmount    = document.getElementById("riskEffectiveAmount");
+
+                const hMode        = document.getElementById("capitalMode");
+                const hValue       = document.getElementById("capitalValue");
+
+                const initModeEl   = document.getElementById("riskInitMode");
+                const initValueEl  = document.getElementById("riskInitValue");
+
+                const freeEl       = document.getElementById("riskFreeBalanceValue");
+                const assetEl      = document.getElementById("riskSelectedAsset");
+
+                const asset = (assetEl && assetEl.value) ? assetEl.value : "USDT";
+
+                function toNum(v) {
+                    if (v === null || v === undefined) return null;
+                    const s = String(v).trim().replace(",", ".");
+                    if (!s) return null;
+                    const n = Number(s);
+                    return Number.isFinite(n) ? n : null;
+                }
+
+                function fmt(n) {
+                    if (n === null || n === undefined || !Number.isFinite(n)) return "—";
+                    return (Math.round(n * 100) / 100).toFixed(2);
+                }
+
+                function setHidden(mode, value) {
+                    if (hMode)  hMode.value  = mode;
+                    if (hValue) hValue.value = (value === null || value === undefined) ? "" : String(value);
+                }
+
+                function applyModeUi(mode) {
+                    const isAll = mode === "ALL";
+                    const isFix = mode === "FIX";
+                    const isPct = mode === "PCT";
+
+                    // показываем/прячем поле значения
+                    valueInput.closest(".input-group").classList.toggle("d-none", isAll);
+                    valueLabel.classList.toggle("d-none", isAll);
+                    valueHint.classList.toggle("d-none", isAll);
+                    document.getElementById("riskQuickButtons")?.classList.toggle("d-none", isAll);
+
+                    if (isAll) {
+                        modeHelp.textContent = "ALL — стратегия может использовать весь доступный баланс выбранного актива.";
+                    }
+                    if (isFix) {
+                        modeHelp.textContent = "FIX — использует не больше указанной суммы (но не больше доступного баланса).";
+                    }
+                    if (isPct) {
+                        modeHelp.textContent = "PCT — использует процент от доступного баланса (например 25%).";
+                    }
+
+                    // подписи/юниты
+                    if (isFix) {
+                        valueLabel.textContent = "Сумма входа";
+                        valueUnit.textContent = asset;
+                        valueInput.step = "1";
+                        valueInput.placeholder = "Напр. 40";
+                        valueHint.textContent = "Укажи сумму в " + asset + " (будет ограничена доступным балансом).";
+                    } else if (isPct) {
+                        valueLabel.textContent = "Процент";
+                        valueUnit.textContent = "%";
+                        valueInput.step = "1";
+                        valueInput.placeholder = "Напр. 25";
+                        valueHint.textContent = "Укажи процент от доступного баланса (1–100).";
+                    }
+                }
+
+                function calcPreview() {
+                    const free = toNum(freeEl ? freeEl.value : null);
+                    const mode = modeSelect ? modeSelect.value : "ALL";
+                    const raw  = toNum(valueInput ? valueInput.value : null);
+
+                    let eff = null;
+
+                    if (mode === "ALL") {
+                        eff = free;
+                        setHidden("ALL", null);
+                    } else if (mode === "FIX") {
+                        const v = (raw !== null && raw > 0) ? raw : null;
+                        if (v === null) {
+                            eff = null;
+                            setHidden("FIX", "");
+                        } else {
+                            eff = (free !== null) ? Math.min(free, v) : v;
+                            setHidden("FIX", v);
+                        }
+                    } else if (mode === "PCT") {
+                        const p = (raw !== null && raw > 0) ? Math.min(raw, 100) : null;
+                        if (p === null) {
+                            eff = null;
+                            setHidden("PCT", "");
+                        } else {
+                            eff = (free !== null) ? (free * (p / 100.0)) : null;
+                            setHidden("PCT", p);
+                        }
+                    }
+
+                    if (effAmount) {
+                        effAmount.textContent = (eff !== null ? (fmt(eff) + " " + asset) : "—");
+                    }
+                }
+
+                // init
+                const initMode = (initModeEl && initModeEl.value) ? String(initModeEl.value).trim().toUpperCase() : "ALL";
+                const initVal  = (initValueEl && initValueEl.value) ? String(initValueEl.value).trim() : "";
+
+                if (modeSelect) modeSelect.value = (["ALL","FIX","PCT"].includes(initMode) ? initMode : "ALL");
+                applyModeUi(modeSelect.value);
+
+                if (valueInput) valueInput.value = initVal;
+
+                calcPreview();
+
+                // events
+                modeSelect?.addEventListener("change", () => {
+                    applyModeUi(modeSelect.value);
+                    // при смене режима, если ALL — очищаем инпут
+                    if (modeSelect.value === "ALL" && valueInput) valueInput.value = "";
+                    calcPreview();
+                    // чтобы твой change-tracker увидел изменения
+                    modeSelect.dispatchEvent(new Event("input", { bubbles: true }));
+                });
+
+                valueInput?.addEventListener("input", () => calcPreview());
+
+                // quick buttons
+                document.querySelectorAll("[data-risk-set]").forEach(btn => {
+                    btn.addEventListener("click", () => {
+                        const m = (btn.getAttribute("data-risk-mode") || "FIX").toUpperCase();
+                        const v = btn.getAttribute("data-risk-set");
+                        if (modeSelect) modeSelect.value = (["ALL","FIX","PCT"].includes(m) ? m : "FIX");
+                        applyModeUi(modeSelect.value);
+
+                        if (valueInput) valueInput.value = (v !== null ? String(v) : "");
+                        calcPreview();
+
+                        // триггерим change чтобы автосейв/dirty поймал
+                        valueInput?.dispatchEvent(new Event("change", { bubbles: true }));
+                    });
+                });
+            })();
+        </script>
+
+
+        <script>
+            (() => {
+                function toNum(v) {
+                    if (v === null || v === undefined) return null;
+                    const s = String(v).trim().replace(",", ".");
+                    if (!s) return null;
+                    const n = Number(s);
+                    return Number.isFinite(n) ? n : null;
+                }
+                function fmt(n) {
+                    if (n === null || n === undefined || !Number.isFinite(n)) return "—";
+                    return (Math.round(n * 100) / 100).toFixed(2);
+                }
+
+                const freeEl   = document.getElementById("riskFreeBalanceValue");
+                const assetEl  = document.getElementById("riskSelectedAsset");
+
+                const modeEl   = document.getElementById("riskBudgetMode");
+                const valueEl  = document.getElementById("riskBudgetValue");
+
+                const unitEl   = document.getElementById("riskBudgetValueUnit");
+                const labelEl  = document.getElementById("riskBudgetValueLabel");
+                const hintEl   = document.getElementById("riskBudgetValueHint");
+
+                const effEl    = document.getElementById("riskEffectiveAmount");
+
+                const initModeEl  = document.getElementById("riskInitMode");
+                const initValueEl = document.getElementById("riskInitValue");
+
+                const selectedAsset = assetEl ? (assetEl.value || "USDT") : "USDT";
+
+                function applyModeUi() {
+                    const mode = (modeEl && modeEl.value) ? modeEl.value : "FIXED";
+
+                    if (mode === "PERCENT") {
+                        labelEl.textContent = "Процент (%)";
+                        unitEl.textContent = "%";
+                        valueEl.step = "0.1";
+                        valueEl.placeholder = "Напр. 20";
+                        hintEl.textContent = "Будет взято % от доступного баланса на бирже.";
+                    } else {
+                        labelEl.textContent = "Сумма";
+                        unitEl.textContent = selectedAsset;
+                        valueEl.step = "1";
+                        valueEl.placeholder = "Напр. 40";
+                        hintEl.textContent = "Будет взята фиксированная сумма, но не больше доступного баланса.";
+                    }
+                }
+
+                function calcPreview() {
+                    const free = toNum(freeEl ? freeEl.value : null);
+                    const v = toNum(valueEl ? valueEl.value : null);
+                    const mode = (modeEl && modeEl.value) ? modeEl.value : "FIXED";
+
+                    if (free === null || free <= 0) {
+                        effEl.textContent = "—";
+                        return;
+                    }
+
+                    if (v === null || v <= 0) {
+                        effEl.textContent = "—";
+                        return;
+                    }
+
+                    let used;
+                    if (mode === "PERCENT") {
+                        const pct = Math.max(0, Math.min(100, v));
+                        used = free * (pct / 100.0);
+                    } else {
+                        used = Math.min(free, v);
+                    }
+
+                    effEl.textContent = fmt(used) + " " + selectedAsset;
+                }
+
+                function init() {
+                    // init values from server (если есть)
+                    if (initModeEl && initModeEl.value) {
+                        const m = String(initModeEl.value).trim().toUpperCase();
+                        if (m === "PERCENT" || m === "FIXED") modeEl.value = m;
+                    }
+                    if (initValueEl && initValueEl.value && valueEl) {
+                        valueEl.value = initValueEl.value;
+                    }
+
+                    applyModeUi();
+                    calcPreview();
+                }
+
+                // quick buttons
+                document.querySelectorAll("[data-risk-set]").forEach(btn => {
+                    btn.addEventListener("click", () => {
+                        const forcedMode = btn.getAttribute("data-risk-mode");
+                        if (forcedMode && modeEl) {
+                            modeEl.value = forcedMode;
+                            applyModeUi();
+                        }
+
+                        const raw = btn.getAttribute("data-risk-set");
+                        if (!raw || !valueEl) return;
+
+                        if (raw.endsWith("p")) {
+                            // "25p" -> 25
+                            valueEl.value = raw.slice(0, -1);
+                        } else {
+                            valueEl.value = raw;
+                        }
+
+                        calcPreview();
+                        valueEl.dispatchEvent(new Event("change", { bubbles: true }));
+                    });
+                });
+
+                if (modeEl) modeEl.addEventListener("change", () => {
+                    applyModeUi();
+                    calcPreview();
+                });
+                if (valueEl) valueEl.addEventListener("input", calcPreview);
+
+                init();
+            })();
+        </script>
+
+
 
         <!-- ===================================================== -->
         <!-- TAB: ADVANCED -->
@@ -874,7 +1192,7 @@
                     <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Закрыть"></button>
                 </div>
                 <div class="modal-body">
-                    <div id="generalConfirmText">Сохранить изменения?</div>
+                    <div id="generalConfirmText">Сохранить изменения?</div>rsi_strategy_settings
                 </div>
                 <div class="modal-footer">
                     <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal" id="generalConfirmCancel">
@@ -887,6 +1205,5 @@
             </div>
         </div>
     </div>
-
 
 </div>

@@ -11,6 +11,8 @@
     function $(sel) { return document.querySelector(sel); }
     function $all(sel) { return Array.from(document.querySelectorAll(sel)); }
 
+    const initedTabs = new Set();
+
     function getRoot() {
         return $(".strategy-settings-page");
     }
@@ -19,10 +21,10 @@
         const root = getRoot();
         if (!root) return null;
 
-        const chatId = root.getAttribute("data-chat-id") || "";
-        const type = root.getAttribute("data-type") || "";
+        const chatId   = root.getAttribute("data-chat-id") || "";
+        const type     = root.getAttribute("data-type") || "";
         const exchange = root.getAttribute("data-exchange") || "";
-        const network = root.getAttribute("data-network") || "";
+        const network  = root.getAttribute("data-network") || "";
 
         return {
             chatId: String(chatId),
@@ -61,56 +63,53 @@
         panes.forEach(p => {
             const on = (p.id === "tab-" + tabName);
             p.classList.toggle("active", on);
-
-            // ✅ на всякий случай (если где-то включены bootstrap-классы)
             p.classList.toggle("show", on);
         });
 
         try { window.scrollTo({ top: 0, behavior: "smooth" }); } catch (_) {}
     }
 
-    function initTabOnce(tabName) {
-        const key = "__init_settings_tab_" + tabName;
-        if (window[key]) return;
-        window[key] = true;
+    function resolveAdvancedTab() {
+        return window.SettingsTabAdvanced || window.SettingsTabAi || window.SettingsTabStatus || null;
+    }
 
-        if (tabName === "network") {
-            window.SettingsTabNetwork?.init?.();
-            return;
-        }
+    function initTabOnce(tabId) {
+        if (!tabId) return;
+        if (initedTabs.has(tabId)) return;
+        initedTabs.add(tabId);
 
-        if (tabName === "control") {
-            // ✅ если у тебя контрольный таб реализован как SettingsTabGeneral — поддержим
-            window.SettingsTabControl?.init?.();
-            window.SettingsTabGeneral?.init?.();
-            return;
-        }
+        const advancedTab = resolveAdvancedTab();
 
-        if (tabName === "trade") {
-            window.SettingsTabTrade?.init?.();
-            window.SettingsTabMarket?.init?.(); // совместимость, если где-то осталось старое имя
-            return;
-        }
+        const map = {
+            "tab-network":  () => window.SettingsTabNetwork?.init?.(),
+            "tab-control":  () => window.SettingsTabGeneral?.init?.(),
+            "tab-risk":     () => window.SettingsTabRisk?.init?.(),
+            "tab-trade":    () => window.SettingsTabTrade?.init?.(),
+            "tab-advanced": () => advancedTab?.init?.()
+        };
 
-        if (tabName === "risk") {
-            window.SettingsTabRisk?.init?.();
-            return;
-        }
+        console.log("[settings/page] initTabOnce:", tabId, "->", Object.keys(map).includes(tabId) ? "OK" : "NO_HANDLER");
 
-        if (tabName === "advanced") {
-            window.SettingsTabAdvanced?.init?.();
-            return;
+        try {
+            map[tabId]?.();
+        } catch (e) {
+            console.error(`settings/page.js: init failed for ${tabId}`, e);
         }
     }
 
     function boot() {
         const ctx = getCtx();
-        if (!ctx) return;
+        if (!ctx) {
+            console.warn("[settings/page] root ctx not found");
+            return;
+        }
 
-        // expose ctx for other scripts
         window.StrategySettingsContext = ctx;
+        console.log("[settings/page] boot ctx:", ctx);
 
         const buttons = $all(".tab-btn");
+        console.log("[settings/page] tab buttons:", buttons.map(b => b.dataset.tab));
+
         if (!buttons.length) return;
 
         buttons.forEach(btn => {
@@ -118,10 +117,14 @@
             btn.setAttribute("tabindex", "0");
 
             btn.addEventListener("click", () => {
-                const tabId = btn.dataset.tab || "";
-                const tabName = normalizeTabName(tabId.replace("tab-", ""));
+                const tabId = btn.dataset.tab || ""; // "tab-risk"
+                const tabName = normalizeTabName(tabId.replace("tab-", "")); // "risk"
+
+                console.log("[settings/page] click:", tabId);
+
                 setActiveTab(tabName);
-                initTabOnce(tabName);
+                initTabOnce(tabId);
+
                 try { localStorage.setItem(storageKey(ctx), tabName); } catch (_) {}
             });
 
@@ -133,7 +136,6 @@
             });
         });
 
-        // initial tab: query > localStorage > default
         const url = new URL(window.location.href);
         const fromQuery = normalizeTabName(url.searchParams.get("tab"));
 
@@ -141,8 +143,9 @@
         try { saved = normalizeTabName(localStorage.getItem(storageKey(ctx))); } catch (_) {}
 
         const initial = fromQuery || saved || "network";
+
         setActiveTab(initial);
-        initTabOnce(initial);
+        initTabOnce("tab-" + initial);
     }
 
     if (document.readyState === "loading") {

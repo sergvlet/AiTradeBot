@@ -23,8 +23,25 @@ window.SettingsTabTrade = (function () {
         return isBlank(s) ? "" : String(s).trim();
     }
 
+    // ✅ 1) гарантируем StrategySettingsContext из data-* корня страницы
+    function ensureCtx() {
+        if (window.StrategySettingsContext && window.StrategySettingsContext.chatId) return window.StrategySettingsContext;
+
+        const root = document.querySelector(".strategy-settings-page[data-chat-id][data-type]");
+        if (!root) return window.StrategySettingsContext || null;
+
+        const ctx = window.StrategySettingsContext || {};
+        ctx.chatId = ctx.chatId || root.dataset.chatId;
+        ctx.type = ctx.type || root.dataset.type;
+        ctx.exchange = ctx.exchange || root.dataset.exchange;
+        ctx.network = ctx.network || root.dataset.network;
+
+        window.StrategySettingsContext = ctx;
+        return ctx;
+    }
+
     function getCtx() {
-        return window.StrategySettingsContext || null;
+        return ensureCtx();
     }
 
     function ctxQuery() {
@@ -81,6 +98,10 @@ window.SettingsTabTrade = (function () {
         const ctx = getCtx();
         if (ctx?.accountAsset) return normalizeUpper(ctx.accountAsset);
 
+        // ✅ 2) если пусто — берём первый option
+        if (sel && sel.options && sel.options.length > 0) {
+            return normalizeUpper(sel.options[0].value);
+        }
         return "";
     }
 
@@ -88,11 +109,24 @@ window.SettingsTabTrade = (function () {
         const a = normalizeUpper(asset);
         const sel = byId("accountAssetSelect");
         const hid = byId("accountAssetHidden");
-        if (sel) sel.value = a || "";
-        if (hid) hid.value = a || "";
+
+        if (sel) {
+            // если такого значения нет — ставим первый option
+            sel.value = a || "";
+            if (a && sel.value !== a && sel.options && sel.options.length > 0) {
+                sel.value = sel.options[0].value;
+            }
+            if (!sel.value && sel.options && sel.options.length > 0) {
+                sel.value = sel.options[0].value;
+            }
+        }
+
+        const finalA = normalizeUpper(sel ? sel.value : a);
+
+        if (hid) hid.value = finalA || "";
 
         const hint = byId("assetInHint");
-        if (hint) hint.textContent = a || "—";
+        if (hint) hint.textContent = finalA || "—";
     }
 
     function setModeUi() {
@@ -315,11 +349,6 @@ window.SettingsTabTrade = (function () {
 
         async function doSave() {
             if (inFlight) return;
-            if (nowMode() === "AI") {
-                // ✅ В AI всё равно сохраняем asset/symbol (это нужно для контекста),
-                // но tf/candles пользователь не меняет (candles disabled).
-                // Не блокируем сохранение.
-            }
 
             inFlight = true;
             setSave("Сохраняю…", "info");
@@ -346,7 +375,8 @@ window.SettingsTabTrade = (function () {
             const asset = getAccountAsset();
             setAccountAssetUi(asset);
 
-            if (!asset) {
+            const finalAsset = getAccountAsset();
+            if (!finalAsset) {
                 list.innerHTML = `<li><span class="dropdown-item text-muted">Выберите актив</span></li>`;
                 return;
             }
@@ -432,8 +462,7 @@ window.SettingsTabTrade = (function () {
         setModeUi();
         setLimitsUiEmpty();
 
-        const initialAsset = getAccountAsset();
-        setAccountAssetUi(initialAsset);
+        setAccountAssetUi(getAccountAsset());
 
         const initialSymbol = normalizeUpper(symbolHidden?.value || byId("symbolLabel")?.textContent || "");
         if (initialSymbol) loadLimits(initialSymbol).catch(() => {});

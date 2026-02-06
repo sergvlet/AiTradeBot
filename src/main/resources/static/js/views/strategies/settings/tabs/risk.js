@@ -25,8 +25,30 @@ window.SettingsTabRisk = (function () {
         return `${hh}:${mm}`;
     }
 
+    // =====================================================
+    // ✅ CONTEXT (сам восстанавливается из data-атрибутов)
+    // =====================================================
+    function ensureCtx() {
+        if (window.StrategySettingsContext && window.StrategySettingsContext.chatId) {
+            return window.StrategySettingsContext;
+        }
+
+        const root = document.querySelector(".strategy-settings-page[data-chat-id][data-type]");
+        if (!root) return window.StrategySettingsContext || null;
+
+        const ctx = window.StrategySettingsContext || {};
+        ctx.chatId = ctx.chatId || root.getAttribute("data-chat-id");
+        ctx.type = ctx.type || root.getAttribute("data-type");
+        ctx.exchange = ctx.exchange || root.getAttribute("data-exchange");
+        ctx.network = ctx.network || root.getAttribute("data-network");
+        ctx.baseUrl = ctx.baseUrl || window.location.pathname;
+
+        window.StrategySettingsContext = ctx;
+        return ctx;
+    }
+
     function getCtx() {
-        return window.StrategySettingsContext || null;
+        return ensureCtx();
     }
 
     function ctxQuery() {
@@ -70,14 +92,13 @@ window.SettingsTabRisk = (function () {
 
         const disable = (mode === "AI");
         form.querySelectorAll("input, select, textarea, button").forEach(el => {
-            // ничего лишнего не блокируем, если вдруг появится кнопка
             if (el.id === "advancedControlMode") return;
             if (el.type === "hidden") return;
             el.disabled = disable;
         });
     }
 
-    function setSaveUi(kind, meta) {
+    function setSaveUi(kind, meta, errMsg) {
         const state = byId("riskSaveState");
         const saveMeta = byId("riskSaveMeta");
         const dirtyBadge = byId("riskDirtyBadge");
@@ -85,6 +106,7 @@ window.SettingsTabRisk = (function () {
 
         if (kind === "saving") {
             if (state) { state.className = "badge bg-secondary"; state.textContent = "Сохранение…"; }
+            if (saveMeta) saveMeta.textContent = nowHHmm();
             return;
         }
 
@@ -98,11 +120,10 @@ window.SettingsTabRisk = (function () {
 
         if (kind === "err") {
             if (state) { state.className = "badge bg-danger"; state.textContent = "Ошибка"; }
-            if (saveMeta) saveMeta.textContent = "проверь API";
+            if (saveMeta) saveMeta.textContent = errMsg || "проверь API";
             return;
         }
 
-        // idle
         if (state) { state.className = "badge bg-secondary"; state.textContent = "Готово"; }
         if (saveMeta) saveMeta.textContent = "";
     }
@@ -124,17 +145,16 @@ window.SettingsTabRisk = (function () {
         return new Promise((resolve) => {
             const modalEl = byId("generalConfirmModal");
             const titleEl = byId("generalConfirmTitle");
-            const textEl  = byId("generalConfirmText");
-            const okBtn   = byId("generalConfirmOk");
+            const textEl = byId("generalConfirmText");
+            const okBtn = byId("generalConfirmOk");
 
-            // если bootstrap нет — не блокируем UX
             if (!modalEl || !window.bootstrap?.Modal || !okBtn) {
                 resolve(true);
                 return;
             }
 
             if (titleEl) titleEl.textContent = title || "Подтверждение";
-            if (textEl)  textEl.textContent  = text  || "Сохранить изменения?";
+            if (textEl) textEl.textContent = text || "Сохранить изменения?";
 
             const modal = window.bootstrap.Modal.getOrCreateInstance(modalEl, {
                 backdrop: "static",
@@ -176,13 +196,13 @@ window.SettingsTabRisk = (function () {
 
         const url = `/strategies/${encodeURIComponent(String(ctx.type))}/config?${ctxQuery()}`;
 
-        // ⚠️ отправляем только реально существующие поля
         const payload = Object.assign({
             saveScope: "risk",
-            tab: "risk"
+            tab: "risk",
+            exchange: ctx.exchange || "",
+            network: ctx.network || ""
         }, scopePayload || {});
 
-        // используем общий API если есть, иначе fetch
         if (window.SettingsApi?.postForm) {
             await window.SettingsApi.postForm(url, payload);
             return;
@@ -206,38 +226,71 @@ window.SettingsTabRisk = (function () {
         if (!resp.ok) throw new Error("HTTP " + resp.status);
     }
 
-    // ---------- bind ----------
+    // =====================================================
+    // ✅ INIT
+    // =====================================================
     function init() {
         if (started) return;
-        started = true;
 
         const ctx = getCtx();
-        if (!ctx) return;
+        if (!ctx) {
+            console.warn("[risk] ctx not ready -> skip init (will retry on tab click)");
+            return;
+        }
 
         const form = byId("riskForm");
-        if (!form) return;
+        if (!form) {
+            console.warn("[risk] #riskForm not found -> skip init (will retry)");
+            return;
+        }
 
-        // элементы из твоего текущего “минимального risk”
+        started = true;
+        console.log("[risk] init OK, binding listeners…", ctx);
+
         const budgetMode = byId("strategyBudgetMode");
         const budgetValue = byId("strategyBudgetValue");
         const budgetPreview = byId("strategyBudgetPreview");
         const budgetValueHint = byId("strategyBudgetValueHint");
         const budgetValueLabel = byId("strategyBudgetValueLabel");
 
+        // ✅ ВАЖНО: это реальные id из твоего HTML
         const initialModeEl = byId("strategyBudgetInitialMode");
-        const maxExposureUsd = byId("maxExposureUsd");
-        const maxExposurePct = byId("maxExposurePct");
+        const initialUsdEl = byId("strategyBudgetInitialUsd");
+        const initialPctEl = byId("strategyBudgetInitialPct");
 
         const riskPerTrade = byId("riskPerTradePctInput");
 
-        // чтобы при HYBRID “откатывать”
         const prev = {
             budgetMode: (initialModeEl?.value || "NONE"),
-            budgetValue: "",
+            budgetValue: (budgetValue?.value || ""),
             riskPerTrade: (riskPerTrade?.value || "")
         };
 
-        // ----- budget UI helpers -----
+        function updateBudgetPreview() {
+            if (!budgetPreview) return;
+
+            const m = (budgetMode?.value || "NONE").toUpperCase();
+            const v = numOrNull(budgetValue?.value);
+
+            if (m === "NONE") {
+                budgetPreview.textContent = "Будет использован весь доступный баланс (без лимита).";
+                return;
+            }
+            if (m === "USD") {
+                budgetPreview.textContent = (v != null)
+                    ? `Лимит: ${v} (фиксированная сумма).`
+                    : "Лимит: укажи сумму.";
+                return;
+            }
+            if (m === "PCT") {
+                budgetPreview.textContent = (v != null)
+                    ? `Лимит: ${v}% от доступного баланса.`
+                    : "Лимит: укажи процент.";
+                return;
+            }
+            budgetPreview.textContent = "Лимит: —";
+        }
+
         function setBudgetUi(mode) {
             const m = (mode || "NONE").toUpperCase();
 
@@ -255,7 +308,6 @@ window.SettingsTabRisk = (function () {
                         : "Лимит не используется.");
             }
 
-            // в NONE value можно скрыть/заблокировать
             if (budgetValue) {
                 const disable = (m === "NONE" || getControlMode(ctx) === "AI");
                 budgetValue.disabled = disable;
@@ -265,35 +317,26 @@ window.SettingsTabRisk = (function () {
             updateBudgetPreview();
         }
 
-        function updateBudgetPreview() {
-            if (!budgetPreview) return;
+        // ✅ КЛЮЧЕВОЙ ФИКС: подтягиваем стартовое значение лимита в input,
+        // чтобы не улетало null при первом же сохранении
+        function applyInitialBudgetValueIfEmpty() {
+            if (!budgetMode || !budgetValue) return;
 
-            const m = (budgetMode?.value || "NONE").toUpperCase();
-            const v = numOrNull(budgetValue?.value);
-
-            if (m === "NONE") {
-                budgetPreview.textContent = "Будет использован весь доступный баланс (без лимита).";
-                return;
-            }
+            if (!isBlank(budgetValue.value)) return; // уже заполнено
+            const m = (budgetMode.value || "NONE").toUpperCase();
 
             if (m === "USD") {
-                budgetPreview.textContent = (v != null)
-                    ? `Лимит: ${v} (фиксированная сумма).`
-                    : "Лимит: укажи сумму.";
-                return;
+                const v = (initialUsdEl?.value || "").trim();
+                if (!isBlank(v)) budgetValue.value = v;
+            } else if (m === "PCT") {
+                const v = (initialPctEl?.value || "").trim();
+                if (!isBlank(v)) budgetValue.value = v;
             }
 
-            if (m === "PCT") {
-                budgetPreview.textContent = (v != null)
-                    ? `Лимит: ${v}% от доступного баланса.`
-                    : "Лимит: укажи процент.";
-                return;
-            }
-
-            budgetPreview.textContent = "Лимит: —";
+            updateBudgetPreview();
+            prev.budgetValue = budgetValue.value || "";
         }
 
-        // ----- save pipeline -----
         let timer = null;
         let inFlight = false;
 
@@ -308,7 +351,7 @@ window.SettingsTabRisk = (function () {
                 setSaveUi("ok", nowHHmm());
             } catch (e) {
                 console.error("[risk] save failed:", e);
-                setSaveUi("err");
+                setSaveUi("err", "", String(e?.message || "ошибка"));
                 if (typeof rollback === "function") rollback();
             } finally {
                 inFlight = false;
@@ -334,61 +377,88 @@ window.SettingsTabRisk = (function () {
             );
         }
 
-        // ----- binds: budget mode/value -----
+        // ✅ Защита от затирания: при смене режима USD/PCT без значения — не сохраняем null
+        function hasValidBudgetValueFor(mode) {
+            if (!budgetValue) return false;
+            const m = (mode || "NONE").toUpperCase();
+            if (m === "NONE") return true;
+
+            const raw = (budgetValue.value || "").trim();
+            const n = numOrNull(raw);
+            if (n == null) return false;
+
+            // доп. защита (0 — бессмысленно)
+            return n > 0;
+        }
+
+        // ----- budget mode -----
         if (budgetMode) {
-            // init from server flags (maxExposureUsd/maxExposurePct)
-            if (initialModeEl && initialModeEl.value) {
-                budgetMode.value = initialModeEl.value;
-            }
+            if (initialModeEl && initialModeEl.value) budgetMode.value = initialModeEl.value;
             prev.budgetMode = budgetMode.value || "NONE";
+
+            setBudgetUi(prev.budgetMode);
+            applyInitialBudgetValueIfEmpty(); // ✅ вот тут
 
             budgetMode.addEventListener("change", async () => {
                 const modeNow = getControlMode(ctx);
                 if (modeNow === "AI") {
                     budgetMode.value = prev.budgetMode;
+                    setBudgetUi(prev.budgetMode);
+                    applyInitialBudgetValueIfEmpty();
                     return;
                 }
 
                 const nextMode = (budgetMode.value || "NONE").toUpperCase();
                 markChanged("лимит капитала");
                 setBudgetUi(nextMode);
+                applyInitialBudgetValueIfEmpty();
+
+                // ✅ если выбрали USD/PCT и значение пустое/невалидное — не даём сохранить null
+                if (!hasValidBudgetValueFor(nextMode)) {
+                    updateBudgetPreview();
+                    // откатываем режим обратно (чтобы не терять старое значение в БД)
+                    budgetMode.value = prev.budgetMode;
+                    setBudgetUi(prev.budgetMode);
+                    applyInitialBudgetValueIfEmpty();
+                    setSaveUi("err", "", "укажи значение лимита (> 0)");
+                    return;
+                }
 
                 const ok = await maybeConfirmIfHybrid();
                 if (!ok) {
                     budgetMode.value = prev.budgetMode;
                     setBudgetUi(prev.budgetMode);
+                    applyInitialBudgetValueIfEmpty();
                     return;
                 }
 
-                // сохраняем: записываем только одно поле (USD или PCT), второе чистим
                 await commitSave(() => {
                     const payload = {};
+                    const v = (budgetValue?.value || "").trim() || null;
+
                     if (nextMode === "USD") {
-                        payload.maxExposureUsd = (budgetValue?.value || "").trim() || null;
+                        payload.maxExposureUsd = v;
                         payload.maxExposurePct = null;
-                        if (maxExposureUsd) maxExposureUsd.value = payload.maxExposureUsd || "";
-                        if (maxExposurePct) maxExposurePct.value = "";
                     } else if (nextMode === "PCT") {
-                        payload.maxExposurePct = (budgetValue?.value || "").trim() || null;
+                        payload.maxExposurePct = v;
                         payload.maxExposureUsd = null;
-                        if (maxExposurePct) maxExposurePct.value = payload.maxExposurePct || "";
-                        if (maxExposureUsd) maxExposureUsd.value = "";
                     } else {
                         payload.maxExposureUsd = null;
                         payload.maxExposurePct = null;
-                        if (maxExposureUsd) maxExposureUsd.value = "";
-                        if (maxExposurePct) maxExposurePct.value = "";
                     }
                     return payload;
                 }, () => {
                     budgetMode.value = prev.budgetMode;
                     setBudgetUi(prev.budgetMode);
+                    applyInitialBudgetValueIfEmpty();
                 });
 
                 prev.budgetMode = budgetMode.value || "NONE";
+                prev.budgetValue = budgetValue?.value || "";
             });
         }
 
+        // ----- budget value -----
         if (budgetValue) {
             prev.budgetValue = budgetValue.value || "";
 
@@ -399,12 +469,19 @@ window.SettingsTabRisk = (function () {
                 markChanged("значение лимита");
                 updateBudgetPreview();
 
-                // debounce save
                 scheduleSave(650, () => {
                     const m = (budgetMode?.value || "NONE").toUpperCase();
                     const payload = {};
-                    if (m === "USD") payload.maxExposureUsd = (budgetValue.value || "").trim() || null;
-                    else if (m === "PCT") payload.maxExposurePct = (budgetValue.value || "").trim() || null;
+                    const v = (budgetValue.value || "").trim() || null;
+
+                    // ✅ если пусто/невалидно — не шлём null (не затираем БД)
+                    if (m === "USD") {
+                        if (numOrNull(v) == null) return {};
+                        payload.maxExposureUsd = v;
+                    } else if (m === "PCT") {
+                        if (numOrNull(v) == null) return {};
+                        payload.maxExposurePct = v;
+                    }
                     return payload;
                 }, () => {
                     budgetValue.value = prev.budgetValue;
@@ -422,11 +499,23 @@ window.SettingsTabRisk = (function () {
                     return;
                 }
 
-                // валидация числа
-                const v = budgetValue.value;
-                if (!isBlank(v) && numOrNull(v) == null) {
+                const v = (budgetValue.value || "").trim();
+                const n = isBlank(v) ? null : numOrNull(v);
+
+                // ✅ если очищено — НЕ сохраняем null (чтобы не потерять лимит случайно),
+                // а откатываем значение обратно
+                if (isBlank(v)) {
                     budgetValue.value = prev.budgetValue;
                     updateBudgetPreview();
+                    setSaveUi("err", "", "нельзя пусто (иначе сбросишь лимит)");
+                    return;
+                }
+
+                // ✅ не число — откат
+                if (n == null || n <= 0) {
+                    budgetValue.value = prev.budgetValue;
+                    updateBudgetPreview();
+                    setSaveUi("err", "", "значение должно быть > 0");
                     return;
                 }
 
@@ -443,8 +532,9 @@ window.SettingsTabRisk = (function () {
                 await commitSave(() => {
                     const m = (budgetMode?.value || "NONE").toUpperCase();
                     const payload = {};
-                    if (m === "USD") payload.maxExposureUsd = (budgetValue.value || "").trim() || null;
-                    if (m === "PCT") payload.maxExposurePct = (budgetValue.value || "").trim() || null;
+                    const vv = (budgetValue.value || "").trim() || null;
+                    if (m === "USD") payload.maxExposureUsd = vv;
+                    else if (m === "PCT") payload.maxExposurePct = vv;
                     return payload;
                 }, () => {
                     budgetValue.value = prev.budgetValue;
@@ -455,7 +545,7 @@ window.SettingsTabRisk = (function () {
             });
         }
 
-        // ----- bind: riskPerTradePct -----
+        // ----- risk per trade -----
         if (riskPerTrade) {
             prev.riskPerTrade = riskPerTrade.value || "";
 
@@ -464,9 +554,14 @@ window.SettingsTabRisk = (function () {
                 if (modeNow === "AI") return;
 
                 markChanged("риск на сделку");
-                scheduleSave(650, () => ({
-                    riskPerTradePct: (riskPerTrade.value || "").trim() || null
-                }), () => {
+
+                scheduleSave(650, () => {
+                    const raw = (riskPerTrade.value || "").trim();
+                    if (isBlank(raw)) return {}; // ✅ не затираем случайно
+                    const n = numOrNull(raw);
+                    if (n == null || n < 0) return {}; // невалид — не шлём
+                    return { riskPerTradePct: raw };
+                }, () => {
                     riskPerTrade.value = prev.riskPerTrade;
                 });
             });
@@ -480,9 +575,19 @@ window.SettingsTabRisk = (function () {
                     return;
                 }
 
-                const v = riskPerTrade.value;
-                if (!isBlank(v) && numOrNull(v) == null) {
+                const raw = (riskPerTrade.value || "").trim();
+
+                // ✅ пусто — откат (чтобы не улетело null)
+                if (isBlank(raw)) {
                     riskPerTrade.value = prev.riskPerTrade;
+                    setSaveUi("err", "", "нельзя пусто");
+                    return;
+                }
+
+                const n = numOrNull(raw);
+                if (n == null || n < 0) {
+                    riskPerTrade.value = prev.riskPerTrade;
+                    setSaveUi("err", "", "введи число");
                     return;
                 }
 
@@ -495,7 +600,7 @@ window.SettingsTabRisk = (function () {
                 }
 
                 await commitSave(() => ({
-                    riskPerTradePct: (riskPerTrade.value || "").trim() || null
+                    riskPerTradePct: raw
                 }), () => {
                     riskPerTrade.value = prev.riskPerTrade;
                 });
@@ -504,22 +609,13 @@ window.SettingsTabRisk = (function () {
             });
         }
 
-        // ----- sync mode changes from Control tab -----
         function syncMode() {
             const mode = getControlMode(ctx);
             ctx.advancedControlMode = mode;
             setModeUi(mode);
             setBudgetUi(budgetMode?.value || "NONE");
-
-            // если AI — сбрасываем “грязь”
-            if (mode === "AI") {
-                setSaveUi("ok", nowHHmm());
-            }
-        }
-
-        const controlModeSelect = byId("advancedControlMode");
-        if (controlModeSelect) {
-            controlModeSelect.addEventListener("change", syncMode);
+            applyInitialBudgetValueIfEmpty();
+            if (mode === "AI") setSaveUi("ok", nowHHmm());
         }
 
         window.addEventListener("strategy:controlModeChanged", (e) => {
@@ -530,17 +626,9 @@ window.SettingsTabRisk = (function () {
             }
         });
 
-        // first render
         setSaveUi("idle");
         syncMode();
         updateBudgetPreview();
-    }
-
-    // safe boot
-    if (document.readyState === "loading") {
-        document.addEventListener("DOMContentLoaded", init);
-    } else {
-        init();
     }
 
     return { init };

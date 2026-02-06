@@ -410,10 +410,36 @@ public class BybitExchangeClient implements ExchangeClient {
 
         ExchangeSettings s = resolve(chatId, network);
 
+        // ✅ Bybit: у разных аккаунтов баланс может быть в разных accountType
+        List<String> accountTypes = List.of("UNIFIED", "SPOT", "CONTRACT");
+
+        Map<String, Balance> merged = new LinkedHashMap<>();
+
+        for (String accountType : accountTypes) {
+            try {
+                Map<String, Balance> part = loadWalletBalance(s, accountType);
+                if (part == null || part.isEmpty()) continue;
+
+                // ✅ merge: суммируем free/locked по активам
+                part.forEach((asset, bal) -> merged.merge(asset, bal, (a, b) ->
+                        new Balance(asset, a.free() + b.free(), a.locked() + b.locked())
+                ));
+
+            } catch (Exception e) {
+                // не валим UI целиком
+                log.debug("BYBIT getFullBalance accountType={} failed: {}", accountType, e.toString());
+            }
+        }
+
+        return merged;
+    }
+
+    private Map<String, Balance> loadWalletBalance(ExchangeSettings s, String accountType) throws Exception {
+
         String raw = signedV5(
                 s,
                 "/v5/account/wallet-balance",
-                Map.of("accountType", "UNIFIED"),
+                Map.of("accountType", accountType),
                 HttpMethod.GET
         );
 
@@ -422,9 +448,8 @@ public class BybitExchangeClient implements ExchangeClient {
         JSONObject root = new JSONObject(raw);
 
         if (root.optInt("retCode", -1) != 0) {
-            log.warn("⚠️ BYBIT BALANCE retCode={} msg={}",
-                    root.optInt("retCode"),
-                    root.optString("retMsg"));
+            log.debug("BYBIT BALANCE accountType={} retCode={} msg={}",
+                    accountType, root.optInt("retCode"), root.optString("retMsg"));
             return Map.of();
         }
 
@@ -434,25 +459,41 @@ public class BybitExchangeClient implements ExchangeClient {
         JSONArray list = result.optJSONArray("list");
         if (list == null || list.isEmpty()) return Map.of();
 
-        JSONArray coins = list.getJSONObject(0).optJSONArray("coin");
-        if (coins == null) return Map.of();
-
         Map<String, Balance> out = new LinkedHashMap<>();
 
-        for (int i = 0; i < coins.length(); i++) {
-            JSONObject c = coins.getJSONObject(i);
+        // ✅ важно: list может быть несколько
+        for (int li = 0; li < list.length(); li++) {
+            JSONObject acc = list.optJSONObject(li);
+            if (acc == null) continue;
 
-            String a = c.optString("coin", "").trim().toUpperCase(Locale.ROOT);
-            if (a.isBlank()) continue;
+            JSONArray coins = acc.optJSONArray("coin");
+            if (coins == null || coins.isEmpty()) continue;
 
-            BigDecimal wallet = safeDecimal(c.opt("walletBalance"));
-            BigDecimal withdraw = safeDecimal(c.opt("availableToWithdraw"));
+            for (int i = 0; i < coins.length(); i++) {
+                JSONObject c = coins.optJSONObject(i);
+                if (c == null) continue;
 
-            BigDecimal free = withdraw.compareTo(BigDecimal.ZERO) > 0 ? withdraw : wallet;
-            BigDecimal locked = wallet.subtract(free).max(BigDecimal.ZERO);
+                String a = c.optString("coin", "").trim().toUpperCase(Locale.ROOT);
+                if (a.isBlank()) continue;
 
-            if (wallet.compareTo(BigDecimal.ZERO) > 0) {
-                out.put(a, new Balance(a, free.doubleValue(), locked.doubleValue()));
+                BigDecimal wallet = safeDecimal(c.opt("walletBalance"));
+                BigDecimal withdraw = safeDecimal(c.opt("availableToWithdraw"));
+
+                // ✅ если availableToWithdraw пусто/0, fallback на walletBalance
+                BigDecimal free = (withdraw != null && withdraw.compareTo(BigDecimal.ZERO) > 0)
+                        ? withdraw
+                        : wallet;
+
+                if (free == null) free = BigDecimal.ZERO;
+                if (wallet == null) wallet = BigDecimal.ZERO;
+
+                BigDecimal locked = wallet.subtract(free).max(BigDecimal.ZERO);
+
+                // ✅ фильтруем total > 0
+                if (wallet.compareTo(BigDecimal.ZERO) > 0 || free.compareTo(BigDecimal.ZERO) > 0 || locked.compareTo(BigDecimal.ZERO) > 0) {
+                    Balance bal = new Balance(a, free.doubleValue(), locked.doubleValue());
+                    out.merge(a, bal, (x, y) -> new Balance(a, x.free() + y.free(), x.locked() + y.locked()));
+                }
             }
         }
 

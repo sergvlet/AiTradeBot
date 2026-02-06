@@ -273,14 +273,7 @@ public class SupportResistanceStrategyV4 implements TradingStrategy {
             // =====================================================
             if (!st.inPosition) {
 
-                Integer cooldown = ss != null ? ss.getCooldownSeconds() : null;
-                if (cooldown != null && cooldown > 0 && st.lastTradeClosedAt != null) {
-                    long passed = Duration.between(st.lastTradeClosedAt, time).getSeconds();
-                    if (passed < cooldown) {
-                        pushHoldThrottled(chatId, sym, st, "cooldown", time);
-                        return;
-                    }
-                }
+
 
                 boolean doBounce = cfg.isEnabledBounce() && nearSupport;
                 boolean doBreakout = cfg.isEnabledBreakout() && breakout;
@@ -460,7 +453,6 @@ public class SupportResistanceStrategyV4 implements TradingStrategy {
         String net    = ss != null ? String.valueOf(ss.getNetworkType()) : "null";
         String tf     = ss != null ? safe(ss.getTimeframe()) : "null";
         String candles = ss != null && ss.getCachedCandlesLimit() != null ? String.valueOf(ss.getCachedCandlesLimit()) : "null";
-        String cooldown = ss != null && ss.getCooldownSeconds() != null ? String.valueOf(ss.getCooldownSeconds()) : "null";
 
         String w = cfg != null ? String.valueOf(cfg.getWindowSize()) : "null";
         String minR = cfg != null ? String.valueOf(cfg.getMinRangePct()) : "null";
@@ -469,8 +461,7 @@ public class SupportResistanceStrategyV4 implements TradingStrategy {
         String b1 = cfg != null ? String.valueOf(cfg.isEnabledBounce()) : "null";
         String b2 = cfg != null ? String.valueOf(cfg.isEnabledBreakout()) : "null";
 
-        return symbol + "|" + ex + "|" + net + "|" + tf + "|" + candles + "|" + cooldown
-                + "|" + w + "|" + minR + "|" + entry + "|" + br + "|" + b1 + "|" + b2;
+        return symbol + "|" + ex + "|" + net + "|" + tf + "|" + candles + "|"  + w + "|" + minR + "|" + entry + "|" + br + "|" + b1 + "|" + b2;
     }
 
     // =====================================================

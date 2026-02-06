@@ -443,13 +443,7 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         p.put("stopLossPct", cfg.getStopLossPct());
 
         // ss
-        p.put("riskPerTradePct", ss.getRiskPerTradePct());
-        p.put("minRiskReward", ss.getMinRiskReward());
-        p.put("leverage", ss.getLeverage());
-        p.put("allowAveraging", ss.getAllowAveraging());
-        p.put("cooldownAfterLossSeconds", ss.getCooldownAfterLossSeconds());
-        p.put("maxConsecutiveLosses", ss.getMaxConsecutiveLosses());
-        p.put("maxDrawdownPct", ss.getMaxDrawdownPct());
+
 
         return p;
     }
@@ -469,26 +463,7 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         if (tp != null && tp.signum() > 0) cfg.setTakeProfitPct(tp);
         if (sl != null && sl.signum() > 0) cfg.setStopLossPct(sl);
 
-        BigDecimal risk = bd(p.get("riskPerTradePct"));
-        if (risk != null && risk.signum() > 0) ss.setRiskPerTradePct(risk);
 
-        BigDecimal rr = bd(p.get("minRiskReward"));
-        if (rr != null && rr.signum() > 0) ss.setMinRiskReward(rr);
-
-        Integer lev = intObjOf(p.get("leverage"));
-        if (lev != null && lev > 0) ss.setLeverage(lev);
-
-        Boolean avg = boolOf(p.get("allowAveraging"));
-        if (avg != null) ss.setAllowAveraging(avg);
-
-        Integer cd = intObjOf(p.get("cooldownAfterLossSeconds"));
-        if (cd != null && cd >= 0) ss.setCooldownAfterLossSeconds(cd);
-
-        Integer mcl = intObjOf(p.get("maxConsecutiveLosses"));
-        if (mcl != null && mcl > 0) ss.setMaxConsecutiveLosses(mcl);
-
-        BigDecimal dd = bd(p.get("maxDrawdownPct"));
-        if (dd != null && dd.signum() > 0) ss.setMaxDrawdownPct(dd);
     }
 
     // =====================================================

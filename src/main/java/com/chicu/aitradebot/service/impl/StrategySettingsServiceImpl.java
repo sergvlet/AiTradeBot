@@ -3,6 +3,7 @@ package com.chicu.aitradebot.service.impl;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
+import com.chicu.aitradebot.domain.StrategySettings.CapitalMode;
 import com.chicu.aitradebot.domain.enums.AdvancedControlMode;
 import com.chicu.aitradebot.repository.StrategySettingsRepository;
 import com.chicu.aitradebot.service.StrategySettingsService;
@@ -12,7 +13,6 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Locale;
@@ -22,6 +22,17 @@ import java.util.Locale;
 @RequiredArgsConstructor
 public class StrategySettingsServiceImpl implements StrategySettingsService {
 
+    private static final String DEFAULT_EXCHANGE = "BINANCE";
+    private static final String DEFAULT_SYMBOL = "BTCUSDT";
+    private static final String DEFAULT_TIMEFRAME = "1m";
+    private static final int    MIN_CANDLES = 50;
+    private static final int    DEFAULT_CANDLES = 500;
+
+    private static final String PHASE_LIVE = "LIVE";
+    private static final String PHASE_PAPER = "PAPER";
+    private static final String PHASE_BACKTEST = "BACKTEST";
+    private static final String PHASE_COLLECT = "COLLECT";
+
     private final StrategySettingsRepository repo;
 
     @Override
@@ -29,15 +40,99 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
     public StrategySettings save(StrategySettings s) {
         if (s == null) throw new IllegalArgumentException("StrategySettings is null");
 
-        // ✅ не затираем режим, если он уже выбран
+        // --- дефолты/нормализация обязательных полей ---
         if (s.getAdvancedControlMode() == null) {
             s.setAdvancedControlMode(AdvancedControlMode.MANUAL);
         }
 
-        // ✅ корректное время (Instant -> LocalDateTime напрямую нельзя)
-        s.setUpdatedAt(LocalDateTime.now());
+        if (s.getSymbol() == null || s.getSymbol().isBlank()) {
+            s.setSymbol(DEFAULT_SYMBOL);
+        } else {
+            s.setSymbol(s.getSymbol().trim().toUpperCase(Locale.ROOT));
+        }
+
+        if (s.getTimeframe() == null || s.getTimeframe().isBlank()) {
+            s.setTimeframe(DEFAULT_TIMEFRAME);
+        } else {
+            s.setTimeframe(s.getTimeframe().trim().toLowerCase(Locale.ROOT));
+        }
+
+        if (s.getCachedCandlesLimit() == null || s.getCachedCandlesLimit() < MIN_CANDLES) {
+            s.setCachedCandlesLimit(DEFAULT_CANDLES);
+        }
+
+        if (s.getExchangeName() != null) {
+            String ex = s.getExchangeName().trim().toUpperCase(Locale.ROOT);
+            s.setExchangeName(ex.isEmpty() ? DEFAULT_EXCHANGE : ex);
+        } else {
+            s.setExchangeName(DEFAULT_EXCHANGE);
+        }
+
+        if (s.getAccountAsset() != null) {
+            String a = s.getAccountAsset().trim().toUpperCase(Locale.ROOT);
+            s.setAccountAsset(a.isEmpty() ? null : a);
+        }
+
+        // --- единая логика режима управления (флаги + безопасная фаза) ---
+        applyControlModeFlags(s);
+
+        // --- капитал: если mode null -> ALL; value в StrategySettings нормализуется lifecycle-методами,
+        // но здесь дополнительно защитимся от null mode ---
+        if (s.getCapitalMode() == null) {
+            s.setCapitalMode(CapitalMode.ALL);
+        }
+
+        // timestamps
+        LocalDateTime now = LocalDateTime.now();
+        if (s.getCreatedAt() == null) s.setCreatedAt(now);
+        s.setUpdatedAt(now);
 
         return repo.save(s);
+    }
+
+    /**
+     * MANUAL/HYBRID/AI => системные флаги исполнения.
+     * ВАЖНО: сервис не должен “сам” менять сеть/режим торговли.
+     * Он лишь гарантирует консистентность: флаги и безопасная runPhase.
+     */
+    private void applyControlModeFlags(StrategySettings s) {
+        AdvancedControlMode mode = (s.getAdvancedControlMode() != null)
+                ? s.getAdvancedControlMode()
+                : AdvancedControlMode.MANUAL;
+
+        // runPhase нормализуем “бережно”:
+        // - BACKTEST/ COLLECT не делаем дефолтом здесь
+        // - PAPER допускаем, но только если кто-то (UI) явно поставил
+        String phase = normalizeUpperNullable(s.getRunPhase());
+
+        switch (mode) {
+            case MANUAL -> {
+                s.setAutoTuneEnabled(false);
+                s.setMlGateEnabled(false);
+                // MANUAL всегда “обычная работа”
+                s.setRunPhase(PHASE_LIVE);
+            }
+            case HYBRID -> {
+                s.setAutoTuneEnabled(true);
+                s.setMlGateEnabled(true);
+                // HYBRID по умолчанию LIVE (а PAPER/LIVE решает контроллер/UI по network)
+                if (phase == null || PHASE_BACKTEST.equals(phase) || PHASE_COLLECT.equals(phase)) {
+                    s.setRunPhase(PHASE_LIVE);
+                } else {
+                    s.setRunPhase(phase);
+                }
+            }
+            case AI -> {
+                s.setAutoTuneEnabled(true);
+                s.setMlGateEnabled(true);
+                // AI: если UI не поставил PAPER явно — держим LIVE
+                if (phase == null || PHASE_BACKTEST.equals(phase) || PHASE_COLLECT.equals(phase)) {
+                    s.setRunPhase(PHASE_LIVE);
+                } else {
+                    s.setRunPhase(phase);
+                }
+            }
+        }
     }
 
     @Override
@@ -71,6 +166,17 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
                 .networkType(network)
                 .active(false)
                 .advancedControlMode(AdvancedControlMode.MANUAL)
+                .runPhase(PHASE_LIVE)
+
+                // дефолты торговли/данных
+                .symbol(DEFAULT_SYMBOL)
+                .timeframe(DEFAULT_TIMEFRAME)
+                .cachedCandlesLimit(DEFAULT_CANDLES)
+
+                // ✅ новый риск-контроль: по умолчанию “весь баланс”
+                .capitalMode(CapitalMode.ALL)
+                .capitalValue(null)
+
                 .createdAt(now)
                 .updatedAt(now)
                 .build();
@@ -81,7 +187,6 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
                     chatId, type, exchange, network, saved.getId());
             return saved;
         } catch (DataIntegrityViolationException dup) {
-            // ✅ если два потока одновременно создали — просто читаем существующую (UNIQUE спасает)
             return repo.findByChatIdAndTypeAndExchangeNameAndNetworkType(chatId, type, exchange, network)
                     .orElseThrow(() -> dup);
         }
@@ -104,28 +209,19 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
         return repo.findAllByChatIdAndExchangeName(chatId, ex);
     }
 
-    @Override
-    @Transactional
-    public void updateRiskFromUi(long chatId, StrategyType type, String exchange, NetworkType network,
-                                 BigDecimal dailyLossLimitPct, BigDecimal riskPerTradePct) {
-        StrategySettings s = getOrCreate(chatId, type, exchange, network);
-        s.setDailyLossLimitPct(dailyLossLimitPct);
-        s.setRiskPerTradePct(riskPerTradePct);
-        save(s);
-    }
-
-    @Override
-    @Transactional
-    public void updateRiskFromAi(long chatId, StrategyType type, String exchange, NetworkType network,
-                                 BigDecimal newRiskPerTradePct) {
-        StrategySettings s = getOrCreate(chatId, type, exchange, network);
-        s.setRiskPerTradePct(newRiskPerTradePct);
-        save(s);
-    }
+    // ✅ Старые методы riskPerTradePct/dailyLossLimitPct УДАЛЯЕМ из интерфейса StrategySettingsService.
+    // Здесь их больше не реализуем, потому что полей больше нет и это будет “тихий” баг.
 
     private static String normalizeExchange(String exchange) {
-        if (exchange == null) return "BINANCE";
+        if (exchange == null) return DEFAULT_EXCHANGE;
         String ex = exchange.trim().toUpperCase(Locale.ROOT);
-        return ex.isEmpty() ? "BINANCE" : ex;
+        return ex.isEmpty() ? DEFAULT_EXCHANGE : ex;
+    }
+
+    private static String normalizeUpperNullable(String s) {
+        if (s == null) return null;
+        String v = s.trim();
+        if (v.isEmpty()) return null;
+        return v.toUpperCase(Locale.ROOT);
     }
 }

@@ -283,14 +283,6 @@ public class FibonacciRetraceStrategyV4 implements TradingStrategy {
             // =====================================================
             if (!st.inPosition && inZone) {
 
-                Integer cooldown = ss != null ? ss.getCooldownSeconds() : null;
-                if (cooldown != null && cooldown > 0 && st.lastTradeClosedAt != null) {
-                    long passed = Duration.between(st.lastTradeClosedAt, time).getSeconds();
-                    if (passed < cooldown) {
-                        pushHoldThrottled(chatId, sym, st, "cooldown", time);
-                        return;
-                    }
-                }
 
                 // score 0..100: чем ближе к fibPrice тем выше
                 double dist = price.subtract(fibPrice).abs()
@@ -466,7 +458,6 @@ public class FibonacciRetraceStrategyV4 implements TradingStrategy {
         String net    = ss != null ? String.valueOf(ss.getNetworkType()) : "null";
         String tf     = ss != null ? safe(ss.getTimeframe()) : "null";
         String candles = ss != null && ss.getCachedCandlesLimit() != null ? String.valueOf(ss.getCachedCandlesLimit()) : "null";
-        String cooldown = ss != null && ss.getCooldownSeconds() != null ? String.valueOf(ss.getCooldownSeconds()) : "null";
 
         String w = cfg != null ? String.valueOf(cfg.getWindowSize()) : "null";
         String minR = cfg != null ? String.valueOf(cfg.getMinRangePct()) : "null";
@@ -475,7 +466,7 @@ public class FibonacciRetraceStrategyV4 implements TradingStrategy {
         String inv = cfg != null ? String.valueOf(cfg.getInvalidateBelowLowPct()) : "null";
         String en  = cfg != null ? String.valueOf(cfg.isEnabled()) : "null";
 
-        return symbol + "|" + ex + "|" + net + "|" + tf + "|" + candles + "|" + cooldown
+        return symbol + "|" + ex + "|" + net + "|" + tf + "|" + candles + "|"
                 + "|" + w + "|" + minR + "|" + lvl + "|" + tol + "|" + inv + "|" + en;
     }
 

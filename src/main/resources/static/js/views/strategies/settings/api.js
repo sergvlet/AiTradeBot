@@ -5,6 +5,7 @@
  * - CSRF friendly (meta + hidden input)
  * - same-origin cookies
  * - safe error parsing (JSON/HTML/text)
+ * - detects silent HTML login/403 pages (so you see real problem)
  */
 window.SettingsApi = (function () {
 
@@ -13,10 +14,10 @@ window.SettingsApi = (function () {
     }
 
     function readCsrf() {
-        const tokenMeta = document.querySelector('meta[name="_csrf"]');
+        const tokenMeta  = document.querySelector('meta[name="_csrf"]');
         const headerMeta = document.querySelector('meta[name="_csrf_header"]');
 
-        const token = tokenMeta?.getAttribute("content") || "";
+        const token  = tokenMeta?.getAttribute("content") || "";
         const header = headerMeta?.getAttribute("content") || "";
 
         if (token && header) return { token, header, paramName: "_csrf" };
@@ -31,7 +32,37 @@ window.SettingsApi = (function () {
         return null;
     }
 
+    function withCsrfHeaders(headers) {
+        const csrf = readCsrf();
+        if (csrf?.token && csrf?.header) headers[csrf.header] = csrf.token;
+        return headers;
+    }
+
+    function withCsrfParam(params) {
+        const csrf = readCsrf();
+        if (csrf?.token && csrf?.paramName && !params.has(csrf.paramName)) {
+            params.append(csrf.paramName, csrf.token);
+        }
+        return params;
+    }
+
+    function looksLikeLoginHtml(text) {
+        if (!text) return false;
+        const t = String(text).toLowerCase();
+        // типичные признаки Spring Security login/403 страниц
+        if (t.includes("login") && (t.includes("password") || t.includes("username"))) return true;
+        if (t.includes("sign in") && t.includes("password")) return true;
+        if (t.includes("csrf") && t.includes("invalid")) return true;
+        if (t.includes("whitelabel error page")) return true;
+        if (t.includes("access denied")) return true;
+        return t.includes("403") && t.includes("forbidden");
+
+    }
+
     async function readBodySafe(resp) {
+        // 204 / empty body
+        if (resp.status === 204) return { kind: "empty", text: "" };
+
         const ct = (resp.headers.get("content-type") || "").toLowerCase();
         const text = await resp.text().catch(() => "");
         if (!text) return { kind: "empty", text: "" };
@@ -51,7 +82,6 @@ window.SettingsApi = (function () {
     function prettifyError(status, body) {
         if (!body) return `HTTP ${status}`;
 
-        // если это JSON с полями message/error/path/code — красиво соберём
         if (body.kind === "json" && body.json && typeof body.json === "object") {
             const obj = body.json;
             const msg = obj.message || obj.error || obj.details || `HTTP ${status}`;
@@ -60,35 +90,20 @@ window.SettingsApi = (function () {
             return `${msg}${path}${code}`;
         }
 
-        // если это HTML — режем
         if (body.kind === "text") {
             const t = String(body.text || "");
-            const cut = t.replace(/\s+/g, " ").trim().slice(0, 240);
+            const cut = t.replace(/\s+/g, " ").trim().slice(0, 260);
             return `HTTP ${status}: ${cut}`;
         }
 
         return `HTTP ${status}`;
     }
 
-    function withCsrfHeaders(headers) {
-        const csrf = readCsrf();
-        if (csrf?.token && csrf?.header) headers[csrf.header] = csrf.token;
-        return headers;
-    }
-
-    function withCsrfParam(params) {
-        const csrf = readCsrf();
-        if (csrf?.token && csrf?.paramName && !params.has(csrf.paramName)) {
-            params.append(csrf.paramName, csrf.token);
-        }
-        return params;
-    }
-
     async function getJson(url) {
-        const headers = withCsrfHeaders({
+        const headers = {
             "Accept": "application/json",
             "X-Requested-With": "fetch"
-        });
+        };
 
         const resp = await fetch(url, {
             method: "GET",
@@ -103,7 +118,7 @@ window.SettingsApi = (function () {
 
         const body = await readBodySafe(resp);
         if (body.kind === "json") return body.json;
-        // fallback: пусто / текст
+        // пусто/текст -> вернём пустой объект
         return {};
     }
 
@@ -119,7 +134,7 @@ window.SettingsApi = (function () {
 
         const headers = withCsrfHeaders({
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "Accept": "application/json",
+            "Accept": "*/*",                 // ✅ важно: сервер может вернуть HTML redirect
             "X-Requested-With": "fetch"
         });
 
@@ -127,17 +142,26 @@ window.SettingsApi = (function () {
             method: "POST",
             credentials: "same-origin",
             headers,
-            body: params.toString()
+            body: params.toString(),
+            redirect: "follow"
         });
 
+        const body = await readBodySafe(resp);
+
+        // ❌ сервер может вернуть 200 и HTML login page — это НЕ успех
+        if (resp.ok && body.kind === "text" && looksLikeLoginHtml(body.text)) {
+            throw new Error("Сессия/доступ потеряны (похоже на страницу логина/403). Проверь авторизацию и CSRF.");
+        }
+
         if (!resp.ok) {
-            const body = await readBodySafe(resp);
             throw new Error(prettifyError(resp.status, body));
         }
 
-        const body = await readBodySafe(resp);
+        // ✅ если вернулся JSON — отдадим его
         if (body.kind === "json") return body.json;
-        return true;
+
+        // ✅ если HTML/пусто — считаем успехом
+        return { ok: true };
     }
 
     async function postJson(url, payload) {
@@ -151,15 +175,20 @@ window.SettingsApi = (function () {
             method: "POST",
             credentials: "same-origin",
             headers,
-            body: JSON.stringify(payload || {})
+            body: JSON.stringify(payload || {}),
+            redirect: "follow"
         });
 
+        const body = await readBodySafe(resp);
+
+        if (resp.ok && body.kind === "text" && looksLikeLoginHtml(body.text)) {
+            throw new Error("Сессия/доступ потеряны (похоже на страницу логина/403). Проверь авторизацию и CSRF.");
+        }
+
         if (!resp.ok) {
-            const body = await readBodySafe(resp);
             throw new Error(prettifyError(resp.status, body));
         }
 
-        const body = await readBodySafe(resp);
         if (body.kind === "json") return body.json;
         return {};
     }

@@ -24,103 +24,126 @@ public class AccountBalanceService {
     private final StrategySettingsService strategySettingsService;
     private final ExchangeClientFactory exchangeClientFactory;
 
+    /**
+     * Источник истины:
+     * - networkType/exchangeName приходят СВЕРХУ (из StrategySettings / UI / оркестратора).
+     * - баланс берём С БИРЖИ, строго через клиента (exchange + network).
+     * - выбранный asset (accountAsset) хранится В БАЗЕ в StrategySettings и синхронизируется с тем,
+     *   что реально доступно на бирже.
+     */
     public AccountBalanceSnapshot getSnapshot(
             long chatId,
             StrategyType type,
             String exchangeName,
             NetworkType networkType
     ) {
+        String ex = normalize(exchangeName);
+        NetworkType net = networkType;
 
-        StrategySettings settings =
-                strategySettingsService.getOrCreate(chatId, type, exchangeName, networkType);
-
+        // ✅ StrategySettings берём/создаём строго в разрезе (chatId, type, exchange, network)
+        StrategySettings settings = null;
         try {
-            // ✅ корректная сигнатура
-            ExchangeClient client =
-                    exchangeClientFactory.get(exchangeName, networkType);
+            settings = strategySettingsService.getOrCreate(chatId, type, ex, net);
+        } catch (Exception e) {
+            // если settings не удалось получить — всё равно попробуем баланс (биржа может быть доступна)
+            log.warn("⚠️ Не удалось загрузить StrategySettings (chatId={}, type={}, ex={}, net={}): {}",
+                    chatId, type, ex, net, e.toString());
+        }
 
-            // ✅ реальный тип данных
-            Map<String, Balance> full =
-                    safeMap(client.getFullBalance(chatId, networkType));
+        // ✅ дальше всё — с биржи, строго в контексте (exchange, network)
+        try {
+            ExchangeClient client = exchangeClientFactory.get(ex, net);
 
-            // 1) только free > 0
-            Map<String, Balance> positiveFree = full.entrySet().stream()
-                    .filter(e -> e.getValue() != null && e.getValue().free() > 0.0)
+            Map<String, Balance> full = safeMap(client.getFullBalance(chatId, net));
+
+            // ✅ оставляем только те активы, где total > 0 (free + locked)
+            Map<String, Balance> positiveTotal = full.entrySet().stream()
+                    .filter(e -> e.getKey() != null)
+                    .filter(e -> e.getValue() != null)
+                    .filter(e -> (e.getValue().free() + e.getValue().locked()) > 0.0d)
                     .collect(Collectors.toMap(
-                            Map.Entry::getKey,
+                            e -> normalize(e.getKey()),
                             Map.Entry::getValue,
                             (a, b) -> a,
                             LinkedHashMap::new
                     ));
 
-            List<String> availableAssets = positiveFree.keySet().stream()
+            List<String> availableAssets = positiveTotal.keySet().stream()
                     .sorted(String.CASE_INSENSITIVE_ORDER)
                     .toList();
 
-            String selected = normalize(settings.getAccountAsset());
+            String selected = (settings != null) ? normalize(settings.getAccountAsset()) : null;
 
+            // ✅ если на бирже нет положительных балансов
             if (availableAssets.isEmpty()) {
-                if (selected != null) {
+                // в базе очищаем только если settings реально есть
+                if (settings != null && selected != null) {
                     settings.setAccountAsset(null);
                     strategySettingsService.save(settings);
                 }
+
                 return AccountBalanceSnapshot.builder()
                         .availableAssets(List.of())
                         .selectedAsset(null)
-                        .selectedFreeBalance(null)
+                        .selectedBalance(null)
                         .connectionOk(true)
                         .build();
             }
 
+            // ✅ если выбранный актив отсутствует на бирже — выбираем первый из доступных
             boolean changed = false;
-            if (selected == null || !positiveFree.containsKey(selected)) {
+            if (selected == null || !positiveTotal.containsKey(selected)) {
                 selected = availableAssets.getFirst();
-                settings.setAccountAsset(selected);
                 changed = true;
             }
 
-            if (changed) {
+            // ✅ сохраняем выбранный актив в БД только если settings существует
+            if (changed && settings != null) {
+                settings.setAccountAsset(selected);
                 strategySettingsService.save(settings);
-                log.info("💰 accountAsset синхронизирован: chatId={}, type={}, asset={}",
-                        chatId, type, selected);
+                log.info("💰 accountAsset синхронизирован: chatId={}, type={}, ex={}, net={}, asset={}",
+                        chatId, type, ex, net, selected);
             }
 
-            BigDecimal selectedFree =
-                    BigDecimal.valueOf(positiveFree.get(selected).free());
+            Balance b = positiveTotal.get(selected);
+
+            // ✅ переводим из double в BigDecimal безопасно
+            BigDecimal free = bdFromDouble(b != null ? b.free() : 0.0d);
+            BigDecimal locked = bdFromDouble(b != null ? b.locked() : 0.0d);
 
             return AccountBalanceSnapshot.builder()
                     .availableAssets(availableAssets)
                     .selectedAsset(selected)
-                    .selectedFreeBalance(selectedFree)
+                    .selectedBalance(AccountBalanceSnapshot.AssetBalance.of(free, locked))
                     .connectionOk(true)
                     .build();
 
-        } catch (Exception ex) {
-            log.warn(
-                    "⚠️ Не удалось получить баланс (chatId={}, type={}, exchange={}, network={}): {}",
-                    chatId, type, exchangeName, networkType, ex.toString()
-            );
+        } catch (Exception exx) {
+            String selectedFallback = (settings != null) ? normalize(settings.getAccountAsset()) : null;
+
+            log.warn("⚠️ Не удалось получить баланс (chatId={}, type={}, ex={}, net={}): {}",
+                    chatId, type, ex, net, exx.toString());
 
             return AccountBalanceSnapshot.builder()
                     .availableAssets(List.of())
-                    .selectedAsset(normalize(settings.getAccountAsset()))
-                    .selectedFreeBalance(null)
+                    .selectedAsset(selectedFallback)
+                    .selectedBalance(null)
                     .connectionOk(false)
-                    .error(ex.getMessage())
+                    .error(exx.getMessage())
                     .build();
         }
     }
 
     public AccountFees getAccountFees(long chatId, String exchangeName, NetworkType networkType) {
-        ExchangeClient client = exchangeClientFactory.get(exchangeName, networkType);
-        return client.getAccountFees(chatId, networkType);
+        String ex = normalize(exchangeName);
+        NetworkType net = networkType;
+        ExchangeClient client = exchangeClientFactory.get(ex, net);
+        return client.getAccountFees(chatId, net);
     }
 
-
-
-    // =====================================================================
+    // =====================================================
     // helpers
-    // =====================================================================
+    // =====================================================
 
     private String normalize(String s) {
         if (s == null) return null;
@@ -132,5 +155,12 @@ public class AccountBalanceService {
         return (m == null) ? Collections.emptyMap() : m;
     }
 
-
+    /**
+     * BigDecimal.valueOf(double) использует Double.toString(double) и обычно безопаснее, чем new BigDecimal(double),
+     * но на биржевых балансах могут прилетать NaN/Inf — страхуемся.
+     */
+    private BigDecimal bdFromDouble(double v) {
+        if (Double.isNaN(v) || Double.isInfinite(v)) return BigDecimal.ZERO;
+        return BigDecimal.valueOf(v);
+    }
 }
