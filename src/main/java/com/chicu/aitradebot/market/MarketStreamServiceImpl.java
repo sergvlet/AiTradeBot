@@ -28,55 +28,59 @@ public class MarketStreamServiceImpl implements MarketStreamService {
     private final StrategyLivePublisher livePublisher;
     private final AiStrategyOrchestrator orchestrator;
 
-    /**
-     * Минимальный интервал диспатча в оркестратор (ms).
-     * 0 = без троттлинга.
-     */
     @Value("${market.dispatch.min-interval-ms:0}")
     private long minDispatchIntervalMs;
 
-    /**
-     * Диагностика: логировать первые N сообщений по каждому ключу.
-     */
     @Value("${market.dispatch.logFirstSeq:5}")
     private long logFirstSeq;
 
-    /**
-     * Диагностика: логировать каждое N-ое сообщение по seq (если seq доступен).
-     */
     @Value("${market.dispatch.logEverySeq:200}")
     private long logEverySeq;
 
-    /**
-     * TTL для очистки ключей, если стратегия не работает/не диспатчит.
-     */
     @Value("${market.dispatch.inactiveTtlMs:60000}")
     private long inactiveTtlMs;
 
-    /**
-     * Анти-спам: лог SKIP не чаще 1 раза в X ms на StreamKey
-     */
     @Value("${market.dispatch.skip-log-cooldown-ms:30000}")
     private long skipLogCooldownMs;
 
-    /**
-     * ✅ Единственный троттлер диспатча
-     * last успешный DISPATCH в оркестратор по StreamKey (eventTs)
-     */
-    private final ConcurrentMap<StreamKey, Long> lastDispatchAtMs = new ConcurrentHashMap<>();
+    // ============================================================
+    // ✅ AGG_TRADE maps (БЕЗ timeframe!)
+    // ============================================================
 
     /**
-     * ✅ Анти-спам SKIP логов по StreamKey
+     * ✅ last успешный DISPATCH в оркестратор (eventTs) по TickKey (без tf)
      */
-    private final ConcurrentMap<StreamKey, Long> lastSkipLogAtMs = new ConcurrentHashMap<>();
+    private final ConcurrentMap<TickKey, Long> lastTickDispatchAtMs = new ConcurrentHashMap<>();
 
     /**
-     * Диагностический счётчик на случай, если push.seq() == 0
+     * ✅ last "seen" event по TickKey (чтобы TTL работал даже если не диспатчим)
+     */
+    private final ConcurrentMap<TickKey, Long> lastTickSeenAtMs = new ConcurrentHashMap<>();
+
+    /**
+     * ✅ Анти-спам SKIP логов по TickKey
+     */
+    private final ConcurrentMap<TickKey, Long> lastTickSkipLogAtMs = new ConcurrentHashMap<>();
+
+    // ============================================================
+    // ✅ KLINE maps (с timeframe!)
+    // ============================================================
+
+    private final ConcurrentMap<KlineKey, Long> lastKlineSeenAtMs = new ConcurrentHashMap<>();
+
+    /**
+     * Диагностический счётчик, если push.seq() == 0
      */
     private final AtomicLong diagCounter = new AtomicLong(0);
 
+    /**
+     * ✅ Запоминаем последнюю "подписку" по (chatId,type),
+     * чтобы при смене контекста сделать resubscribe.
+     */
+    private final ConcurrentMap<SubKey, SubBinding> lastSub = new ConcurrentHashMap<>();
+
     // ============================================================
-    // SUBSCRIBE
+    // SUBSCRIBE (с ресабом при смене binding)
     // ============================================================
 
     @Override
@@ -97,6 +101,22 @@ public class MarketStreamServiceImpl implements MarketStreamService {
             return;
         }
 
+        SubKey k = new SubKey(chatId, type);
+        SubBinding desired = new SubBinding(ex, networkType, sym, tf);
+
+        SubBinding prev = lastSub.put(k, desired);
+
+        if (prev != null && !prev.equals(desired)) {
+            log.info("🔁 [MARKET] resubscribe chatId={} type={} old=[{} {} {} {}] new=[{} {} {} {}]",
+                    chatId, type,
+                    prev.exchange, prev.networkType, prev.symbol, prev.timeframe,
+                    ex, networkType, sym, tf
+            );
+
+            // ✅ безопасная попытка unsubscribe (если метод есть)
+            safeUnsubscribe(prev.exchange, prev.networkType, chatId, type, prev.symbol, prev.timeframe);
+        }
+
         try {
             marketDataStreamService.subscribe(ex, networkType, chatId, type, sym, tf);
             log.info("📡 [MARKET] Подписка OK chatId={} type={} ex={} net={} {} {}",
@@ -107,8 +127,29 @@ public class MarketStreamServiceImpl implements MarketStreamService {
         }
     }
 
+    /**
+     * Пытаемся вызвать marketDataStreamService.unsubscribe(...) если метод существует.
+     * Ничего не ломаем, если его нет.
+     */
+    private void safeUnsubscribe(String ex, NetworkType net, long chatId, StrategyType type, String sym, String tf) {
+        try {
+            Method m = marketDataStreamService.getClass().getMethod(
+                    "unsubscribe",
+                    String.class, NetworkType.class, long.class, StrategyType.class, String.class, String.class
+            );
+            m.invoke(marketDataStreamService, ex, net, chatId, type, sym, tf);
+            log.info("📴 [MARKET] Unsubscribe OK chatId={} type={} ex={} net={} {} {}",
+                    chatId, type, ex, net, sym, tf);
+        } catch (NoSuchMethodException ignored) {
+            // метода нет — ок
+        } catch (Exception e) {
+            log.warn("⚠️ [MARKET] Unsubscribe failed chatId={} type={} ex={} net={} {} {} err={}",
+                    chatId, type, ex, net, sym, tf, e.getMessage());
+        }
+    }
+
     // ============================================================
-    // AGG TRADE (TICK)
+    // ✅ AGG TRADE (TICK) — НОВАЯ СИГНАТУРА БЕЗ timeframe
     // ============================================================
 
     @Override
@@ -117,86 +158,112 @@ public class MarketStreamServiceImpl implements MarketStreamService {
                            String exchange,
                            NetworkType networkType,
                            String symbol,
-                           String timeframe,
                            BigDecimal price,
                            BigDecimal qty,
                            long tradeTsMs) {
 
         final String ex  = sanitizeExchange(exchange);
         final String sym = sanitizeSymbol(symbol);
-        final String tf  = sanitizeTf(timeframe);
 
-        if (type == null || ex == null || networkType == null || sym == null || tf == null ||
+        if (type == null || ex == null || networkType == null || sym == null ||
             price == null || price.signum() <= 0 || tradeTsMs <= 0) {
             return;
         }
 
+        final TickKey key = new TickKey(chatId, type, ex, networkType, sym);
+        final long eventMs = tradeTsMs;
+
+        // ✅ lastSeen всегда (TTL работает даже без диспатча)
+        lastTickSeenAtMs.put(key, eventMs);
+
+        final Long prevDispatchMs = lastTickDispatchAtMs.get(key);
+        final long sinceLastDispatchMs = (prevDispatchMs == null) ? -1L : (eventMs - prevDispatchMs);
+
+        // 0) определяем timeframe для UI/оркестратора (из binding, иначе из lastSub)
+        final String tf = resolveTimeframe(chatId, type, ex, networkType, sym);
+
+        // 1) push в stream cache (оставляем старую сигнатуру сервиса, чтобы проект не ломать)
         final MarketDataStreamService.MarketPushResult push;
         try {
-            push = marketDataStreamService.pushAggTrade(ex, networkType, chatId, type, sym, tf, price, qty, tradeTsMs);
+            push = marketDataStreamService.pushAggTrade(
+                    ex, networkType, chatId, type,
+                    sym,
+                    (tf != null ? tf : "na"),
+                    price, qty, tradeTsMs
+            );
         } catch (Exception e) {
-            log.error("❌ [MARKET] pushAggTrade упал chatId={} type={} ex={} net={} sym={} tf={} err={}",
-                    chatId, type, ex, networkType, sym, tf, e.getMessage(), e);
+            log.error("❌ [MARKET] pushAggTrade упал chatId={} type={} ex={} net={} sym={} err={}",
+                    chatId, type, ex, networkType, sym, e.getMessage(), e);
             return;
         }
 
-        // ✅ live тик
+        // 2) ✅ UI живёт ВСЕГДА (даже если стратегия OFF)
         try {
-            livePublisher.publishAggTick(chatId, type, sym, tf, price, qty, tradeTsMs);
+            livePublisher.publishAggTick(chatId, type, sym, (tf != null ? tf : "na"), price, qty, tradeTsMs);
         } catch (Exception ignored) {}
 
-        // ✅ live свеча (если закрылась внутри pushAggTrade)
-        if (push.candleClosed() != null) {
+        if (push != null && push.candleClosed() != null) {
             try {
                 livePublisher.publishCandle(chatId, type, push.candleClosed());
             } catch (Exception ignored) {}
         }
 
-        final StreamKey key = new StreamKey(chatId, type, ex, networkType, sym, tf);
+        // 3) ✅ торговая логика: диспатчим только если есть binding и он совпал
+        Optional<AiStrategyOrchestrator.RunBinding> bindingOpt = orchestrator.getBinding(chatId, type);
+        if (bindingOpt.isEmpty()) {
+            cleanupTickKeyIfOld(key, eventMs);
+            maybeLogTickSkip(key, eventMs, safeSeq(push),
+                    chatId, type, ex, networkType, sym, tf, price, qty, tradeTsMs,
+                    sinceLastDispatchMs, "Пропуск: стратегия не запущена (binding отсутствует)", push);
+            return;
+        }
 
-        // ✅ используем ts события (важно для sinceLastDispatchMs)
-        final long eventMs = tradeTsMs;
+        AiStrategyOrchestrator.RunBinding b = bindingOpt.get();
 
-        final boolean running = orchestrator.isRunning(chatId, type);
+        // tf обязательно должен совпадать с binding, иначе оркестратор сам будет игнорить и спамить
+        boolean bindingMatch =
+                eq(ex, b.exchange()) &&
+                networkType == b.network() &&
+                eq(sym, b.symbol()) &&
+                eq(tf, b.timeframe());
 
-        // prev ДО put()
-        final Long prevDispatchMs = lastDispatchAtMs.get(key);
-        final long sinceLastDispatchMs = (prevDispatchMs == null) ? -1L : (eventMs - prevDispatchMs);
+        if (!bindingMatch) {
+            cleanupTickKeyIfOld(key, eventMs);
+            maybeLogTickSkip(key, eventMs, safeSeq(push),
+                    chatId, type, ex, networkType, sym, tf, price, qty, tradeTsMs,
+                    sinceLastDispatchMs,
+                    "Пропуск: контекст не совпал с binding (ожидаю ex=" + b.exchange() + " net=" + b.network()
+                    + " " + b.symbol() + " " + b.timeframe() + ")",
+                    push);
+            return;
+        }
 
+        // 4) throttle + dispatch
         boolean dispatched = false;
         String reason;
 
-        if (!running) {
-            reason = "Пропуск: стратегия НЕ запущена в оркестраторе";
-            cleanupKeyIfOld(key, eventMs);
-        } else {
-            final long minInterval = Math.max(0L, minDispatchIntervalMs);
-            final boolean allowedByThrottle = (sinceLastDispatchMs < 0) || (sinceLastDispatchMs >= minInterval);
+        final long minInterval = Math.max(0L, minDispatchIntervalMs);
+        final boolean allowedByThrottle = (sinceLastDispatchMs < 0) || (sinceLastDispatchMs >= minInterval);
 
-            if (allowedByThrottle) {
-                try {
-                    // ✅ сначала диспатчим
-                    orchestrator.onPriceUpdate(chatId, type, ex, networkType, sym, tf, price, tradeTsMs);
+        if (allowedByThrottle) {
+            try {
+                orchestrator.onPriceUpdate(chatId, type, ex, networkType, sym, tf, price, tradeTsMs);
 
-                    // ✅ фиксируем диспатч ТОЛЬКО после успеха
-                    lastDispatchAtMs.put(key, eventMs);
+                // ✅ фиксируем диспатч ТОЛЬКО после успеха
+                lastTickDispatchAtMs.put(key, eventMs);
 
-                    dispatched = true;
-                    reason = "Диспатч: отправлено в оркестратор (ok)";
-                } catch (Exception e) {
-                    reason = "Пропуск: ошибка оркестратора (" + e.getClass().getSimpleName() + ")";
-                    log.error("❌ [MARKET] DISPATCH ошибка chatId={} type={} ex={} net={} sym={} tf={} err={}",
-                            chatId, type, ex, networkType, sym, tf, e.getMessage(), e);
-                }
-            } else {
-                reason = "Пропуск: троттлинг (прошло " + sinceLastDispatchMs + "ms, минимум " + minInterval + "ms)";
+                dispatched = true;
+                reason = "Диспатч: отправлено в оркестратор (ok)";
+            } catch (Exception e) {
+                reason = "Пропуск: ошибка оркестратора (" + e.getClass().getSimpleName() + ")";
+                log.error("❌ [MARKET] DISPATCH ошибка chatId={} type={} ex={} net={} sym={} tf={} err={}",
+                        chatId, type, ex, networkType, sym, tf, e.getMessage(), e);
             }
+        } else {
+            reason = "Пропуск: троттлинг (прошло " + sinceLastDispatchMs + "ms, минимум " + minInterval + "ms)";
         }
 
-        // ===========================
-        // ЛОГИ (без спама)
-        // ===========================
-        final long seq = safeSeq(push);
+        long seq = safeSeq(push);
 
         if (dispatched) {
             logAggInfo(seq, chatId, type, ex, networkType, sym, tf, price, qty, tradeTsMs,
@@ -204,20 +271,73 @@ public class MarketStreamServiceImpl implements MarketStreamService {
             return;
         }
 
-        // ✅ редкий лог пропуска
-        final long lastSkip = lastSkipLogAtMs.getOrDefault(key, 0L);
+        maybeLogTickSkip(key, eventMs, seq,
+                chatId, type, ex, networkType, sym, tf, price, qty, tradeTsMs,
+                sinceLastDispatchMs, reason, push);
+    }
+
+    private String resolveTimeframe(long chatId, StrategyType type, String ex, NetworkType net, String sym) {
+        try {
+            Optional<AiStrategyOrchestrator.RunBinding> b = orchestrator.getBinding(chatId, type);
+            if (b.isPresent()) {
+                AiStrategyOrchestrator.RunBinding rb = b.get();
+                if (eq(ex, rb.exchange()) && net == rb.network() && eq(sym, rb.symbol())) {
+                    String tf = sanitizeTf(rb.timeframe());
+                    if (tf != null) return tf;
+                }
+            }
+        } catch (Exception ignored) {}
+
+        // fallback: lastSub (последняя подписка из UI/настроек)
+        SubBinding sb = lastSub.get(new SubKey(chatId, type));
+        if (sb != null && eq(ex, sb.exchange) && net == sb.networkType && eq(sym, sb.symbol)) {
+            String tf = sanitizeTf(sb.timeframe);
+            if (tf != null) return tf;
+        }
+
+        return null;
+    }
+
+    private void maybeLogTickSkip(TickKey key,
+                                  long eventMs,
+                                  long seq,
+                                  long chatId,
+                                  StrategyType type,
+                                  String ex,
+                                  NetworkType net,
+                                  String sym,
+                                  String tf,
+                                  BigDecimal price,
+                                  BigDecimal qty,
+                                  long ts,
+                                  long sinceLastDispatchMs,
+                                  String reason,
+                                  MarketDataStreamService.MarketPushResult push) {
+
+        final long lastSkip = lastTickSkipLogAtMs.getOrDefault(key, 0L);
         final long dtSkip = eventMs - lastSkip;
 
         if (dtSkip >= Math.max(1000L, skipLogCooldownMs)) {
-            lastSkipLogAtMs.put(key, eventMs);
+            lastTickSkipLogAtMs.put(key, eventMs);
+            logSkipInfo(seq, chatId, type, ex, net, sym, (tf != null ? tf : "na"),
+                    price, qty, ts, sinceLastDispatchMs, reason, push);
+        }
+    }
 
-            logSkipInfo(seq, chatId, type, ex, networkType, sym, tf, price, qty, tradeTsMs,
-                    sinceLastDispatchMs, reason, push);
+    private void cleanupTickKeyIfOld(TickKey key, long nowMs) {
+        Long lastSeen = lastTickSeenAtMs.get(key);
+        if (lastSeen == null) return;
+
+        long ttl = Math.max(1L, inactiveTtlMs);
+        if (nowMs - lastSeen >= ttl) {
+            lastTickSeenAtMs.remove(key);
+            lastTickDispatchAtMs.remove(key);
+            lastTickSkipLogAtMs.remove(key);
         }
     }
 
     // ============================================================
-    // KLINE (CANDLE)
+    // KLINE (CANDLE) — как было, но TTL по lastKlineSeenAtMs
     // ============================================================
 
     @Override
@@ -237,13 +357,16 @@ public class MarketStreamServiceImpl implements MarketStreamService {
 
         if (ex == null || networkType == null || sym == null || tf == null) return;
 
-        // ✅ страховка для UI/потребителей
+        final KlineKey key = new KlineKey(chatId, type, ex, networkType, sym, tf);
+        lastKlineSeenAtMs.put(key, System.currentTimeMillis());
+
+        // страховка
         try {
             if (kline.getSymbol() == null || kline.getSymbol().isBlank()) kline.setSymbol(sym);
             if (kline.getTimeframe() == null || kline.getTimeframe().isBlank()) kline.setTimeframe(tf);
         } catch (Exception ignored) {}
 
-        // 1) кладём свечу в кэш строго по (sym, tf)
+        // 1) кэш
         try {
             marketDataStreamService.pushKline(ex, networkType, chatId, type, sym, tf, kline);
         } catch (Exception e) {
@@ -252,49 +375,59 @@ public class MarketStreamServiceImpl implements MarketStreamService {
             return;
         }
 
-        // 2) публикуем в UI
+        // 2) UI свеча всегда
         try {
             livePublisher.publishCandle(chatId, type, kline);
         } catch (Exception ignored) {}
 
-        // 3) если свеча закрыта — отправляем в оркестратор
-        boolean closed = isKlineClosed(kline);
+        // 3) закрытие свечи -> оркестратор (только если binding совпал)
+        if (!isKlineClosed(kline)) return;
 
-        if (closed && orchestrator.isRunning(chatId, type)) {
-            try {
-                orchestrator.onCandleClosed(chatId, type, ex, networkType, sym, tf, kline);
-            } catch (Exception e) {
-                log.error("❌ [MARKET] onCandleClosed упал chatId={} type={} ex={} net={} sym={} tf={} err={}",
-                        chatId, type, ex, networkType, sym, tf, e.getMessage(), e);
-            }
+        Optional<AiStrategyOrchestrator.RunBinding> bindingOpt = orchestrator.getBinding(chatId, type);
+        if (bindingOpt.isEmpty()) {
+            cleanupKlineKeyIfOld(key, System.currentTimeMillis());
+            return;
+        }
+
+        AiStrategyOrchestrator.RunBinding b = bindingOpt.get();
+
+        boolean match =
+                eq(ex, b.exchange()) &&
+                networkType == b.network() &&
+                eq(sym, b.symbol()) &&
+                eq(tf, b.timeframe());
+
+        if (!match) {
+            cleanupKlineKeyIfOld(key, System.currentTimeMillis());
+            return;
+        }
+
+        try {
+            orchestrator.onCandleClosed(chatId, type, ex, networkType, sym, tf, kline);
+        } catch (Exception e) {
+            log.error("❌ [MARKET] onCandleClosed упал chatId={} type={} ex={} net={} sym={} tf={} err={}",
+                    chatId, type, ex, networkType, sym, tf, e.getMessage(), e);
         }
     }
 
-    // ============================================================
-    // HELPERS
-    // ============================================================
-
-    private void cleanupKeyIfOld(StreamKey key, long nowMs) {
-        Long last = lastDispatchAtMs.get(key);
-        if (last == null) return;
+    private void cleanupKlineKeyIfOld(KlineKey key, long nowMs) {
+        Long lastSeen = lastKlineSeenAtMs.get(key);
+        if (lastSeen == null) return;
 
         long ttl = Math.max(1L, inactiveTtlMs);
-        if (nowMs - last >= ttl) {
-            lastDispatchAtMs.remove(key);
-            lastSkipLogAtMs.remove(key);
+        if (nowMs - lastSeen >= ttl) {
+            lastKlineSeenAtMs.remove(key);
         }
     }
 
+    // ============================================================
+    // LOG + HELPERS (как было)
+    // ============================================================
+
     private long safeSeq(MarketDataStreamService.MarketPushResult push) {
-        long seq = 0L;
-        try {
-            seq = push != null ? push.seq() : 0L;
-        } catch (Exception ignored) {}
-
-        if (seq > 0) return seq;
-
-        // fallback если seq не ведётся
-        return diagCounter.incrementAndGet();
+        long s = 0L;
+        try { s = push != null ? push.seq() : 0L; } catch (Exception ignored) {}
+        return (s > 0) ? s : diagCounter.incrementAndGet();
     }
 
     private void logAggInfo(long seq,
@@ -310,20 +443,19 @@ public class MarketStreamServiceImpl implements MarketStreamService {
                             long sinceLastDispatchMs,
                             MarketDataStreamService.MarketPushResult push) {
 
+        if (!shouldLog(seq)) return;
+
         String priceStr = price.stripTrailingZeros().toPlainString();
         String qtyStr   = qty != null ? qty.stripTrailingZeros().toPlainString() : "null";
-
-        boolean shouldLog = shouldLog(seq);
-        if (!shouldLog) return;
 
         log.info("📈 [MARKET] AGG_TICK[{}] chatId={} type={} ex={} net={} {} {} price={} qty={} ts={} sinceLastDispatchMs={} cache: tick={} candle={} createdCandle={}",
                 seq,
                 chatId, type, ex, net, sym, tf,
                 priceStr, qtyStr, ts,
                 sinceLastDispatchMs,
-                safeBool(() -> push.pushedTick()),
-                safeBool(() -> push.pushedCandle()),
-                safeBool(() -> push.createdCandle())
+                safeBool(() -> push != null && push.pushedTick()),
+                safeBool(() -> push != null && push.pushedCandle()),
+                safeBool(() -> push != null && push.createdCandle())
         );
     }
 
@@ -341,11 +473,10 @@ public class MarketStreamServiceImpl implements MarketStreamService {
                              String reason,
                              MarketDataStreamService.MarketPushResult push) {
 
+        if (!shouldLog(seq)) return;
+
         String priceStr = price.stripTrailingZeros().toPlainString();
         String qtyStr   = qty != null ? qty.stripTrailingZeros().toPlainString() : "null";
-
-        boolean shouldLog = shouldLog(seq);
-        if (!shouldLog) return;
 
         log.info("⏭️ [MARKET] SKIP[{}] chatId={} type={} ex={} net={} {} {} price={} qty={} ts={} | {} | sinceLastDispatchMs={} cache: tick={} candle={} createdCandle={} (cooldown={}ms)",
                 seq,
@@ -353,34 +484,29 @@ public class MarketStreamServiceImpl implements MarketStreamService {
                 priceStr, qtyStr, ts,
                 reason,
                 sinceLastDispatchMs,
-                safeBool(() -> push.pushedTick()),
-                safeBool(() -> push.pushedCandle()),
-                safeBool(() -> push.createdCandle()),
+                safeBool(() -> push != null && push.pushedTick()),
+                safeBool(() -> push != null && push.pushedCandle()),
+                safeBool(() -> push != null && push.createdCandle()),
                 skipLogCooldownMs
         );
     }
 
     private boolean shouldLog(long seq) {
         if (seq <= 0) return true;
-
         long first = Math.max(0L, logFirstSeq);
         long every = Math.max(1L, logEverySeq);
-
         if (seq <= first) return true;
         return (seq % every) == 0;
     }
 
     private boolean isKlineClosed(UnifiedKline kline) {
-        // 1) нормальные варианты
         try {
-            // если у тебя есть isClosed() / getClosed() в модели — будет работать
             Optional<Boolean> a = tryBool(kline, "isClosed");
             if (a.isPresent()) return a.get();
             Optional<Boolean> b = tryBool(kline, "getClosed");
             if (b.isPresent()) return b.get();
         } catch (Exception ignored) {}
 
-        // 2) fallback: иногда поле/метод называется иначе
         try {
             Optional<Boolean> c = tryBool(kline, "closed");
             return c.orElse(false);
@@ -396,6 +522,12 @@ public class MarketStreamServiceImpl implements MarketStreamService {
         } catch (Exception e) {
             return false;
         }
+    }
+
+    private static boolean eq(String a, String b) {
+        if (a == null && b == null) return true;
+        if (a == null || b == null) return false;
+        return a.equalsIgnoreCase(b);
     }
 
     private static String sanitizeSymbol(String symbol) {
@@ -416,13 +548,6 @@ public class MarketStreamServiceImpl implements MarketStreamService {
         return s.isEmpty() ? null : s;
     }
 
-    private record StreamKey(long chatId,
-                             StrategyType type,
-                             String exchange,
-                             NetworkType networkType,
-                             String symbol,
-                             String timeframe) {}
-
     private static Optional<Boolean> tryBool(Object target, String method) {
         try {
             Method m = target.getClass().getMethod(method);
@@ -433,6 +558,59 @@ public class MarketStreamServiceImpl implements MarketStreamService {
             return Optional.empty();
         } catch (Exception ignored) {
             return Optional.empty();
+        }
+    }
+
+    // ============================================================
+    // KEYS
+    // ============================================================
+
+    private record TickKey(long chatId,
+                           StrategyType type,
+                           String exchange,
+                           NetworkType networkType,
+                           String symbol) {}
+
+    private record KlineKey(long chatId,
+                            StrategyType type,
+                            String exchange,
+                            NetworkType networkType,
+                            String symbol,
+                            String timeframe) {}
+
+    private record SubKey(long chatId, StrategyType type) {}
+
+    private static final class SubBinding {
+        final String exchange;
+        final NetworkType networkType;
+        final String symbol;
+        final String timeframe;
+
+        private SubBinding(String exchange, NetworkType networkType, String symbol, String timeframe) {
+            this.exchange = exchange;
+            this.networkType = networkType;
+            this.symbol = symbol;
+            this.timeframe = timeframe;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (!(o instanceof SubBinding b)) return false;
+            return eq(exchange, b.exchange)
+                   && networkType == b.networkType
+                   && eq(symbol, b.symbol)
+                   && eq(timeframe, b.timeframe);
+        }
+
+        @Override
+        public int hashCode() {
+            int r = 17;
+            r = 31 * r + (exchange == null ? 0 : exchange.toUpperCase(Locale.ROOT).hashCode());
+            r = 31 * r + (networkType == null ? 0 : networkType.hashCode());
+            r = 31 * r + (symbol == null ? 0 : symbol.toUpperCase(Locale.ROOT).hashCode());
+            r = 31 * r + (timeframe == null ? 0 : timeframe.toLowerCase(Locale.ROOT).hashCode());
+            return r;
         }
     }
 }

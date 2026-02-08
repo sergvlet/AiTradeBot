@@ -28,11 +28,15 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Controller;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.ui.Model;
 import org.springframework.web.bind.annotation.*;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -68,6 +72,7 @@ public class StrategySettingsController {
     // GET — ОТКРЫТЬ НАСТРОЙКИ
     // =====================================================
     @GetMapping("/{type}/config")
+    @Transactional
     public String openSettings(
             @PathVariable("type") String typeRaw,
             @RequestParam("chatId") long chatId,
@@ -81,8 +86,10 @@ public class StrategySettingsController {
         String exchange = normalizeExchange(exchangeParam);
         NetworkType network = parseNetworkOrDefault(networkParam, NetworkType.TESTNET);
 
-        StrategySettings strategy =
-                strategySettingsService.getOrCreate(chatId, strategyType, exchange, network);
+        // ✅ ОДНА строка на (chatId,type) — exchange/network храним в ней же (патчим)
+        StrategySettings strategy = strategySettingsService.getOrCreate(chatId, strategyType);
+        patchContext(strategy, exchange, network);
+        strategySettingsService.save(strategy);
 
         // runtime status (active)
         try {
@@ -146,13 +153,17 @@ public class StrategySettingsController {
         String strategyAdvancedHtml = null;
         StrategyAdvancedRenderer advancedRenderer = strategyAdvancedRegistry.get(strategyType);
         if (advancedRenderer != null) {
+            AdvancedControlMode mode = strategy.getAdvancedControlMode();
+            if (mode == null) mode = AdvancedControlMode.MANUAL;
+
             strategyAdvancedHtml = advancedRenderer.render(
                     AdvancedRenderContext.builder()
                             .chatId(chatId)
                             .strategyType(strategyType)
                             .exchange(exchange)
                             .networkType(network)
-                            .controlMode(strategy.getAdvancedControlMode())
+                            .controlMode(mode)
+                            .params(Map.of())
                             .build()
             );
         }
@@ -195,6 +206,7 @@ public class StrategySettingsController {
     // =====================================================
     @PostMapping(value = "/{type}/config", headers = "X-Requested-With=fetch")
     @ResponseBody
+    @Transactional
     public ResponseEntity<?> saveSettingsFetch(
             @PathVariable("type") String typeRaw,
             @RequestParam("chatId") long chatId,
@@ -206,7 +218,11 @@ public class StrategySettingsController {
         String exchange = normalizeExchange(params.get("exchange"));
         NetworkType network = parseNetworkOrDefault(params.get("network"), NetworkType.TESTNET);
 
-        StrategySettings s = strategySettingsService.getOrCreate(chatId, strategyType, exchange, network);
+        StrategySettings s = strategySettingsService.getOrCreate(chatId, strategyType);
+        patchContext(s, exchange, network);
+
+        // ✅ снимок ДО изменения
+        CtxSnap before = snap(s);
 
         // CONTROL MODE + defaults
         AdvancedControlMode requestedMode = parseModeOrNull(params.get("advancedControlMode"));
@@ -218,7 +234,14 @@ public class StrategySettingsController {
 
         applySaveScope(chatId, strategyType, exchange, network, saveScope, params, s);
 
+        // ✅ снимок ПОСЛЕ изменения (s уже сохранён в applySaveScope, если надо)
+        CtxSnap after = snap(s);
+
+        // кеш можно сразу инвалидировать
         settingsCache.invalidate(chatId, strategyType);
+
+        // ✅ атомарный рестарт ТОЛЬКО если реально поменялся контекст и стратегия запущена
+        scheduleRestartAfterCommitIfNeeded(chatId, strategyType, saveScope, before, after);
 
         return ResponseEntity.ok().build();
     }
@@ -227,6 +250,7 @@ public class StrategySettingsController {
     // POST — СОХРАНЕНИЕ (обычная форма) ✅ С РЕДИРЕКТОМ
     // =====================================================
     @PostMapping("/{type}/config")
+    @Transactional
     public String saveSettings(
             @PathVariable("type") String typeRaw,
             @RequestParam("chatId") long chatId,
@@ -238,7 +262,11 @@ public class StrategySettingsController {
         String exchange = normalizeExchange(params.get("exchange"));
         NetworkType network = parseNetworkOrDefault(params.get("network"), NetworkType.TESTNET);
 
-        StrategySettings s = strategySettingsService.getOrCreate(chatId, strategyType, exchange, network);
+        StrategySettings s = strategySettingsService.getOrCreate(chatId, strategyType);
+        patchContext(s, exchange, network);
+
+        // ✅ снимок ДО изменения
+        CtxSnap before = snap(s);
 
         // CONTROL MODE + defaults
         AdvancedControlMode requestedMode = parseModeOrNull(params.get("advancedControlMode"));
@@ -250,7 +278,13 @@ public class StrategySettingsController {
 
         applySaveScope(chatId, strategyType, exchange, network, saveScope, params, s);
 
+        // ✅ снимок ПОСЛЕ изменения
+        CtxSnap after = snap(s);
+
         settingsCache.invalidate(chatId, strategyType);
+
+        // ✅ рестарт после commit (чтобы start увидел новые настройки)
+        scheduleRestartAfterCommitIfNeeded(chatId, strategyType, saveScope, before, after);
 
         String tab = params.getOrDefault("tab", "network");
         return buildRedirect(strategyType, chatId, exchange, network, tab);
@@ -261,12 +295,14 @@ public class StrategySettingsController {
     // =========================================================
     @PostMapping("/apply")
     @ResponseBody
+    @Transactional
     public ResponseEntity<ApplyResponse> apply(@RequestBody ApplyRequest req) {
 
         String ex = normalizeExchange(req.getExchange());
         NetworkType net = (req.getNetwork() != null) ? req.getNetwork() : NetworkType.TESTNET;
 
-        StrategySettings s = strategySettingsService.getOrCreate(req.getChatId(), req.getType(), ex, net);
+        StrategySettings s = strategySettingsService.getOrCreate(req.getChatId(), req.getType());
+        patchContext(s, ex, net);
 
         AdvancedControlMode requested = parseModeOrNull(req.getAdvancedControlMode());
         AdvancedControlMode current = s.getAdvancedControlMode();
@@ -367,11 +403,16 @@ public class StrategySettingsController {
             Map<String, String> params,
             StrategySettings s
     ) {
+        if (s == null) return;
+
+        // ✅ всегда фиксируем контекст в сущности
+        patchContext(s, exchange, network);
+
         switch (saveScope) {
 
             case "network" -> {
-                strategySettingsService.getOrCreate(chatId, strategyType, exchange, network);
                 exchangeSettingsService.getOrCreate(chatId, exchange, network);
+                strategySettingsService.save(s);
             }
 
             case "keys" -> exchangeSettingsService.saveKeys(
@@ -415,20 +456,14 @@ public class StrategySettingsController {
 
                 BigDecimal value = parseBigDecimalOrNull(params.get("capitalValue"));
 
-                // нормализуем value под режим
                 if (mode == StrategySettings.CapitalMode.ALL) {
-                    value = null; // не нужно хранить
+                    value = null;
                 } else if (mode == StrategySettings.CapitalMode.FIX) {
-                    value = validateMoneyOrNull(value); // <=0 => null
-                    if (value == null) {
-                        // FIX без значения бессмысленен → делаем ALL
-                        mode = StrategySettings.CapitalMode.ALL;
-                    }
+                    value = validateMoneyOrNull(value);
+                    if (value == null) mode = StrategySettings.CapitalMode.ALL;
                 } else if (mode == StrategySettings.CapitalMode.PCT) {
-                    value = validatePctOrNull(value); // 0..100, <=0 => null
-                    if (value == null) {
-                        mode = StrategySettings.CapitalMode.ALL;
-                    }
+                    value = validatePctOrNull(value);
+                    if (value == null) mode = StrategySettings.CapitalMode.ALL;
                 }
 
                 s.setCapitalMode(mode);
@@ -441,10 +476,20 @@ public class StrategySettingsController {
 
             case "advanced" -> {
                 StrategyAdvancedRenderer renderer = strategyAdvancedRegistry.get(strategyType);
+
                 AdvancedControlMode currentMode = s.getAdvancedControlMode();
                 if (currentMode == null) currentMode = AdvancedControlMode.MANUAL;
 
                 if (renderer != null && currentMode != AdvancedControlMode.AI) {
+                    // ✅ чистим системные поля, чтобы renderer не видел мусор
+                    HashMap<String, String> clean = new HashMap<>(params);
+                    clean.remove("chatId");
+                    clean.remove("saveScope");
+                    clean.remove("tab");
+                    clean.remove("exchange");
+                    clean.remove("network");
+                    clean.remove("type");
+
                     AdvancedRenderContext ctx =
                             AdvancedRenderContext.builder()
                                     .chatId(chatId)
@@ -452,7 +497,7 @@ public class StrategySettingsController {
                                     .exchange(exchange)
                                     .networkType(network)
                                     .controlMode(currentMode)
-                                    .params(params)
+                                    .params(clean)
                                     .build();
                     renderer.handleSubmit(ctx);
                 }
@@ -476,15 +521,10 @@ public class StrategySettingsController {
                 s.setMlGateEnabled(false);
                 s.setRunPhase(PHASE_LIVE);
             }
-            case HYBRID -> {
+            case HYBRID, AI -> {
                 s.setAutoTuneEnabled(true);
                 s.setMlGateEnabled(true);
                 s.setRunPhase(net == NetworkType.TESTNET ? PHASE_PAPER : PHASE_LIVE);
-            }
-            case AI -> {
-                s.setAutoTuneEnabled(true);
-                s.setMlGateEnabled(true);
-                s.setRunPhase(PHASE_LIVE);
             }
             default -> s.setRunPhase(PHASE_LIVE);
         }
@@ -495,6 +535,179 @@ public class StrategySettingsController {
         if (s.getRunPhase() == null || s.getRunPhase().isBlank()) {
             s.setRunPhase(PHASE_LIVE);
         }
+    }
+
+    // =====================================================
+    // ✅ PATCH CONTEXT
+    // =====================================================
+    private void patchContext(StrategySettings s, String exchange, NetworkType network) {
+        if (s == null) return;
+
+        String ex = normalizeExchange(exchange);
+        NetworkType net = (network != null) ? network : NetworkType.TESTNET;
+        s.setExchangeName(ex);
+        s.setNetworkType(net);
+    }
+
+    // =====================================================
+    // ✅ AUTO-RESTART after commit
+    // =====================================================
+    private void scheduleRestartAfterCommitIfNeeded(long chatId,
+                                                    StrategyType type,
+                                                    String saveScope,
+                                                    CtxSnap before,
+                                                    CtxSnap after) {
+
+        // рестартуем только если изменились symbol/tf/ex/net
+        if (!ctxChanged(before, after)) return;
+
+        // и только если стратегия запущена
+        if (!orchestrator.isRunning(chatId, type)) return;
+
+        // exchange/network берём из "после"
+        final String ex = (after.exchange != null ? after.exchange : "BINANCE");
+        final NetworkType net = (after.network != null ? after.network : NetworkType.TESTNET);
+        final String reason = "ui_settings_changed:" + (saveScope == null ? "unknown" : saveScope);
+
+        // чтобы start увидел новые settings — делаем рестарт после commit
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    try {
+                        orchestrator.restartStrategyAtomic(chatId, type, ex, net, reason);
+                    } catch (Exception e) {
+                        log.warn("⚠ restartStrategyAtomic failed chatId={} type={} ex={} net={} : {}",
+                                chatId, type, ex, net, e.getMessage());
+                    }
+                }
+            });
+            return;
+        }
+
+        // fallback (на случай если кто-то вызовет без транзакции)
+        try {
+            orchestrator.restartStrategyAtomic(chatId, type, ex, net, reason);
+        } catch (Exception e) {
+            log.warn("⚠ restartStrategyAtomic failed chatId={} type={} ex={} net={} : {}",
+                    chatId, type, ex, net, e.getMessage());
+        }
+    }
+
+    private static final class CtxSnap {
+        final String exchange;
+        final NetworkType network;
+        final String symbol;
+        final String timeframe;
+
+        private CtxSnap(String exchange, NetworkType network, String symbol, String timeframe) {
+            this.exchange = exchange;
+            this.network = network;
+            this.symbol = symbol;
+            this.timeframe = timeframe;
+        }
+    }
+
+    private CtxSnap snap(StrategySettings s) {
+        if (s == null) return new CtxSnap(null, null, null, null);
+        return new CtxSnap(
+                normalizeExchange(s.getExchangeName()),
+                s.getNetworkType(),
+                normalizeSymbol(s.getSymbol()),
+                normalizeTimeframe(s.getTimeframe())
+        );
+    }
+
+    private boolean ctxChanged(CtxSnap a, CtxSnap b) {
+        if (a == null && b == null) return false;
+        if (a == null || b == null) return true;
+        if (!eq(a.exchange, b.exchange)) return true;
+        if (a.network != b.network) return true;
+        if (!eq(a.symbol, b.symbol)) return true;
+        return !eq(a.timeframe, b.timeframe);
+    }
+
+    private boolean eq(String a, String b) {
+        if (a == null && b == null) return true;
+        if (a == null || b == null) return false;
+        return a.equalsIgnoreCase(b);
+    }
+
+    // =====================================================
+    // POST — DIAGNOSE (UI)
+    // =====================================================
+    @PostMapping("/{type}/config/diagnose")
+    @ResponseBody
+    public ResponseEntity<DiagnoseResponse> diagnose(
+            @PathVariable("type") String typeRaw,
+            @RequestParam("chatId") long chatId,
+            @RequestParam Map<String, String> params
+    ) {
+        StrategyType strategyType = parseStrategyType(typeRaw);
+
+        String exchange = normalizeExchange(params.get("exchange"));
+        NetworkType network = parseNetworkOrDefault(params.get("network"), NetworkType.TESTNET);
+
+        DiagnoseResponse res = new DiagnoseResponse();
+        res.ok = false;
+        res.message = "Диагностика не выполнена";
+
+        if (!isDiagnosticsSupported(exchange)) {
+            res.message = "Диагностика недоступна для выбранной биржи: " + exchange;
+            return ResponseEntity.ok(res);
+        }
+
+        ExchangeSettings es = exchangeSettingsService.getOrCreate(chatId, exchange, network);
+        boolean hasKeys = (es != null && es.hasBaseKeys());
+
+        if (!hasKeys) {
+            res.message = "Ключи не заданы (apiKey/apiSecret пустые)";
+            res.networkOk = true;
+            return ResponseEntity.ok(res);
+        }
+
+        try {
+            ApiKeyDiagnostics d = exchangeSettingsService.testConnectionDetailed(es);
+
+            res.ok = (d != null && d.isOk());
+            res.message = (d != null && d.getMessage() != null && !d.getMessage().isBlank())
+                    ? d.getMessage()
+                    : (res.ok ? "OK" : "Ошибка");
+
+            if (d != null) {
+                res.apiKeyValid       = d.isApiKeyValid();
+                res.secretValid       = d.isSecretValid();
+                res.signatureValid    = d.isSignatureValid();
+                res.accountReadable   = d.isAccountReadable();
+                res.tradingAllowed    = d.isTradingAllowed();
+                res.ipAllowed         = d.isIpAllowed();
+                res.networkOk         = d.isNetworkOk();
+            }
+
+            return ResponseEntity.ok(res);
+
+        } catch (Exception e) {
+            log.warn("⚠ diagnose failed chatId={} type={} ex={} net={}: {}",
+                    chatId, strategyType, exchange, network, e.getMessage(), e);
+
+            res.ok = false;
+            res.message = "Ошибка диагностики: " + e.getMessage();
+            return ResponseEntity.ok(res);
+        }
+    }
+
+    @Data
+    private static class DiagnoseResponse {
+        private boolean ok;
+        private String message;
+
+        private Boolean apiKeyValid;
+        private Boolean secretValid;
+        private Boolean signatureValid;
+        private Boolean accountReadable;
+        private Boolean tradingAllowed;
+        private Boolean ipAllowed;
+        private Boolean networkOk;
     }
 
     // =====================================================
@@ -597,7 +810,6 @@ public class StrategySettingsController {
         }
     }
 
-    // percent only for capitalValue in PCT-mode
     private BigDecimal validatePctOrNull(BigDecimal v) {
         if (v == null) return null;
         if (v.compareTo(BigDecimal.ZERO) <= 0) return null;
@@ -605,7 +817,6 @@ public class StrategySettingsController {
         return v.setScale(4, RoundingMode.HALF_UP);
     }
 
-    // money only for capitalValue in FIX-mode
     private BigDecimal validateMoneyOrNull(BigDecimal v) {
         if (v == null) return null;
         if (v.compareTo(BigDecimal.ZERO) <= 0) return null;

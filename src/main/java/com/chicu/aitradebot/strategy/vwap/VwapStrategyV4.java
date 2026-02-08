@@ -418,7 +418,7 @@ public class VwapStrategyV4 implements TradingStrategy {
     private StrategySettings loadStrategySettings(Long chatId) {
         // ✅ самый новый: updatedAt DESC, затем id DESC
         return strategySettingsService
-                .findAllByChatId(chatId, null, null)
+                .findAllByChatId(chatId)
                 .stream()
                 .filter(s -> s.getType() == StrategyType.VWAP)
                 .max(Comparator

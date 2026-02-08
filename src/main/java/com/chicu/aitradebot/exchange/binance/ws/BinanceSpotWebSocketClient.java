@@ -36,25 +36,30 @@ public class BinanceSpotWebSocketClient {
     private final MarketStreamService marketStream;
 
     /**
-     * key = BINANCE:NET:chatId:TYPE:symbol:tf:CHANNEL
+     * key = BINANCE:NET:chatId:TYPE:symbol[:tf]:CHANNEL
+     * ⚠️ ВАЖНО:
+     * - AGG_TRADE НЕ зависит от tf → ключ без tf
+     * - KLINE зависит от tf → ключ с tf
      */
     private final Map<String, WebSocket> sockets = new ConcurrentHashMap<>();
 
     // =====================================================
-    // PUBLIC API (используется твоим MarketDataStreamService)
+    // PUBLIC API (используется MarketDataStreamService)
     // =====================================================
 
     public void subscribeAggTrade(NetworkType networkType,
                                   String symbol,
-                                  String timeframe,
+                                  String timeframeIgnored,
                                   long chatId,
                                   StrategyType strategyType) {
+
         NetworkType net = (networkType != null) ? networkType : NetworkType.MAINNET;
 
-        String sym = normSymbolLower(symbol);
-        String tf  = normTfLower(timeframe);
+        String sym = normSymbolLowerSafe(symbol);
+        if (sym == null || strategyType == null) return;
 
-        String key = buildKey(chatId, strategyType, sym, tf, net, "AGG_TRADE");
+        // ✅ ключ БЕЗ tf
+        String key = buildKeyAgg(chatId, strategyType, sym, net);
         if (sockets.containsKey(key)) return;
 
         String streams = sym + "@aggTrade";
@@ -62,26 +67,31 @@ public class BinanceSpotWebSocketClient {
 
         Request request = new Request.Builder().url(wsUrl).build();
 
-        log.info("🔌 WS CONNECT BINANCE chatId={} type={} sym={} tf={} net={} channel=AGG_TRADE url={}",
-                chatId, strategyType, sym.toUpperCase(Locale.ROOT), tf, net, wsUrl);
+        log.info("🔌 WS CONNECT BINANCE chatId={} type={} sym={} net={} channel=AGG_TRADE url={}",
+                chatId, strategyType, sym.toUpperCase(Locale.ROOT), net, wsUrl);
 
         WebSocket ws = client.newWebSocket(request,
-                new AggTradeListener(key, chatId, strategyType, sym, tf, net));
+                new AggTradeListener(key, chatId, strategyType, sym, net));
 
-        sockets.put(key, ws);
+        // защита от гонок: если параллельно уже положили — закрываем лишний
+        WebSocket prev = sockets.putIfAbsent(key, ws);
+        if (prev != null) {
+            try { ws.close(1000, "duplicate"); } catch (Exception ignored) {}
+        }
     }
 
     public void unsubscribeAggTrade(NetworkType networkType,
                                     String symbol,
-                                    String timeframe,
+                                    String timeframeIgnored,
                                     long chatId,
                                     StrategyType strategyType) {
+
         NetworkType net = (networkType != null) ? networkType : NetworkType.MAINNET;
 
-        String sym = normSymbolLower(symbol);
-        String tf  = normTfLower(timeframe);
+        String sym = normSymbolLowerSafe(symbol);
+        if (sym == null || strategyType == null) return;
 
-        String key = buildKey(chatId, strategyType, sym, tf, net, "AGG_TRADE");
+        String key = buildKeyAgg(chatId, strategyType, sym, net);
         closeAndRemove(key, "unsubscribe");
     }
 
@@ -90,12 +100,15 @@ public class BinanceSpotWebSocketClient {
                                String timeframe,
                                long chatId,
                                StrategyType strategyType) {
+
         NetworkType net = (networkType != null) ? networkType : NetworkType.MAINNET;
 
-        String sym = normSymbolLower(symbol);
-        String tf  = normTfLower(timeframe);
+        String sym = normSymbolLowerSafe(symbol);
+        String tf  = normTfLowerSafe(timeframe);
 
-        String key = buildKey(chatId, strategyType, sym, tf, net, "KLINE");
+        if (sym == null || tf == null || strategyType == null) return;
+
+        String key = buildKeyKline(chatId, strategyType, sym, tf, net);
         if (sockets.containsKey(key)) return;
 
         String streams = sym + "@kline_" + tf;
@@ -109,7 +122,10 @@ public class BinanceSpotWebSocketClient {
         WebSocket ws = client.newWebSocket(request,
                 new KlineListener(key, chatId, strategyType, sym, tf, net));
 
-        sockets.put(key, ws);
+        WebSocket prev = sockets.putIfAbsent(key, ws);
+        if (prev != null) {
+            try { ws.close(1000, "duplicate"); } catch (Exception ignored) {}
+        }
     }
 
     public void unsubscribeKline(NetworkType networkType,
@@ -117,12 +133,15 @@ public class BinanceSpotWebSocketClient {
                                  String timeframe,
                                  long chatId,
                                  StrategyType strategyType) {
+
         NetworkType net = (networkType != null) ? networkType : NetworkType.MAINNET;
 
-        String sym = normSymbolLower(symbol);
-        String tf  = normTfLower(timeframe);
+        String sym = normSymbolLowerSafe(symbol);
+        String tf  = normTfLowerSafe(timeframe);
 
-        String key = buildKey(chatId, strategyType, sym, tf, net, "KLINE");
+        if (sym == null || tf == null || strategyType == null) return;
+
+        String key = buildKeyKline(chatId, strategyType, sym, tf, net);
         closeAndRemove(key, "unsubscribe");
     }
 
@@ -135,20 +154,17 @@ public class BinanceSpotWebSocketClient {
         private final long chatId;
         private final StrategyType type;
         private final String symLower;
-        private final String tfLower;
         private final NetworkType net;
 
         private AggTradeListener(String key,
                                  long chatId,
                                  StrategyType type,
                                  String symLower,
-                                 String tfLower,
                                  NetworkType net) {
             this.key = key;
             this.chatId = chatId;
             this.type = type;
             this.symLower = symLower;
-            this.tfLower = tfLower;
             this.net = net;
         }
 
@@ -175,14 +191,14 @@ public class BinanceSpotWebSocketClient {
         @Override
         public void onClosed(@NotNull WebSocket webSocket, int code, @NotNull String reason) {
             log.warn("❌ WS CLOSED BINANCE key={} code={} reason={}", key, code, reason);
-            sockets.remove(key);
+            removeIfSame(key, webSocket);
         }
 
         @Override
         public void onFailure(@NotNull WebSocket webSocket, @NotNull Throwable t, Response response) {
             String resp = (response != null) ? (response.code() + " " + response.message()) : "no-response";
             log.error("💥 WS FAIL BINANCE key={} resp={} err={}", key, resp, t.toString());
-            sockets.remove(key);
+            removeIfSame(key, webSocket);
         }
 
         private void handleAggTrade(String raw) {
@@ -202,13 +218,13 @@ public class BinanceSpotWebSocketClient {
                 long ts = data.has("T") ? data.getLong("T")
                         : (data.has("E") ? data.getLong("E") : System.currentTimeMillis());
 
+                // ✅ НОВАЯ сигнатура: БЕЗ timeframe
                 marketStream.onAggTrade(
                         chatId,
                         type,
                         "BINANCE",
                         net,
                         symUpper,
-                        tfLower,
                         price,
                         qty,
                         ts
@@ -265,14 +281,14 @@ public class BinanceSpotWebSocketClient {
         @Override
         public void onClosed(@NotNull WebSocket webSocket, int code, @NotNull String reason) {
             log.warn("❌ WS CLOSED BINANCE key={} code={} reason={}", key, code, reason);
-            sockets.remove(key);
+            removeIfSame(key, webSocket);
         }
 
         @Override
         public void onFailure(@NotNull WebSocket webSocket, @NotNull Throwable t, Response response) {
             String resp = (response != null) ? (response.code() + " " + response.message()) : "no-response";
             log.error("💥 WS FAIL BINANCE key={} resp={} err={}", key, resp, t.toString());
-            sockets.remove(key);
+            removeIfSame(key, webSocket);
         }
 
         private void handleKline(String raw) {
@@ -314,37 +330,51 @@ public class BinanceSpotWebSocketClient {
 
         try {
             ws.close(1000, reason);
-        } catch (Exception ignored) {
-        }
+        } catch (Exception ignored) {}
 
         log.info("🔌 WS DISCONNECT BINANCE key={} reason={}", key, reason);
     }
 
-    private static String buildKey(long chatId,
-                                   StrategyType strategyType,
-                                   String symLower,
-                                   String tfLower,
-                                   NetworkType net,
-                                   String channel) {
-        return "BINANCE:" + net + ":" + chatId + ":" + strategyType.name() + ":" + symLower + ":" + tfLower + ":" + channel;
+    /**
+     * ✅ защита от гонок: удаляем сокет из map только если он тот же,
+     * который закрылся/упал (иначе можно удалить уже новый сокет при рестарте).
+     */
+    private void removeIfSame(String key, WebSocket ws) {
+        if (key == null || ws == null) return;
+        sockets.compute(key, (k, cur) -> (cur == ws) ? null : cur);
+    }
+
+    private static String buildKeyAgg(long chatId,
+                                      StrategyType strategyType,
+                                      String symLower,
+                                      NetworkType net) {
+        return "BINANCE:" + net + ":" + chatId + ":" + strategyType.name() + ":" + symLower + ":AGG_TRADE";
+    }
+
+    private static String buildKeyKline(long chatId,
+                                        StrategyType strategyType,
+                                        String symLower,
+                                        String tfLower,
+                                        NetworkType net) {
+        return "BINANCE:" + net + ":" + chatId + ":" + strategyType.name() + ":" + symLower + ":" + tfLower + ":KLINE";
     }
 
     private static String buildWsUrl(NetworkType networkType, String streams) {
-        String tpl = (networkType == NetworkType.TESTNET) ? WS_TEST_STREAM_TEMPLATE : WS_MAIN_STREAM_TEMPLATE;
+        NetworkType nt = (networkType != null) ? networkType : NetworkType.MAINNET;
+        String tpl = (nt == NetworkType.TESTNET) ? WS_TEST_STREAM_TEMPLATE : WS_MAIN_STREAM_TEMPLATE;
         return String.format(tpl, streams);
     }
 
-    private static String normSymbolLower(String symbol) {
-        if (symbol == null) throw new IllegalArgumentException("symbol is null");
+    // ✅ безопасная нормализация без throw (чтобы рестарт не падал)
+    private static String normSymbolLowerSafe(String symbol) {
+        if (symbol == null) return null;
         String s = symbol.trim().toLowerCase(Locale.ROOT).replace("/", "");
-        if (s.isEmpty()) throw new IllegalArgumentException("symbol is blank");
-        return s;
+        return s.isEmpty() ? null : s;
     }
 
-    private static String normTfLower(String timeframe) {
-        if (timeframe == null) throw new IllegalArgumentException("timeframe is null");
+    private static String normTfLowerSafe(String timeframe) {
+        if (timeframe == null) return null;
         String s = timeframe.trim().toLowerCase(Locale.ROOT);
-        if (s.isEmpty()) throw new IllegalArgumentException("timeframe is blank");
-        return s;
+        return s.isEmpty() ? null : s;
     }
 }

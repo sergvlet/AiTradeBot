@@ -14,12 +14,12 @@ import java.util.Locale;
 @Table(
         name = "strategy_settings",
         uniqueConstraints = @UniqueConstraint(
-                name = "uk_strategy_settings_ctx",
-                columnNames = {"chat_id", "type", "exchange_name", "network_type"}
+                name = "uk_strategy_settings_chat_type",
+                columnNames = {"chat_id", "type"}
         ),
         indexes = {
                 @Index(name = "ix_strategy_settings_chat", columnList = "chat_id"),
-                @Index(name = "ix_strategy_settings_ctx", columnList = "chat_id,type,exchange_name,network_type")
+                @Index(name = "ix_strategy_settings_chat_type", columnList = "chat_id,type")
         }
 )
 @Getter
@@ -28,10 +28,6 @@ import java.util.Locale;
 @AllArgsConstructor
 @Builder
 public class StrategySettings {
-
-    // =====================================================
-    // ИДЕНТИФИКАЦИЯ / КОНТЕКСТ
-    // =====================================================
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -44,16 +40,14 @@ public class StrategySettings {
     @Column(nullable = false, length = 32)
     private StrategyType type;
 
+    // ✅ НЕ ключ, просто контекст
     @Column(name = "exchange_name", nullable = false, length = 32)
     private String exchangeName;
 
+    // ✅ НЕ ключ, просто контекст
     @Enumerated(EnumType.STRING)
     @Column(name = "network_type", nullable = false, length = 16)
     private NetworkType networkType;
-
-    // =====================================================
-    // ИНСТРУМЕНТ / ДАННЫЕ
-    // =====================================================
 
     @Column(nullable = false, length = 32)
     private String symbol;
@@ -65,53 +59,24 @@ public class StrategySettings {
     @Column(name = "cached_candles_limit", nullable = false)
     private Integer cachedCandlesLimit = 500;
 
-    // =====================================================
-    // BALANCE / CAPITAL (ЕДИНЫЙ ИСТОЧНИК РИСКА)
-    // =====================================================
-
-    /**
-     * Актив, по которому берём баланс (например USDT).
-     * Это именно выбор пользователя.
-     */
     @Column(name = "account_asset", length = 16)
     private String accountAsset;
 
-    /**
-     * ✅ Режим капитала стратегии:
-     * ALL  - использовать весь доступный free баланс выбранного актива
-     * FIX  - использовать фиксированную сумму (но не больше free баланса)
-     * PCT  - использовать % от free баланса
-     */
     @Enumerated(EnumType.STRING)
     @Column(name = "capital_mode", nullable = false, length = 8)
     @Builder.Default
     private CapitalMode capitalMode = CapitalMode.ALL;
 
-    /**
-     * ✅ Значение капитала:
-     * - для FIX: сумма (например 40)
-     * - для PCT: процент (например 20 = 20%)
-     * - для ALL: всегда null
-     */
     @Column(name = "capital_value", precision = 18, scale = 6)
     private BigDecimal capitalValue;
 
-    public enum CapitalMode {
-        ALL, FIX, PCT
-    }
-
-    // =====================================================
-    // ADVANCED / AI
-    // =====================================================
+    public enum CapitalMode { ALL, FIX, PCT }
 
     @Enumerated(EnumType.STRING)
     @Column(name = "advanced_control_mode", nullable = false, length = 16)
     @Builder.Default
     private AdvancedControlMode advancedControlMode = AdvancedControlMode.MANUAL;
 
-    /**
-     * Фаза исполнения (COLLECT / BACKTEST / PAPER / LIVE и т.д.)
-     */
     @Column(name = "run_phase", length = 24)
     private String runPhase;
 
@@ -143,10 +108,6 @@ public class StrategySettings {
     @Column(name = "total_profit_pct", precision = 12, scale = 6, nullable = false)
     private BigDecimal totalProfitPct = BigDecimal.ZERO;
 
-    // =====================================================
-    // СОСТОЯНИЕ / ВРЕМЯ
-    // =====================================================
-
     @Builder.Default
     @Column(nullable = false)
     private boolean active = false;
@@ -166,23 +127,11 @@ public class StrategySettings {
     @Version
     private Integer version;
 
-    // =====================================================
-    // DOMAIN HELPERS (чисто для удобства)
-    // =====================================================
-
-    /**
-     * Возвращает валидное значение capitalValue в зависимости от режима,
-     * либо null если лимит не задан/невалиден.
-     */
     public BigDecimal getEffectiveCapitalValueOrNull() {
         CapitalMode m = (capitalMode != null ? capitalMode : CapitalMode.ALL);
         if (m == CapitalMode.ALL) return null;
         return capitalValue;
     }
-
-    // =====================================================
-    // LIFECYCLE
-    // =====================================================
 
     @PrePersist
     protected void onCreate() {
@@ -190,7 +139,6 @@ public class StrategySettings {
         this.createdAt = (this.createdAt != null) ? this.createdAt : now;
         this.updatedAt = (this.updatedAt != null) ? this.updatedAt : now;
 
-        // not-null поля при создании
         if (this.symbol == null || this.symbol.trim().isEmpty()) this.symbol = "BTCUSDT";
         this.symbol = this.symbol.trim().toUpperCase(Locale.ROOT);
 
@@ -200,12 +148,15 @@ public class StrategySettings {
         if (this.cachedCandlesLimit == null || this.cachedCandlesLimit < 50) this.cachedCandlesLimit = 500;
 
         this.exchangeName = normalizeUpperNullable(this.exchangeName);
+        if (this.exchangeName == null) this.exchangeName = "BINANCE";
+
+        this.networkType = (this.networkType != null) ? this.networkType : NetworkType.TESTNET;
+
         this.accountAsset = normalizeUpperNullable(this.accountAsset);
 
         if (this.advancedControlMode == null) this.advancedControlMode = AdvancedControlMode.MANUAL;
         if (this.capitalMode == null) this.capitalMode = CapitalMode.ALL;
 
-        // нормализация строк AI/ML
         this.runPhase = normalizeUpperNullable(this.runPhase);
         this.mlModelKey = normalizeTrimNullable(this.mlModelKey);
         this.mlSchemaHash = normalizeTrimNullable(this.mlSchemaHash);
@@ -229,6 +180,10 @@ public class StrategySettings {
         }
 
         this.exchangeName = normalizeUpperNullable(this.exchangeName);
+        if (this.exchangeName == null) this.exchangeName = "BINANCE";
+
+        this.networkType = (this.networkType != null) ? this.networkType : NetworkType.TESTNET;
+
         this.accountAsset = normalizeUpperNullable(this.accountAsset);
 
         if (this.cachedCandlesLimit != null && this.cachedCandlesLimit < 50) {
@@ -238,7 +193,6 @@ public class StrategySettings {
         if (this.advancedControlMode == null) this.advancedControlMode = AdvancedControlMode.MANUAL;
         if (this.capitalMode == null) this.capitalMode = CapitalMode.ALL;
 
-        // нормализация строк AI/ML
         this.runPhase = normalizeUpperNullable(this.runPhase);
         this.mlModelKey = normalizeTrimNullable(this.mlModelKey);
         this.mlSchemaHash = normalizeTrimNullable(this.mlSchemaHash);
@@ -250,12 +204,6 @@ public class StrategySettings {
         normalizeCapital();
     }
 
-    /**
-     * ✅ Правила:
-     * - ALL => capitalValue=null
-     * - FIX => capitalValue>0 иначе null
-     * - PCT => 0<capitalValue<=100 иначе null
-     */
     private void normalizeCapital() {
         CapitalMode m = (this.capitalMode != null ? this.capitalMode : CapitalMode.ALL);
 
@@ -266,14 +214,12 @@ public class StrategySettings {
 
         if (this.capitalValue == null) return;
 
-        // <=0 => null
         if (this.capitalValue.signum() <= 0) {
             this.capitalValue = null;
             return;
         }
 
         if (m == CapitalMode.PCT) {
-            // >100 => 100 (можно и null, но UX лучше clamp)
             if (this.capitalValue.compareTo(BigDecimal.valueOf(100)) > 0) {
                 this.capitalValue = BigDecimal.valueOf(100);
             }

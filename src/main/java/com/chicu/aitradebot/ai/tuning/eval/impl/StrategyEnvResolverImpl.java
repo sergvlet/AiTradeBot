@@ -44,7 +44,7 @@ public class StrategyEnvResolverImpl implements StrategyEnvResolver {
                                 Comparator.nullsLast(Comparator.reverseOrder())
                         );
 
-        List<StrategySettings> all = strategySettingsService.findAllByChatId(chatId, null, null);
+        List<StrategySettings> all = strategySettingsService.findAllByChatId(chatId);
 
         StrategySettings s = all.stream()
                 .filter(x -> x != null && x.getType() == type)

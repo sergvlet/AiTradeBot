@@ -246,7 +246,7 @@ public class MlAutoTuneRuntime {
             }
 
             // 2) Берём настройки (строго по env)
-            StrategySettings ss = strategySettingsService.getOrCreate(chatId, type, env.exchange, env.network);
+            StrategySettings ss = strategySettingsService.getOrCreate(chatId, type);
             if (ss == null) return;
 
             if (!ss.isAutoTuneEnabled()) {

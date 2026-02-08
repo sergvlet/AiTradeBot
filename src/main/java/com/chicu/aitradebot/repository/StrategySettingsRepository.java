@@ -1,6 +1,5 @@
 package com.chicu.aitradebot.repository;
 
-import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
 import jakarta.persistence.LockModeType;
@@ -16,64 +15,23 @@ import java.util.Optional;
 
 public interface StrategySettingsRepository extends JpaRepository<StrategySettings, Long> {
 
-    // =========================================================
-    // LIST
-    // =========================================================
     List<StrategySettings> findAllByChatId(long chatId);
 
+    Optional<StrategySettings> findByChatIdAndType(long chatId, StrategyType type);
 
+    List<StrategySettings> findAllByChatIdAndTypeOrderByUpdatedAtDescIdDesc(long chatId, StrategyType type);
 
-
-
-    List<StrategySettings> findAllByChatIdAndExchangeName(long chatId, String exchangeName);
-
-    List<StrategySettings> findAllByChatIdAndExchangeNameAndNetworkType(
-            long chatId, String exchangeName, NetworkType networkType
-    );
-    // =========================================================
-    // ✅ STRICT KEY (основной метод)
-    // =========================================================
-    Optional<StrategySettings> findByChatIdAndTypeAndExchangeNameAndNetworkType(
-            long chatId,
-            StrategyType type,
-            String exchangeName,
-            NetworkType networkType
-    );
-
-    // нужен для дедупа (если до UNIQUE уже наплодились записи)
-    List<StrategySettings> findAllByChatIdAndTypeAndExchangeNameAndNetworkTypeOrderByUpdatedAtDescIdDesc(
-            long chatId,
-            StrategyType type,
-            String exchangeName,
-            NetworkType networkType
-    );
-
-    // =========================================================
-    // ✅ PROD: row lock, чтобы параллельные autosave не делали гонки
-    // (если строка уже существует)
-    // =========================================================
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("""
            select s
            from StrategySettings s
            where s.chatId = :chatId
              and s.type = :type
-             and s.exchangeName = :exchangeName
-             and s.networkType = :networkType
            """)
-    Optional<StrategySettings> findByKeyForUpdate(
+    Optional<StrategySettings> findByChatIdAndTypeForUpdate(
             @Param("chatId") long chatId,
-            @Param("type") StrategyType type,
-            @Param("exchangeName") String exchangeName,
-            @Param("networkType") NetworkType networkType
+            @Param("type") StrategyType type
     );
-
-    // =========================================================
-    // ✅ DEDUP helpers
-    // =========================================================
-    @Modifying
-    @Transactional
-    void deleteByIdIn(List<Long> ids);
 
     @Modifying
     @Transactional
@@ -81,15 +39,11 @@ public interface StrategySettingsRepository extends JpaRepository<StrategySettin
            delete from StrategySettings s
            where s.chatId = :chatId
              and s.type = :type
-             and s.exchangeName = :exchangeName
-             and s.networkType = :networkType
              and s.id <> :keepId
            """)
-    int deleteDuplicatesKeepId(
+    int deleteDuplicatesByChatIdAndTypeKeepId(
             @Param("chatId") long chatId,
             @Param("type") StrategyType type,
-            @Param("exchangeName") String exchangeName,
-            @Param("networkType") NetworkType networkType,
             @Param("keepId") long keepId
     );
 }

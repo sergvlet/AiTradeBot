@@ -7,6 +7,7 @@ import com.chicu.aitradebot.domain.StrategySettings.CapitalMode;
 import com.chicu.aitradebot.domain.enums.AdvancedControlMode;
 import com.chicu.aitradebot.repository.StrategySettingsRepository;
 import com.chicu.aitradebot.service.StrategySettingsService;
+import jakarta.persistence.EntityManager;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -23,10 +24,12 @@ import java.util.Locale;
 public class StrategySettingsServiceImpl implements StrategySettingsService {
 
     private static final String DEFAULT_EXCHANGE = "BINANCE";
+    private static final NetworkType DEFAULT_NETWORK = NetworkType.TESTNET;
+
     private static final String DEFAULT_SYMBOL = "BTCUSDT";
     private static final String DEFAULT_TIMEFRAME = "1m";
-    private static final int    MIN_CANDLES = 50;
-    private static final int    DEFAULT_CANDLES = 500;
+    private static final int MIN_CANDLES = 50;
+    private static final int DEFAULT_CANDLES = 500;
 
     private static final String PHASE_LIVE = "LIVE";
     private static final String PHASE_PAPER = "PAPER";
@@ -34,13 +37,147 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
     private static final String PHASE_COLLECT = "COLLECT";
 
     private final StrategySettingsRepository repo;
+    private final EntityManager em;
+
+    // =====================================================
+    // API
+    // =====================================================
 
     @Override
     @Transactional
     public StrategySettings save(StrategySettings s) {
         if (s == null) throw new IllegalArgumentException("StrategySettings is null");
+        if (s.getChatId() == null) throw new IllegalArgumentException("chatId is null");
+        if (s.getType() == null) throw new IllegalArgumentException("type is null");
 
-        // --- дефолты/нормализация обязательных полей ---
+        normalizeAndDefaults(s);
+        applyControlModeFlags(s);
+
+        LocalDateTime now = LocalDateTime.now();
+        if (s.getCreatedAt() == null) s.setCreatedAt(now);
+        s.setUpdatedAt(now);
+
+        return repo.save(s);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public StrategySettings getSettings(long chatId, StrategyType type) {
+        if (chatId <= 0 || type == null) return null;
+        return repo.findByChatIdAndType(chatId, type).orElse(null);
+    }
+
+    @Override
+    @Transactional
+    public StrategySettings getOrCreate(long chatId, StrategyType type) {
+        if (chatId <= 0) throw new IllegalArgumentException("chatId must be positive");
+        if (type == null) throw new IllegalArgumentException("type must be provided");
+
+        // ✅ можно сразу lock-методом — меньше гонок от autosave
+        return repo.findByChatIdAndTypeForUpdate(chatId, type)
+                .orElseGet(() -> createOne(chatId, type));
+    }
+
+    @Override
+    @Transactional
+    public StrategySettings getOrCreateAndPatchContext(long chatId, StrategyType type, String exchange, NetworkType network) {
+        StrategySettings s = getOrCreate(chatId, type);
+        boolean changed = patchContextInternal(s, exchange, network);
+        if (changed) {
+            s = repo.save(s);
+        }
+        return s;
+    }
+
+    @Override
+    @Transactional
+    public void patchContext(StrategySettings settings, String exchange, NetworkType network) {
+        if (settings == null) return;
+        boolean changed = patchContextInternal(settings, exchange, network);
+        if (changed) repo.save(settings);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<StrategySettings> findAllByChatId(long chatId) {
+        return repo.findAllByChatId(chatId);
+    }
+
+    // =====================================================
+    // INTERNALS
+    // =====================================================
+
+    private StrategySettings createOne(long chatId, StrategyType type) {
+        LocalDateTime now = LocalDateTime.now();
+
+        StrategySettings s = StrategySettings.builder()
+                .chatId(chatId)
+                .type(type)
+
+                // контекст (не ключ)
+                .exchangeName(DEFAULT_EXCHANGE)
+                .networkType(DEFAULT_NETWORK)
+
+                // данные
+                .symbol(DEFAULT_SYMBOL)
+                .timeframe(DEFAULT_TIMEFRAME)
+                .cachedCandlesLimit(DEFAULT_CANDLES)
+
+                // риск/капитал
+                .capitalMode(CapitalMode.ALL)
+                .capitalValue(null)
+
+                // управление
+                .advancedControlMode(AdvancedControlMode.MANUAL)
+                .autoTuneEnabled(false)
+                .mlGateEnabled(false)
+                .runPhase(PHASE_LIVE)
+
+                .active(false)
+                .createdAt(now)
+                .updatedAt(now)
+                .build();
+
+        try {
+            StrategySettings saved = repo.saveAndFlush(s);
+            log.info("🆕 Created StrategySettings chatId={} type={} id={}", chatId, type, saved.getId());
+            return saved;
+
+        } catch (DataIntegrityViolationException dup) {
+            // ✅ критично для Hibernate: после ошибки уникальности чистим persistence context
+            try { em.clear(); } catch (Exception ignored) {}
+
+            // если уже есть запись — возвращаем её (или “самую свежую”, если были дубли)
+            StrategySettings existing = repo.findByChatIdAndType(chatId, type).orElse(null);
+            if (existing != null) return existing;
+
+            List<StrategySettings> list = repo.findAllByChatIdAndTypeOrderByUpdatedAtDescIdDesc(chatId, type);
+            if (!list.isEmpty()) return list.getFirst();
+
+            throw dup;
+        }
+    }
+
+    private boolean patchContextInternal(StrategySettings s, String exchange, NetworkType network) {
+        if (s == null) return false;
+
+        String ex = normalizeExchange(exchange);
+        NetworkType net = (network != null ? network : DEFAULT_NETWORK);
+
+        boolean changed = false;
+
+        if (s.getExchangeName() == null || !s.getExchangeName().equals(ex)) {
+            s.setExchangeName(ex);
+            changed = true;
+        }
+        if (s.getNetworkType() == null || s.getNetworkType() != net) {
+            s.setNetworkType(net);
+            changed = true;
+        }
+        return changed;
+    }
+
+    private void normalizeAndDefaults(StrategySettings s) {
         if (s.getAdvancedControlMode() == null) {
             s.setAdvancedControlMode(AdvancedControlMode.MANUAL);
         }
@@ -61,11 +198,10 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
             s.setCachedCandlesLimit(DEFAULT_CANDLES);
         }
 
-        if (s.getExchangeName() != null) {
-            String ex = s.getExchangeName().trim().toUpperCase(Locale.ROOT);
-            s.setExchangeName(ex.isEmpty() ? DEFAULT_EXCHANGE : ex);
-        } else {
-            s.setExchangeName(DEFAULT_EXCHANGE);
+        s.setExchangeName(normalizeExchange(s.getExchangeName()));
+
+        if (s.getNetworkType() == null) {
+            s.setNetworkType(DEFAULT_NETWORK);
         }
 
         if (s.getAccountAsset() != null) {
@@ -73,49 +209,28 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
             s.setAccountAsset(a.isEmpty() ? null : a);
         }
 
-        // --- единая логика режима управления (флаги + безопасная фаза) ---
-        applyControlModeFlags(s);
-
-        // --- капитал: если mode null -> ALL; value в StrategySettings нормализуется lifecycle-методами,
-        // но здесь дополнительно защитимся от null mode ---
         if (s.getCapitalMode() == null) {
             s.setCapitalMode(CapitalMode.ALL);
         }
-
-        // timestamps
-        LocalDateTime now = LocalDateTime.now();
-        if (s.getCreatedAt() == null) s.setCreatedAt(now);
-        s.setUpdatedAt(now);
-
-        return repo.save(s);
+        // capitalValue нормализуется в @PrePersist/@PreUpdate (у тебя это есть)
     }
 
-    /**
-     * MANUAL/HYBRID/AI => системные флаги исполнения.
-     * ВАЖНО: сервис не должен “сам” менять сеть/режим торговли.
-     * Он лишь гарантирует консистентность: флаги и безопасная runPhase.
-     */
     private void applyControlModeFlags(StrategySettings s) {
         AdvancedControlMode mode = (s.getAdvancedControlMode() != null)
                 ? s.getAdvancedControlMode()
                 : AdvancedControlMode.MANUAL;
 
-        // runPhase нормализуем “бережно”:
-        // - BACKTEST/ COLLECT не делаем дефолтом здесь
-        // - PAPER допускаем, но только если кто-то (UI) явно поставил
         String phase = normalizeUpperNullable(s.getRunPhase());
 
         switch (mode) {
             case MANUAL -> {
                 s.setAutoTuneEnabled(false);
                 s.setMlGateEnabled(false);
-                // MANUAL всегда “обычная работа”
                 s.setRunPhase(PHASE_LIVE);
             }
             case HYBRID -> {
                 s.setAutoTuneEnabled(true);
                 s.setMlGateEnabled(true);
-                // HYBRID по умолчанию LIVE (а PAPER/LIVE решает контроллер/UI по network)
                 if (phase == null || PHASE_BACKTEST.equals(phase) || PHASE_COLLECT.equals(phase)) {
                     s.setRunPhase(PHASE_LIVE);
                 } else {
@@ -125,7 +240,6 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
             case AI -> {
                 s.setAutoTuneEnabled(true);
                 s.setMlGateEnabled(true);
-                // AI: если UI не поставил PAPER явно — держим LIVE
                 if (phase == null || PHASE_BACKTEST.equals(phase) || PHASE_COLLECT.equals(phase)) {
                     s.setRunPhase(PHASE_LIVE);
                 } else {
@@ -134,83 +248,6 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
             }
         }
     }
-
-    @Override
-    @Transactional(readOnly = true)
-    public StrategySettings getSettings(long chatId, StrategyType type, String exchange, NetworkType network) {
-        if (chatId <= 0 || type == null || network == null) return null;
-        String ex = normalizeExchange(exchange);
-        return repo.findByChatIdAndTypeAndExchangeNameAndNetworkType(chatId, type, ex, network).orElse(null);
-    }
-
-    @Override
-    @Transactional
-    public StrategySettings getOrCreate(long chatId, StrategyType type, String exchange, NetworkType network) {
-        if (chatId <= 0) throw new IllegalArgumentException("chatId must be positive");
-        if (type == null) throw new IllegalArgumentException("type must be provided");
-        if (network == null) throw new IllegalArgumentException("network must be provided");
-
-        String ex = normalizeExchange(exchange);
-
-        return repo.findByChatIdAndTypeAndExchangeNameAndNetworkType(chatId, type, ex, network)
-                .orElseGet(() -> createOne(chatId, type, ex, network));
-    }
-
-    private StrategySettings createOne(long chatId, StrategyType type, String exchange, NetworkType network) {
-        LocalDateTime now = LocalDateTime.now();
-
-        StrategySettings s = StrategySettings.builder()
-                .chatId(chatId)
-                .type(type)
-                .exchangeName(exchange)
-                .networkType(network)
-                .active(false)
-                .advancedControlMode(AdvancedControlMode.MANUAL)
-                .runPhase(PHASE_LIVE)
-
-                // дефолты торговли/данных
-                .symbol(DEFAULT_SYMBOL)
-                .timeframe(DEFAULT_TIMEFRAME)
-                .cachedCandlesLimit(DEFAULT_CANDLES)
-
-                // ✅ новый риск-контроль: по умолчанию “весь баланс”
-                .capitalMode(CapitalMode.ALL)
-                .capitalValue(null)
-
-                .createdAt(now)
-                .updatedAt(now)
-                .build();
-
-        try {
-            StrategySettings saved = repo.save(s);
-            log.info("🆕 Created StrategySettings chatId={} type={} ex={} net={} id={}",
-                    chatId, type, exchange, network, saved.getId());
-            return saved;
-        } catch (DataIntegrityViolationException dup) {
-            return repo.findByChatIdAndTypeAndExchangeNameAndNetworkType(chatId, type, exchange, network)
-                    .orElseThrow(() -> dup);
-        }
-    }
-
-    @Override
-    @Transactional(readOnly = true)
-    public List<StrategySettings> findAllByChatId(long chatId, String exchange, NetworkType network) {
-        String ex = normalizeExchange(exchange);
-        if (network == null) {
-            return repo.findAllByChatIdAndExchangeName(chatId, ex);
-        }
-        return repo.findAllByChatIdAndExchangeNameAndNetworkType(chatId, ex, network);
-    }
-
-    @Override
-    @Transactional(readOnly = true)
-    public List<StrategySettings> findAllByChatId(long chatId, String exchange) {
-        String ex = normalizeExchange(exchange);
-        return repo.findAllByChatIdAndExchangeName(chatId, ex);
-    }
-
-    // ✅ Старые методы riskPerTradePct/dailyLossLimitPct УДАЛЯЕМ из интерфейса StrategySettingsService.
-    // Здесь их больше не реализуем, потому что полей больше нет и это будет “тихий” баг.
 
     private static String normalizeExchange(String exchange) {
         if (exchange == null) return DEFAULT_EXCHANGE;
@@ -221,7 +258,6 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
     private static String normalizeUpperNullable(String s) {
         if (s == null) return null;
         String v = s.trim();
-        if (v.isEmpty()) return null;
-        return v.toUpperCase(Locale.ROOT);
+        return v.isEmpty() ? null : v.toUpperCase(Locale.ROOT);
     }
 }

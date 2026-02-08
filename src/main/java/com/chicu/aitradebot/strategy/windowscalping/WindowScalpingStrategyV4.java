@@ -50,7 +50,6 @@ public class WindowScalpingStrategyV4 implements
     private boolean mlEnabled;
 
     /**
-     * ✅ Если ML недоступен — не блокируем торговлю.
      * true  -> fail-open: если predict недоступен, продолжаем без ML-гейта
      * false -> fail-closed: predict_failed => HOLD и запрет входа
      */
@@ -104,7 +103,7 @@ public class WindowScalpingStrategyV4 implements
     private final Map<Long, LocalState> states = new ConcurrentHashMap<>();
 
     // =====================================================
-    // ✅ КЭШИ (чтобы не сканировать контекст/не парсить строки по кругу)
+    // ✅ КЭШИ
     // =====================================================
 
     private volatile Object cachedMlBean;
@@ -171,6 +170,7 @@ public class WindowScalpingStrategyV4 implements
 
         String hintEx = normalizeExchangeOrNull(exchange);
 
+        // ✅ FIX: settings грузим всегда (без зависимости от exchange/network)
         StrategySettings ss = loadStrategySettingsAuto(chatId, hintEx, network);
         WindowScalpingStrategySettings cfg = windowSettingsService.getOrCreate(chatId);
 
@@ -184,6 +184,8 @@ public class WindowScalpingStrategyV4 implements
         st.exchange = normalizeExchangeOrNull(ss != null ? ss.getExchangeName() : hintEx);
         st.network = ss != null ? ss.getNetworkType() : network;
 
+        // ✅ символ: только из StrategySettings (если есть), иначе из hint.
+        // НИКАКИХ дефолтов вроде BTCTUSD.
         String sym = ss != null ? normalizeSymbolOrNull(ss.getSymbol()) : null;
         if (sym == null) sym = normalizeSymbolOrNull(symbolHint);
         st.symbol = sym;
@@ -221,12 +223,12 @@ public class WindowScalpingStrategyV4 implements
         if (ss != null) {
             log.info("[WINDOW] ▶ START chatId={} ex={} net={} symbol={} window={} entryLow%={} minRange%={} TP%={} SL%={} ML={} failOpen={} mlMinFallback={} coarseAdjust={}",
                     chatId,
-                    ss.getExchangeName(),
-                    ss.getNetworkType(),
+                    fmtEnumOrString(ss.getExchangeName()),
+                    fmtEnumOrString(ss.getNetworkType()),
                     ss.getSymbol(),
                     cfg != null ? cfg.getWindowSize() : null,
-                    cfg != null ? cfg.getEntryFromLowPct() : null,
-                    cfg != null ? cfg.getMinRangePct() : null,
+                    safeToStr(tryInvoke(cfg, Double.class, BigDecimal.class, "getEntryFromLowPct", "getEntryLowPct", "getEntryLow")),
+                    safeToStr(tryInvoke(cfg, Double.class, BigDecimal.class, "getMinRangePct", "getMinRangePctForEntry")),
                     cfg != null ? cfg.getTakeProfitPct() : null,
                     cfg != null ? cfg.getStopLossPct() : null,
                     mlEnabled,
@@ -245,7 +247,7 @@ public class WindowScalpingStrategyV4 implements
             safeLive(() -> live.pushSignal(chatId, StrategyType.WINDOW_SCALPING, symFinal, null, Signal.hold("Стратегия запущена")));
         }
 
-        // ✅ восстановим позицию после рестарта/перезапуска (без конфликтов с TradeExecutionService)
+        // ✅ восстановим позицию после рестарта/перезапуска
         if (st.symbol != null) {
             synchronized (st) {
                 maybeRestorePositionFromStore(chatId, st, st.symbol, Instant.now());
@@ -266,10 +268,6 @@ public class WindowScalpingStrategyV4 implements
 
         ensureRuntimeContext(st, st.ss);
         st.lastEntryAt = null;
-
-        // ❗ ВАЖНО:
-        // stop() НЕ должен чистить PositionStore, иначе при остановке/рестарте ты "забываешь" открытую позицию.
-        // Позицию должен закрывать только TradeExecutionService по факту SELL (или отдельный emergency close).
 
         if (st.exchange != null && st.network != null) {
             safeAutoTune(() -> autoTuneRuntime.onStrategyStopped(chatId, StrategyType.WINDOW_SCALPING, st.exchange, st.network));
@@ -321,8 +319,21 @@ public class WindowScalpingStrategyV4 implements
             if (ex != null) st.exchange = ex;
             if (network != null) st.network = network;
 
-            String sym = normalizeSymbolOrNull(symbol);
-            if (sym != null) st.symbol = sym;
+            // ✅ FIX: НЕ перезаписываем st.symbol чужим символом.
+            // Если символ уже задан (из настроек) — принимаем только совпадающий.
+            // Если st.symbol == null — тогда можно принять из события.
+            String incoming = normalizeSymbolOrNull(symbol);
+            String current = normalizeSymbolOrNull(st.symbol);
+            if (current == null && incoming != null) {
+                st.symbol = incoming;
+            } else if (current != null && incoming != null && !current.equals(incoming)) {
+                // можно логнуть редко, чтобы видеть реальную причину "почему нет свечей"
+                if (st.ticks % Math.max(1, tickLogEveryTicks) == 0) {
+                    log.warn("[WINDOW] ⚠ drop price event due to symbol mismatch chatId={} currentSym={} incomingSym={} ex={} net={}",
+                            chatId, current, incoming, ex, network);
+                }
+                return;
+            }
         }
 
         Instant ts = (tradeTsMs > 0) ? Instant.ofEpochMilli(tradeTsMs) : Instant.now();
@@ -353,8 +364,18 @@ public class WindowScalpingStrategyV4 implements
             if (ex != null) st.exchange = ex;
             if (network != null) st.network = network;
 
-            String sym = normalizeSymbolOrNull(symbol);
-            if (sym != null) st.symbol = sym;
+            // ✅ FIX: то же правило, что и для тиков.
+            String incoming = normalizeSymbolOrNull(symbol);
+            String current = normalizeSymbolOrNull(st.symbol);
+            if (current == null && incoming != null) {
+                st.symbol = incoming;
+            } else if (current != null && incoming != null && !current.equals(incoming)) {
+                if (st.ticks % Math.max(1, tickLogEveryTicks) == 0) {
+                    log.warn("[WINDOW] ⚠ drop candle event due to symbol mismatch chatId={} currentSym={} incomingSym={} ex={} net={}",
+                            chatId, current, incoming, ex, network);
+                }
+                return;
+            }
         }
 
         onPriceUpdate(chatId, symbol, close, ts);
@@ -387,7 +408,12 @@ public class WindowScalpingStrategyV4 implements
         String tickSymbol = normalizeSymbolOrNull(symbolFromTick);
         String cfgSymbol = normalizeSymbolOrNull(st.symbol);
 
-        if (cfgSymbol != null && tickSymbol != null && !cfgSymbol.equals(tickSymbol)) return;
+        // ✅ если настроечный символ есть — принимаем только совпадающий тик
+        if (cfgSymbol != null && tickSymbol != null && !cfgSymbol.equals(tickSymbol)) {
+            return;
+        }
+
+        // ✅ если символ ещё не известен — можно принять
         if (cfgSymbol == null && tickSymbol != null) st.symbol = tickSymbol;
 
         final String symLive = normalizeSymbolOrNull(st.symbol);
@@ -426,7 +452,7 @@ public class WindowScalpingStrategyV4 implements
                 pushHoldThrottled(chatId, sym, st, "warming_up", time, holdMs);
                 if (st.ticks % logEvery == 0) {
                     log.info("[WINDOW] ⏳ warmup chatId={} sym={} window={}/{} price={}",
-                            chatId, sym, st.window.size(), windowSize, price.stripTrailingZeros().toPlainString());
+                            chatId, sym, st.window.size(), windowSize, fmtBd(price));
                 }
                 return;
             }
@@ -490,9 +516,9 @@ public class WindowScalpingStrategyV4 implements
                 log.debug("[WINDOW] tick chatId={} sym={} price={} low={} high={} rangePct={} posPct={}",
                         chatId,
                         sym,
-                        price.stripTrailingZeros().toPlainString(),
-                        low.stripTrailingZeros().toPlainString(),
-                        high.stripTrailingZeros().toPlainString(),
+                        fmtBd(price),
+                        fmtBd(low),
+                        fmtBd(high),
                         fmt(rangePct),
                         fmt(pos * 100.0));
             }
@@ -501,7 +527,6 @@ public class WindowScalpingStrategyV4 implements
             // ENTRY (SPOT LONG)
             // =====================================================
             if (!st.inPosition && pos <= lowZone) {
-
 
                 final double score = clamp01(
                         (lowZone <= 0.000001) ? 1.0 : (1.0 - (pos / lowZone))
@@ -517,7 +542,7 @@ public class WindowScalpingStrategyV4 implements
                 }
 
                 // =====================================================
-                // ✅ ML gate (fail-open / fail-closed)
+                // ✅ ML gate
                 // =====================================================
                 if (mlEnabled) {
                     double threshold = resolveMlThreshold(ss);
@@ -539,7 +564,6 @@ public class WindowScalpingStrategyV4 implements
                                     chatId, sym, pred.reason);
                         }
                     } else {
-                        // ✅ прокидываем актуальную proba в StrategySettings (чтобы TradeExecution ML-gate видел реальную уверенность)
                         try { ss.setMlConfidence(BigDecimal.valueOf(pred.proba)); } catch (Exception ignored) {}
 
                         if (st.ticks % logEvery == 0) {
@@ -585,9 +609,6 @@ public class WindowScalpingStrategyV4 implements
 
                     ensureRuntimeContext(st, ss);
 
-                    // ❗ НЕ пишем PositionStore тут.
-                    // PositionStore snapshot уже записан внутри TradeExecutionServiceImpl после успешного BUY.
-
                     if (st.tp != null && st.sl != null) {
                         safeLive(() -> live.pushTpSl(chatId, StrategyType.WINDOW_SCALPING, sym, st.tp, st.sl));
                     }
@@ -610,7 +631,6 @@ public class WindowScalpingStrategyV4 implements
             // EXIT: TP/SL
             // =====================================================
 
-            // ✅ если состояние позиции потерялось — восстановим из PositionStore
             maybeRestorePositionFromStore(chatId, st, sym, time);
 
             if (st.inPosition && st.entryQty != null && st.tp != null && st.sl != null) {
@@ -648,9 +668,6 @@ public class WindowScalpingStrategyV4 implements
                         st.lastEntryAt = null;
 
                         ensureRuntimeContext(st, ss);
-
-                        // ❗ НЕ чистим PositionStore тут.
-                        // PositionStore чистится внутри TradeExecutionServiceImpl после успешного SELL.
 
                         if (st.exchange != null && st.network != null) {
                             safeAutoTune(() -> autoTuneRuntime.onPositionClosed(
@@ -701,7 +718,7 @@ public class WindowScalpingStrategyV4 implements
         log.info("[WINDOW] 🩺 chatId={} sym={} price={} => {}",
                 chatId,
                 symbol,
-                price != null ? price.stripTrailingZeros().toPlainString() : "null",
+                price != null ? fmtBd(price) : "null",
                 msg
         );
         st.lastDiagAt = now;
@@ -721,6 +738,7 @@ public class WindowScalpingStrategyV4 implements
         }
 
         try {
+            // ✅ FIX: грузим всегда
             StrategySettings loaded = loadStrategySettingsAuto(chatId, st.exchange, st.network);
             WindowScalpingStrategySettings cfg = windowSettingsService.getOrCreate(chatId);
 
@@ -733,8 +751,8 @@ public class WindowScalpingStrategyV4 implements
             if (cfg != null) st.cfg = cfg;
 
             if (loaded != null) {
-                // ⚠️ Если позиция открыта — не меняем символ "на лету", иначе ты потеряешь контекст.
                 String loadedSymbol = normalizeSymbolOrNull(loaded.getSymbol());
+                // ✅ символ меняем только если НЕ в позиции (как и было)
                 if (!st.inPosition && loadedSymbol != null) st.symbol = loadedSymbol;
 
                 if (loaded.getExchangeName() != null) st.exchange = normalizeExchangeOrNull(loaded.getExchangeName());
@@ -753,7 +771,7 @@ public class WindowScalpingStrategyV4 implements
                             st.network,
                             st.symbol,
                             cfg != null ? cfg.getWindowSize() : null,
-                            cfg != null ? cfg.getMinRangePct() : null,
+                            safeToStr(tryInvoke(cfg, Double.class, BigDecimal.class, "getMinRangePct", "getMinRangePctForEntry")),
                             cfg != null ? cfg.getTakeProfitPct() : null,
                             cfg != null ? cfg.getStopLossPct() : null
                     );
@@ -775,92 +793,114 @@ public class WindowScalpingStrategyV4 implements
         }
     }
 
+    // =====================================================
+    // 🔎 Fingerprint helpers (safe across different entity versions)
+    // =====================================================
+
+    private static String fmtEnumOrString(Object v) {
+        if (v == null) return "null";
+        if (v instanceof Enum<?> e) return e.name();
+        String s = String.valueOf(v).trim();
+        return s.isEmpty() ? "null" : s;
+    }
+
+    private static String fmtNum(Object v) {
+        if (v == null) return "null";
+        try {
+            if (v instanceof BigDecimal bd) {
+                return bd.stripTrailingZeros().toPlainString();
+            }
+            if (v instanceof Number n) {
+                double d = n.doubleValue();
+                if (Double.isNaN(d) || Double.isInfinite(d)) return "null";
+                return BigDecimal.valueOf(d).stripTrailingZeros().toPlainString();
+            }
+            String s = String.valueOf(v).trim();
+            if (s.isEmpty() || "null".equalsIgnoreCase(s)) return "null";
+            BigDecimal bd = new BigDecimal(s);
+            return bd.stripTrailingZeros().toPlainString();
+        } catch (Exception ignore) {
+            return "null";
+        }
+    }
+
+    private static Object tryInvoke(Object target,
+                                    Class<?> preferredA,
+                                    Class<?> preferredB,
+                                    String... methodNames) {
+        if (target == null || methodNames == null) return null;
+
+        Class<?> cls = target.getClass();
+
+        for (String mName : methodNames) {
+            if (mName == null || mName.isBlank()) continue;
+
+            try {
+                Method m = cls.getMethod(mName);
+                m.setAccessible(true);
+                Object val = m.invoke(target);
+                if (val == null) continue;
+
+                if (preferredA != null && preferredA.isInstance(val)) return val;
+                if (preferredB != null && preferredB.isInstance(val)) return val;
+
+                if (val instanceof Number || val instanceof Boolean || val instanceof String || val instanceof Enum) {
+                    return val;
+                }
+            } catch (NoSuchMethodException ignored) {
+            } catch (Exception ignored) {
+            }
+        }
+
+        return null;
+    }
+
     private String buildFingerprint(StrategySettings ss, WindowScalpingStrategySettings cfg) {
-        String symbol = ss != null ? normalizeSymbolOrNull(ss.getSymbol()) : null;
-        String ex = ss != null ? String.valueOf(ss.getExchangeName()) : "null";
-        String net = ss != null ? String.valueOf(ss.getNetworkType()) : "null";
-        String tf = ss != null ? safeNullable(ss.getTimeframe()) : "null";
-        String candles = ss != null && ss.getCachedCandlesLimit() != null ? String.valueOf(ss.getCachedCandlesLimit()) : "null";
+        String symbol  = ss != null ? normalizeSymbolOrNull(ss.getSymbol()) : null;
+        String ex      = ss != null ? fmtEnumOrString(ss.getExchangeName()) : "null";
+        String net     = ss != null ? fmtEnumOrString(ss.getNetworkType()) : "null";
+        String tf      = ss != null ? safeNullable(ss.getTimeframe()) : "null";
+        String candles = (ss != null && ss.getCachedCandlesLimit() != null) ? String.valueOf(ss.getCachedCandlesLimit()) : "null";
 
-        String w = cfg != null ? String.valueOf(cfg.getWindowSize()) : "null";
-        String low = cfg != null ? String.valueOf(cfg.getEntryFromLowPct()) : "null";
-        String high = cfg != null ? String.valueOf(cfg.getEntryFromHighPct()) : "null";
-        String minR = cfg != null ? String.valueOf(cfg.getMinRangePct()) : "null";
+        String w         = (cfg != null) ? fmtNum(cfg.getWindowSize()) : "null";
+        String low       = (cfg != null) ? fmtNum(tryInvoke(cfg, Double.class, BigDecimal.class, "getEntryFromLowPct", "getEntryLowPct", "getEntryLow")) : "null";
+        String high      = (cfg != null) ? fmtNum(tryInvoke(cfg, Double.class, BigDecimal.class, "getEntryFromHighPct", "getEntryHighPct", "getEntryHigh")) : "null";
+        String minRange  = (cfg != null) ? fmtNum(tryInvoke(cfg, Double.class, BigDecimal.class, "getMinRangePct", "getMinRangePctForEntry")) : "null";
+        String maxSpread = (cfg != null) ? fmtNum(tryInvoke(cfg, Double.class, BigDecimal.class, "getMaxSpreadPct", "getMaxSpread", "getSpreadThreshold")) : "null";
 
-        String tpPct = cfg != null && cfg.getTakeProfitPct() != null ? cfg.getTakeProfitPct().stripTrailingZeros().toPlainString() : "null";
-        String slPct = cfg != null && cfg.getStopLossPct() != null ? cfg.getStopLossPct().stripTrailingZeros().toPlainString() : "null";
+        String tpPct = (cfg != null) ? fmtNum(cfg.getTakeProfitPct()) : "null";
+        String slPct = (cfg != null) ? fmtNum(cfg.getStopLossPct()) : "null";
 
-        return (symbol != null ? symbol : "null") + "|" + ex + "|" + net + "|" + tf + "|" + candles + "|" + tpPct + "|" + slPct;
+        String coarseAdjust = (cfg != null) ? fmtEnumOrString(tryInvoke(cfg, Boolean.class, null, "isCoarseAdjustEnabled", "getCoarseAdjustEnabled", "isCoarseAdjust")) : "null";
+        String failOpen     = (cfg != null) ? fmtEnumOrString(tryInvoke(cfg, Boolean.class, null, "isFailOpen", "getFailOpen")) : "null";
+        String mlEnabledCfg = (cfg != null) ? fmtEnumOrString(tryInvoke(cfg, Boolean.class, null, "isMlEnabled", "getMlEnabled")) : "null";
+        String mlMinConf    = (cfg != null) ? fmtNum(tryInvoke(cfg, Double.class, BigDecimal.class, "getMlMinConfidence", "getMlMinConf")) : "null";
+        String mlFallback   = (cfg != null) ? fmtNum(tryInvoke(cfg, Double.class, BigDecimal.class, "getMlMinFallback", "getMlFallback")) : "null";
+
+        return String.join("|",
+                "WINDOW_SCALPING",
+                ex, net,
+                (symbol != null ? symbol : "null"),
+                tf, candles,
+                w, low, high, minRange, maxSpread, tpPct, slPct,
+                coarseAdjust, failOpen, mlEnabledCfg, mlMinConf, mlFallback
+        );
     }
 
     // =====================================================
-    // ✅ STRATEGY SETTINGS LOAD (AUTO, NO HARDCODE)
+    // ✅ STRATEGY SETTINGS LOAD (AUTO)
     // =====================================================
 
     private StrategySettings loadStrategySettingsAuto(Long chatId, String exchange, NetworkType network) {
-        String ex = normalizeExchangeOrNull(exchange);
-
-        if (ex != null && network != null) {
-            return strategySettingsService.getOrCreate(chatId, StrategyType.WINDOW_SCALPING, ex, network);
-        }
-
-        StrategySettings viaReflection = tryCallSettingsServiceFallback(chatId);
-        if (viaReflection != null) return viaReflection;
-
-        // ✅ НЕ ПАДАЕМ. Возвращаем null -> стратегия уйдёт в HOLD "no_settings"
-        if (log.isDebugEnabled()) {
-            log.debug("[WINDOW] loadStrategySettingsAuto: no exchange/network and no fallback methods (chatId={}) -> return null", chatId);
-        }
-        return null;
-    }
-
-    /**
-     * ✅ FIX: поддерживаем primitive long и Long (у тебя часто long в интерфейсе)
-     */
-    private StrategySettings tryCallSettingsServiceFallback(Long chatId) {
         if (chatId == null) return null;
 
-        // 1) getOrCreate(long, StrategyType)
+        // ✅ FIX: здесь никаких условий — настройки и так keyed by (chatId, type)
         try {
-            Method m = strategySettingsService.getClass().getMethod("getOrCreate", long.class, StrategyType.class);
-            Object r = m.invoke(strategySettingsService, chatId.longValue(), StrategyType.WINDOW_SCALPING);
-            return (r instanceof StrategySettings ss) ? ss : null;
-        } catch (NoSuchMethodException ignored) {
+            return strategySettingsService.getOrCreate(chatId, StrategyType.WINDOW_SCALPING);
         } catch (Exception e) {
-            log.warn("[WINDOW] ⚠ fallback getOrCreate(long,type) failed: {}", e.toString());
+            log.warn("[WINDOW] ⚠ loadStrategySettingsAuto getOrCreate failed chatId={} err={}", chatId, e.toString());
+            return null;
         }
-
-        // 2) getOrCreate(Long, StrategyType)
-        try {
-            Method m = strategySettingsService.getClass().getMethod("getOrCreate", Long.class, StrategyType.class);
-            Object r = m.invoke(strategySettingsService, chatId, StrategyType.WINDOW_SCALPING);
-            return (r instanceof StrategySettings ss) ? ss : null;
-        } catch (NoSuchMethodException ignored) {
-        } catch (Exception e) {
-            log.warn("[WINDOW] ⚠ fallback getOrCreate(Long,type) failed: {}", e.toString());
-        }
-
-        // 3) getSettingsOrThrow(long, StrategyType)
-        try {
-            Method m = strategySettingsService.getClass().getMethod("getSettingsOrThrow", long.class, StrategyType.class);
-            Object r = m.invoke(strategySettingsService, chatId.longValue(), StrategyType.WINDOW_SCALPING);
-            return (r instanceof StrategySettings ss) ? ss : null;
-        } catch (NoSuchMethodException ignored) {
-        } catch (Exception e) {
-            log.warn("[WINDOW] ⚠ fallback getSettingsOrThrow(long,type) failed: {}", e.toString());
-        }
-
-        // 4) getSettingsOrThrow(Long, StrategyType)
-        try {
-            Method m = strategySettingsService.getClass().getMethod("getSettingsOrThrow", Long.class, StrategyType.class);
-            Object r = m.invoke(strategySettingsService, chatId, StrategyType.WINDOW_SCALPING);
-            return (r instanceof StrategySettings ss) ? ss : null;
-        } catch (NoSuchMethodException ignored) {
-        } catch (Exception e) {
-            log.warn("[WINDOW] ⚠ fallback getSettingsOrThrow(Long,type) failed: {}", e.toString());
-        }
-
-        return null;
     }
 
     // =====================================================
@@ -882,7 +922,7 @@ public class WindowScalpingStrategyV4 implements
     }
 
     // =====================================================
-    // ✅ COARSE-ADJUST реализация
+    // ✅ COARSE-ADJUST
     // =====================================================
 
     private void maybeCoarseAdjustOnRangeTooSmall(Long chatId, String symbol, LocalState st, Instant now) {
@@ -965,10 +1005,6 @@ public class WindowScalpingStrategyV4 implements
         }
     }
 
-    /**
-     * ✅ FIX: порог — это gateMinProb (настройка), а не mlConfidence (текущее значение модели).
-     * mlConfidence используется как runtime-значение (мы его выставляем из pred.proba выше).
-     */
     private double resolveMlThreshold(StrategySettings ss) {
         if (ss != null) {
             BigDecimal gate = ss.getGateMinProb();
@@ -1110,10 +1146,8 @@ public class WindowScalpingStrategyV4 implements
             Class<?>[] pt = m.getParameterTypes();
 
             if (pc == 1 && Map.class.isAssignableFrom(pt[0])) return true;
-            if (pc == 5 && pt[2] == String.class && Map.class.isAssignableFrom(pt[3]) && pt[4] == Instant.class)
-                return true;
-            if (pc == 4 && pt[1] == String.class && Map.class.isAssignableFrom(pt[2]) && pt[3] == Instant.class)
-                return true;
+            if (pc == 5 && pt[2] == String.class && Map.class.isAssignableFrom(pt[3]) && pt[4] == Instant.class) return true;
+            if (pc == 4 && pt[1] == String.class && Map.class.isAssignableFrom(pt[2]) && pt[3] == Instant.class) return true;
         }
         return false;
     }
@@ -1199,17 +1233,11 @@ public class WindowScalpingStrategyV4 implements
     // =====================================================
 
     private void safeLive(Runnable r) {
-        try {
-            r.run();
-        } catch (Exception ignored) {
-        }
+        try { r.run(); } catch (Exception ignored) {}
     }
 
     private void safeAutoTune(Runnable r) {
-        try {
-            r.run();
-        } catch (Exception ignored) {
-        }
+        try { r.run(); } catch (Exception ignored) {}
     }
 
     private Set<String> parsedAutoTuneHoldReasons() {
@@ -1394,7 +1422,6 @@ public class WindowScalpingStrategyV4 implements
     private void maybeRestorePositionFromStore(Long chatId, LocalState st, String symbol, Instant now) {
         if (chatId == null || st == null) return;
 
-        // уже восстановлено
         if (st.inPosition && st.entryQty != null && st.tp != null && st.sl != null) return;
 
         String ex = normalizeExchangeOrNull(st.exchange);
@@ -1410,11 +1437,9 @@ public class WindowScalpingStrategyV4 implements
                 positionStore.getPosition(chatId, StrategyType.WINDOW_SCALPING, ex, net, sym);
 
         if (opt.isEmpty()) {
-            // ✅ FIX: snapshot missing = рассинхрон. Не ставим inPosition=true, иначе стратегия попытается выйти "из воздуха".
             st.inPosition = false;
             st.isLong = true;
 
-            // чистим store, чтобы не долбило вечным восстановлением
             try {
                 positionStore.clearPosition(chatId, StrategyType.WINDOW_SCALPING, ex, net, sym);
             } catch (Exception ignored) {
@@ -1450,23 +1475,23 @@ public class WindowScalpingStrategyV4 implements
             log.info("[WINDOW] ♻️ RESTORED chatId={} sym={} qty={} tp={} sl={} entryPrice={} orderId={}",
                     chatId,
                     sym,
-                    st.entryQty != null ? st.entryQty.stripTrailingZeros().toPlainString() : "null",
-                    st.tp != null ? st.tp.stripTrailingZeros().toPlainString() : "null",
-                    st.sl != null ? st.sl.stripTrailingZeros().toPlainString() : "null",
-                    st.entryPrice != null ? st.entryPrice.stripTrailingZeros().toPlainString() : "null",
+                    st.entryQty != null ? fmtBd(st.entryQty) : "null",
+                    st.tp != null ? fmtBd(st.tp) : "null",
+                    st.sl != null ? fmtBd(st.sl) : "null",
+                    st.entryPrice != null ? fmtBd(st.entryPrice) : "null",
                     st.entryOrderId
             );
         }
     }
 
     // =====================================================
-    // UTILS
+    // UTILS (fixed)
     // =====================================================
 
-    private static String safeNullable(String s) {
-        if (s == null) return null;
-        String t = s.trim();
-        return t.isEmpty() ? null : t;
+    private static String safeNullable(Object v) {
+        if (v == null) return "null";
+        String s = String.valueOf(v).trim();
+        return s.isEmpty() ? "null" : s;
     }
 
     private static String normalizeSymbolOrNull(String symbol) {
@@ -1475,9 +1500,10 @@ public class WindowScalpingStrategyV4 implements
         return s.isEmpty() ? null : s;
     }
 
-    private static String normalizeExchangeOrNull(String exchange) {
+    private static String normalizeExchangeOrNull(Object exchange) {
         if (exchange == null) return null;
-        String s = exchange.trim().toUpperCase(Locale.ROOT);
+        String s = (exchange instanceof Enum<?> e) ? e.name() : String.valueOf(exchange);
+        s = s.trim().toUpperCase(Locale.ROOT);
         return s.isEmpty() ? null : s;
     }
 
@@ -1489,5 +1515,19 @@ public class WindowScalpingStrategyV4 implements
 
     private static String fmt(double v) {
         return String.format(Locale.ROOT, "%.4f", v);
+    }
+
+    private static String fmtBd(BigDecimal v) {
+        if (v == null) return "null";
+        try {
+            return v.stripTrailingZeros().toPlainString();
+        } catch (Exception e) {
+            return String.valueOf(v);
+        }
+    }
+
+    private static String safeToStr(Object v) {
+        if (v == null) return "null";
+        return String.valueOf(v);
     }
 }

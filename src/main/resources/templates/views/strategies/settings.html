@@ -709,12 +709,9 @@
                       onsubmit="return false;"
                       novalidate>
 
+                    <!-- важно для сервера -->
                     <input type="hidden" name="exchange" th:value="${selectedExchange}"/>
                     <input type="hidden" name="network"  th:value="${selectedNetwork != null ? selectedNetwork.name() : 'TESTNET'}"/>
-
-                    <!-- ✅ ВАЖНО: имена должны совпадать с контроллером -->
-                    <input type="hidden" name="capitalMode"  id="capitalMode"  value="ALL"/>
-                    <input type="hidden" name="capitalValue" id="capitalValue" value=""/>
 
                     <!-- ===================================================== -->
                     <!-- INFO: exchange balance -->
@@ -739,8 +736,10 @@
                         <div class="col-md-4">
                             <label class="form-label" for="riskModeSelect">Режим</label>
 
+                            <!-- ✅ ДОБАВИЛИ name="capitalMode" -->
                             <select class="form-select"
                                     id="riskModeSelect"
+                                    name="capitalMode"
                                     data-confirm="true"
                                     data-confirm-title="Подтверждение"
                                     data-confirm-text="Изменение лимита входа влияет на объём ордеров. Сохранить?">
@@ -758,10 +757,12 @@
                         <div class="col-md-4">
                             <label class="form-label" id="riskValueLabel" for="riskValueInput">Значение</label>
 
-                            <div class="input-group">
+                            <div class="input-group" id="riskValueGroup">
+                                <!-- ✅ ДОБАВИЛИ name="capitalValue" -->
                                 <input type="number"
                                        class="form-control"
                                        id="riskValueInput"
+                                       name="capitalValue"
                                        step="1"
                                        min="0"
                                        placeholder="Напр. 40"
@@ -774,10 +775,9 @@
 
                             <div class="form-text" id="riskValueHint">Укажи число.</div>
 
-                            <!-- quick buttons -->
                             <div class="mt-2 d-flex flex-wrap gap-2" id="riskQuickButtons">
-                                <button type="button" class="btn btn-outline-secondary btn-sm" data-risk-set="20" data-risk-mode="FIX">20</button>
-                                <button type="button" class="btn btn-outline-secondary btn-sm" data-risk-set="40" data-risk-mode="FIX">40</button>
+                                <button type="button" class="btn btn-outline-secondary btn-sm" data-risk-set="20"  data-risk-mode="FIX">20</button>
+                                <button type="button" class="btn btn-outline-secondary btn-sm" data-risk-set="40"  data-risk-mode="FIX">40</button>
                                 <button type="button" class="btn btn-outline-secondary btn-sm" data-risk-set="100" data-risk-mode="FIX">100</button>
 
                                 <button type="button" class="btn btn-outline-secondary btn-sm" data-risk-set="10" data-risk-mode="PCT">10%</button>
@@ -803,7 +803,7 @@
                         </div>
                     </div>
 
-                    <!-- init from server -->
+                    <!-- init from server (для JS) -->
                     <input type="hidden" id="riskInitMode"
                            th:value="${strategy != null && strategy.capitalMode != null ? strategy.capitalMode : 'ALL'}"/>
                     <input type="hidden" id="riskInitValue"
@@ -816,287 +816,6 @@
                 </form>
             </div>
         </div>
-
-        <!-- ===================================================== -->
-        <!-- RISK TAB helper script (tiny, no deps) -->
-        <!-- ===================================================== -->
-        <script>
-            (() => {
-                const modeSelect   = document.getElementById("riskModeSelect");
-                const valueInput   = document.getElementById("riskValueInput");
-                const valueLabel   = document.getElementById("riskValueLabel");
-                const valueUnit    = document.getElementById("riskValueUnit");
-                const valueHint    = document.getElementById("riskValueHint");
-                const modeHelp     = document.getElementById("riskModeHelp");
-
-                const effAmount    = document.getElementById("riskEffectiveAmount");
-
-                const hMode        = document.getElementById("capitalMode");
-                const hValue       = document.getElementById("capitalValue");
-
-                const initModeEl   = document.getElementById("riskInitMode");
-                const initValueEl  = document.getElementById("riskInitValue");
-
-                const freeEl       = document.getElementById("riskFreeBalanceValue");
-                const assetEl      = document.getElementById("riskSelectedAsset");
-
-                const asset = (assetEl && assetEl.value) ? assetEl.value : "USDT";
-
-                function toNum(v) {
-                    if (v === null || v === undefined) return null;
-                    const s = String(v).trim().replace(",", ".");
-                    if (!s) return null;
-                    const n = Number(s);
-                    return Number.isFinite(n) ? n : null;
-                }
-
-                function fmt(n) {
-                    if (n === null || n === undefined || !Number.isFinite(n)) return "—";
-                    return (Math.round(n * 100) / 100).toFixed(2);
-                }
-
-                function setHidden(mode, value) {
-                    if (hMode)  hMode.value  = mode;
-                    if (hValue) hValue.value = (value === null || value === undefined) ? "" : String(value);
-                }
-
-                function applyModeUi(mode) {
-                    const isAll = mode === "ALL";
-                    const isFix = mode === "FIX";
-                    const isPct = mode === "PCT";
-
-                    // показываем/прячем поле значения
-                    valueInput.closest(".input-group").classList.toggle("d-none", isAll);
-                    valueLabel.classList.toggle("d-none", isAll);
-                    valueHint.classList.toggle("d-none", isAll);
-                    document.getElementById("riskQuickButtons")?.classList.toggle("d-none", isAll);
-
-                    if (isAll) {
-                        modeHelp.textContent = "ALL — стратегия может использовать весь доступный баланс выбранного актива.";
-                    }
-                    if (isFix) {
-                        modeHelp.textContent = "FIX — использует не больше указанной суммы (но не больше доступного баланса).";
-                    }
-                    if (isPct) {
-                        modeHelp.textContent = "PCT — использует процент от доступного баланса (например 25%).";
-                    }
-
-                    // подписи/юниты
-                    if (isFix) {
-                        valueLabel.textContent = "Сумма входа";
-                        valueUnit.textContent = asset;
-                        valueInput.step = "1";
-                        valueInput.placeholder = "Напр. 40";
-                        valueHint.textContent = "Укажи сумму в " + asset + " (будет ограничена доступным балансом).";
-                    } else if (isPct) {
-                        valueLabel.textContent = "Процент";
-                        valueUnit.textContent = "%";
-                        valueInput.step = "1";
-                        valueInput.placeholder = "Напр. 25";
-                        valueHint.textContent = "Укажи процент от доступного баланса (1–100).";
-                    }
-                }
-
-                function calcPreview() {
-                    const free = toNum(freeEl ? freeEl.value : null);
-                    const mode = modeSelect ? modeSelect.value : "ALL";
-                    const raw  = toNum(valueInput ? valueInput.value : null);
-
-                    let eff = null;
-
-                    if (mode === "ALL") {
-                        eff = free;
-                        setHidden("ALL", null);
-                    } else if (mode === "FIX") {
-                        const v = (raw !== null && raw > 0) ? raw : null;
-                        if (v === null) {
-                            eff = null;
-                            setHidden("FIX", "");
-                        } else {
-                            eff = (free !== null) ? Math.min(free, v) : v;
-                            setHidden("FIX", v);
-                        }
-                    } else if (mode === "PCT") {
-                        const p = (raw !== null && raw > 0) ? Math.min(raw, 100) : null;
-                        if (p === null) {
-                            eff = null;
-                            setHidden("PCT", "");
-                        } else {
-                            eff = (free !== null) ? (free * (p / 100.0)) : null;
-                            setHidden("PCT", p);
-                        }
-                    }
-
-                    if (effAmount) {
-                        effAmount.textContent = (eff !== null ? (fmt(eff) + " " + asset) : "—");
-                    }
-                }
-
-                // init
-                const initMode = (initModeEl && initModeEl.value) ? String(initModeEl.value).trim().toUpperCase() : "ALL";
-                const initVal  = (initValueEl && initValueEl.value) ? String(initValueEl.value).trim() : "";
-
-                if (modeSelect) modeSelect.value = (["ALL","FIX","PCT"].includes(initMode) ? initMode : "ALL");
-                applyModeUi(modeSelect.value);
-
-                if (valueInput) valueInput.value = initVal;
-
-                calcPreview();
-
-                // events
-                modeSelect?.addEventListener("change", () => {
-                    applyModeUi(modeSelect.value);
-                    // при смене режима, если ALL — очищаем инпут
-                    if (modeSelect.value === "ALL" && valueInput) valueInput.value = "";
-                    calcPreview();
-                    // чтобы твой change-tracker увидел изменения
-                    modeSelect.dispatchEvent(new Event("input", { bubbles: true }));
-                });
-
-                valueInput?.addEventListener("input", () => calcPreview());
-
-                // quick buttons
-                document.querySelectorAll("[data-risk-set]").forEach(btn => {
-                    btn.addEventListener("click", () => {
-                        const m = (btn.getAttribute("data-risk-mode") || "FIX").toUpperCase();
-                        const v = btn.getAttribute("data-risk-set");
-                        if (modeSelect) modeSelect.value = (["ALL","FIX","PCT"].includes(m) ? m : "FIX");
-                        applyModeUi(modeSelect.value);
-
-                        if (valueInput) valueInput.value = (v !== null ? String(v) : "");
-                        calcPreview();
-
-                        // триггерим change чтобы автосейв/dirty поймал
-                        valueInput?.dispatchEvent(new Event("change", { bubbles: true }));
-                    });
-                });
-            })();
-        </script>
-
-
-        <script>
-            (() => {
-                function toNum(v) {
-                    if (v === null || v === undefined) return null;
-                    const s = String(v).trim().replace(",", ".");
-                    if (!s) return null;
-                    const n = Number(s);
-                    return Number.isFinite(n) ? n : null;
-                }
-                function fmt(n) {
-                    if (n === null || n === undefined || !Number.isFinite(n)) return "—";
-                    return (Math.round(n * 100) / 100).toFixed(2);
-                }
-
-                const freeEl   = document.getElementById("riskFreeBalanceValue");
-                const assetEl  = document.getElementById("riskSelectedAsset");
-
-                const modeEl   = document.getElementById("riskBudgetMode");
-                const valueEl  = document.getElementById("riskBudgetValue");
-
-                const unitEl   = document.getElementById("riskBudgetValueUnit");
-                const labelEl  = document.getElementById("riskBudgetValueLabel");
-                const hintEl   = document.getElementById("riskBudgetValueHint");
-
-                const effEl    = document.getElementById("riskEffectiveAmount");
-
-                const initModeEl  = document.getElementById("riskInitMode");
-                const initValueEl = document.getElementById("riskInitValue");
-
-                const selectedAsset = assetEl ? (assetEl.value || "USDT") : "USDT";
-
-                function applyModeUi() {
-                    const mode = (modeEl && modeEl.value) ? modeEl.value : "FIXED";
-
-                    if (mode === "PERCENT") {
-                        labelEl.textContent = "Процент (%)";
-                        unitEl.textContent = "%";
-                        valueEl.step = "0.1";
-                        valueEl.placeholder = "Напр. 20";
-                        hintEl.textContent = "Будет взято % от доступного баланса на бирже.";
-                    } else {
-                        labelEl.textContent = "Сумма";
-                        unitEl.textContent = selectedAsset;
-                        valueEl.step = "1";
-                        valueEl.placeholder = "Напр. 40";
-                        hintEl.textContent = "Будет взята фиксированная сумма, но не больше доступного баланса.";
-                    }
-                }
-
-                function calcPreview() {
-                    const free = toNum(freeEl ? freeEl.value : null);
-                    const v = toNum(valueEl ? valueEl.value : null);
-                    const mode = (modeEl && modeEl.value) ? modeEl.value : "FIXED";
-
-                    if (free === null || free <= 0) {
-                        effEl.textContent = "—";
-                        return;
-                    }
-
-                    if (v === null || v <= 0) {
-                        effEl.textContent = "—";
-                        return;
-                    }
-
-                    let used;
-                    if (mode === "PERCENT") {
-                        const pct = Math.max(0, Math.min(100, v));
-                        used = free * (pct / 100.0);
-                    } else {
-                        used = Math.min(free, v);
-                    }
-
-                    effEl.textContent = fmt(used) + " " + selectedAsset;
-                }
-
-                function init() {
-                    // init values from server (если есть)
-                    if (initModeEl && initModeEl.value) {
-                        const m = String(initModeEl.value).trim().toUpperCase();
-                        if (m === "PERCENT" || m === "FIXED") modeEl.value = m;
-                    }
-                    if (initValueEl && initValueEl.value && valueEl) {
-                        valueEl.value = initValueEl.value;
-                    }
-
-                    applyModeUi();
-                    calcPreview();
-                }
-
-                // quick buttons
-                document.querySelectorAll("[data-risk-set]").forEach(btn => {
-                    btn.addEventListener("click", () => {
-                        const forcedMode = btn.getAttribute("data-risk-mode");
-                        if (forcedMode && modeEl) {
-                            modeEl.value = forcedMode;
-                            applyModeUi();
-                        }
-
-                        const raw = btn.getAttribute("data-risk-set");
-                        if (!raw || !valueEl) return;
-
-                        if (raw.endsWith("p")) {
-                            // "25p" -> 25
-                            valueEl.value = raw.slice(0, -1);
-                        } else {
-                            valueEl.value = raw;
-                        }
-
-                        calcPreview();
-                        valueEl.dispatchEvent(new Event("change", { bubbles: true }));
-                    });
-                });
-
-                if (modeEl) modeEl.addEventListener("change", () => {
-                    applyModeUi();
-                    calcPreview();
-                });
-                if (valueEl) valueEl.addEventListener("input", calcPreview);
-
-                init();
-            })();
-        </script>
-
 
 
         <!-- ===================================================== -->

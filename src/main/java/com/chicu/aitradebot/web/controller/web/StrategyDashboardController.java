@@ -203,7 +203,7 @@ public class StrategyDashboardController {
     private StrategySettings resolveBaselineSettings(Long chatId, StrategyType type) {
         if (chatId == null || chatId <= 0) return null;
 
-        List<StrategySettings> all = strategySettingsService.findAllByChatId(chatId, null);
+        List<StrategySettings> all = strategySettingsService.findAllByChatId(chatId);
         if (all == null || all.isEmpty()) return null;
 
         Comparator<StrategySettings> cmp =

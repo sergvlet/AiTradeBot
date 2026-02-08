@@ -51,6 +51,55 @@ public class StrategySettingsAdvancedController {
         }
     }
 
+    /**
+     * ✅ У тебя StrategySettingsService пока без (exchange, network),
+     * поэтому мы берём settings по (chatId, type) и синхронизируем контекст в самой сущности.
+     */
+    private void syncContextIfNeeded(StrategySettings ss, String exchange, NetworkType network) {
+        if (ss == null) return;
+
+        boolean changed = false;
+
+        if (exchange != null) {
+            String ex = exchange.trim().toUpperCase(Locale.ROOT);
+            if (!ex.isEmpty() && (ss.getExchangeName() == null || !ss.getExchangeName().equalsIgnoreCase(ex))) {
+                ss.setExchangeName(ex);
+                changed = true;
+            }
+        }
+
+        if (network != null && ss.getNetworkType() != network) {
+            ss.setNetworkType(network);
+            changed = true;
+        }
+
+        if (changed) {
+            try {
+                strategySettingsService.save(ss);
+            } catch (Exception ignored) {
+                // тут не ломаем ответ — это синхронизация для консистентности UI
+            }
+        }
+    }
+
+    private static void applyModeFlagsProd(StrategySettings ss, AdvancedControlMode mode) {
+        if (ss == null || mode == null) return;
+
+        // ✅ ПРОД: не включаем COLLECT/BACKTEST/PAPER автоматически
+        ss.setRunPhase("LIVE");
+
+        switch (mode) {
+            case MANUAL -> {
+                ss.setAutoTuneEnabled(false);
+                ss.setMlGateEnabled(false);
+            }
+            case HYBRID, AI -> {
+                ss.setAutoTuneEnabled(true);
+                ss.setMlGateEnabled(true);
+            }
+        }
+    }
+
     // =========================================================
     // GET /advanced
     // =========================================================
@@ -63,7 +112,10 @@ public class StrategySettingsAdvancedController {
     ) {
         String ex = normalizeExchange(exchange);
 
-        StrategySettings ss = strategySettingsService.getOrCreate(chatId, type, ex, network);
+        StrategySettings ss = strategySettingsService.getOrCreate(chatId, type);
+
+        // ✅ синхронизируем exchange/network в StrategySettings (иначе вкладки живут разной жизнью)
+        syncContextIfNeeded(ss, ex, network);
 
         StrategyAdvancedRenderer renderer = advancedRegistry.get(type);
 
@@ -103,31 +155,9 @@ public class StrategySettingsAdvancedController {
         );
     }
 
-    private static void applyModeFlagsProd(StrategySettings ss, AdvancedControlMode mode) {
-        if (ss == null || mode == null) return;
-
-        // ✅ ПРОД: не включаем COLLECT/BACKTEST/PAPER автоматически
-        // иначе ты сам себя заблокируешь (у тебя в TradeExecutionServiceImpl collect/backtest режут вход/выход)
-        ss.setRunPhase("LIVE");
-
-        switch (mode) {
-            case MANUAL -> {
-
-                ss.setAutoTuneEnabled(false);
-                ss.setMlGateEnabled(false);
-            }
-            case HYBRID, AI -> {
-
-                ss.setAutoTuneEnabled(true);
-                ss.setMlGateEnabled(true);
-            }
-        }
-    }
-
-
     // =========================================================
     // POST /advanced/submit
-    // ✅ теперь также сохраняет advancedControlMode в StrategySettings
+    // ✅ сохраняет advancedControlMode + flags и вызывает renderer.handleSubmit(ctx)
     // =========================================================
     @Transactional
     @PostMapping(value = "/advanced/submit", consumes = MediaType.APPLICATION_FORM_URLENCODED_VALUE)
@@ -140,18 +170,24 @@ public class StrategySettingsAdvancedController {
     ) {
         String ex = normalizeExchange(exchange);
 
-        StrategySettings ss = strategySettingsService.getOrCreate(chatId, type, ex, network);
+        // ✅ FIX: только getOrCreate(chatId, type)
+        StrategySettings ss = strategySettingsService.getOrCreate(chatId, type);
+
+        // ✅ синхронизируем контекст (чтобы не терялось при сохранениях вкладок)
+        syncContextIfNeeded(ss, ex, network);
 
         // ✅ 1) сохраняем режим, если пришёл (accept: advancedControlMode / controlMode)
-        AdvancedControlMode requestedMode =
-                parseModeOrNull(allParams.get("advancedControlMode"));
-
+        AdvancedControlMode requestedMode = parseModeOrNull(allParams.get("advancedControlMode"));
         if (requestedMode == null) {
             requestedMode = parseModeOrNull(allParams.get("controlMode"));
         }
 
         if (requestedMode != null && requestedMode != ss.getAdvancedControlMode()) {
             ss.setAdvancedControlMode(requestedMode);
+
+            // ✅ флаги режима (без PAPER/COLLECT/BACKTEST)
+            applyModeFlagsProd(ss, requestedMode);
+
             strategySettingsService.save(ss);
         }
 
@@ -188,6 +224,10 @@ public class StrategySettingsAdvancedController {
         }
 
         renderer.handleSubmit(ctx);
+
+        // ✅ подстрахуем сохранение базовых полей (updatedAt и т.п. — если у тебя это в save)
+        strategySettingsService.save(ss);
+
         return Map.of("ok", true);
     }
 }

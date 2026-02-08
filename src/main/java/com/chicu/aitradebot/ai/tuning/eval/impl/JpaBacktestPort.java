@@ -133,7 +133,7 @@ public class JpaBacktestPort implements BacktestPort {
                 Comparator.comparing(isInactive) // active(false) раньше inactive(true)
                         .thenComparing(byFreshDesc);
 
-        List<StrategySettings> all = strategySettingsService.findAllByChatId(chatId, null, null)
+        List<StrategySettings> all = strategySettingsService.findAllByChatId(chatId)
                 .stream()
                 .filter(s -> s.getType() == type)
                 .toList();

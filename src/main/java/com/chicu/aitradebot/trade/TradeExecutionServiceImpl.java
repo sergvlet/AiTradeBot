@@ -305,6 +305,15 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
 
         // Защита: если стратегия в COLLECT/BACKTEST — EXIT запрещён
         StrategySettings ss = tryLoadSettings(chatId, strategyType, ex, net);
+
+        // ✅ ВАЖНО: если настройки нашлись — контекст (exchange/network) берём из БД как источник истины
+        if (ss != null) {
+            String exFromDb = safeExchange(ss.getExchangeName());
+            NetworkType netFromDb = ss.getNetworkType();
+            if (exFromDb != null) ex = exFromDb;
+            if (netFromDb != null) net = netFromDb;
+        }
+
         if (ss != null) {
             String phase = normalizeUpperNullable(ss.getRunPhase());
             boolean collectMode = PHASE_COLLECT.equals(phase);
@@ -561,10 +570,17 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         }
     }
 
+    /**
+     * ✅ FIX: теперь модель (chatId,type) → одна запись.
+     * Поэтому НЕ зовём settingsService.getSettings(chatId,type,ex,net),
+     * а берём/создаём по (chatId,type).
+     */
     private StrategySettings tryLoadSettings(Long chatId, StrategyType type, String ex, NetworkType net) {
-        if (settingsService == null || chatId == null || type == null || net == null) return null;
+        if (settingsService == null || chatId == null || type == null) return null;
         try {
-            return settingsService.getSettings(chatId, type, ex, net);
+            return settingsService.getOrCreate(chatId, type);
+            // либо если у тебя есть read-only:
+            // return settingsService.getSettings(chatId, type);
         } catch (Exception ignored) {
             return null;
         }

@@ -28,6 +28,7 @@ import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 
 @Slf4j
 @Component
@@ -41,19 +42,12 @@ public class AiStrategyOrchestrator {
     // ✅ ML autotune runtime (оркестратор — главный lifecycle хаб)
     private final MlAutoTuneRuntime mlAutoTuneRuntime;
 
-    @PostConstruct
-    public void init() {
-        log.info("🧠 AiStrategyOrchestrator v4 initialized");
-    }
-
     // =====================================================================
     // ✅ RUN CONTEXT (источник истины)
     // =====================================================================
 
     /**
      * Жёстко фиксируем один запуск на (chatId,type).
-     * Если позже разрешишь несколько символов/сетей одновременно — поменяем ключ на:
-     * (chatId,type,exchange,network,symbol,tf)
      */
     private record RunKey(long chatId, StrategyType type) {}
 
@@ -73,10 +67,21 @@ public class AiStrategyOrchestrator {
     private final ConcurrentMap<RunKey, AtomicLong> ignoreCounters = new ConcurrentHashMap<>();
 
     /**
-     * Лёгкая защита от “слишком частых” ручных триггеров тюнинга с оркестратора.
-     * (MlAutoTuneRuntime внутри тоже имеет свою защиту, но тут удобно отсечь шум раньше)
+     * Дебаунс ручных триггеров тюнинга.
      */
     private final ConcurrentMap<RunKey, Long> lastTuneTriggerAtMs = new ConcurrentHashMap<>();
+
+    // 🔒 атомарность операций на (chatId,type)
+    private final ConcurrentMap<RunKey, ReentrantLock> locks = new ConcurrentHashMap<>();
+
+    private ReentrantLock lockFor(RunKey key) {
+        return locks.computeIfAbsent(key, k -> new ReentrantLock());
+    }
+
+    @PostConstruct
+    public void init() {
+        log.info("🧠 AiStrategyOrchestrator v4 initialized");
+    }
 
     public Optional<RunBinding> getBinding(long chatId, StrategyType type) {
         if (type == null) return Optional.empty();
@@ -89,42 +94,118 @@ public class AiStrategyOrchestrator {
     }
 
     // =====================================================================
-    // ▶️ START (КОНТЕКСТНЫЙ)
+    // 🔄 ATOMIC RESTART (главный метод)
     // =====================================================================
-    public StrategyRunInfo startStrategy(
-            Long chatId,
-            StrategyType type,
-            String exchange,
-            NetworkType network
-    ) {
-        StrategySettings s = loadSettingsStrict(chatId, type, exchange, network);
 
-        String sym = sanitizeSymbol(s.getSymbol());
-        String tf  = sanitizeTf(s.getTimeframe());
-        String ex  = sanitizeExchange(s.getExchangeName());
-        NetworkType net = s.getNetworkType();
+    /**
+     * ✅ Атомарный рестарт (stop(old) -> bind(new) -> start(new)).
+     * Должен вызываться после сохранения StrategySettings (symbol/tf/ex/net).
+     */
+    public StrategyRunInfo restartStrategyAtomic(Long chatId,
+                                                 StrategyType type,
+                                                 String exchange,
+                                                 NetworkType network,
+                                                 String reason) {
 
-        if (sym == null) return buildRunInfo(s, false, "Ошибка: не выбран символ");
-        if (ex == null || net == null) return buildRunInfo(s, false, "Ошибка: не выбрана биржа/сеть");
-
-        TradingStrategy strategy = strategyRegistry.get(type);
-        if (strategy == null) return buildRunInfo(s, false, "Стратегия не найдена");
+        if (chatId == null || chatId <= 0 || type == null) {
+            return StrategyRunInfo.builder()
+                    .chatId(chatId)
+                    .type(type)
+                    .active(false)
+                    .exchangeName(sanitizeExchange(exchange))
+                    .networkType(network)
+                    .message("Ошибка: chatId/type пустые")
+                    .updatedAt(Instant.now())
+                    .build();
+        }
 
         RunKey key = new RunKey(chatId, type);
-        RunBinding newBinding = new RunBinding(ex, net, sym, tf, Instant.now());
+        ReentrantLock lock = lockFor(key);
+        lock.lock();
+        try {
+            RunBinding current = running.get(key);
+            if (current == null) {
+                // не запущено — ничего рестартить
+                return getStatus(chatId, type, exchange, network);
+            }
 
-        // Если уже запущено — и это ТОТ ЖЕ binding -> ничего не делаем
-        RunBinding existing = running.get(key);
-        if (existing != null
-            && eq(existing.exchange(), newBinding.exchange())
-            && existing.network() == newBinding.network()
-            && eq(existing.symbol(), newBinding.symbol())
-            && eq(existing.timeframe(), newBinding.timeframe())) {
+            StrategySettings s = loadSettingsStrict(chatId, type, exchange, network);
+            if (s == null) {
+                return StrategyRunInfo.builder()
+                        .chatId(chatId)
+                        .type(type)
+                        .active(true)
+                        .exchangeName(current.exchange())
+                        .networkType(current.network())
+                        .symbol(current.symbol())
+                        .timeframe(current.timeframe())
+                        .message("Ошибка: StrategySettings не удалось загрузить (рестарт пропущен)")
+                        .updatedAt(Instant.now())
+                        .build();
+            }
 
-            log.info("⏭ [ORCH] Уже запущено: {} chatId={} ex={} net={} {} {}",
-                    type, chatId, ex, net, sym, tf);
+            String newSym = sanitizeSymbol(s.getSymbol());
+            String newTf  = sanitizeTf(s.getTimeframe());
 
-            // подчистим рассинхрон в БД, если нужно
+            String newEx = sanitizeExchange(exchange);
+            if (newEx == null) newEx = sanitizeExchange(s.getExchangeName());
+            if (newEx == null) newEx = "BINANCE";
+
+            NetworkType newNet = (network != null ? network : s.getNetworkType());
+            if (newNet == null) newNet = NetworkType.TESTNET;
+
+            if (newSym == null) {
+                return buildRunInfoFromBinding(s, current, true, "Рестарт невозможен: не выбран symbol");
+            }
+
+            RunBinding desired = new RunBinding(newEx, newNet, newSym, newTf, Instant.now());
+
+            boolean changed =
+                    !eq(current.exchange(), desired.exchange())
+                    || current.network() != desired.network()
+                    || !eq(current.symbol(), desired.symbol())
+                    || !eq(current.timeframe(), desired.timeframe());
+
+            if (!changed) {
+                return buildRunInfoFromBinding(s, current, true, "Контекст не изменился (рестарт не нужен)");
+            }
+
+            log.warn("🔄 [ORCH] ATOMIC_RESTART chatId={} type={} reason={} old=[ex={} net={} {} {}] new=[ex={} net={} {} {}]",
+                    chatId, type, (reason == null ? "n/a" : reason),
+                    current.exchange(), current.network(), current.symbol(), current.timeframe(),
+                    desired.exchange(), desired.network(), desired.symbol(), desired.timeframe()
+            );
+
+            TradingStrategy strategy = strategyRegistry.get(type);
+            if (strategy == null) {
+                return buildRunInfoFromBinding(s, current, true, "Стратегия не найдена (рестарт пропущен)");
+            }
+
+            // 1) STOP старого binding
+            try {
+                strategy.stop(chatId, current.symbol(), current.exchange(), current.network());
+            } catch (Exception e) {
+                log.warn("⚠️ [ORCH] stop(old) failed chatId={} type={} : {}", chatId, type, e.getMessage());
+            }
+            safeAutotuneStop(chatId, type, current.exchange(), current.network());
+
+            // 2) UPDATE binding (до старта!)
+            running.put(key, desired);
+            ignoreCounters.remove(key);
+
+            // 3) START нового binding
+            try {
+                strategy.start(chatId, desired.symbol(), desired.exchange(), desired.network());
+            } catch (Exception e) {
+                // откат binding если старт не удался
+                running.put(key, current);
+                log.error("❌ [ORCH] start(new) failed chatId={} type={} ex={} net={} sym={} tf={}",
+                        chatId, type, desired.exchange(), desired.network(), desired.symbol(), desired.timeframe(), e);
+                return buildRunInfoFromBinding(s, current, true, "Ошибка рестарта: не удалось запустить новый контекст");
+            }
+
+            // ✅ фиксируем контекст и active=true в БД (косметика/консистентность)
+            syncSettingsContextIfNeeded(s, desired.exchange(), desired.network());
             if (!s.isActive()) {
                 s.setActive(true);
                 s.setStartedAt(LocalDateTime.now());
@@ -132,142 +213,277 @@ public class AiStrategyOrchestrator {
                 settingsService.save(s);
             }
 
-            // ✅ гарантируем, что autotune jobs подняты (например после рестарта)
-            safeAutotuneStart(chatId, type, ex, net);
+            safeAutotuneStart(chatId, type, desired.exchange(), desired.network());
 
-            return buildRunInfo(s, true, "Стратегия уже запущена");
+            return buildRunInfoFromBinding(s, desired, true, "Контекст изменён — стратегия перезапущена");
+
+        } finally {
+            lock.unlock();
         }
-
-        // Если запущено, но binding другой — жёстко останавливаем старый runtime (чтобы не было смешений)
-        if (existing != null) {
-            log.warn("⚠️ [ORCH] Перезапуск binding: {} chatId={} было ex={} net={} {} {} -> стало ex={} net={} {} {}",
-                    type, chatId,
-                    existing.exchange(), existing.network(), existing.symbol(), existing.timeframe(),
-                    ex, net, sym, tf);
-
-            try {
-                strategy.stop(chatId, existing.symbol(), existing.exchange(), existing.network());
-            } catch (Exception e) {
-                log.warn("⚠️ [ORCH] Не удалось корректно остановить старый runtime перед перезапуском: {}", e.getMessage());
-            }
-
-            // ✅ старые джобы autotune гасим (и поднять заново)
-            safeAutotuneStop(chatId, type, existing.exchange(), existing.network());
-        }
-
-        // ✅ фиксируем binding ДО старта — теперь любой левый тик/свеча будет отрезан
-        running.put(key, newBinding);
-        ignoreCounters.remove(key);
-
-        try {
-            strategy.start(chatId, sym, ex, net);
-        } catch (Exception e) {
-            running.remove(key, newBinding);
-            log.error("❌ [ORCH] startStrategy failed type={} chatId={} ex={} net={} sym={} tf={}",
-                    type, chatId, ex, net, sym, tf, e);
-            return buildRunInfo(s, false, "Ошибка запуска стратегии");
-        }
-
-        // ✅ фиксируем реальный старт в БД
-        s.setActive(true);
-        s.setStartedAt(LocalDateTime.now());
-        s.setStoppedAt(null);
-        settingsService.save(s);
-
-        log.info("▶️ [ORCH] START {} chatId={} ex={} net={} symbol={} tf={}",
-                type, chatId, ex, net, sym, tf);
-
-        // ✅ стартуем autotune (периодический + warmup)
-        safeAutotuneStart(chatId, type, ex, net);
-
-        return buildRunInfo(s, true, "Стратегия запущена");
     }
 
     // =====================================================================
-    // ⏹ STOP (КОНТЕКСТНЫЙ)
+    // ▶️ START
     // =====================================================================
-    public StrategyRunInfo stopStrategy(
-            Long chatId,
-            StrategyType type,
-            String exchange,
-            NetworkType network
-    ) {
-        StrategySettings s = loadSettingsStrict(chatId, type, exchange, network);
+    public StrategyRunInfo startStrategy(Long chatId, StrategyType type, String exchange, NetworkType network) {
 
-        String sym = sanitizeSymbol(s.getSymbol());
-        String ex  = sanitizeExchange(s.getExchangeName());
-        NetworkType net = s.getNetworkType();
+        if (chatId == null || chatId <= 0 || type == null) {
+            return StrategyRunInfo.builder()
+                    .chatId(chatId)
+                    .type(type)
+                    .active(false)
+                    .exchangeName(sanitizeExchange(exchange))
+                    .networkType(network)
+                    .message("Ошибка: chatId/type пустые")
+                    .updatedAt(Instant.now())
+                    .build();
+        }
 
-        TradingStrategy strategy = strategyRegistry.get(type);
-
-        // ✅ сначала снимаем runtime binding
         RunKey key = new RunKey(chatId, type);
-        RunBinding removed = running.remove(key);
-        ignoreCounters.remove(key);
-        lastTuneTriggerAtMs.remove(key);
-
-        // ✅ и останавливаем стратегию в том контексте, который был в runtime (если он был)
-        if (strategy != null) {
-            try {
-                if (removed != null) {
-                    strategy.stop(chatId, removed.symbol(), removed.exchange(), removed.network());
-                } else {
-                    // fallback: по настройкам
-                    strategy.stop(chatId, sym, ex, net);
-                }
-            } catch (Exception e) {
-                log.error("❌ [ORCH] stopStrategy failed type={} chatId={} ex={} net={} sym={}",
-                        type, chatId, ex, net, sym, e);
+        ReentrantLock lock = lockFor(key);
+        lock.lock();
+        try {
+            StrategySettings s = loadSettingsStrict(chatId, type, exchange, network);
+            if (s == null) {
+                return StrategyRunInfo.builder()
+                        .chatId(chatId)
+                        .type(type)
+                        .active(false)
+                        .exchangeName(sanitizeExchange(exchange))
+                        .networkType(network)
+                        .message("Ошибка: StrategySettings не удалось загрузить")
+                        .updatedAt(Instant.now())
+                        .build();
             }
+
+            String sym = sanitizeSymbol(s.getSymbol());
+            String tf  = sanitizeTf(s.getTimeframe());
+
+            String ex = sanitizeExchange(exchange);
+            if (ex == null) ex = sanitizeExchange(s.getExchangeName());
+            if (ex == null) ex = "BINANCE";
+
+            NetworkType net = (network != null ? network : s.getNetworkType());
+            if (net == null) net = NetworkType.TESTNET;
+
+            if (sym == null) return buildRunInfo(s, false, "Ошибка: не выбран символ");
+
+            TradingStrategy strategy = strategyRegistry.get(type);
+            if (strategy == null) return buildRunInfo(s, false, "Стратегия не найдена");
+
+            RunBinding newBinding = new RunBinding(ex, net, sym, tf, Instant.now());
+            RunBinding existing = running.get(key);
+
+            if (existing != null
+                && eq(existing.exchange(), newBinding.exchange())
+                && existing.network() == newBinding.network()
+                && eq(existing.symbol(), newBinding.symbol())
+                && eq(existing.timeframe(), newBinding.timeframe())) {
+
+                log.info("⏭ [ORCH] Уже запущено: {} chatId={} ex={} net={} {} {}",
+                        type, chatId, ex, net, sym, tf);
+
+                syncSettingsContextIfNeeded(s, ex, net);
+                if (!s.isActive()) {
+                    s.setActive(true);
+                    s.setStartedAt(LocalDateTime.now());
+                    s.setStoppedAt(null);
+                    settingsService.save(s);
+                }
+
+                safeAutotuneStart(chatId, type, ex, net);
+                return buildRunInfo(s, true, "Стратегия уже запущена");
+            }
+
+            // если был другой binding — аккуратно стопаем старый
+            if (existing != null) {
+                log.warn("⚠️ [ORCH] Перезапуск binding: {} chatId={} было ex={} net={} {} {} -> стало ex={} net={} {} {}",
+                        type, chatId,
+                        existing.exchange(), existing.network(), existing.symbol(), existing.timeframe(),
+                        ex, net, sym, tf);
+
+                try {
+                    strategy.stop(chatId, existing.symbol(), existing.exchange(), existing.network());
+                } catch (Exception e) {
+                    log.warn("⚠️ [ORCH] Не удалось корректно остановить старый runtime: {}", e.getMessage());
+                }
+
+                safeAutotuneStop(chatId, type, existing.exchange(), existing.network());
+            }
+
+            // ✅ фиксируем binding ДО старта
+            running.put(key, newBinding);
+            ignoreCounters.remove(key);
+
+            try {
+                strategy.start(chatId, sym, ex, net);
+            } catch (Exception e) {
+                running.remove(key, newBinding);
+                log.error("❌ [ORCH] startStrategy failed type={} chatId={} ex={} net={} sym={} tf={}",
+                        type, chatId, ex, net, sym, tf, e);
+                return buildRunInfo(s, false, "Ошибка запуска стратегии");
+            }
+
+            syncSettingsContextIfNeeded(s, ex, net);
+
+            s.setActive(true);
+            s.setStartedAt(LocalDateTime.now());
+            s.setStoppedAt(null);
+            settingsService.save(s);
+
+            log.info("▶️ [ORCH] START {} chatId={} ex={} net={} symbol={} tf={}",
+                    type, chatId, ex, net, sym, tf);
+
+            safeAutotuneStart(chatId, type, ex, net);
+            return buildRunInfo(s, true, "Стратегия запущена");
+
+        } finally {
+            lock.unlock();
         }
-
-        // ✅ фиксируем остановку в БД
-        s.setActive(false);
-        s.setStoppedAt(LocalDateTime.now());
-        settingsService.save(s);
-
-        // ✅ гасим autotune jobs
-        if (removed != null) {
-            safeAutotuneStop(chatId, type, removed.exchange(), removed.network());
-        } else {
-            safeAutotuneStop(chatId, type, ex, net);
-        }
-
-        log.info("⏹ [ORCH] STOP {} chatId={} | bindingRemoved={}",
-                type, chatId, removed != null);
-
-        return buildRunInfo(s, false, "Стратегия остановлена");
     }
 
     // =====================================================================
-    // ℹ STATUS (КОНТЕКСТНЫЙ)
+    // ⏹ STOP
     // =====================================================================
-    public StrategyRunInfo getStatus(
-            Long chatId,
-            StrategyType type,
-            String exchange,
-            NetworkType network
-    ) {
+    public StrategyRunInfo stopStrategy(Long chatId, StrategyType type, String exchange, NetworkType network) {
+
+        if (chatId == null || chatId <= 0 || type == null) {
+            return StrategyRunInfo.builder()
+                    .chatId(chatId)
+                    .type(type)
+                    .active(false)
+                    .exchangeName(sanitizeExchange(exchange))
+                    .networkType(network)
+                    .message("Ошибка: chatId/type пустые")
+                    .updatedAt(Instant.now())
+                    .build();
+        }
+
+        RunKey key = new RunKey(chatId, type);
+        ReentrantLock lock = lockFor(key);
+        lock.lock();
+        try {
+            StrategySettings s = loadSettingsStrict(chatId, type, exchange, network);
+            if (s == null) {
+                return StrategyRunInfo.builder()
+                        .chatId(chatId)
+                        .type(type)
+                        .active(false)
+                        .exchangeName(sanitizeExchange(exchange))
+                        .networkType(network)
+                        .message("Ошибка: StrategySettings не удалось загрузить")
+                        .updatedAt(Instant.now())
+                        .build();
+            }
+
+            String sym = sanitizeSymbol(s.getSymbol());
+
+            RunBinding removed = running.remove(key);
+            ignoreCounters.remove(key);
+            lastTuneTriggerAtMs.remove(key);
+
+            String ex = removed != null ? removed.exchange() : sanitizeExchange(exchange);
+            if (ex == null) ex = sanitizeExchange(s.getExchangeName());
+            if (ex == null) ex = "BINANCE";
+
+            NetworkType net = removed != null ? removed.network() : (network != null ? network : s.getNetworkType());
+            if (net == null) net = NetworkType.TESTNET;
+
+            TradingStrategy strategy = strategyRegistry.get(type);
+
+            if (strategy != null) {
+                try {
+                    if (removed != null) {
+                        strategy.stop(chatId, removed.symbol(), removed.exchange(), removed.network());
+                    } else {
+                        strategy.stop(chatId, sym, ex, net);
+                    }
+                } catch (Exception e) {
+                    log.error("❌ [ORCH] stopStrategy failed type={} chatId={} ex={} net={} sym={}",
+                            type, chatId, ex, net, sym, e);
+                }
+            }
+
+            syncSettingsContextIfNeeded(s, ex, net);
+
+            s.setActive(false);
+            s.setStoppedAt(LocalDateTime.now());
+            settingsService.save(s);
+
+            safeAutotuneStop(chatId, type, ex, net);
+
+            log.info("⏹ [ORCH] STOP {} chatId={} | bindingRemoved={}", type, chatId, removed != null);
+            return buildRunInfo(s, false, "Стратегия остановлена");
+
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * ✅ Совместимость со старым вызовом из UI.
+     * Теперь это просто рестарт под локом.
+     */
+    public StrategyRunInfo onSettingsChanged(Long chatId,
+                                             StrategyType type,
+                                             String exchange,
+                                             NetworkType network) {
+        return restartStrategyAtomic(chatId, type, exchange, network, "onSettingsChanged");
+    }
+
+    // =====================================================================
+    // ℹ STATUS
+    // =====================================================================
+    public StrategyRunInfo getStatus(Long chatId, StrategyType type, String exchange, NetworkType network) {
+
+        if (chatId == null || chatId <= 0 || type == null) {
+            return StrategyRunInfo.builder()
+                    .chatId(chatId)
+                    .type(type)
+                    .active(false)
+                    .exchangeName(sanitizeExchange(exchange))
+                    .networkType(network)
+                    .message("Ошибка: chatId/type пустые")
+                    .updatedAt(Instant.now())
+                    .build();
+        }
+
         StrategySettings s = loadSettingsStrict(chatId, type, exchange, network);
+        if (s == null) {
+            return StrategyRunInfo.builder()
+                    .chatId(chatId)
+                    .type(type)
+                    .active(false)
+                    .exchangeName(sanitizeExchange(exchange))
+                    .networkType(network)
+                    .message("StrategySettings отсутствуют")
+                    .updatedAt(Instant.now())
+                    .build();
+        }
 
         boolean active = isRunning(chatId, type);
 
-        // ✅ если БД active=true, а runtime пустой — после рестарта НЕ угадываем.
         if (s.isActive() && !active) {
             s.setActive(false);
             if (s.getStoppedAt() == null) s.setStoppedAt(LocalDateTime.now());
             settingsService.save(s);
         }
 
-        return buildRunInfo(
-                s,
-                active,
-                active ? "Стратегия запущена" : "Стратегия остановлена"
-        );
+        RunBinding b = running.get(new RunKey(chatId, type));
+        String ex = b != null ? b.exchange() : sanitizeExchange(exchange);
+        if (ex == null) ex = sanitizeExchange(s.getExchangeName());
+        if (ex == null) ex = "BINANCE";
+
+        NetworkType net = b != null ? b.network() : (network != null ? network : s.getNetworkType());
+        if (net == null) net = NetworkType.TESTNET;
+
+        syncSettingsContextIfNeeded(s, ex, net);
+
+        return buildRunInfo(s, active, active ? "Стратегия запущена" : "Стратегия остановлена");
     }
 
     // =====================================================================
-    // ✅ ML AUTO-TUNE HOOKS (жизненный цикл + триггеры)
+    // ✅ ML AUTO-TUNE HOOKS
     // =====================================================================
 
     private void safeAutotuneStart(Long chatId, StrategyType type, String exchange, NetworkType network) {
@@ -288,10 +504,6 @@ public class AiStrategyOrchestrator {
         }
     }
 
-    /**
-     * ✅ ЭТО ДОЛЖЕН ВЫЗЫВАТЬ ТОРГОВЫЙ СЛОЙ, когда позиция РЕАЛЬНО закрылась (TP/SL/Manual close).
-     * Тогда autotuner получит событие "after-close" и сможет обновить параметры.
-     */
     public void onPositionClosed(Long chatId, StrategyType type, String exchange, NetworkType network) {
         try {
             if (chatId == null || type == null || exchange == null || network == null) return;
@@ -301,9 +513,6 @@ public class AiStrategyOrchestrator {
         }
     }
 
-    /**
-     * Универсальный ручной/автоматический триггер тюнинга с дебаунсом.
-     */
     public void triggerTuneDebounced(Long chatId,
                                      StrategyType type,
                                      String exchange,
@@ -331,13 +540,9 @@ public class AiStrategyOrchestrator {
     }
 
     // =====================================================================
-    // ✅ ВХОД ДЛЯ МАРКЕТ-СТРИМА (СТРОГИЙ КОНТЕКСТ)
+    // ✅ MARKET STREAM входы (строгий контекст)
     // =====================================================================
 
-    /**
-     * НОВЫЙ строгий метод: обязательно передавать exchange + network.
-     * Любая несостыковка -> IGNORE (предсказуемый throttled-log).
-     */
     public void onPriceUpdate(long chatId,
                               StrategyType type,
                               String exchange,
@@ -357,7 +562,6 @@ public class AiStrategyOrchestrator {
         String tf  = sanitizeTf(timeframe);
         String ex  = sanitizeExchange(exchange);
 
-        // ✅ строгая защита от смешений
         if (!eq(ex, b.exchange()) || network != b.network() || !eq(sym, b.symbol()) || !eq(tf, b.timeframe())) {
             logIgnore(key, "TICK_IGNORED",
                     "пришло ex=" + ex + " net=" + network + " " + sym + " " + tf
@@ -368,29 +572,22 @@ public class AiStrategyOrchestrator {
         TradingStrategy strategy = strategyRegistry.get(type);
         if (strategy == null) return;
 
-        // ✅ 1) новый путь (если стратегия хочет получать exchange/network)
         if (strategy instanceof PriceUpdateAware aware) {
             try {
                 aware.onPriceUpdate(chatId, type, sym, tf, price, tradeTsMs, b.exchange(), b.network());
             } catch (Exception e) {
-                log.warn("⚠️ [ORCH] TICK_HANDLER_FAILED chatId={} type={} | {}",
-                        chatId, type, e.getMessage());
+                log.warn("⚠️ [ORCH] TICK_HANDLER_FAILED chatId={} type={} | {}", chatId, type, e.getMessage());
             }
             return;
         }
 
-        // ✅ 2) fallback путь: обычные стратегии, которые уже умеют onPriceUpdate(chatId, symbol, price, Instant)
         try {
             strategy.onPriceUpdate(chatId, sym, price, Instant.ofEpochMilli(tradeTsMs));
         } catch (Exception e) {
-            log.warn("⚠️ [ORCH] TICK_HANDLER_FAILED_LEGACY chatId={} type={} | {}",
-                    chatId, type, e.getMessage());
+            log.warn("⚠️ [ORCH] TICK_HANDLER_FAILED_LEGACY chatId={} type={} | {}", chatId, type, e.getMessage());
         }
     }
 
-    /**
-     * BACKWARD-COMPAT: старый вызов без exchange/network.
-     */
     public void onPriceUpdate(long chatId,
                               StrategyType type,
                               String symbol,
@@ -415,9 +612,6 @@ public class AiStrategyOrchestrator {
         onPriceUpdate(chatId, type, b.exchange(), b.network(), b.symbol(), b.timeframe(), price, tradeTsMs);
     }
 
-    /**
-     * ✅ БЕЗ РЕФЛЕКСИИ: стратегия должна реализовать CandleCloseAware.
-     */
     public void onCandleClosed(long chatId,
                                StrategyType type,
                                String exchange,
@@ -450,8 +644,7 @@ public class AiStrategyOrchestrator {
             try {
                 aware.onCandleClosed(chatId, type, sym, tf, kline, b.exchange(), b.network());
             } catch (Exception e) {
-                log.warn("⚠️ [ORCH] CANDLE_HANDLER_FAILED chatId={} type={} | {}",
-                        chatId, type, e.getMessage());
+                log.warn("⚠️ [ORCH] CANDLE_HANDLER_FAILED chatId={} type={} | {}", chatId, type, e.getMessage());
             }
             return;
         }
@@ -461,9 +654,6 @@ public class AiStrategyOrchestrator {
                 + " не реализует CandleCloseAware (свеча пропущена)");
     }
 
-    /**
-     * BACKWARD-COMPAT: старый вызов без exchange/network.
-     */
     public void onCandleClosed(long chatId,
                                StrategyType type,
                                String symbol,
@@ -510,7 +700,6 @@ public class AiStrategyOrchestrator {
         int active = 0;
 
         for (StrategyType t : StrategyType.values()) {
-
             if (isActiveSafe(chatId, t, "BINANCE", NetworkType.MAINNET)) active++;
             if (isActiveSafe(chatId, t, "BINANCE", NetworkType.TESTNET)) active++;
 
@@ -526,8 +715,16 @@ public class AiStrategyOrchestrator {
 
     private boolean isActiveSafe(Long chatId, StrategyType type, String exchange, NetworkType network) {
         try {
-            StrategySettings s = settingsService.getSettings(chatId, type, exchange, network);
-            return s != null && s.isActive();
+            if (chatId == null || chatId <= 0 || type == null) return false;
+
+            StrategySettings s = settingsService.getSettings(chatId, type);
+            if (s == null) s = settingsService.getOrCreate(chatId, type);
+
+            String ex = sanitizeExchange(exchange);
+            NetworkType net = (network != null ? network : NetworkType.TESTNET);
+            syncSettingsContextIfNeeded(s, ex, net);
+
+            return s.isActive();
         } catch (Exception ignored) {
             return false;
         }
@@ -536,19 +733,60 @@ public class AiStrategyOrchestrator {
     // =====================================================================
     // 🔑 STRICT LOAD
     // =====================================================================
-    private StrategySettings loadSettingsStrict(
-            Long chatId,
-            StrategyType type,
-            String exchange,
-            NetworkType network
-    ) {
-        return settingsService.getOrCreate(chatId, type, exchange, network);
+    private StrategySettings loadSettingsStrict(Long chatId, StrategyType type, String exchange, NetworkType network) {
+        if (chatId == null || chatId <= 0 || type == null) return null;
+
+        StrategySettings s = null;
+        try {
+            s = settingsService.getSettings(chatId, type);
+        } catch (Exception ignored) {}
+
+        if (s == null) {
+            s = settingsService.getOrCreate(chatId, type);
+        }
+
+        String ex = sanitizeExchange(exchange);
+        NetworkType net = (network != null ? network : NetworkType.TESTNET);
+        syncSettingsContextIfNeeded(s, ex, net);
+
+        return s;
+    }
+
+    private void syncSettingsContextIfNeeded(StrategySettings s, String exchange, NetworkType network) {
+        if (s == null) return;
+
+        boolean changed = false;
+
+        if (exchange != null && (s.getExchangeName() == null || !eq(s.getExchangeName(), exchange))) {
+            s.setExchangeName(exchange);
+            changed = true;
+        }
+
+        if (network != null && s.getNetworkType() != network) {
+            s.setNetworkType(network);
+            changed = true;
+        }
+
+        if (changed) {
+            try {
+                settingsService.save(s);
+            } catch (Exception e) {
+                log.debug("⚠ [ORCH] syncSettingsContextIfNeeded failed: {}", e.getMessage());
+            }
+        }
     }
 
     // =====================================================================
     // 🧱 RUN INFO (DTO)
     // =====================================================================
     private StrategyRunInfo buildRunInfo(StrategySettings s, boolean active, String msg) {
+        if (s == null) {
+            return StrategyRunInfo.builder()
+                    .active(active)
+                    .message(msg)
+                    .updatedAt(Instant.now())
+                    .build();
+        }
 
         return StrategyRunInfo.builder()
                 .chatId(s.getChatId())
@@ -560,7 +798,6 @@ public class AiStrategyOrchestrator {
                 .exchangeName(s.getExchangeName())
                 .networkType(s.getNetworkType())
 
-
                 .version(s.getVersion())
 
                 .startedAt(toInstant(s.getStartedAt()))
@@ -569,6 +806,21 @@ public class AiStrategyOrchestrator {
 
                 .message(msg)
                 .build();
+    }
+
+    private StrategyRunInfo buildRunInfoFromBinding(StrategySettings s, RunBinding b, boolean active, String msg) {
+        StrategyRunInfo info = buildRunInfo(s, active, msg);
+        if (b != null) {
+            try {
+                info.setExchangeName(b.exchange());
+                info.setNetworkType(b.network());
+                info.setSymbol(b.symbol());
+                info.setTimeframe(b.timeframe());
+            } catch (Exception ignored) {
+                // если вдруг DTO без сеттеров — просто вернём buildRunInfo(s,...)
+            }
+        }
+        return info;
     }
 
     private Instant toInstant(LocalDateTime time) {
@@ -598,7 +850,7 @@ public class AiStrategyOrchestrator {
             Order order = orderService.placeMarket(
                     chatId, symbol, "BUY", qty, BigDecimal.ZERO, "WEB_UI"
             );
-            return new OrderResult(true, "BUY OK", order.getId());
+            return new OrderResult(true, "BUY OK", order != null ? order.getId() : null);
         } catch (Exception e) {
             log.error("❌ marketBuy error", e);
             return new OrderResult(false, e.getMessage(), null);
@@ -610,7 +862,7 @@ public class AiStrategyOrchestrator {
             Order order = orderService.placeMarket(
                     chatId, symbol, "SELL", qty, BigDecimal.ZERO, "WEB_UI"
             );
-            return new OrderResult(true, "SELL OK", order.getId());
+            return new OrderResult(true, "SELL OK", order != null ? order.getId() : null);
         } catch (Exception e) {
             log.error("❌ marketSell error", e);
             return new OrderResult(false, e.getMessage(), null);
@@ -647,10 +899,6 @@ public class AiStrategyOrchestrator {
         }
     }
 
-    /**
-     * Здесь рефлексия не критична для торговли (только UI-время),
-     * оставляем пока, чтобы не поломать совместимость с разными моделями Order.
-     */
     private Long extractOrderTimestamp(Order o) {
         if (o == null) return null;
 
@@ -715,7 +963,6 @@ public class AiStrategyOrchestrator {
     // =====================================================================
     // ✅ ТИПОБЕЗОПАСНЫЕ ХУКИ ДЛЯ РЫНКА
     // =====================================================================
-
     public interface PriceUpdateAware {
         void onPriceUpdate(long chatId,
                            StrategyType type,

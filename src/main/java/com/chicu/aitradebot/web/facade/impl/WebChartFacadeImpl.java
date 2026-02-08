@@ -114,7 +114,7 @@ public class WebChartFacadeImpl implements WebChartFacade {
     }
 
     private StrategySettings resolveBaselineSettings(long chatId, StrategyType type) {
-        List<StrategySettings> all = settingsService.findAllByChatId(chatId, null);
+        List<StrategySettings> all = settingsService.findAllByChatId(chatId);
         if (all == null || all.isEmpty()) return null;
 
         return all.stream()

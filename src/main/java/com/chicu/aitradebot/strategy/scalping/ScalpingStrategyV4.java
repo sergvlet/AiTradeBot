@@ -505,7 +505,7 @@ public class ScalpingStrategyV4 implements TradingStrategy {
     // =====================================================
     private StrategySettings loadStrategySettings(Long chatId) {
         return strategySettingsService
-                .findAllByChatId(chatId, null, null)
+                .findAllByChatId(chatId)
                 .stream()
                 .filter(s -> s.getType() == StrategyType.SCALPING)
                 .sorted(

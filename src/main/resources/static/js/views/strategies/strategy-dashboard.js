@@ -3,14 +3,12 @@
 import { ChartController } from "../../chart/chart-controller.js";
 import { LayerRenderer }   from "../../chart/layer-renderer.js";
 
-// ✅ Стратегии-оверлеи (те, что реально существуют у тебя)
 import { ScalpingStrategy }    from "../../strategies/scalping.strategy.js";
 import { FibonacciStrategy }   from "../../strategies/fibonacci.strategy.js";
 import { SmartFusionStrategy } from "../../strategies/smartfusion.strategy.js";
 
 /**
- * ✅ Пустая стратегия-заглушка для всех остальных типов:
- * график работает, WS работает, но специфичных слоёв нет.
+ * Заглушка для неизвестных стратегий.
  */
 class GenericStrategy {
     constructor({ layers, ctx }) {
@@ -24,18 +22,18 @@ class GenericStrategy {
 document.addEventListener("DOMContentLoaded", () => {
     console.log("📊 Strategy Dashboard START");
 
-    // =========================================================================
+    // =====================================================
     // CONTEXT
-    // =========================================================================
+    // =====================================================
     const root = document.querySelector("[data-chat-id][data-type][data-symbol]");
     if (!root) {
         console.error("❌ Context root not found");
         return;
     }
 
-    const chatId = root.dataset.chatId;
-    const type   = (root.dataset.type || "").trim();
-    const symbol = (root.dataset.symbol || "").trim().toUpperCase();
+    const chatId = String(root.dataset.chatId || "").trim();
+    const type   = String(root.dataset.type || "").trim();
+    const symbol = String(root.dataset.symbol || "").trim().toUpperCase();
 
     console.log("🧩 Context:", { chatId, type, symbol });
 
@@ -45,93 +43,39 @@ document.addEventListener("DOMContentLoaded", () => {
         return;
     }
 
-    // =========================================================================
+    // =====================================================
     // CHART
-    // =========================================================================
+    // =====================================================
     const chartCtrl = new ChartController(container);
-    chartCtrl.symbol    = symbol;
+    chartCtrl.symbol = symbol;
+
+    // дефолт (позже может переписаться из REST)
     chartCtrl.timeframe = "1m";
 
     const layers = new LayerRenderer(chartCtrl.chart, chartCtrl.candles);
-
-    // ✅ ВАЖНО: держим ссылку на один и тот же массив
-    layers.candlesData = chartCtrl.candlesData;
-
-    // если нужно
+    layers.candlesData = chartCtrl.candlesData; // ✅ одна и та же ссылка
     chartCtrl.layerRenderer = layers;
 
-    // =========================================================================
-    // STRATEGY (все типы StrategyType)
-    // =========================================================================
+    // =====================================================
+    // STRATEGY OVERLAY
+    // =====================================================
     const ctx = { chatId, type, symbol };
     let strategy;
 
     switch (type) {
-
-        // ===================== III) SCALPING =====================
         case "SCALPING":
         case "WINDOW_SCALPING":
             strategy = new ScalpingStrategy({ layers, ctx });
             break;
 
-        // ===================== VI) GRIDS =====================
         case "FIBONACCI_GRID":
         case "FIBONACCI_RETRACE":
             strategy = new FibonacciStrategy({ layers, ctx });
             break;
 
-        case "GRID":
-            strategy = new GenericStrategy({ layers, ctx });
-            break;
-
-        // ===================== VIII) AI =====================
         case "SMART_FUSION":
         case "HYBRID":
             strategy = new SmartFusionStrategy({ layers, ctx });
-            break;
-
-        case "RL_AGENT":
-        case "ML_CLASSIFICATION":
-            strategy = new GenericStrategy({ layers, ctx });
-            break;
-
-        // ===================== I) MOMENTUM / TREND =====================
-        case "MOMENTUM":
-        case "TREND":
-        case "TREND_FOLLOWING":
-        case "EMA_CROSSOVER":
-            strategy = new GenericStrategy({ layers, ctx });
-            break;
-
-        // ===================== II) MEAN REVERSION / RSI =====================
-        case "MEAN_REVERSION":
-        case "RSI_OBOS":
-            strategy = new GenericStrategy({ layers, ctx });
-            break;
-
-        // ===================== IV) BREAKOUT =====================
-        case "BREAKOUT":
-        case "VOLATILITY_BREAKOUT":
-            strategy = new GenericStrategy({ layers, ctx });
-            break;
-
-        // ===================== V) LEVELS / STRUCTURE =====================
-        case "SUPPORT_RESISTANCE":
-        case "PRICE_ACTION":
-            strategy = new GenericStrategy({ layers, ctx });
-            break;
-
-        // ===================== VII) VOLUME =====================
-        case "VOLUME_PROFILE":
-        case "VWAP":
-        case "ORDER_FLOW":
-            strategy = new GenericStrategy({ layers, ctx });
-            break;
-
-        // ===================== DCA / GLOBAL =====================
-        case "DCA":
-        case "GLOBAL":
-            strategy = new GenericStrategy({ layers, ctx });
             break;
 
         default:
@@ -142,9 +86,9 @@ document.addEventListener("DOMContentLoaded", () => {
 
     console.log("🧠 Strategy initialized:", type, strategy?.constructor?.name);
 
-    // =========================================================================
-    // REST SNAPSHOT (HISTORY)
-    // =========================================================================
+    // =====================================================
+    // REST SNAPSHOT (ВАЖНО: timeframe ДО setHistory)
+    // =====================================================
     const snapshotUrl =
         `/api/chart/strategy` +
         `?chatId=${encodeURIComponent(chatId)}` +
@@ -154,109 +98,205 @@ document.addEventListener("DOMContentLoaded", () => {
     fetch(snapshotUrl)
         .then(r => r.json())
         .then(data => {
-            // 1) история → в график
+            // ✅ 1) применяем timeframe СНАЧАЛА
+            if (data?.timeframe) {
+                const tf = String(data.timeframe).trim().toLowerCase();
+                if (tf) chartCtrl.timeframe = tf;
+            }
+
+            // ✅ 2) история уже в правильном бакете
             if (Array.isArray(data?.candles)) {
                 chartCtrl.setHistory(data.candles);
                 strategy.onCandleHistory?.(chartCtrl.candlesData);
             }
 
-            // 2) слои (если бек прислал)
+            // ✅ 3) слои
             if (data?.layers) {
                 strategy.onEvent?.({ type: "layers", layers: data.layers });
 
                 if ((type === "SCALPING" || type === "WINDOW_SCALPING") && data.layers.windowZone) {
-                    strategy.onEvent?.({
-                        type: "window_zone",
-                        windowZone: data.layers.windowZone
-                    });
+                    strategy.onEvent?.({ type: "window_zone", windowZone: data.layers.windowZone });
                 }
-            }
-
-            // 3) если бек вернул timeframe — можно применить (опционально)
-            if (data?.timeframe) {
-                chartCtrl.timeframe = String(data.timeframe).toLowerCase();
             }
         })
         .catch(err => console.error("❌ REST snapshot error", err));
 
-    // =========================================================================
-    // WEBSOCKET (STOMP)
-    // =========================================================================
+    // =====================================================
+    // WS de-dup (мы подписаны на несколько топиков)
+    // =====================================================
+    const _wsDedup = new Map(); // key -> lastSeenMs
+
+    function wsDedupKey(ev) {
+        const k = ev?.kline || ev?.k || ev?.data?.k;
+        const t = ev?.time ?? k?.openTime ?? k?.t ?? k?.startTime ?? k?.T ?? "";
+        const sym = String(ev?.symbol || k?.symbol || "").trim().toUpperCase();
+        const tf  = String(ev?.timeframe || "").trim();
+        const st  = String(ev?.strategyType || type || "").trim();
+        const et  = String(ev?.type || "").trim();
+        return `${et}|${st}|${sym}|${tf}|${t}`;
+    }
+
+    function wsSeenRecently(key, ttlMs) {
+        const now = Date.now();
+        const last = _wsDedup.get(key);
+        if (last && (now - last) < ttlMs) return true;
+        _wsDedup.set(key, now);
+
+        // лёгкая чистка
+        if (_wsDedup.size > 3000) {
+            for (const [k, v] of _wsDedup) {
+                if ((now - v) > 15_000) _wsDedup.delete(k);
+            }
+        }
+        return false;
+    }
+
+    function isCandleEvent(ev) {
+        return (
+            ev?.type === "candle" ||
+            !!ev?.kline ||
+            !!ev?.k ||
+            !!ev?.data?.k
+        );
+    }
+
+    function eventSymbolUpper(ev) {
+        const k = ev?.kline || ev?.k || ev?.data?.k;
+        const s = ev?.symbol || k?.symbol || "";
+        return String(s).trim().toUpperCase();
+    }
+
+    // =====================================================
+    // WEBSOCKET (STOMP) — production reconnect
+    // =====================================================
     if (typeof SockJS === "undefined" || typeof Stomp === "undefined") {
         console.error("❌ SockJS / Stomp not loaded");
         return;
     }
 
-    const socket = new SockJS("/ws/strategy/");
-    const stomp  = Stomp.over(socket);
-    stomp.debug = null;
+    let stomp = null;
+    let socket = null;
+    let reconnectAttempt = 0;
+    let reconnectTimer = null;
 
-    stomp.connect({}, () => {
-        console.log("✅ STOMP CONNECTED");
+    const symbolUpper = symbol;
+    const symbolLower = symbol.toLowerCase();
 
-        const symbolUpper = symbol;               // BTCUSDT
-        const symbolLower = symbol.toLowerCase(); // btcusdt
+    const destinations = [
+        `/topic/strategy/${chatId}/${type}/${symbolUpper}`,
+        `/topic/strategy/${chatId}/${type}/${symbolLower}`,
+        `/topic/strategy/${chatId}/${type}`,
+        `/topic/strategy/${chatId}`,
+    ];
 
-        // ✅ подписываемся на оба варианта (topic может быть регистрозависим)
-        const destinations = [
-            `/topic/strategy/${chatId}/${type}/${symbolUpper}`,
-            `/topic/strategy/${chatId}/${type}/${symbolLower}`,
-            `/topic/strategy/${chatId}/${type}`,
-            `/topic/strategy/${chatId}`,
-        ];
+    let wsCount = 0;
+    let lastLogAt = 0;
 
-        let wsCount = 0;
-        let lastLogAt = 0;
+    function cleanupWs() {
+        try { if (reconnectTimer) clearTimeout(reconnectTimer); } catch (_) {}
+        reconnectTimer = null;
 
-        destinations.forEach(dest => {
-            stomp.subscribe(dest, msg => {
-                wsCount++;
+        try {
+            if (stomp && stomp.connected) stomp.disconnect(() => {});
+        } catch (_) {}
 
-                // логируем редко (антиспам)
-                const now = Date.now();
-                if (now - lastLogAt > 3000) {
-                    lastLogAt = now;
-                    console.log(`📡 WS IN (#${wsCount}) from ${dest}:`, msg.body?.slice(0, 200));
-                }
+        stomp = null;
 
-                let ev;
-                try { ev = JSON.parse(msg.body); } catch { return; }
+        try { if (socket) socket.close(); } catch (_) {}
+        socket = null;
+    }
 
-                // фильтр по symbol (если есть) — не мешаем другим вкладкам
-                const evSymbol = (ev?.symbol || "").trim().toUpperCase();
-                if (evSymbol && evSymbol !== symbolUpper) return;
+    function scheduleReconnect(reason) {
+        cleanupWs();
 
-                // 🔥 ЕДИНСТВЕННЫЙ ВХОД В ГРАФИК
-                chartCtrl.onWsMessage(ev);
+        reconnectAttempt = Math.min(10, reconnectAttempt + 1);
 
-                // стратегия получает ВСЁ
-                strategy.onEvent?.(ev);
+        // backoff: 0.5s, 1s, 2s, 4s, ... max 15s
+        const delay = Math.min(15_000, 500 * Math.pow(2, reconnectAttempt - 1));
 
-                // обновление зон по “свечным” сообщениям
-                const looksLikeCandle =
-                    ev?.type === "candle" ||
-                    !!ev?.kline ||
-                    !!ev?.k ||
-                    !!ev?.data?.k;
+        console.warn(`⚠ WS reconnect scheduled in ${delay}ms (attempt=${reconnectAttempt}) reason=${reason}`);
 
-                if ((type === "SCALPING" || type === "WINDOW_SCALPING") && looksLikeCandle) {
-                    strategy.onCandleHistory?.(chartCtrl.candlesData);
-                }
-            });
+        reconnectTimer = setTimeout(() => {
+            connectWs();
+        }, delay);
+    }
 
-            console.log("✅ SUBSCRIBED", dest);
-        });
+    function connectWs() {
+        cleanupWs();
 
-        // replay после подписки
-        fetch(`/api/strategy/${chatId}/${type}/replay`, { method: "POST" });
-    });
+        socket = new SockJS("/ws/strategy/");
+        stomp = Stomp.over(socket);
+        stomp.debug = null;
 
-    // =========================================================================
+        // если sockjs умер — переподключаемся
+        socket.onclose = () => scheduleReconnect("socket_close");
+        socket.onerror = () => scheduleReconnect("socket_error");
+
+        stomp.connect(
+            {},
+            () => {
+                reconnectAttempt = 0;
+                console.log("✅ STOMP CONNECTED");
+
+                destinations.forEach(dest => {
+                    stomp.subscribe(dest, msg => {
+                        let ev;
+                        try { ev = JSON.parse(msg.body); } catch { return; }
+
+                        // ✅ дедуп по ключу (между разными подписками)
+                        const key = wsDedupKey(ev);
+                        if (wsSeenRecently(key, 1500)) return;
+
+                        // антиспам лог
+                        wsCount++;
+                        const now = Date.now();
+                        if (now - lastLogAt > 3000) {
+                            lastLogAt = now;
+                            console.log(`📡 WS IN (#${wsCount}) from ${dest}:`, msg.body?.slice(0, 200));
+                        }
+
+                        // ✅ фильтр по symbol (для candle сообщений — symbol обязателен)
+                        const evSym = eventSymbolUpper(ev);
+                        if (evSym && evSym !== symbolUpper) return;
+
+                        // ✅ график
+                        if (isCandleEvent(ev)) {
+                            chartCtrl.onWsMessage(ev);
+                        }
+
+                        // ✅ стратегия получает всё
+                        strategy.onEvent?.(ev);
+
+                        // ✅ оверлеи пересчитываем только когда реально свеча
+                        if ((type === "SCALPING" || type === "WINDOW_SCALPING") && isCandleEvent(ev)) {
+                            strategy.onCandleHistory?.(chartCtrl.candlesData);
+                        }
+                    });
+
+                    console.log("✅ SUBSCRIBED", dest);
+                });
+
+                // replay
+                fetch(`/api/strategy/${chatId}/${type}/replay`, { method: "POST" })
+                    .catch(() => {});
+            },
+            (err) => {
+                console.warn("❌ STOMP CONNECT ERROR", err);
+                scheduleReconnect("stomp_connect_error");
+            }
+        );
+    }
+
+    connectWs();
+
+    // =====================================================
     // RESIZE
-    // =========================================================================
+    // =====================================================
     window.addEventListener("resize", () => {
-        chartCtrl.chart.applyOptions({ width: container.clientWidth });
-        chartCtrl.adjustBarSpacing();
+        try {
+            chartCtrl.chart.applyOptions({ width: container.clientWidth });
+            chartCtrl.adjustBarSpacing();
+        } catch (_) {}
     });
 
     chartCtrl.adjustBarSpacing();

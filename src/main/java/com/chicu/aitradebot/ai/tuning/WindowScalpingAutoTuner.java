@@ -65,7 +65,7 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         String ex = normalizeExchange(request.exchange());
         NetworkType net = request.network() != null ? request.network() : NetworkType.MAINNET;
 
-        StrategySettings ss = strategySettingsService.getOrCreate(chatId, StrategyType.WINDOW_SCALPING, ex, net);
+        StrategySettings ss = strategySettingsService.getOrCreate(chatId, StrategyType.WINDOW_SCALPING);
         WindowScalpingStrategySettings cfg = windowSettingsService.getOrCreate(chatId);
 
         if (ss == null || cfg == null) {
@@ -220,7 +220,7 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         String ex = normalizeExchange(request.exchange());
         NetworkType net = request.network() != null ? request.network() : NetworkType.MAINNET;
 
-        StrategySettings ss = strategySettingsService.getOrCreate(chatId, StrategyType.WINDOW_SCALPING, ex, net);
+        StrategySettings ss = strategySettingsService.getOrCreate(chatId, StrategyType.WINDOW_SCALPING);
         WindowScalpingStrategySettings cfg = windowSettingsService.getOrCreate(chatId);
 
         if (ss == null || cfg == null) return false;

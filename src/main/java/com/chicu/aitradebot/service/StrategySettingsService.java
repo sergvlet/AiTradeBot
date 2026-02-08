@@ -11,9 +11,22 @@ public interface StrategySettingsService {
     StrategySettings save(StrategySettings s);
 
     /**
+     * Источник истины: одна строка на (chatId, type).
      * Может вернуть null, если настроек ещё нет.
      */
-    StrategySettings getSettings(
+    StrategySettings getSettings(long chatId, StrategyType type);
+
+    /**
+     * Гарантированно не null: одна строка на (chatId, type).
+     * НЕ плодит записи.
+     */
+    StrategySettings getOrCreate(long chatId, StrategyType type);
+
+    /**
+     * Контекст исполнения (exchange/network) — НЕ ключ.
+     * Патчит exchange/network в той же строке и возвращает сущность.
+     */
+    StrategySettings getOrCreateAndPatchContext(
             long chatId,
             StrategyType type,
             String exchange,
@@ -21,23 +34,9 @@ public interface StrategySettingsService {
     );
 
     /**
-     * Гарантированно не null (и НЕ плодит записи из-за UNIQUE).
+     * Патч контекста в уже существующей сущности.
      */
-    StrategySettings getOrCreate(
-            long chatId,
-            StrategyType type,
-            String exchange,
-            NetworkType network
-    );
+    void patchContext(StrategySettings settings, String exchange, NetworkType network);
 
-    List<StrategySettings> findAllByChatId(
-            long chatId,
-            String exchange,
-            NetworkType network
-    );
-
-    List<StrategySettings> findAllByChatId(
-            long chatId,
-            String exchange
-    );
+    List<StrategySettings> findAllByChatId(long chatId);
 }
