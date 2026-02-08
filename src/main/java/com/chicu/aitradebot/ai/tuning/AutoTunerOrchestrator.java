@@ -80,7 +80,7 @@ public class AutoTunerOrchestrator {
         if (!env.ok) return reject(env.failReason);
 
         // ==========================
-        // ✅ Анти-гонка (один ctx -> один тюнинг)
+        // ✅ Анти-гонка
         // ==========================
         TuningKey key = new TuningKey(chatId, type, env.exchange, env.network);
         if (!inFlight.add(key)) {
@@ -269,7 +269,6 @@ public class AutoTunerOrchestrator {
     }
 
     private static String signatureOf(TuningRequest r) {
-        // тут уже r.exchange/r.network гарантированно не null после normalize
         String sym = (r.symbol() == null ? "" : r.symbol().trim().toUpperCase(Locale.ROOT));
         String tf  = (r.timeframe() == null ? "" : r.timeframe().trim().toLowerCase(Locale.ROOT));
         int cl = (r.candlesLimit() == null ? 0 : r.candlesLimit());
@@ -323,7 +322,7 @@ public class AutoTunerOrchestrator {
     }
 
     /**
-     * ✅ Если тюнер умеет — разжимает грубые фильтры после NO_TRADES.
+     * ✅ После NO_TRADES даём тюнеру шанс "разжать" грубые фильтры.
      * Опционально, через reflection:
      * - adjustCoarseFilters(TuningRequest)
      * - onNoTrades(TuningRequest)

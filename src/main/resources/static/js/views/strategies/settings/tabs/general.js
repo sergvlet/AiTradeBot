@@ -46,6 +46,16 @@ window.SettingsTabGeneral = (function () {
         return qs ? (base + "?" + qs) : base;
     }
 
+    function buildStateUrl(ctx, diagnostics) {
+        const base = `/strategies/${encodeURIComponent(String(ctx.type || ""))}/config/state`;
+        const q = new URLSearchParams();
+        q.set("chatId", String(ctx.chatId || ""));
+        if (!isBlank(ctx?.exchange)) q.set("exchange", String(ctx.exchange));
+        if (!isBlank(ctx?.network)) q.set("network", String(ctx.network));
+        q.set("diagnostics", diagnostics ? "true" : "false");
+        return base + "?" + q.toString();
+    }
+
     // =====================================================
     // Confirm modal (Bootstrap) fallback -> window.confirm
     // =====================================================
@@ -159,6 +169,57 @@ window.SettingsTabGeneral = (function () {
         } catch (_) {}
     }
 
+    function dispatchUiState(state) {
+        try {
+            window.dispatchEvent(new CustomEvent("strategy:uiStateChanged", { detail: { state } }));
+        } catch (_) {}
+    }
+
+    // =====================================================
+    // State sync
+    // =====================================================
+    function isObj(x) { return x && typeof x === "object"; }
+
+    function applyStateToCtx(ctx, st) {
+        if (!ctx || !isObj(st)) return;
+
+        if (!isBlank(st.exchange)) ctx.exchange = String(st.exchange);
+        if (st.network) ctx.network = String(st.network);
+
+        if (st.advancedControlMode) ctx.advancedControlMode = normalizeMode(st.advancedControlMode);
+        if (!isBlank(st.runPhase)) ctx.runPhase = String(st.runPhase);
+
+        if (typeof st.autoTuneEnabled === "boolean") ctx.autoTuneEnabled = st.autoTuneEnabled;
+        if (typeof st.mlGateEnabled === "boolean") ctx.mlGateEnabled = st.mlGateEnabled;
+
+        // можно расширять при надобности (symbol/timeframe/limit)
+        if (!isBlank(st.symbol)) ctx.symbol = String(st.symbol);
+        if (!isBlank(st.timeframe)) ctx.timeframe = String(st.timeframe);
+        if (typeof st.cachedCandlesLimit === "number") ctx.cachedCandlesLimit = st.cachedCandlesLimit;
+    }
+
+    async function fetchUiState(ctx) {
+        const api = window.SettingsApi;
+
+        const url = buildStateUrl(ctx, false);
+        try {
+            if (api?.getJson) {
+                return await api.getJson(url);
+            }
+
+            const resp = await fetch(url, {
+                method: "GET",
+                credentials: "same-origin",
+                headers: { "Accept": "application/json" }
+            });
+            if (!resp.ok) return null;
+            return await resp.json().catch(() => null);
+        } catch (e) {
+            console.warn("[general] fetch state failed:", e);
+            return null;
+        }
+    }
+
     // =====================================================
     // MAIN INIT
     // =====================================================
@@ -221,7 +282,8 @@ window.SettingsTabGeneral = (function () {
 
         async function saveModeToServer(mode) {
             const url = buildConfigUrl(ctx, "control");
-            await api.postForm(url, {
+            // важно: ожидаем, что postForm вернет JSON (StrategyUiState). Если нет — ок.
+            return await api.postForm(url, {
                 saveScope: "general",
                 tab: "control",
                 exchange: ctx.exchange || "",
@@ -267,19 +329,24 @@ window.SettingsTabGeneral = (function () {
             }
         }
 
+        function revertToPrev(prev) {
+            modeSelect.value = prev;
+            ctx.advancedControlMode = prev;
+            modeSelect.dataset.prevValue = prev;
+            setModeHint(prev);
+            dispatchMode(prev);
+        }
+
         let inFlight = false;
 
         modeSelect.addEventListener("change", async () => {
             if (inFlight) return;
 
-            const prev = normalizeMode(modeSelect.dataset.prevValue || "MANUAL");
+            const prev = normalizeMode(modeSelect.dataset.prevValue || modeSelect.value || "MANUAL");
             const next = normalizeMode(modeSelect.value || "MANUAL");
             if (next === prev) return;
 
-            ctx.advancedControlMode = next;
-            setModeHint(next);
-            dispatchMode(next);
-
+            // ✅ подтверждение ДО изменения UI
             if (next === "HYBRID") {
                 const ok = await showConfirm(
                     "Подтверждение",
@@ -287,10 +354,6 @@ window.SettingsTabGeneral = (function () {
                 );
                 if (!ok) {
                     modeSelect.value = prev;
-                    ctx.advancedControlMode = prev;
-                    modeSelect.dataset.prevValue = prev;
-                    setModeHint(prev);
-                    dispatchMode(prev);
                     return;
                 }
             }
@@ -302,40 +365,63 @@ window.SettingsTabGeneral = (function () {
                 );
                 if (!ok) {
                     modeSelect.value = prev;
-                    ctx.advancedControlMode = prev;
-                    modeSelect.dataset.prevValue = prev;
-                    setModeHint(prev);
-                    dispatchMode(prev);
                     return;
                 }
             }
+
+            // ✅ теперь меняем UI
+            ctx.advancedControlMode = next;
+            setModeHint(next);
+            dispatchMode(next);
 
             inFlight = true;
             setSavingUi();
             setProgress(next === "HYBRID" || next === "AI");
 
             try {
-                await saveModeToServer(next);
+                const saved = await saveModeToServer(next);
 
+                // ✅ подтянуть реальный state (если postForm не вернул json — добираем GET’ом)
+                let state = (isObj(saved) && saved.type) ? saved : null;
+                if (!state) state = await fetchUiState(ctx);
+
+                if (state) {
+                    applyStateToCtx(ctx, state);
+
+                    const realMode = normalizeMode(state.advancedControlMode || next);
+                    modeSelect.value = realMode;
+                    modeSelect.dataset.prevValue = realMode;
+
+                    setModeHint(realMode);
+                    dispatchMode(realMode);
+                    dispatchUiState(state);
+                } else {
+                    modeSelect.dataset.prevValue = next;
+                }
+
+                // ✅ apply для HYBRID/AI
                 if (next === "HYBRID" || next === "AI") {
                     const r = await tryApplyMode(next);
                     const applied = (r && r.applied === true);
                     const reason = (r && r.reason) ? String(r.reason) : "";
                     setSavedUi(nowHHmm() + (applied ? " • применено" : (reason ? (" • " + reason) : "")));
+
+                    // после apply тоже можно обновить state (фазы/флаги могут сдвинуться)
+                    const st2 = await fetchUiState(ctx);
+                    if (st2) {
+                        applyStateToCtx(ctx, st2);
+                        dispatchUiState(st2);
+                    }
                 } else {
                     setSavedUi(nowHHmm());
                 }
 
-                modeSelect.dataset.prevValue = next;
                 setProgress(false);
+
             } catch (e) {
                 console.error("[general] save control mode failed:", e);
 
-                modeSelect.value = prev;
-                ctx.advancedControlMode = prev;
-                modeSelect.dataset.prevValue = prev;
-                setModeHint(prev);
-                dispatchMode(prev);
+                revertToPrev(prev);
 
                 setProgress(false);
                 setErrorUi(String(e?.message || "ошибка"));

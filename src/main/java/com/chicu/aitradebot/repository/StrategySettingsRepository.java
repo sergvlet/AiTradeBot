@@ -17,10 +17,18 @@ public interface StrategySettingsRepository extends JpaRepository<StrategySettin
 
     List<StrategySettings> findAllByChatId(long chatId);
 
+    // ✅ обычный SELECT (можно вызывать без транзакции)
     Optional<StrategySettings> findByChatIdAndType(long chatId, StrategyType type);
 
+    // ✅ явный "без lock" алиас (чтобы в коде было понятно, что тут нет FOR UPDATE)
+    default Optional<StrategySettings> findByChatIdAndTypeNoLock(long chatId, StrategyType type) {
+        return findByChatIdAndType(chatId, type);
+    }
+
+    // (оставил как у тебя)
     List<StrategySettings> findAllByChatIdAndTypeOrderByUpdatedAtDescIdDesc(long chatId, StrategyType type);
 
+    // ✅ PESSIMISTIC_WRITE (только внутри активной транзакции)
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("""
            select s

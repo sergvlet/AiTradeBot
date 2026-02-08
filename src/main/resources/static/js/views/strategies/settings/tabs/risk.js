@@ -14,12 +14,76 @@ window.SettingsTabRisk = (function () {
     // debounce для автосейва если мы поджимаем FIX
     let saveTimer = null;
 
-    // debug (включи true если надо увидеть что реально происходит)
     const DEBUG = false;
     function dbg(...a) { if (DEBUG) console.log("[risk]", ...a); }
 
     function getCtx() { return window.StrategySettingsContext || null; }
     function byId(id) { return document.getElementById(id); }
+
+    function isBlank(s) {
+        return s === null || s === undefined || String(s).trim() === "";
+    }
+    function normalizeUpper(s) {
+        return isBlank(s) ? "" : String(s).trim().toUpperCase();
+    }
+    function normalizeMode(v) {
+        const m = String(v || "ALL").trim().toUpperCase();
+        return ["ALL", "FIX", "PCT"].includes(m) ? m : "ALL";
+    }
+    function toNum(v) {
+        if (v === null || v === undefined) return null;
+        const s = String(v).trim().replace(",", ".");
+        if (!s) return null;
+        const n = Number(s);
+        return Number.isFinite(n) ? n : null;
+    }
+    function fmt(n) {
+        if (n === null || n === undefined || !Number.isFinite(n)) return "—";
+        return (Math.round(n * 100) / 100).toFixed(2);
+    }
+    function fmtNum(v, digits) {
+        if (v === null || v === undefined) return null;
+        const n = Number(v);
+        if (!Number.isFinite(n)) return null;
+        const d = Number.isFinite(digits) ? digits : 8;
+        return n.toFixed(d).replace(/\.?0+$/, "");
+    }
+
+    // --- ui state publish (только валидный) ---
+    function looksLikeUiState(obj) {
+        return !!(obj && typeof obj === "object"
+            && ("chatId" in obj) && ("type" in obj) && ("exchange" in obj) && ("network" in obj));
+    }
+
+    function ensureStrategyStore() {
+        if (window.StrategySettingsStore && typeof window.StrategySettingsStore.subscribe === "function") {
+            return window.StrategySettingsStore;
+        }
+        const listeners = new Set();
+        const store = {
+            _state: null,
+            getState() { return this._state; },
+            setState(state) {
+                this._state = state;
+                listeners.forEach(fn => { try { fn(state); } catch (e) {} });
+                try { window.dispatchEvent(new CustomEvent("strategy:state", { detail: state })); } catch (e) {}
+            },
+            subscribe(fn) {
+                if (typeof fn !== "function") return () => {};
+                listeners.add(fn);
+                if (this._state) { try { fn(this._state); } catch (e) {} }
+                return () => listeners.delete(fn);
+            }
+        };
+        window.StrategySettingsStore = store;
+        return store;
+    }
+
+    function publishState(state) {
+        if (!looksLikeUiState(state)) return;
+        try { ensureStrategyStore().setState(state); } catch (e) {}
+        try { window.dispatchEvent(new CustomEvent("strategy:state", { detail: state })); } catch (e) {}
+    }
 
     function badge(text) {
         const el = byId("riskSaveMeta");
@@ -32,59 +96,10 @@ window.SettingsTabRisk = (function () {
 
         el.textContent = txt;
 
-        el.classList.remove("bg-secondary", "bg-success", "bg-danger");
+        el.classList.remove("bg-secondary", "bg-success", "bg-danger", "bg-info", "text-dark");
         if (ok === true) el.classList.add("bg-success");
         else if (ok === false) el.classList.add("bg-danger");
-        else el.classList.add("bg-secondary");
-    }
-
-    // ✅ ВАЖНО: публикуем state ВСЕГДА и в Store, и как DOM event (чтобы ничего не “молчало”)
-    function publishState(state) {
-        if (!state) return;
-
-        try {
-            if (window.StrategySettingsStore && typeof window.StrategySettingsStore.setState === "function") {
-                window.StrategySettingsStore.setState(state);
-            }
-        } catch (e) {}
-
-        try {
-            window.dispatchEvent(new CustomEvent("strategy:state", { detail: state }));
-        } catch (e) {}
-    }
-
-    function normalizeMode(v) {
-        const m = String(v || "ALL").trim().toUpperCase();
-        return ["ALL", "FIX", "PCT"].includes(m) ? m : "ALL";
-    }
-
-    function toNum(v) {
-        if (v === null || v === undefined) return null;
-        const s = String(v).trim().replace(",", ".");
-        if (!s) return null;
-        const n = Number(s);
-        return Number.isFinite(n) ? n : null;
-    }
-
-    function fmt(n) {
-        if (n === null || n === undefined || !Number.isFinite(n)) return "—";
-        return (Math.round(n * 100) / 100).toFixed(2);
-    }
-
-    function fmtNum(v, digits) {
-        if (v === null || v === undefined) return null;
-        const n = Number(v);
-        if (!Number.isFinite(n)) return null;
-        const d = Number.isFinite(digits) ? digits : 8;
-        return n.toFixed(d).replace(/\.?0+$/, "");
-    }
-
-    function isBlank(s) {
-        return s === null || s === undefined || String(s).trim() === "";
-    }
-
-    function normalizeUpper(s) {
-        return isBlank(s) ? "" : String(s).trim().toUpperCase();
+        else { el.classList.add("bg-secondary"); }
     }
 
     function ctxQuery() {
@@ -94,9 +109,26 @@ window.SettingsTabRisk = (function () {
         if (ctx.chatId) q.set("chatId", String(ctx.chatId));
         if (ctx.exchange) q.set("exchange", String(ctx.exchange));
         if (ctx.network) q.set("network", String(ctx.network));
-        // cache-buster
         q.set("_ts", String(Date.now()));
         return q.toString();
+    }
+
+    // --- confirm tracker sync ---
+    function syncConfirmPrev(el) {
+        if (!el) return;
+        if (String(el.getAttribute("data-confirm") || "").toLowerCase() !== "true") return;
+
+        const now = (el.type === "checkbox") ? String(!!el.checked) : String(el.value ?? "");
+        el.setAttribute("data-prev", now);
+    }
+
+    // если FormChangeTracker не привязан — data-prev не будет, тогда считаем change подтверждённым
+    function isConfirmedChange(el) {
+        if (!el) return true;
+        const prev = el.getAttribute("data-prev");
+        if (prev === null || prev === undefined) return true;
+        const now = (el.type === "checkbox") ? String(!!el.checked) : String(el.value ?? "");
+        return prev === now;
     }
 
     function applyModeUi(mode, asset) {
@@ -133,9 +165,9 @@ window.SettingsTabRisk = (function () {
         const modeSel = byId("riskModeSelect");
         const valInp  = byId("riskValueInput");
 
-        const freeValueEl = byId("riskFreeBalanceValue");   // input/hidden (число)
-        const assetEl = byId("riskSelectedAsset");          // input/hidden (asset)
-        const effEl   = byId("riskEffectiveAmount");        // span/text
+        const freeValueEl = byId("riskFreeBalanceValue");
+        const assetEl = byId("riskSelectedAsset");
+        const effEl   = byId("riskEffectiveAmount");
 
         currentAsset = (assetEl && assetEl.value)
             ? normalizeUpper(assetEl.value)
@@ -197,11 +229,12 @@ window.SettingsTabRisk = (function () {
     }
 
     // =====================================================
-    // ✅ подтянуть свежий UI-state с сервера
+    // ✅ подтянуть свежий UI-state с сервера (через SettingsApi)
     // =====================================================
     async function refreshUiStateFromServer(reason) {
         const ctx = getCtx();
         if (!ctx?.type || !ctx?.chatId) return;
+        if (!window.SettingsApi?.getJson) return;
 
         const now = Date.now();
         if (refreshInFlight) return;
@@ -213,11 +246,8 @@ window.SettingsTabRisk = (function () {
             const url = `/strategies/${encodeURIComponent(String(ctx.type))}/config/state?${ctxQuery()}`;
             dbg("refresh:", reason, url);
 
-            const res = await fetch(url, { method: "GET", cache: "no-store" });
-            if (!res.ok) return;
-
-            const state = await res.json().catch(() => null);
-            if (state) publishState(state);
+            const state = await window.SettingsApi.getJson(url);
+            if (looksLikeUiState(state)) publishState(state);
 
         } catch (e) {
             console.warn("[risk] refreshUiStateFromServer failed:", e);
@@ -226,60 +256,94 @@ window.SettingsTabRisk = (function () {
         }
     }
 
+    // =====================================================
+    // ✅ save (через SettingsApi.postForm => CSRF + login/403 детект)
+    // =====================================================
     async function saveRisk() {
         const ctx = getCtx();
-        if (!ctx) return;
+        if (!ctx?.type || !ctx?.chatId) return;
+        if (!window.SettingsApi?.postForm) return;
 
-        const form = byId("riskForm");
-        if (!form) return;
+        const modeSel = byId("riskModeSelect");
+        const valInp  = byId("riskValueInput");
 
-        const fd = new FormData(form);
-        fd.set("chatId", String(ctx.chatId));
-        fd.set("saveScope", "risk");
-        fd.set("tab", "risk");
-
-        if (ctx.exchange) fd.set("exchange", String(ctx.exchange));
-        if (ctx.network) fd.set("network", String(ctx.network));
+        const payload = {
+            saveScope: "risk",
+            tab: "risk",
+            exchange: ctx.exchange || "",
+            network: ctx.network || "",
+            capitalMode: normalizeMode(modeSel?.value || "ALL"),
+            capitalValue: String(valInp?.value ?? "").trim(),
+            accountAsset: normalizeUpper(byId("riskSelectedAsset")?.value || currentAsset || "")
+        };
 
         setState("Сохраняю…", null);
 
-        const res = await fetch(`/strategies/${encodeURIComponent(String(ctx.type))}/config?${ctxQuery()}`, {
-            method: "POST",
-            headers: { "X-Requested-With": "fetch" },
-            body: new URLSearchParams(fd)
-        });
+        try {
+            const url = `/strategies/${encodeURIComponent(String(ctx.type))}/config?${ctxQuery()}`;
+            const state = await window.SettingsApi.postForm(url, payload);
 
-        if (res.ok) {
             setState("Сохранено", true);
             badge(new Date().toLocaleTimeString());
 
-            const state = await res.json().catch(() => null);
-            publishState(state);
-        } else {
+            if (looksLikeUiState(state)) {
+                publishState(state);
+            } else {
+                // если сервер вернул {ok:true} — добираем state отдельно
+                refreshUiStateFromServer("post_ok_no_state").catch(() => {});
+            }
+        } catch (e) {
             setState("Ошибка", false);
-            badge("HTTP " + res.status);
+            badge(String(e?.message || "ошибка"));
+            console.error("[risk] save failed:", e);
         }
     }
 
+    function pickModeFromState(state) {
+        return normalizeMode(
+            state?.capitalMode ||
+            state?.riskCapitalMode ||
+            state?.strategy?.capitalMode ||
+            state?.settings?.capitalMode ||
+            "ALL"
+        );
+    }
+
+    function pickValueFromState(state) {
+        const v =
+            state?.capitalValue ??
+            state?.riskCapitalValue ??
+            state?.strategy?.capitalValue ??
+            state?.settings?.capitalValue ??
+            null;
+        return (v === null || v === undefined) ? "" : String(v);
+    }
+
     function applyUiState(state) {
-        if (!state) return;
+        if (!looksLikeUiState(state)) return;
 
         const modeSel = byId("riskModeSelect");
+        const valInp  = byId("riskValueInput");
+
         const freeValueEl = byId("riskFreeBalanceValue");
         const freeTextEl  = byId("riskFreeBalanceText");
         const assetEl     = byId("riskSelectedAsset");
         const assetTextEl = byId("riskAssetText");
 
-        const bal = state.selectedBalance || null;
+        const bal = state.selectedBalance || state.balance || null;
 
         // ✅ asset: сначала accountAsset, потом selectedBalance.asset
-        const nextAsset = normalizeUpper(state.accountAsset || (bal && bal.asset));
+        const nextAsset = normalizeUpper(state.accountAsset || (bal && (bal.asset || bal.currency || bal.code)));
         if (nextAsset) {
             const changed = nextAsset !== currentAsset;
             currentAsset = nextAsset;
 
             if (assetEl) assetEl.value = nextAsset;
             if (assetTextEl) assetTextEl.textContent = nextAsset;
+
+            // держим ctx в актуале (чтобы другие вкладки брали одно и то же)
+            const ctx = getCtx();
+            if (ctx) ctx.accountAsset = nextAsset;
 
             if (changed) dbg("asset changed ->", nextAsset);
         }
@@ -290,65 +354,107 @@ window.SettingsTabRisk = (function () {
             if (freeTextEl) freeTextEl.textContent = fmtNum(bal.free, 8) || "—";
         }
 
-        const m = normalizeMode(modeSel ? (modeSel.value || "ALL") : "ALL");
-        applyModeUi(m, currentAsset || "USDT");
+        // ✅ mode/value из state (важно: если AI/тюнер меняет)
+        const modeFromState = pickModeFromState(state);
+        const valFromState  = pickValueFromState(state);
+
+        if (modeSel && modeSel.value !== modeFromState) modeSel.value = modeFromState;
+        if (valInp && String(valInp.value || "") !== String(valFromState || "")) valInp.value = String(valFromState || "");
+
+        // синхронизируем data-prev, чтобы confirm не срабатывал на “серверных” изменениях
+        syncConfirmPrev(modeSel);
+        syncConfirmPrev(valInp);
+
+        applyModeUi(modeFromState, currentAsset || "USDT");
 
         const clamped = clampRiskIfNeeded();
         calcPreview();
 
+        // если free уменьшился и FIX стал выше free — поджимаем и сохраняем один раз
         if (clamped) scheduleSaveRisk();
     }
 
     // =====================================================
-    // ✅ ловим смену accountAsset максимально широко
+    // ✅ ловим смену accountAsset (основной путь — событие из Trade)
     // =====================================================
     function attachAccountAssetListeners() {
+        // 1) from Trade (правильный путь)
+        window.addEventListener("strategy:accountAssetChanged", (ev) => {
+            const next = normalizeUpper(ev?.detail?.asset || "");
+            if (!next) return;
+
+            dbg("strategy:accountAssetChanged ->", next);
+
+            currentAsset = next;
+
+            const assetEl = byId("riskSelectedAsset");
+            const assetTextEl = byId("riskAssetText");
+            if (assetEl) assetEl.value = next;
+            if (assetTextEl) assetTextEl.textContent = next;
+
+            calcPreview();
+            setTimeout(() => refreshUiStateFromServer("accountAsset_event"), 60);
+        });
+
+        // 2) fallback: если кто-то поменял select в DOM без события
         const selectors = [
             '[name="accountAsset"]',
             '#accountAsset',
             '#accountAssetSelect',
             '[data-role="accountAsset"]'
         ];
-
         function isAccountAssetEl(el) {
             if (!el || !el.matches) return false;
-            return selectors.some(sel => {
-                try { return el.matches(sel); } catch (e) { return false; }
-            });
+            return selectors.some(sel => { try { return el.matches(sel); } catch (e) { return false; } });
         }
-
         document.addEventListener("change", (e) => {
             const t = e.target;
             if (!isAccountAssetEl(t)) return;
 
             const next = normalizeUpper(t.value);
+            if (!next) return;
+
             dbg("accountAsset changed in DOM ->", next);
 
-            // визуально обновим asset сразу
+            currentAsset = next;
+
             const assetEl = byId("riskSelectedAsset");
             const assetTextEl = byId("riskAssetText");
-            if (next) {
-                currentAsset = next;
-                if (assetEl) assetEl.value = next;
-                if (assetTextEl) assetTextEl.textContent = next;
-                calcPreview();
-            }
+            if (assetEl) assetEl.value = next;
+            if (assetTextEl) assetTextEl.textContent = next;
 
-            // и подтянем реальный баланс из state (после того как trade-tab, возможно, сохранит настройки)
+            calcPreview();
             setTimeout(() => refreshUiStateFromServer("accountAsset_dom_change"), 80);
         });
     }
 
     function init() {
         if (started) return;
-        started = true;
 
+        // не стартуем пока нет ctx/api/dom
+        const ctx = getCtx();
+        if (!ctx?.chatId || !ctx?.type) {
+            dbg("ctx not ready -> skip init (retry)");
+            return;
+        }
+        if (!window.SettingsApi?.postForm || !window.SettingsApi?.getJson) {
+            dbg("SettingsApi not ready -> skip init (retry)");
+            return;
+        }
+
+        const modeSel = byId("riskModeSelect");
+        const valInp  = byId("riskValueInput");
+        const form    = byId("riskForm");
+        if (!form || !modeSel || !valInp) {
+            dbg("risk DOM not ready -> skip init (retry)");
+            return;
+        }
+
+        started = true;
         dbg("init");
 
         const initModeEl  = byId("riskInitMode");
         const initValueEl = byId("riskInitValue");
-        const modeSel = byId("riskModeSelect");
-        const valInp  = byId("riskValueInput");
         const assetEl = byId("riskSelectedAsset");
 
         currentAsset = (assetEl && assetEl.value) ? normalizeUpper(assetEl.value) : (currentAsset || "USDT");
@@ -356,8 +462,12 @@ window.SettingsTabRisk = (function () {
         const initMode = normalizeMode(initModeEl ? initModeEl.value : "ALL");
         const initVal  = (initValueEl && initValueEl.value) ? String(initValueEl.value).trim() : "";
 
-        if (modeSel) modeSel.value = initMode;
-        if (valInp)  valInp.value = initVal;
+        modeSel.value = initMode;
+        valInp.value  = initVal;
+
+        // синк для confirm
+        syncConfirmPrev(modeSel);
+        syncConfirmPrev(valInp);
 
         applyModeUi(initMode, currentAsset);
         calcPreview();
@@ -369,9 +479,7 @@ window.SettingsTabRisk = (function () {
             }
         };
 
-        if (window.StrategySettingsStore && typeof window.StrategySettingsStore.subscribe === "function") {
-            window.StrategySettingsStore.subscribe(onState);
-        }
+        ensureStrategyStore().subscribe(onState);
         window.addEventListener("strategy:state", (ev) => onState(ev && ev.detail));
 
         attachAccountAssetListeners();
@@ -379,31 +487,63 @@ window.SettingsTabRisk = (function () {
         // первичный refresh
         setTimeout(() => refreshUiStateFromServer("init"), 0);
 
-        // events
-        modeSel?.addEventListener("change", async () => {
+        // =====================================================
+        // events (ВАЖНО: save только на confirmed-change или когда confirm не привязан)
+        // =====================================================
+
+        // mode: мгновенно обновляем UI на change, а сохраняем после подтверждения
+        modeSel.addEventListener("change", () => {
             const m = normalizeMode(modeSel.value);
-            if (m === "ALL" && valInp) valInp.value = "";
+            if (m === "ALL") valInp.value = "";
+            applyModeUi(m, currentAsset);
+            calcPreview();
+
+            // если confirm tracker не подключён — change считаем подтверждённым
+            setTimeout(() => {
+                if (isConfirmedChange(modeSel)) saveRisk().catch(() => {});
+            }, 0);
+        });
+        modeSel.addEventListener("confirmed-change", async () => {
+            const m = normalizeMode(modeSel.value);
+            if (m === "ALL") valInp.value = "";
+            syncConfirmPrev(modeSel);
+            syncConfirmPrev(valInp);
             applyModeUi(m, currentAsset);
             calcPreview();
             await saveRisk();
         });
 
-        valInp?.addEventListener("input", () => calcPreview());
-        valInp?.addEventListener("change", async () => {
+        // value: превью на input, сохранение — после подтверждения
+        valInp.addEventListener("input", () => calcPreview());
+        valInp.addEventListener("change", () => {
             clampRiskIfNeeded();
+            calcPreview();
+
+            setTimeout(() => {
+                if (isConfirmedChange(valInp)) saveRisk().catch(() => {});
+            }, 0);
+        });
+        valInp.addEventListener("confirmed-change", async () => {
+            clampRiskIfNeeded();
+            syncConfirmPrev(valInp);
             calcPreview();
             await saveRisk();
         });
 
+        // quick buttons
         document.querySelectorAll("[data-risk-set]").forEach(btn => {
             btn.addEventListener("click", async () => {
                 const m = normalizeMode(btn.getAttribute("data-risk-mode") || "FIX");
                 const v = btn.getAttribute("data-risk-set") || "";
 
-                if (modeSel) modeSel.value = m;
+                modeSel.value = m;
                 applyModeUi(m, currentAsset);
 
-                if (valInp) valInp.value = v;
+                valInp.value = v;
+
+                // sync confirm prev, чтобы после клика не требовало подтверждение "с нуля"
+                syncConfirmPrev(modeSel);
+                syncConfirmPrev(valInp);
 
                 clampRiskIfNeeded();
                 calcPreview();
@@ -415,16 +555,15 @@ window.SettingsTabRisk = (function () {
     }
 
     // =====================================================
-    // ✅ АВТО-СТАРТ: если вкладки ленивые — всё равно стартуем когда DOM готов
+    // ✅ АВТО-СТАРТ: если табы ленивые — ждём DOM
     // =====================================================
     function autoBoot() {
-        // если элементы риска уже есть — стартуем
+        // уже есть элементы риска — стартуем
         if (byId("riskForm") || byId("riskModeSelect") || byId("riskValueInput")) {
             init();
             return;
         }
 
-        // иначе ждём появления (если табы рендерятся лениво)
         const mo = new MutationObserver(() => {
             if (byId("riskForm") || byId("riskModeSelect") || byId("riskValueInput")) {
                 mo.disconnect();
@@ -440,6 +579,5 @@ window.SettingsTabRisk = (function () {
         autoBoot();
     }
 
-    // наружу
     return { init, applyUiState };
 })();

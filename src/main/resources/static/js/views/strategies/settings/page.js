@@ -8,11 +8,7 @@
     if (!window.StrategySettingsBus) {
         window.StrategySettingsBus = {
             emit(name, detail) {
-                try {
-                    window.dispatchEvent(new CustomEvent(name, { detail }));
-                } catch (e) {
-                    // если CustomEvent недоступен/сломался — просто игнор
-                }
+                try { window.dispatchEvent(new CustomEvent(name, { detail })); } catch (e) {}
             },
             on(name, handler) {
                 if (!name || typeof handler !== "function") return () => {};
@@ -22,19 +18,15 @@
         };
     }
 
-    // Store
+    // Store (✅ совместим: setState/getState/onChange)
     if (!window.StrategySettingsStore) {
         let _state = null;
         const listeners = new Set();
 
         function set(next) {
             _state = next || null;
-            // 1) event
-            window.StrategySettingsBus.emit("strategy:state", _state);
-            // 2) subscribers
-            listeners.forEach(fn => {
-                try { fn(_state); } catch (_) {}
-            });
+            // ✅ только подписчики (DOM event эмитим через Bus в compat/store ниже)
+            listeners.forEach(fn => { try { fn(_state); } catch (_) {} });
         }
 
         function get() {
@@ -44,12 +36,19 @@
         function subscribe(fn) {
             if (typeof fn !== "function") return () => {};
             listeners.add(fn);
-            // push current immediately
             try { fn(_state); } catch (_) {}
             return () => listeners.delete(fn);
         }
 
-        window.StrategySettingsStore = { set, get, subscribe };
+        window.StrategySettingsStore = {
+            // canonical
+            set, get, subscribe,
+
+            // compat
+            setState: set,
+            getState: get,
+            onChange: subscribe,
+        };
     }
 })();
 
@@ -97,16 +96,212 @@
     }
 
     // =====================================================
+    // ✅ CONFIRM MODAL (без window.confirm + фикс залипающего backdrop)
+    // =====================================================
+    function cleanupBackdrops() {
+        try {
+            document.querySelectorAll(".modal-backdrop").forEach(b => b.remove());
+            document.body.classList.remove("modal-open");
+            document.body.style.removeProperty("padding-right");
+        } catch (_) {}
+    }
+
+    function resolveConfirmModalEls() {
+        // ✅ берём только НАСТОЯЩУЮ модалку (class="modal")
+        const modal =
+            document.querySelector("#confirmModal.modal")
+            || document.querySelector("#generalConfirmModal.modal")
+            || null;
+
+        const title =
+            document.getElementById("confirmModalTitle")
+            || document.getElementById("generalConfirmTitle")
+            || null;
+
+        const body =
+            document.getElementById("confirmModalBody")
+            || document.getElementById("generalConfirmText")
+            || null;
+
+        const ok =
+            document.getElementById("confirmModalOk")
+            || document.getElementById("generalConfirmOk")
+            || null;
+
+        const cancel =
+            document.getElementById("confirmModalCancel")
+            || document.getElementById("generalConfirmCancel")
+            || null;
+
+        return { modal, title, body, ok, cancel };
+    }
+
+    function showConfirmModal({ title, text }) {
+        return new Promise((resolve) => {
+            const els = resolveConfirmModalEls();
+            if (!els.modal || !els.ok) {
+                // ✅ если модалки нет — НЕ создаём backdrop, просто безопасный fallback
+                resolve(window.confirm(`${title ? title + "\n\n" : ""}${text || "Сохранить изменения?"}`));
+                return;
+            }
+
+            // перед показом чистим "залипший" бекдроп (если вдруг был баг ранее)
+            cleanupBackdrops();
+
+            if (els.title && title) els.title.textContent = String(title);
+            if (els.body) els.body.textContent = String(text || "Сохранить изменения?");
+
+            let done = false;
+
+            const finish = (ok) => {
+                if (done) return;
+                done = true;
+                try {
+                    els.ok.removeEventListener("click", onOk);
+                    els.cancel?.removeEventListener("click", onCancel);
+                    els.modal.removeEventListener("hidden.bs.modal", onHidden);
+                } catch (_) {}
+                resolve(!!ok);
+            };
+
+            const onOk = () => {
+                try { bsHide(); } catch (_) {}
+                finish(true);
+            };
+
+            const onCancel = () => {
+                try { bsHide(); } catch (_) {}
+                finish(false);
+            };
+
+            const onHidden = () => {
+                // если закрыли крестиком/ESC
+                finish(false);
+            };
+
+            function bsShow() {
+                if (window.bootstrap?.Modal) {
+                    const inst = window.bootstrap.Modal.getOrCreateInstance(els.modal, {
+                        backdrop: "static",
+                        keyboard: true
+                    });
+                    els.modal.addEventListener("hidden.bs.modal", onHidden, { once: true });
+                    inst.show();
+                    return inst;
+                }
+
+                // === fallback если вдруг нет bootstrap js ===
+                els.modal.style.display = "block";
+                els.modal.classList.add("show");
+                els.modal.removeAttribute("aria-hidden");
+                els.modal.setAttribute("aria-modal", "true");
+                document.body.classList.add("modal-open");
+
+                const bd = document.createElement("div");
+                bd.className = "modal-backdrop fade show";
+                document.body.appendChild(bd);
+
+                const esc = (e) => {
+                    if (e.key === "Escape") {
+                        document.removeEventListener("keydown", esc, true);
+                        bsHide();
+                        finish(false);
+                    }
+                };
+                document.addEventListener("keydown", esc, true);
+                return null;
+            }
+
+            function bsHide() {
+                if (window.bootstrap?.Modal) {
+                    const inst = window.bootstrap.Modal.getInstance(els.modal);
+                    if (inst) inst.hide();
+                    else cleanupBackdrops();
+                    return;
+                }
+                // fallback hide
+                els.modal.classList.remove("show");
+                els.modal.style.display = "none";
+                cleanupBackdrops();
+            }
+
+            els.ok.addEventListener("click", onOk);
+            els.cancel?.addEventListener("click", onCancel);
+
+            try { bsShow(); }
+            catch (e) {
+                // если bootstrap сломался — чистим бекдроп и fallback
+                cleanupBackdrops();
+                finish(window.confirm(`${title ? title + "\n\n" : ""}${text || "Сохранить изменения?"}`));
+            }
+        });
+    }
+
+    // ✅ перехват [data-confirm] на CHANGE, чтобы до автосейва спрашивать модалкой
+    function bindDataConfirm(root) {
+        const doc = root || document;
+        const selector = "[data-confirm='true'],[data-confirm='1'],[data-confirm='yes'],[data-confirm='on']";
+
+        const tracked = new WeakMap();
+
+        function readValue(el) {
+            if (!el) return null;
+            const t = (el.type || "").toLowerCase();
+            if (t === "checkbox" || t === "radio") return !!el.checked;
+            return String(el.value ?? "");
+        }
+
+        // init snapshot
+        doc.querySelectorAll(selector).forEach(el => tracked.set(el, readValue(el)));
+
+        // capture BEFORE autosave handlers
+        doc.addEventListener("change", async (e) => {
+            const el = e.target;
+            if (!el || !tracked.has(el)) return;
+
+            // пропуск "второго" события, которое мы сами генерим после OK
+            if (el.dataset._confirmSkipOnce === "1") {
+                delete el.dataset._confirmSkipOnce;
+                tracked.set(el, readValue(el));
+                return;
+            }
+
+            const prev = tracked.get(el);
+            const next = readValue(el);
+            if (prev === next) return;
+
+            // ✅ стопаем всё, пока пользователь не ответит
+            e.preventDefault();
+            e.stopImmediatePropagation();
+
+            const title = el.getAttribute("data-confirm-title") || "Подтверждение";
+            const text  = el.getAttribute("data-confirm-text")  || "Сохранить изменения?";
+
+            const ok = await showConfirmModal({ title, text });
+
+            if (ok) {
+                tracked.set(el, next);
+                el.dataset._confirmSkipOnce = "1";
+                // запускаем нормальный change, чтобы автосейв/логика вкладок отработали
+                el.dispatchEvent(new Event("change", { bubbles: true }));
+            } else {
+                // откат значения без вызова автосейва
+                const t = (el.type || "").toLowerCase();
+                if (t === "checkbox" || t === "radio") el.checked = !!prev;
+                else el.value = String(prev ?? "");
+            }
+        }, true);
+    }
+
+    // =====================================================
     // ✅ COMPAT: api.js ожидает window.SettingsPageStore
     // =====================================================
     function initCompatSettingsPageStore() {
         if (window.SettingsPageStore) return;
 
-        // store + bus уже созданы в initStrategySettingsBusAndStore()
         const Store = window.StrategySettingsStore;
-        const Bus = window.StrategySettingsBus;
+        const Bus   = window.StrategySettingsBus;
 
-        // защита: если по какой-то причине не поднялись
         if (!Store || !Bus) {
             console.warn("⚠ StrategySettingsStore/Bus not found — compat store disabled");
             return;
@@ -124,8 +319,31 @@
             const q = new URLSearchParams();
             q.set("chatId", String(ctx.chatId));
             if (ctx.exchange) q.set("exchange", String(ctx.exchange));
-            if (ctx.network) q.set("network", String(ctx.network));
-            return `/strategies/${encodeURIComponent(ctx.type)}/config/state?${q.toString()}`;
+            if (ctx.network)  q.set("network", String(ctx.network));
+            q.set("_ts", String(Date.now()));
+            return `/strategies/${encodeURIComponent(String(ctx.type))}/config/state?${q.toString()}`;
+        }
+
+        function scheduleHardRefresh(delayMs) {
+            clearTimeout(hardRefreshTimer);
+            hardRefreshTimer = setTimeout(() => { hardRefreshNow(); }, Math.max(0, delayMs || 0));
+        }
+
+        function setStateFromServerState(serverState, opts) {
+            try {
+                if (typeof Store.setState === "function") Store.setState(serverState);
+                else Store.set(serverState);
+
+                // ✅ единый DOM event для всех вкладок/слушателей
+                Bus.emit("strategy:state", serverState);
+                Bus.emit("ui:state", serverState);
+            } catch (e) {
+                console.warn("⚠ failed to set store state:", e);
+            }
+
+            if (!opts || !opts.skipHardRefresh) {
+                scheduleHardRefresh(80);
+            }
         }
 
         async function hardRefreshNow() {
@@ -133,21 +351,20 @@
             const url = buildStateUrl(ctx);
             if (!url) return null;
             if (hardRefreshInProgress) return null;
+
             hardRefreshInProgress = true;
             try {
-                // используем SettingsApi если есть
                 let st = null;
+
                 if (window.SettingsApi && typeof window.SettingsApi.getJson === "function") {
                     st = await window.SettingsApi.getJson(url);
                 } else {
-                    const r = await fetch(url, { headers: { "Accept": "application/json" } });
+                    const r = await fetch(url, { headers: { "Accept": "application/json" }, cache: "no-store" });
                     if (!r.ok) throw new Error(`state fetch failed: ${r.status}`);
                     st = await r.json();
                 }
-                if (st) {
-                    // важно: не запускаем повторный hard refresh из этого применения
-                    window.SettingsPageStore.setStateFromServerState(st, { skipHardRefresh: true });
-                }
+
+                if (st) setStateFromServerState(st, { skipHardRefresh: true });
                 return st;
             } catch (e) {
                 console.warn("⚠ hardRefreshNow failed:", e);
@@ -157,39 +374,15 @@
             }
         }
 
-        function scheduleHardRefresh(delayMs) {
-            clearTimeout(hardRefreshTimer);
-            hardRefreshTimer = setTimeout(() => { hardRefreshNow(); }, Math.max(0, delayMs || 0));
-        }
-
-        function setStateFromServerState(serverState, opts) {
-            // кладём в общий store — это триггерит подписчиков
-            try {
-                Store.set(serverState);
-                Bus.emit("ui:state", serverState);
-            } catch (e) {
-                console.warn("⚠ failed to set store state:", e);
-            }
-
-            // ✅ после POST часто нужно дочитать свежий баланс/снапшот
-            if (!opts || !opts.skipHardRefresh) {
-                scheduleHardRefresh(80);
-            }
-        }
-
-        window.SettingsPageStore = {
-            getContext,
-            setStateFromServerState,
-            hardRefreshNow,
-        };
+        window.SettingsPageStore = { getContext, setStateFromServerState, hardRefreshNow };
     }
 
     // =====================================================
-    // ✅ DOM AUTO-UPDATE (балансы / риск / кнопка active)
+    // ✅ DOM AUTO-UPDATE (балансы / риск / exchange/network)
     // =====================================================
     function initDomAutoUpdate() {
         const Store = window.StrategySettingsStore;
-        if (!Store || typeof Store.onChange !== "function") return;
+        if (!Store || (typeof Store.onChange !== "function" && typeof Store.subscribe !== "function")) return;
 
         function byId(id) { return document.getElementById(id); }
 
@@ -214,44 +407,42 @@
             return n.toFixed(sc).replace(/\.0+$/, "").replace(/(\.\d*?)0+$/, "$1");
         }
 
+        function normNet(v) {
+            if (v === null || v === undefined) return "";
+            if (typeof v === "object" && v.name) return String(v.name);
+            return String(v);
+        }
+
         function applyStateToDom(state) {
             if (!state) return;
 
-            // 1) badges / active
-            const activeBadge = byId("strategyActiveBadge");
-            const toggleBtn = byId("strategyToggleBtn");
-
-            if (activeBadge) {
-                const isOn = !!state.active;
-                activeBadge.textContent = isOn ? "RUNNING" : "STOPPED";
-                activeBadge.classList.toggle("bg-success", isOn);
-                activeBadge.classList.toggle("bg-secondary", !isOn);
+            const root = getRoot();
+            if (root) {
+                if (state.chatId)   root.setAttribute("data-chat-id", String(state.chatId));
+                if (state.type)     root.setAttribute("data-type", String(state.type));
+                if (state.exchange) root.setAttribute("data-exchange", String(state.exchange));
+                if (state.network)  root.setAttribute("data-network", normNet(state.network));
             }
 
-            if (toggleBtn) {
-                const isOn = !!state.active;
-                toggleBtn.textContent = isOn ? "Остановить" : "Запустить";
-                toggleBtn.classList.toggle("btn-danger", isOn);
-                toggleBtn.classList.toggle("btn-success", !isOn);
-            }
-
-            // 2) hidden inputs: exchange/network чтобы формы сохраняли актуальное
             if (state.exchange) {
-                document.querySelectorAll("input[name='exchange']").forEach(i => i.value = state.exchange);
+                document.querySelectorAll("input[name='exchange']").forEach(i => i.value = String(state.exchange));
+                const kEx = byId("keysExchange");
+                if (kEx) kEx.value = String(state.exchange).toUpperCase();
             }
             if (state.network) {
-                document.querySelectorAll("input[name='network']").forEach(i => i.value = state.network);
+                const nn = normNet(state.network);
+                document.querySelectorAll("input[name='network']").forEach(i => i.value = nn);
+                const kNet = byId("keysNetwork");
+                if (kNet) kNet.value = String(nn).toUpperCase();
             }
 
-            // 3) балансы (trade tab)
-            const bal = state.selectedBalance || null;
+            const bal = state.selectedBalance || state.balance || null;
             if (bal) {
-                const asset = bal.asset || state.accountAsset || "";
-                text(byId("selectedAssetText"), asset);
-                text(byId("assetFreeView"), fmtMoney(bal.free, 8));
+                const asset = (bal.asset || state.accountAsset || "").toString().toUpperCase();
+
+                text(byId("assetFreeView"),   fmtMoney(bal.free, 8));
                 text(byId("assetLockedView"), fmtMoney(bal.locked, 8));
 
-                // total: если пришёл с бэка — используем, иначе считаем
                 let total = bal.total;
                 if (total === undefined || total === null) {
                     const f = asNum(bal.free);
@@ -259,35 +450,37 @@
                     if (f !== null && l !== null) total = f + l;
                 }
                 text(byId("assetTotalView"), fmtMoney(total, 8));
-            }
 
-            // 4) риск (available balance)
-            if (bal) {
-                const asset = bal.asset || state.accountAsset || "";
-                text(byId("riskAssetText"), asset);
+                text(byId("riskAssetText"), asset || "—");
                 text(byId("riskFreeBalanceText"), fmtMoney(bal.free, 8));
+
                 const freeVal = byId("riskFreeBalanceValue");
                 if (freeVal) freeVal.value = (bal.free !== null && bal.free !== undefined) ? String(bal.free) : "";
+
                 const sel = byId("riskSelectedAsset");
-                if (sel) sel.value = asset;
+                if (sel) sel.value = asset || "";
             }
 
-            // 5) accountAsset hidden/select (если есть)
             if (state.accountAsset) {
+                const aa = String(state.accountAsset).toUpperCase();
+
                 const h = byId("accountAssetHidden");
-                if (h) h.value = state.accountAsset;
+                if (h) h.value = aa;
+
                 const s = byId("accountAssetSelect");
-                if (s && s.value !== state.accountAsset) s.value = state.accountAsset;
+                if (s && s.value !== aa) s.value = aa;
+
+                const hint = byId("assetInHint");
+                if (hint) hint.textContent = aa;
             }
         }
 
-        // подписка
-        Store.onChange((st) => {
+        const sub = (typeof Store.onChange === "function") ? Store.onChange : Store.subscribe;
+        sub((st) => {
             try { applyStateToDom(st); } catch (e) { console.warn("⚠ applyStateToDom failed:", e); }
         });
 
-        // кнопка ручного refresh (trade tab)
-        const btn = document.getElementById("assetRefreshBtn");
+        const btn = byId("assetRefreshBtn");
         if (btn && window.SettingsPageStore && typeof window.SettingsPageStore.hardRefreshNow === "function") {
             btn.addEventListener("click", (e) => {
                 e.preventDefault();
@@ -295,18 +488,17 @@
             });
         }
 
-        // active toggle: делаем AJAX + state refresh, без перезагрузки страницы
-        const toggleForm = document.getElementById("strategyToggleForm");
+        const toggleForm =
+            document.getElementById("strategyToggleForm")
+            || document.querySelector("form[action*='/toggle']");
+
         if (toggleForm) {
             toggleForm.addEventListener("submit", async (e) => {
                 e.preventDefault();
                 try {
                     await fetch(toggleForm.action, {
                         method: "POST",
-                        headers: {
-                            "X-Requested-With": "fetch",
-                            "Accept": "application/json"
-                        },
+                        headers: { "X-Requested-With": "fetch", "Accept": "application/json" },
                         body: new FormData(toggleForm)
                     });
                 } catch (err) {
@@ -364,13 +556,8 @@
             "tab-advanced": () => advancedTab?.init?.()
         };
 
-        console.log("[settings/page] initTabOnce:", tabId, "->", Object.keys(map).includes(tabId) ? "OK" : "NO_HANDLER");
-
-        try {
-            map[tabId]?.();
-        } catch (e) {
-            console.error(`settings/page.js: init failed for ${tabId}`, e);
-        }
+        try { map[tabId]?.(); }
+        catch (e) { console.error(`settings/page.js: init failed for ${tabId}`, e); }
     }
 
     function boot() {
@@ -381,16 +568,19 @@
         }
 
         window.StrategySettingsContext = ctx;
-        console.log("[settings/page] boot ctx:", ctx);
 
-        // ✅ включаем единый стор обновления UI (балансы/риск/бейдж Active)
-        try { initCompatSettingsPageStore(); } catch (e) {
-            console.warn("[settings/page] initCompatSettingsPageStore failed:", e);
+        // ✅ compat store
+        try { initCompatSettingsPageStore(); } catch (e) {}
+
+        // ✅ авто-обновление DOM
+        try { initDomAutoUpdate(); } catch (e) {}
+
+        // ✅ подтверждения через модалку (без window.confirm)
+        try { bindDataConfirm(document); } catch (e) {
+            console.warn("[settings/page] bindDataConfirm failed:", e);
         }
 
         const buttons = $all(".tab-btn");
-        console.log("[settings/page] tab buttons:", buttons.map(b => b.dataset.tab));
-
         if (!buttons.length) return;
 
         buttons.forEach(btn => {
@@ -398,10 +588,8 @@
             btn.setAttribute("tabindex", "0");
 
             btn.addEventListener("click", () => {
-                const tabId = btn.dataset.tab || ""; // "tab-risk"
-                const tabName = normalizeTabName(tabId.replace("tab-", "")); // "risk"
-
-                console.log("[settings/page] click:", tabId);
+                const tabId = btn.dataset.tab || "";
+                const tabName = normalizeTabName(tabId.replace("tab-", ""));
 
                 setActiveTab(tabName);
                 initTabOnce(tabId);
@@ -427,6 +615,9 @@
 
         setActiveTab(initial);
         initTabOnce("tab-" + initial);
+
+        // ✅ свежий state сразу
+        try { window.SettingsPageStore?.hardRefreshNow?.(); } catch (e) {}
     }
 
     if (document.readyState === "loading") {

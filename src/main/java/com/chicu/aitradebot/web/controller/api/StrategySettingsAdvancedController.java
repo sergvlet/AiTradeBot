@@ -26,6 +26,10 @@ import java.util.Map;
 @RequestMapping("/api/strategy/settings")
 public class StrategySettingsAdvancedController {
 
+    private static final String PHASE_COLLECT = "COLLECT";
+    private static final String PHASE_PAPER   = "PAPER";
+    private static final String PHASE_LIVE    = "LIVE";
+
     private final StrategySettingsService strategySettingsService;
     private final StrategyAdvancedRegistry advancedRegistry;
 
@@ -52,8 +56,8 @@ public class StrategySettingsAdvancedController {
     }
 
     /**
-     * ✅ У тебя StrategySettingsService пока без (exchange, network),
-     * поэтому мы берём settings по (chatId, type) и синхронизируем контекст в самой сущности.
+     * ✅ StrategySettingsService пока без (exchange, network),
+     * поэтому берём settings по (chatId, type) и синхронизируем контекст в самой сущности.
      */
     private void syncContextIfNeeded(StrategySettings ss, String exchange, NetworkType network) {
         if (ss == null) return;
@@ -77,25 +81,30 @@ public class StrategySettingsAdvancedController {
             try {
                 strategySettingsService.save(ss);
             } catch (Exception ignored) {
-                // тут не ломаем ответ — это синхронизация для консистентности UI
+                // синхронизация для консистентности UI — не ломаем ответ
             }
         }
     }
 
-    private static void applyModeFlagsProd(StrategySettings ss, AdvancedControlMode mode) {
+    private static void applyModeFlags(StrategySettings ss, AdvancedControlMode mode, NetworkType network) {
         if (ss == null || mode == null) return;
-
-        // ✅ ПРОД: не включаем COLLECT/BACKTEST/PAPER автоматически
-        ss.setRunPhase("LIVE");
 
         switch (mode) {
             case MANUAL -> {
                 ss.setAutoTuneEnabled(false);
                 ss.setMlGateEnabled(false);
+                ss.setRunPhase(PHASE_LIVE);
             }
-            case HYBRID, AI -> {
+            case HYBRID -> {
                 ss.setAutoTuneEnabled(true);
                 ss.setMlGateEnabled(true);
+                ss.setRunPhase(network == NetworkType.TESTNET ? PHASE_PAPER : PHASE_LIVE);
+            }
+            case AI -> {
+                ss.setAutoTuneEnabled(true);
+                ss.setMlGateEnabled(true);
+                // AI запускается с фазы COLLECT (дальше цикл докрутим отдельным рантаймом)
+                ss.setRunPhase(PHASE_COLLECT);
             }
         }
     }
@@ -157,7 +166,6 @@ public class StrategySettingsAdvancedController {
 
     // =========================================================
     // POST /advanced/submit
-    // ✅ сохраняет advancedControlMode + flags и вызывает renderer.handleSubmit(ctx)
     // =========================================================
     @Transactional
     @PostMapping(value = "/advanced/submit", consumes = MediaType.APPLICATION_FORM_URLENCODED_VALUE)
@@ -170,7 +178,6 @@ public class StrategySettingsAdvancedController {
     ) {
         String ex = normalizeExchange(exchange);
 
-        // ✅ FIX: только getOrCreate(chatId, type)
         StrategySettings ss = strategySettingsService.getOrCreate(chatId, type);
 
         // ✅ синхронизируем контекст (чтобы не терялось при сохранениях вкладок)
@@ -185,8 +192,8 @@ public class StrategySettingsAdvancedController {
         if (requestedMode != null && requestedMode != ss.getAdvancedControlMode()) {
             ss.setAdvancedControlMode(requestedMode);
 
-            // ✅ флаги режима (без PAPER/COLLECT/BACKTEST)
-            applyModeFlagsProd(ss, requestedMode);
+            // ✅ флаги режима + фаза
+            applyModeFlags(ss, requestedMode, network);
 
             strategySettingsService.save(ss);
         }
@@ -225,7 +232,7 @@ public class StrategySettingsAdvancedController {
 
         renderer.handleSubmit(ctx);
 
-        // ✅ подстрахуем сохранение базовых полей (updatedAt и т.п. — если у тебя это в save)
+        // ✅ подстрахуем сохранение базовых полей
         strategySettingsService.save(ss);
 
         return Map.of("ok", true);

@@ -4,7 +4,7 @@
         data-chat-id=${chatId},
         data-type=${type},
         data-exchange=${selectedExchange},
-        data-network=${selectedNetwork}
+        data-network=${selectedNetwork != null ? selectedNetwork.name() : 'TESTNET'}
      ">
 
     <link rel="stylesheet" th:href="@{/css/views/strategies/settings.css}"/>
@@ -31,7 +31,9 @@
                         BINANCE / TESTNET
                     </span>
 
-                    <span class="badge"
+                    <!-- ✅ важно для page.js auto-update -->
+                    <span id="strategyActiveBadge"
+                          class="badge"
                           th:classappend="${strategy != null and strategy.active} ? ' bg-success' : ' bg-secondary'"
                           th:text="${strategy != null and strategy.active} ? '🟢 Активна' : '⚫ Остановлена'">
                         ⚫ Остановлена
@@ -44,34 +46,38 @@
             </div>
         </div>
 
-        <!-- ✅ НЕ УДАЛЯЮ "Назад", просто добавляю нужные кнопки -->
         <div class="d-flex align-items-center gap-2 flex-wrap">
             <a th:href="@{/strategies(chatId=${chatId})}" class="btn btn-outline-secondary">
                 <i class="bi bi-arrow-left me-1"></i> Назад
             </a>
 
-            <!-- ✅ Дашборд стратегии -->
             <a class="btn btn-outline-info"
                th:href="@{|/strategies/${type}/dashboard?chatId=${chatId}&exchange=${selectedExchange}&network=${selectedNetwork != null ? selectedNetwork.name() : 'TESTNET'}|}">
                 <i class="bi bi-graph-up-arrow me-1"></i> Дашборд
             </a>
 
-            <!-- ✅ Бэктест -->
             <a class="btn btn-outline-warning"
                th:href="@{|/strategies/${type}/backtest?chatId=${chatId}&exchange=${selectedExchange}&network=${selectedNetwork != null ? selectedNetwork.name() : 'TESTNET'}|}">
                 <i class="bi bi-play-circle me-1"></i> Бэктест
             </a>
 
-            <!-- ✅ Запуск/Стоп -->
-            <form class="d-inline"
+            <!-- ✅ важно для page.js: toggle через AJAX + hardRefresh -->
+            <form id="strategyToggleForm"
+                  class="d-inline"
                   method="post"
                   th:action="@{|/strategies/${type}/toggle?chatId=${chatId}&exchange=${selectedExchange}&network=${selectedNetwork != null ? selectedNetwork.name() : 'TESTNET'}|}">
-                <button type="submit"
+
+                <button id="strategyToggleBtn"
+                        type="submit"
                         class="btn"
                         th:classappend="${strategy != null and strategy.active} ? ' btn-outline-danger' : ' btn-outline-success'">
-                    <i class="bi me-1"
+
+                    <i id="strategyToggleIcon"
+                       class="bi me-1"
                        th:classappend="${strategy != null and strategy.active} ? 'bi-stop-circle' : 'bi-play-circle'"></i>
-                    <span th:text="${strategy != null and strategy.active} ? 'Остановить' : 'Запустить'">Запустить</span>
+
+                    <span id="strategyToggleText"
+                          th:text="${strategy != null and strategy.active} ? 'Остановить' : 'Запустить'">Запустить</span>
                 </button>
             </form>
         </div>
@@ -206,6 +212,7 @@
                                     <input type="hidden" name="saveScope" value="keys"/>
                                     <input type="hidden" name="tab" value="network"/>
 
+                                    <!-- ✅ эти hidden должны обновляться при смене биржи/сети -->
                                     <input type="hidden" id="keysExchange" name="exchange" th:value="${selectedExchange}"/>
                                     <input type="hidden" id="keysNetwork"  name="network"
                                            th:value="${selectedNetwork != null ? selectedNetwork.name() : 'TESTNET'}"/>
@@ -255,6 +262,9 @@
                             </div>
                         </div>
                     </div>
+
+                    <!-- дальше по файлу без изменений -->
+
 
                     <!-- Diagnostics -->
                     <div class="accordion-item">
@@ -419,7 +429,6 @@
                             </option>
                         </select>
 
-
                         <div id="controlModeProgress" class="small text-secondary mt-2 d-none" aria-live="polite">
                             <span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>
                             Применяю… (тюнинг / бэктест / обучение)
@@ -488,26 +497,36 @@
                 <div class="small text-secondary mb-3" id="tradeChangedList"></div>
 
                 <form id="tradeForm" onsubmit="return false;">
+                    <!-- ✅ чтобы автосейв мог постить как обычную форму -->
+                    <input type="hidden" name="saveScope" value="trade"/>
+                    <input type="hidden" name="tab" value="trade"/>
+                    <input type="hidden" name="exchange" th:value="${selectedExchange}"/>
+                    <input type="hidden" name="network" th:value="${selectedNetwork != null ? selectedNetwork.name() : 'TESTNET'}"/>
 
-                    <!-- ✅ главный актив из аккаунта + баланс -->
                     <div class="row g-3 mb-4">
                         <div class="col-lg-5">
                             <div class="section-title">Главный актив (из баланса биржи)</div>
 
                             <label class="form-label" for="accountAssetSelect">Актив аккаунта</label>
 
-                            <!-- ✅ name="accountAsset" + availableAssets -->
                             <select class="form-select"
                                     id="accountAssetSelect"
                                     name="accountAsset">
+                                <!-- ✅ если assets пустой — показываем хотя бы текущий выбранный -->
+                                <option th:if="${(availableAssets == null or #lists.isEmpty(availableAssets)) and selectedAsset != null}"
+                                        th:value="${#strings.toUpperCase(selectedAsset)}"
+                                        th:text="${#strings.toUpperCase(selectedAsset)}"
+                                        selected>
+                                </option>
+
                                 <option th:each="a : ${availableAssets}"
                                         th:value="${#strings.toUpperCase(a)}"
                                         th:text="${#strings.toUpperCase(a)}"
-                                        th:selected="${#strings.toUpperCase(a) == #strings.toUpperCase(selectedAsset)}">
+                                        th:selected="${selectedAsset != null and #strings.toUpperCase(a) == #strings.toUpperCase(selectedAsset)}">
                                 </option>
                             </select>
 
-                            <!-- ✅ важно для JS/автосейва -->
+                            <!-- ✅ важно для JS/инициализации -->
                             <input type="hidden"
                                    id="accountAssetHidden"
                                    th:value="${selectedAsset != null ? #strings.toUpperCase(selectedAsset) : ''}"/>
@@ -520,7 +539,6 @@
                         <div class="col-lg-7">
                             <div class="section-title">Баланс выбранного актива</div>
 
-                            <!-- ✅ теперь берём из accountAssetBalance (free/locked/total) -->
                             <div class="row g-2">
                                 <div class="col-4">
                                     <div class="small text-secondary">Free</div>
@@ -534,8 +552,13 @@
                                 </div>
                                 <div class="col-4">
                                     <div class="small text-secondary">Total</div>
+                                    <!-- ✅ total считаем сами: free + locked -->
                                     <div class="fw-bold" id="assetTotalView"
-                                         th:text="${accountAssetBalance != null and accountAssetBalance.total != null ? accountAssetBalance.total : '—'}">—</div>
+                                         th:text="${accountAssetBalance != null
+                                        and accountAssetBalance.free != null
+                                        and accountAssetBalance.locked != null
+                                        ? accountAssetBalance.free.add(accountAssetBalance.locked)
+                                        : '—'}">—</div>
                                 </div>
                             </div>
 
@@ -552,7 +575,6 @@
                             </div>
                         </div>
                     </div>
-                    <!-- ✅ /главный актив -->
 
                     <div class="row g-4">
                         <div class="col-lg-5">
@@ -574,7 +596,7 @@
                                      role="button"
                                      tabindex="0">
                             <span id="symbolLabel"
-                                  th:text="${strategy.symbol != null ? strategy.symbol : 'Выберите торговую пару'}">
+                                  th:text="${strategy != null and strategy.symbol != null ? strategy.symbol : 'Выберите торговую пару'}">
                                 Выберите торговую пару
                             </span>
                                 </div>
@@ -582,7 +604,12 @@
                                 <ul class="dropdown-menu w-100 strategy-dropdown" id="symbolList"></ul>
                             </div>
 
-                            <input type="hidden" id="symbolHidden" th:value="${strategy.symbol}">
+                            <!-- ✅ name нужен для нормального form-like автосейва -->
+                            <input type="hidden"
+                                   id="symbolHidden"
+                                   name="symbol"
+                                   th:value="${strategy != null ? strategy.symbol : ''}"/>
+
                             <div class="form-text">Пара, по которой стратегия работает.</div>
 
                             <div class="alert alert-info small mt-3 mb-0">
@@ -600,13 +627,19 @@
                                     <label class="form-label" id="tradeTimeframeLabel">Таймфрейм</label>
 
                                     <div class="form-control d-none" id="tradeTimeframeReadonly"
+                                         data-lock-mode="AI"
                                          style="cursor:not-allowed; opacity:.85;">—</div>
 
-                                    <select class="form-select" id="tradeTimeframeSelect">
+                                    <!-- ✅ name + lock в AI -->
+                                    <select class="form-select"
+                                            id="tradeTimeframeSelect"
+                                            name="timeframe"
+                                            data-lock-mode="AI"
+                                            data-lock-type="disabled">
                                         <option th:each="tf : ${availableTimeframes}"
                                                 th:value="${tf}"
                                                 th:text="${tf}"
-                                                th:selected="${tf == strategy.timeframe}">
+                                                th:selected="${strategy != null and tf == strategy.timeframe}">
                                         </option>
                                     </select>
 
@@ -622,10 +655,13 @@
                                     <input type="number"
                                            class="form-control"
                                            id="tradeCachedCandlesLimit"
+                                           name="cachedCandlesLimit"
                                            min="50"
                                            step="50"
-                                           th:value="${strategy.cachedCandlesLimit}"
-                                           placeholder="Например: 500">
+                                           th:value="${strategy != null ? strategy.cachedCandlesLimit : ''}"
+                                           placeholder="Например: 500"
+                                           data-lock-mode="AI"
+                                           data-lock-type="readonly">
                                     <div class="form-text">Сколько последних свечей загружать.</div>
                                 </div>
                             </div>
@@ -679,8 +715,9 @@
             </div>
         </div>
 
+
         <!-- ===================================================== -->
-        <!-- TAB: RISK (ONE CONTROL: ALL / FIX / PCT) -->
+        <!-- TAB: RISK -->
         <!-- ===================================================== -->
         <div class="tab-pane" id="tab-risk">
             <div class="card card-theme p-4">
@@ -709,13 +746,12 @@
                       onsubmit="return false;"
                       novalidate>
 
-                    <!-- важно для сервера -->
+                    <!-- ✅ чтобы автосейв мог постить как обычную форму -->
+                    <input type="hidden" name="saveScope" value="risk"/>
+                    <input type="hidden" name="tab" value="risk"/>
                     <input type="hidden" name="exchange" th:value="${selectedExchange}"/>
                     <input type="hidden" name="network"  th:value="${selectedNetwork != null ? selectedNetwork.name() : 'TESTNET'}"/>
 
-                    <!-- ===================================================== -->
-                    <!-- INFO: exchange balance -->
-                    <!-- ===================================================== -->
                     <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-2">
                         <div class="section-title mb-0">Контроль суммы входа</div>
 
@@ -732,17 +768,17 @@
 
                     <div class="row g-3 align-items-end">
 
-                        <!-- MODE -->
                         <div class="col-md-4">
                             <label class="form-label" for="riskModeSelect">Режим</label>
 
-                            <!-- ✅ ДОБАВИЛИ name="capitalMode" -->
                             <select class="form-select"
                                     id="riskModeSelect"
                                     name="capitalMode"
                                     data-confirm="true"
                                     data-confirm-title="Подтверждение"
-                                    data-confirm-text="Изменение лимита входа влияет на объём ордеров. Сохранить?">
+                                    data-confirm-text="Изменение лимита входа влияет на объём ордеров. Сохранить?"
+                                    data-lock-mode="AI"
+                                    data-lock-type="disabled">
                                 <option value="ALL">Весь доступный баланс</option>
                                 <option value="FIX">Фиксированная сумма</option>
                                 <option value="PCT">Процент от доступного баланса</option>
@@ -753,12 +789,10 @@
                             </div>
                         </div>
 
-                        <!-- VALUE -->
                         <div class="col-md-4">
                             <label class="form-label" id="riskValueLabel" for="riskValueInput">Значение</label>
 
                             <div class="input-group" id="riskValueGroup">
-                                <!-- ✅ ДОБАВИЛИ name="capitalValue" -->
                                 <input type="number"
                                        class="form-control"
                                        id="riskValueInput"
@@ -768,7 +802,9 @@
                                        placeholder="Напр. 40"
                                        data-confirm="true"
                                        data-confirm-title="Подтверждение"
-                                       data-confirm-text="Изменение лимита входа влияет на объём ордеров. Сохранить?"/>
+                                       data-confirm-text="Изменение лимита входа влияет на объём ордеров. Сохранить?"
+                                       data-lock-mode="AI"
+                                       data-lock-type="readonly"/>
 
                                 <span class="input-group-text" id="riskValueUnit">USDT</span>
                             </div>
@@ -786,7 +822,6 @@
                             </div>
                         </div>
 
-                        <!-- PREVIEW -->
                         <div class="col-md-4">
                             <div class="alert alert-info small mb-0" id="riskPreviewBox">
                                 <div class="fw-bold mb-1">Превью</div>
@@ -803,20 +838,17 @@
                         </div>
                     </div>
 
-                    <!-- init from server (для JS) -->
                     <input type="hidden" id="riskInitMode"
                            th:value="${strategy != null && strategy.capitalMode != null ? strategy.capitalMode : 'ALL'}"/>
                     <input type="hidden" id="riskInitValue"
                            th:value="${strategy != null && strategy.capitalValue != null ? strategy.capitalValue : ''}"/>
 
-                    <!-- data для JS (баланс с биржи) -->
                     <input type="hidden" id="riskFreeBalanceValue" th:value="${availableBalance != null ? availableBalance : ''}"/>
                     <input type="hidden" id="riskSelectedAsset" th:value="${selectedAsset != null ? selectedAsset : 'USDT'}"/>
 
                 </form>
             </div>
         </div>
-
 
         <!-- ===================================================== -->
         <!-- TAB: ADVANCED -->
@@ -900,29 +932,75 @@
 
     </div><!-- /tab-content -->
 
+
     <!-- ===================================================== -->
-    <!-- CONFIRM MODAL -->
+    <!-- CONFIRM MODAL (✅ реальная Bootstrap-модалка, без заглушек) -->
     <!-- ===================================================== -->
-    <div class="modal fade" id="generalConfirmModal" tabindex="-1" aria-hidden="true" aria-labelledby="generalConfirmTitle">
+    <div class="modal fade"
+         id="confirmModal"
+         tabindex="-1"
+         aria-hidden="true"
+         aria-labelledby="confirmModalTitle">
+
         <div class="modal-dialog modal-dialog-centered">
             <div class="modal-content card-theme">
+
                 <div class="modal-header">
-                    <h5 class="modal-title" id="generalConfirmTitle">Подтверждение</h5>
+                    <h5 class="modal-title" id="confirmModalTitle">Подтверждение</h5>
                     <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Закрыть"></button>
                 </div>
+
                 <div class="modal-body">
-                    <div id="generalConfirmText">Сохранить изменения?</div>rsi_strategy_settings
+                    <div id="confirmModalBody">Сохранить изменения?</div>
                 </div>
+
                 <div class="modal-footer">
-                    <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal" id="generalConfirmCancel">
+                    <button type="button"
+                            class="btn btn-outline-secondary"
+                            data-bs-dismiss="modal"
+                            id="confirmModalCancel">
                         Отмена
                     </button>
-                    <button type="button" class="btn btn-primary" id="generalConfirmOk">
+
+                    <button type="button"
+                            class="btn btn-primary"
+                            id="confirmModalOk">
                         Сохранить
                     </button>
                 </div>
+
             </div>
         </div>
     </div>
+
+
+    <!-- ===================================================== -->
+    <!-- tiny helper for keysExchange/keysNetwork sync -->
+    <!-- ===================================================== -->
+    <script>
+        (function () {
+            function byId(id){ return document.getElementById(id); }
+
+            function syncKeysCtx() {
+                const exSel = byId("exchangeSelect");
+                const netSel = byId("networkSelect");
+                const kEx = byId("keysExchange");
+                const kNet = byId("keysNetwork");
+                if (!exSel || !netSel || !kEx || !kNet) return;
+                kEx.value = String(exSel.value || "BINANCE").toUpperCase();
+                kNet.value = String(netSel.value || "TESTNET").toUpperCase();
+            }
+
+            document.addEventListener("change", (e) => {
+                const t = e.target;
+                if (!t) return;
+                if (t.id === "exchangeSelect" || t.id === "networkSelect") {
+                    syncKeysCtx();
+                }
+            }, true);
+
+            syncKeysCtx();
+        })();
+    </script>
 
 </div>

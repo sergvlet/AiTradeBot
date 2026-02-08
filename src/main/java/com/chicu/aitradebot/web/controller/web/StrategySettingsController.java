@@ -16,7 +16,6 @@ import com.chicu.aitradebot.exchange.service.ExchangeSettingsService;
 import com.chicu.aitradebot.market.model.SymbolDescriptor;
 import com.chicu.aitradebot.market.service.MarketSymbolService;
 import com.chicu.aitradebot.orchestrator.AiStrategyOrchestrator;
-import com.chicu.aitradebot.orchestrator.dto.StrategyRunInfo;
 import com.chicu.aitradebot.service.StrategySettingsService;
 import com.chicu.aitradebot.strategy.core.cache.StrategySettingsCache;
 import com.chicu.aitradebot.web.advanced.AdvancedRenderContext;
@@ -85,29 +84,36 @@ public class StrategySettingsController {
         StrategyType strategyType = parseStrategyType(typeRaw);
 
         StrategySettings strategy = strategySettingsService.getOrCreate(chatId, strategyType);
+
+        // ✅ контекст для экрана — из query, иначе из БД
         String exchange = resolveExchange(exchangeParam, strategy);
         NetworkType network = resolveNetwork(networkParam, strategy);
 
-        patchContext(strategy, exchange, network);
-        syncRunPhaseWithContext(strategy);
-        strategySettingsService.save(strategy);
-
-        // runtime status (active)
-        try {
-            StrategyRunInfo runtime = orchestrator.getStatus(chatId, strategyType, exchange, network);
-            if (runtime != null) strategy.setActive(runtime.isActive());
-        } catch (Exception e) {
-            log.warn("⚠ Ошибка при получении статуса стратегии: {}", e.getMessage());
+        // ✅ сохраняем только если реально поменялось (а не “на каждый GET”)
+        boolean ctxChanged = patchContextIfChanged(strategy, exchange, network);
+        boolean phaseChanged = syncRunPhaseWithContextChanged(strategy);
+        if (ctxChanged || phaseChanged) {
+            try {
+                strategySettingsService.save(strategy);
+            } catch (Exception e) {
+                log.warn("⚠ Не удалось сохранить контекст стратегии: {}", e.getMessage());
+            }
         }
+
+        // ✅ runtime status: строго в этом контексте (иначе UI путается)
+        boolean runtimeActiveInCtx = orchestrator.isRunning(chatId, strategyType, exchange, network);
+        boolean runtimeActiveAny   = orchestrator.isRunning(chatId, strategyType);
+
+        model.addAttribute("runtimeActive", runtimeActiveInCtx);
+        model.addAttribute("runtimeActiveAny", runtimeActiveAny);
+        model.addAttribute("runtimeBinding", orchestrator.getBinding(chatId, strategyType).orElse(null));
 
         // selected asset из настроек
         String selectedAsset = normalizeAsset(strategy.getAccountAsset());
 
-        // ✅ СТАРАЯ ВЕРСИЯ: getSnapshot может быть только (chatId,type,exchange,network)
-        // ✅ НОВАЯ ВЕРСИЯ: если есть перегрузка с selectedAsset — используем её через reflection
         AccountBalanceSnapshot balance = fetchSnapshotCompat(chatId, strategyType, exchange, network, selectedAsset);
 
-        // если в БД пусто — берём из snapshot и фиксируем
+        // если в БД пусто — берём из snapshot и фиксируем (ОК: разовая “починка” данных)
         if (selectedAsset == null && balance != null) {
             selectedAsset = normalizeAsset(balance.getSelectedAsset());
             if (selectedAsset != null) {
@@ -116,7 +122,6 @@ public class StrategySettingsController {
             }
         }
 
-        // если актив известен — попросим snapshot “переключить” selectedBalance (если умеет)
         ensureSelectedBalanceCompat(balance, selectedAsset);
 
         // KEYS + DIAG
@@ -214,11 +219,11 @@ public class StrategySettingsController {
     }
 
     // =====================================================
-    // ✅ UI STATE (JSON) — для автообновления вкладок без F5
+    // ✅ UI STATE (JSON)
     // =====================================================
     @GetMapping(value = "/{type}/config/state", produces = "application/json")
     @ResponseBody
-    @Transactional
+    @Transactional // ⚠ не readOnly: getOrCreate может создавать запись
     public ResponseEntity<StrategyUiState> getUiState(
             @PathVariable("type") String typeRaw,
             @RequestParam("chatId") long chatId,
@@ -228,20 +233,26 @@ public class StrategySettingsController {
     ) {
         StrategyType strategyType = parseStrategyType(typeRaw);
 
-        StrategySettings s = strategySettingsService.getOrCreate(chatId, strategyType);
+        StrategySettings s;
+        try {
+            s = strategySettingsService.getSettings(chatId, strategyType);
+        } catch (Exception ignored) {
+            s = null;
+        }
+        if (s == null) {
+            s = strategySettingsService.getOrCreate(chatId, strategyType);
+        }
+
+        // ✅ контекст для ответа — из query, иначе из БД (без сохранения!)
         String ex = resolveExchange(exchangeParam, s);
         NetworkType net = resolveNetwork(networkParam, s);
 
-        patchContext(s, ex, net);
-        syncRunPhaseWithContext(s);
-        strategySettingsService.save(s);
-
-        StrategyUiState state = buildUiState(chatId, strategyType, s, diagnostics);
+        StrategyUiState state = buildUiState(chatId, strategyType, s, ex, net, diagnostics);
         return ResponseEntity.ok(state);
     }
 
     // =====================================================
-    // POST — СОХРАНЕНИЕ (AJAX/FETCH) ✅ возвращаем JSON state
+    // POST — СОХРАНЕНИЕ (AJAX/FETCH)
     // =====================================================
     @PostMapping(value = "/{type}/config", headers = "X-Requested-With=fetch", produces = "application/json")
     @ResponseBody
@@ -279,16 +290,20 @@ public class StrategySettingsController {
         CtxSnap after = snap(s);
 
         settingsCache.invalidate(chatId, strategyType);
+
+        // ✅ 1) рестарт при смене контекста (ex/net/sym/tf)
         scheduleRestartAfterCommitIfNeeded(chatId, strategyType, saveScope, before, after);
+        // ✅ 2) иначе — обновить runtime фазу/режим без рестарта
+        scheduleRefreshRuntimeAfterCommitIfNeeded(chatId, strategyType, before, after, exchange, network);
 
         boolean includeDiagnostics = "network".equalsIgnoreCase(saveScope) || "keys".equalsIgnoreCase(saveScope);
-        StrategyUiState state = buildUiState(chatId, strategyType, s, includeDiagnostics);
+        StrategyUiState state = buildUiState(chatId, strategyType, s, exchange, network, includeDiagnostics);
 
         return ResponseEntity.ok(state);
     }
 
     // =====================================================
-    // POST — СОХРАНЕНИЕ (обычная форма) ✅ С РЕДИРЕКТОМ
+    // POST — СОХРАНЕНИЕ (обычная форма)
     // =====================================================
     @PostMapping("/{type}/config")
     @Transactional
@@ -325,14 +340,18 @@ public class StrategySettingsController {
         CtxSnap after = snap(s);
 
         settingsCache.invalidate(chatId, strategyType);
+
+        // ✅ 1) рестарт при смене контекста (ex/net/sym/tf)
         scheduleRestartAfterCommitIfNeeded(chatId, strategyType, saveScope, before, after);
+        // ✅ 2) иначе — обновить runtime фазу/режим без рестарта
+        scheduleRefreshRuntimeAfterCommitIfNeeded(chatId, strategyType, before, after, exchange, network);
 
         String tab = params.getOrDefault("tab", "network");
         return buildRedirect(strategyType, chatId, exchange, network, tab);
     }
 
     // =========================================================
-    // POST /apply — тюнинг (UI)
+    // POST /apply — тюнинг (UI) ✅ AFTER COMMIT
     // =========================================================
     @PostMapping("/apply")
     @ResponseBody
@@ -363,6 +382,7 @@ public class StrategySettingsController {
             return ResponseEntity.ok(
                     ApplyResponse.builder()
                             .ok(true)
+                            .accepted(false)
                             .mode(mode)
                             .applied(false)
                             .reason("MANUAL: apply не требуется")
@@ -370,43 +390,101 @@ public class StrategySettingsController {
             );
         }
 
+        final long chatId = req.getChatId();
+        final StrategyType type = req.getType();
+        final String exchange = ex;
+        final NetworkType network = net;
+
+        final String reason = (req.getReason() == null || req.getReason().isBlank())
+                ? "ui_apply"
+                : req.getReason().trim();
+
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    runApplyTuneAndMaybeRestart(chatId, type, exchange, network, reason);
+                }
+            });
+        } else {
+            runApplyTuneAndMaybeRestart(chatId, type, exchange, network, reason);
+        }
+
+        return ResponseEntity.ok(
+                ApplyResponse.builder()
+                        .ok(true)
+                        .accepted(true)
+                        .mode(mode)
+                        .applied(false)
+                        .reason("Apply принят: тюнинг запущен после сохранения (afterCommit)")
+                        .build()
+        );
+    }
+
+    private void runApplyTuneAndMaybeRestart(long chatId,
+                                             StrategyType type,
+                                             String exchange,
+                                             NetworkType network,
+                                             String reason) {
         try {
+            StrategySettings s = strategySettingsService.getOrCreate(chatId, type);
+
+            patchContext(s, exchange, network);
+            syncRunPhaseWithContext(s);
+            try { strategySettingsService.save(s); } catch (Exception ignored) {}
+
+            // ✅ обновим runtime фазу сразу (без рестарта) — важно для AI/COLLECT блокировки
+            try { orchestrator.refreshRuntimePhase(chatId, type, exchange, network); } catch (Exception ignored) {}
+
+            String symbol = normalizeSymbol(s.getSymbol());
+            String timeframe = normalizeTimeframe(s.getTimeframe());
+            Integer limit = s.getCachedCandlesLimit();
+
+            if (symbol == null || timeframe == null || limit == null || limit <= 0) {
+                log.warn("🧠 apply skipped: bad settings chatId={} type={} ex={} net={} sym={} tf={} limit={}",
+                        chatId, type, exchange, network, symbol, timeframe, limit);
+                return;
+            }
+
             TuningRequest tr = TuningRequest.builder()
-                    .chatId(req.getChatId())
-                    .strategyType(req.getType())
-                    .exchange(ex)
-                    .network(net)
-                    .symbol(s.getSymbol())
-                    .timeframe(s.getTimeframe())
-                    .candlesLimit(s.getCachedCandlesLimit())
-                    .reason((req.getReason() == null || req.getReason().isBlank()) ? "ui_control_mode_change" : req.getReason())
+                    .chatId(chatId)
+                    .strategyType(type)
+                    .exchange(exchange)
+                    .network(network)
+                    .symbol(symbol)
+                    .timeframe(timeframe)
+                    .candlesLimit(limit)
+                    .reason(reason)
                     .build();
 
             TuningResult result = autoTuner.tune(tr);
 
             boolean applied = result != null && result.applied();
-            String reason = (result != null) ? result.reason() : "null";
+            String resReason = (result != null) ? result.reason() : "null";
 
-            return ResponseEntity.ok(
-                    ApplyResponse.builder()
-                            .ok(true)
-                            .mode(mode)
-                            .applied(applied)
-                            .reason(reason)
-                            .build()
-            );
+            if (applied) {
+                settingsCache.invalidate(chatId, type);
+
+                // ✅ РЕСТАРТ ТОЛЬКО ЕСЛИ РАНТАЙМ ЗАПУЩЕН В ЭТОМ ЖЕ КОНТЕКСТЕ
+                if (orchestrator.isRunning(chatId, type, exchange, network)) {
+                    try {
+                        orchestrator.restartStrategyAtomic(chatId, type, exchange, network, "ui_apply:tune_applied");
+                    } catch (Exception e) {
+                        log.warn("⚠ restart after apply failed chatId={} type={} ex={} net={}: {}",
+                                chatId, type, exchange, network, e.getMessage());
+                    }
+                }
+
+                log.info("🧠 apply tune DONE chatId={} type={} ex={} net={} applied=true reason={}",
+                        chatId, type, exchange, network, safe(resReason));
+            } else {
+                log.info("🧠 apply tune DONE chatId={} type={} ex={} net={} applied=false reason={}",
+                        chatId, type, exchange, network, safe(resReason));
+            }
+
         } catch (Exception e) {
-            log.error("apply failed chatId={} type={} ex={} net={}: {}",
-                    req.getChatId(), req.getType(), ex, net, e.getMessage(), e);
-
-            return ResponseEntity.ok(
-                    ApplyResponse.builder()
-                            .ok(false)
-                            .mode(mode)
-                            .applied(false)
-                            .reason("apply failed: " + e.getMessage())
-                            .build()
-            );
+            log.error("🧠 apply tune FAILED chatId={} type={} ex={} net={}: {}",
+                    chatId, type, exchange, network, e.getMessage(), e);
         }
     }
 
@@ -430,6 +508,7 @@ public class StrategySettingsController {
     @lombok.Builder
     public static class ApplyResponse {
         private boolean ok;
+        private boolean accepted;
         private AdvancedControlMode mode;
         private boolean applied;
         private String reason;
@@ -553,7 +632,7 @@ public class StrategySettingsController {
     }
 
     // =====================================================
-    // MODE DEFAULTS
+    // MODE DEFAULTS ✅ FIXED (AI -> COLLECT)
     // =====================================================
     private void applyModeDefaults(StrategySettings s, AdvancedControlMode mode, NetworkType net) {
         if (s == null || mode == null) return;
@@ -564,10 +643,15 @@ public class StrategySettingsController {
                 s.setMlGateEnabled(false);
                 s.setRunPhase(PHASE_LIVE);
             }
-            case HYBRID, AI -> {
+            case HYBRID -> {
                 s.setAutoTuneEnabled(true);
                 s.setMlGateEnabled(true);
                 s.setRunPhase(net == NetworkType.TESTNET ? PHASE_PAPER : PHASE_LIVE);
+            }
+            case AI -> {
+                s.setAutoTuneEnabled(true);
+                s.setMlGateEnabled(true);
+                s.setRunPhase(PHASE_COLLECT);
             }
             default -> s.setRunPhase(PHASE_LIVE);
         }
@@ -595,15 +679,65 @@ public class StrategySettingsController {
         s.setNetworkType(net);
     }
 
+    /**
+     * ✅ PATCH, но только если реально есть изменения (чтобы GET не “писал” БД без причины)
+     */
+    private boolean patchContextIfChanged(StrategySettings s, String exchange, NetworkType network) {
+        if (s == null) return false;
+
+        String ex = (exchange == null || exchange.isBlank()) ? null : normalizeExchange(exchange);
+        if (ex == null) ex = normalizeExchange(s.getExchangeName()); // fallback на текущее
+
+        NetworkType net = (network != null) ? network : s.getNetworkType();
+
+        boolean changed = false;
+
+        String curEx = normalizeExchange(s.getExchangeName());
+        if (ex != null && !eq(curEx, ex)) {
+            s.setExchangeName(ex);
+            changed = true;
+        }
+
+        if (net != null && s.getNetworkType() != net) {
+            s.setNetworkType(net);
+            changed = true;
+        }
+
+        return changed;
+    }
+
+    private boolean syncRunPhaseWithContextChanged(StrategySettings s) {
+        if (s == null) return false;
+        String before = (s.getRunPhase() == null) ? null : s.getRunPhase();
+        syncRunPhaseWithContext(s);
+        String after = (s.getRunPhase() == null) ? null : s.getRunPhase();
+        if (before == null && after == null) return false;
+        if (before == null || after == null) return true;
+        return !before.equalsIgnoreCase(after);
+    }
+
+    /**
+     * ✅ ВАЖНО:
+     * - если runPhase = COLLECT/BACKTEST → не трогаем
+     * - если mode = AI → держим COLLECT (AI цикл начинается оттуда)
+     * - иначе: MANUAL -> LIVE, HYBRID -> PAPER/LIVE по net
+     */
     private void syncRunPhaseWithContext(StrategySettings s) {
         if (s == null) return;
 
         String rp = (s.getRunPhase() == null) ? "" : s.getRunPhase().trim().toUpperCase(Locale.ROOT);
 
-        if (PHASE_BACKTEST.equals(rp) || PHASE_COLLECT.equals(rp)) return;
+        if (PHASE_BACKTEST.equals(rp) || PHASE_COLLECT.equals(rp)) {
+            return;
+        }
 
         AdvancedControlMode mode = s.getAdvancedControlMode();
         if (mode == null) mode = AdvancedControlMode.MANUAL;
+
+        if (mode == AdvancedControlMode.AI) {
+            s.setRunPhase(PHASE_COLLECT);
+            return;
+        }
 
         NetworkType net = (s.getNetworkType() != null) ? s.getNetworkType() : NetworkType.TESTNET;
 
@@ -617,14 +751,15 @@ public class StrategySettingsController {
     }
 
     // =====================================================
-    // UI STATE builder (совместимость со старой версией баланса)
+    // UI STATE builder
     // =====================================================
-    private StrategyUiState buildUiState(long chatId, StrategyType type, StrategySettings s, boolean diagnostics) {
+    private StrategyUiState buildUiState(long chatId, StrategyType type, StrategySettings s, String ex, NetworkType net, boolean diagnostics) {
 
-        String ex = normalizeExchange(s.getExchangeName());
-        NetworkType net = (s.getNetworkType() != null) ? s.getNetworkType() : NetworkType.TESTNET;
+        ex = normalizeExchange(ex);
+        net = (net != null) ? net : (s.getNetworkType() != null ? s.getNetworkType() : NetworkType.TESTNET);
 
-        boolean active = orchestrator.isRunning(chatId, type);
+        // ✅ активность строго по контексту
+        boolean active = orchestrator.isRunning(chatId, type, ex, net);
 
         String selectedAsset = normalizeAsset(s.getAccountAsset());
 
@@ -637,13 +772,9 @@ public class StrategySettingsController {
 
         Boolean hasKeys = (es != null) ? es.hasBaseKeys() : null;
 
-        // если в БД пусто — можно добрать из snapshot и сохранить
+        // ✅ НЕ сохраняем тут ничего в БД (state — read-only)
         if (selectedAsset == null && snap != null) {
             selectedAsset = normalizeAsset(snap.getSelectedAsset());
-            if (selectedAsset != null) {
-                s.setAccountAsset(selectedAsset);
-                try { strategySettingsService.save(s); } catch (Exception ignored) {}
-            }
         }
 
         ensureSelectedBalanceCompat(snap, selectedAsset);
@@ -656,7 +787,6 @@ public class StrategySettingsController {
             if (ab == null) ab = snap.getSelectedBalance();
 
             if (ab != null) {
-                // ✅ СТАРАЯ ВЕРСИЯ: у AssetBalance может не быть getAsset()
                 String asset = normalizeAsset(selectedAsset != null ? selectedAsset : snap.getSelectedAsset());
                 balance = new StrategyUiState.AssetBalance(
                         asset,
@@ -693,7 +823,7 @@ public class StrategySettingsController {
                 s.getRunPhase(),
                 s.isAutoTuneEnabled(),
                 s.isMlGateEnabled(),
-                normalizeAsset(s.getAccountAsset()),
+                normalizeAsset(selectedAsset),
                 normalizeSymbol(s.getSymbol()),
                 normalizeTimeframe(s.getTimeframe()),
                 s.getCachedCandlesLimit(),
@@ -733,7 +863,7 @@ public class StrategySettingsController {
     }
 
     // =====================================================
-    // AUTO-RESTART after commit
+    // AUTO-RESTART / REFRESH after commit
     // =====================================================
     private void scheduleRestartAfterCommitIfNeeded(long chatId,
                                                     StrategyType type,
@@ -768,6 +898,45 @@ public class StrategySettingsController {
         } catch (Exception e) {
             log.warn("⚠ restartStrategyAtomic failed chatId={} type={} ex={} net={} : {}",
                     chatId, type, ex, net, e.getMessage());
+        }
+    }
+
+    /**
+     * ✅ Если контекст НЕ менялся, но менялись режим/фаза — нужно обновить runtime cache оркестратора.
+     * Это закрывает кейс: MANUAL/HYBRID/AI переключили, а рестарт не нужен.
+     */
+    private void scheduleRefreshRuntimeAfterCommitIfNeeded(long chatId,
+                                                           StrategyType type,
+                                                           CtxSnap before,
+                                                           CtxSnap after,
+                                                           String exchange,
+                                                           NetworkType network) {
+
+        // если будет рестарт — refresh не обязателен (рестарт сам обновит кэш), но и не вреден
+        if (ctxChanged(before, after)) return;
+        if (!orchestrator.isRunning(chatId, type)) return;
+
+        final String ex = normalizeExchange(exchange);
+        final NetworkType net = (network != null ? network : NetworkType.TESTNET);
+
+        Runnable job = () -> {
+            try {
+                orchestrator.refreshRuntimePhase(chatId, type, ex, net);
+            } catch (Exception e) {
+                log.debug("⚠ refreshRuntimePhase failed chatId={} type={} ex={} net={} : {}",
+                        chatId, type, ex, net, e.getMessage());
+            }
+        };
+
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    job.run();
+                }
+            });
+        } else {
+            job.run();
         }
     }
 
@@ -889,21 +1058,19 @@ public class StrategySettingsController {
     }
 
     // =====================================================
-    // COMPAT: snapshot selectedAsset (старый/новый контракт)
+    // COMPAT: snapshot selectedAsset
     // =====================================================
     private AccountBalanceSnapshot fetchSnapshotCompat(long chatId,
                                                        StrategyType type,
                                                        String exchange,
                                                        NetworkType network,
                                                        String selectedAsset) {
-        // 1) пробуем новую перегрузку: getSnapshot(long, StrategyType, String, NetworkType, String)
         AccountBalanceSnapshot snap = tryInvokeSnapshot(
                 new Class<?>[]{long.class, StrategyType.class, String.class, NetworkType.class, String.class},
                 new Object[]{chatId, type, exchange, network, selectedAsset}
         );
         if (snap != null) return snap;
 
-        // 2) старая версия: getSnapshot(long, StrategyType, String, NetworkType)
         return tryInvokeSnapshot(
                 new Class<?>[]{long.class, StrategyType.class, String.class, NetworkType.class},
                 new Object[]{chatId, type, exchange, network}
@@ -927,12 +1094,11 @@ public class StrategySettingsController {
     private void ensureSelectedBalanceCompat(AccountBalanceSnapshot snap, String selectedAsset) {
         if (snap == null || selectedAsset == null || selectedAsset.isBlank()) return;
 
-        // если есть метод selectAsset(String) — зовём
         try {
             Method m = snap.getClass().getMethod("selectAsset", String.class);
             m.invoke(snap, selectedAsset);
         } catch (Exception ignored) {
-            // старая версия может не уметь “переключать” selectedBalance — тогда ок
+            // ok
         }
     }
 
@@ -1062,13 +1228,19 @@ public class StrategySettingsController {
         return NetworkType.TESTNET;
     }
 
+    private static String safe(String s) {
+        if (s == null) return "";
+        String x = s.trim();
+        return x.length() > 200 ? x.substring(0, 200) : x;
+    }
+
     @SuppressWarnings("unchecked")
     private AccountBalanceSnapshot.AssetBalance findBalance(AccountBalanceSnapshot snap, String asset) {
         if (snap == null || asset == null || asset.isBlank()) return null;
 
         String a = asset.trim().toUpperCase(Locale.ROOT);
 
-        // 1) пробуем достать balancesByAsset через getBalancesByAsset()
+        // 1) пробуем getBalancesByAsset()
         try {
             Method m = snap.getClass().getMethod("getBalancesByAsset");
             Object r = m.invoke(snap);
@@ -1079,7 +1251,7 @@ public class StrategySettingsController {
             }
         } catch (Exception ignored) {}
 
-        // 2) пробуем поле balancesByAsset напрямую
+        // 2) поле balancesByAsset
         try {
             Field f = snap.getClass().getDeclaredField("balancesByAsset");
             f.setAccessible(true);
@@ -1091,7 +1263,7 @@ public class StrategySettingsController {
             }
         } catch (Exception ignored) {}
 
-        // 3) fallback: selectedBalance
+        // 3) selectedBalance
         try {
             return snap.getSelectedBalance();
         } catch (Exception ignored) {

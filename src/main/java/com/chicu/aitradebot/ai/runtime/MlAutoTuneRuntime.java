@@ -28,15 +28,6 @@ import java.util.concurrent.*;
 @RequiredArgsConstructor
 public class MlAutoTuneRuntime {
 
-    /**
-     * ВАЖНО:
-     * - AutoTunerOrchestrator может вернуть "лучшие параметры", но НЕ применить их в БД (applied=false).
-     * - Этот рантайм теперь умеет:
-     *   1) триггерить тюнинг,
-     *   2) пытаться применить патч в БД сам (минимум для WINDOW_SCALPING),
-     *   3) после применения перечитать настройки и залогировать, что реально поменялось.
-     */
-
     private static final String PHASE_COLLECT  = "COLLECT";
     private static final String PHASE_BACKTEST = "BACKTEST";
     private static final String PHASE_PAPER    = "PAPER";
@@ -64,20 +55,13 @@ public class MlAutoTuneRuntime {
     /**
      * Какие фазы надо пропускать (верхний регистр, через запятую).
      * Пример: COLLECT,BACKTEST
-     * По умолчанию пропускаем COLLECT и BACKTEST, а PAPER и LIVE — разрешаем.
      */
     @Value("${ai.autotune.skipPhases:COLLECT,BACKTEST}")
     private String skipPhases;
 
-    /**
-     * Дебаунс по умолчанию для триггеров (если не передали явно).
-     */
     @Value("${ai.autotune.defaultDebounceSeconds:120}")
     private long defaultDebounceSeconds;
 
-    /**
-     * Минимальная пауза дебаунса (защита от 1-2 сек).
-     */
     @Value("${ai.autotune.minDebounceMillis:30000}")
     private long minDebounceMillis;
 
@@ -91,8 +75,12 @@ public class MlAutoTuneRuntime {
     private final Map<String, ScheduledFuture<?>> jobs = new ConcurrentHashMap<>();
     private final Set<String> running = ConcurrentHashMap.newKeySet();
 
-    // ✅ debounce для ручных/авто триггеров
+    // debounce для ручных/авто триггеров
     private final Map<String, Long> lastTriggerAtMs = new ConcurrentHashMap<>();
+
+    // cache для skipPhases
+    private volatile String skipPhasesRawCache = null;
+    private volatile Set<String> skipPhasesCache = Set.of(PHASE_COLLECT, PHASE_BACKTEST);
 
     @PreDestroy
     public void shutdown() {
@@ -116,8 +104,9 @@ public class MlAutoTuneRuntime {
         ResolvedEnv env = resolveEnvSafe(chatId, type, exchange, network);
         if (!env.ok) return;
 
-        // ✅ В MANUAL режиме (и при autoTuneEnabled=false) никакой тюнинг/планировщики не запускаем
         StrategySettings ss = strategySettingsService.getOrCreate(chatId, type);
+
+        // ✅ В MANUAL (и при autoTuneEnabled=false) не запускаем тюнинг/планировщики
         if (!isTuningAllowed(ss)) {
             String k = key(chatId, type, env.exchange, env.network);
             ScheduledFuture<?> f = jobs.remove(k);
@@ -172,7 +161,7 @@ public class MlAutoTuneRuntime {
     }
 
     // =====================================================
-    // HOLD-хуки
+    // HOLD hooks
     // =====================================================
 
     public void onHold(Long chatId,
@@ -261,6 +250,7 @@ public class MlAutoTuneRuntime {
         AdvancedControlMode m = (ss.getAdvancedControlMode() != null ? ss.getAdvancedControlMode() : AdvancedControlMode.MANUAL);
         return m != AdvancedControlMode.MANUAL;
     }
+
     private void safeTune(Long chatId, StrategyType type, String exchange, NetworkType network, String reason) {
         if (chatId == null || type == null) return;
 
@@ -268,7 +258,6 @@ public class MlAutoTuneRuntime {
         if (!env.ok) return;
 
         String k = key(chatId, type, env.exchange, env.network);
-
         if (!running.add(k)) return;
 
         try {
@@ -278,7 +267,7 @@ public class MlAutoTuneRuntime {
                 return;
             }
 
-            // 2) Берём настройки (строго по env)
+            // 2) Берём настройки
             StrategySettings ss = strategySettingsService.getOrCreate(chatId, type);
             if (ss == null) return;
 
@@ -289,14 +278,14 @@ public class MlAutoTuneRuntime {
                 return;
             }
 
-            // 3) Фазы, которые нужно пропустить (конфигом)
+            // 3) Пропуск фаз (конфигом)
             String phase = normalizeUpperNullable(ss.getRunPhase());
             if (phase != null && parsedSkipPhases().contains(phase)) {
                 log.debug("🧠 ML skip tune (phase={}) chatId={} type={} ex={} net={}", phase, chatId, type, env.exchange, env.network);
                 return;
             }
 
-            // 4) Минимальные параметры для тюнинга
+            // 4) Минимальные параметры
             String symbol = safeUpperNullable(ss.getSymbol());
             String timeframe = safeLowerNullable(ss.getTimeframe());
             Integer candlesLimit = ss.getCachedCandlesLimit();
@@ -367,7 +356,7 @@ public class MlAutoTuneRuntime {
             if (type == StrategyType.WINDOW_SCALPING) {
 
                 // 1) Иногда AutoTuner возвращает прям объект настроек
-                Object maybeCfg = readAny(result,
+                Object maybeCfg = readAnyNonNull(result,
                         "windowSettings", "getWindowSettings",
                         "bestWindowSettings", "getBestWindowSettings",
                         "bestSettings", "getBestSettings",
@@ -382,12 +371,13 @@ public class MlAutoTuneRuntime {
                 }
 
                 // 2) Или Map с параметрами
-                Object maybeMap = readAny(result,
+                Object maybeMap = readAnyNonNull(result,
                         "params", "getParams",
                         "bestParams", "getBestParams",
                         "patch", "getPatch",
                         "settingsPatch", "getSettingsPatch",
-                        "appliedPatch", "getAppliedPatch"
+                        "appliedPatch", "getAppliedPatch",
+                        "newParams", "getNewParams"
                 );
 
                 if (maybeMap instanceof Map<?, ?> raw) {
@@ -399,8 +389,6 @@ public class MlAutoTuneRuntime {
                         windowSettingsService.update(chatId, patch);
                         return true;
                     }
-
-
                 }
             }
 
@@ -528,19 +516,30 @@ public class MlAutoTuneRuntime {
     }
 
     private Set<String> parsedSkipPhases() {
-        try {
-            String s = skipPhases == null ? "" : skipPhases.trim();
-            if (s.isEmpty()) return Set.of();
-
-            Set<String> out = new HashSet<>();
-            for (String p : s.split(",")) {
-                String v = p.trim();
-                if (!v.isEmpty()) out.add(v.toUpperCase(Locale.ROOT));
-            }
-            return out;
-        } catch (Exception ignore) {
-            return Set.of(PHASE_COLLECT, PHASE_BACKTEST);
+        String raw = (skipPhases == null ? "" : skipPhases.trim());
+        if (raw.equals(skipPhasesRawCache) && skipPhasesCache != null) {
+            return skipPhasesCache;
         }
+
+        Set<String> parsed;
+        try {
+            if (raw.isEmpty()) {
+                parsed = Set.of();
+            } else {
+                Set<String> out = new HashSet<>();
+                for (String p : raw.split(",")) {
+                    String v = p.trim();
+                    if (!v.isEmpty()) out.add(v.toUpperCase(Locale.ROOT));
+                }
+                parsed = Collections.unmodifiableSet(out);
+            }
+        } catch (Exception ignore) {
+            parsed = Set.of(PHASE_COLLECT, PHASE_BACKTEST);
+        }
+
+        skipPhasesRawCache = raw;
+        skipPhasesCache = parsed;
+        return parsed;
     }
 
     private static String normalizeUpperNullable(String s) {
@@ -581,26 +580,50 @@ public class MlAutoTuneRuntime {
     // REFLECTION HELPERS (result)
     // =====================================================
 
-    private static Object readAny(Object obj, String... gettersOrFields) {
+    /**
+     * ✅ ВАЖНО: ищем ПЕРВОЕ НЕ-null значение среди методов/полей.
+     * Раньше можно было "попасть" в существующий getter, который вернул null, и не попробовать остальные варианты.
+     */
+    private static Object readAnyNonNull(Object obj, String... gettersOrFields) {
         if (obj == null) return null;
-        try {
-            Class<?> c = obj.getClass();
-            for (String n : gettersOrFields) {
-                Method m = findNoArgMethod(c, n);
-                if (m != null) return m.invoke(obj);
 
-                try {
-                    var f = c.getDeclaredField(n);
-                    f.setAccessible(true);
-                    return f.get(obj);
-                } catch (Exception ignored) {}
+        Class<?> c = obj.getClass();
+
+        for (String n : gettersOrFields) {
+            if (n == null || n.isBlank()) continue;
+
+            // method (no-arg)
+            try {
+                Method m = findNoArgMethod(c, n);
+                if (m != null) {
+                    Object v = m.invoke(obj);
+                    if (v != null) return v;
+                }
+            } catch (Exception ignore) {
+                // ignore
             }
-        } catch (Exception ignored) {}
+
+            // field
+            try {
+                var f = c.getDeclaredField(n);
+                f.setAccessible(true);
+                Object v = f.get(obj);
+                if (v != null) return v;
+            } catch (Exception ignore) {
+                // ignore
+            }
+        }
+
         return null;
     }
 
+    private static Object readAny(Object obj, String... gettersOrFields) {
+        // оставим для обратной совместимости, но используем в коде readAnyNonNull
+        return readAnyNonNull(obj, gettersOrFields);
+    }
+
     private static boolean readBool(Object obj, String... names) {
-        Object v = readAny(obj, names);
+        Object v = readAnyNonNull(obj, names);
         if (v == null) return false;
         if (v instanceof Boolean b) return b;
         String s = String.valueOf(v).trim().toLowerCase(Locale.ROOT);
@@ -608,7 +631,7 @@ public class MlAutoTuneRuntime {
     }
 
     private static String readString(Object obj, String... names) {
-        Object v = readAny(obj, names);
+        Object v = readAnyNonNull(obj, names);
         if (v == null) return null;
         String s = String.valueOf(v);
         return s.isBlank() ? null : s.trim();

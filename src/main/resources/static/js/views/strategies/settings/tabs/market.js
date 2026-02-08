@@ -3,10 +3,11 @@
 /**
  * Trade tab (market.js)
  *
- * ✅ ВАЖНО:
- * - после saveScope=trade мы ЯВНО публикуем strategy:state (Store + DOM event)
- * - при смене актива кидаем strategy:accountAssetChanged (Risk ловит и обновляет баланс/preview без F5)
- * - ctxQuery() содержит _ts чтобы не получать кэшированный state
+ * ✅ FIXES:
+ * - init() не "умирает" если вызвали слишком рано (started=true только после checks)
+ * - publishState() публикует только валидный UiState (не {ok:true})
+ * - advancedControlMode берётся из state (если control tab не был открыт)
+ * - initialSymbol не берётся из текстового placeholder
  */
 window.SettingsTabTrade = (function () {
 
@@ -22,6 +23,11 @@ window.SettingsTabTrade = (function () {
 
     function normalizeTf(s) {
         return isBlank(s) ? "" : String(s).trim();
+    }
+
+    function looksLikeUiState(obj) {
+        return !!(obj && typeof obj === "object"
+            && ("chatId" in obj) && ("type" in obj) && ("exchange" in obj) && ("network" in obj));
     }
 
     // ✅ гарантируем StrategySettingsContext из data-* корня страницы
@@ -47,7 +53,7 @@ window.SettingsTabTrade = (function () {
 
     // ✅ publish helpers (чтобы Risk/General гарантированно получали state)
     function publishState(state) {
-        if (!state) return;
+        if (!looksLikeUiState(state)) return;
 
         try {
             if (window.StrategySettingsStore && typeof window.StrategySettingsStore.setState === "function") {
@@ -61,9 +67,11 @@ window.SettingsTabTrade = (function () {
     }
 
     function dispatchAccountAssetChanged(asset, source) {
+        const a = normalizeUpper(asset || "");
+        if (!a) return;
         try {
             window.dispatchEvent(new CustomEvent("strategy:accountAssetChanged", {
-                detail: { asset: normalizeUpper(asset || ""), source: source || "trade" }
+                detail: { asset: a, source: source || "trade" }
             }));
         } catch (e) {}
     }
@@ -75,8 +83,7 @@ window.SettingsTabTrade = (function () {
         if (ctx.chatId) q.set("chatId", String(ctx.chatId));
         if (ctx.exchange) q.set("exchange", String(ctx.exchange));
         if (ctx.network) q.set("network", String(ctx.network));
-        // ✅ cache-buster
-        q.set("_ts", String(Date.now()));
+        q.set("_ts", String(Date.now())); // cache-buster
         return q.toString();
     }
 
@@ -127,7 +134,6 @@ window.SettingsTabTrade = (function () {
         const ctx = getCtx();
         if (ctx?.accountAsset) return normalizeUpper(ctx.accountAsset);
 
-        // если пусто — берём первый option
         if (sel && sel.options && sel.options.length > 0) {
             return normalizeUpper(sel.options[0].value);
         }
@@ -184,7 +190,12 @@ window.SettingsTabTrade = (function () {
     }
 
     function applyUiState(state) {
-        if (!state) return;
+        if (!looksLikeUiState(state)) return;
+
+        // ✅ если control tab не открыт — всё равно узнаём режим из state
+        if (state.advancedControlMode) {
+            window.__StrategyControlMode = normalizeUpper(state.advancedControlMode);
+        }
 
         // список активов может поменяться
         if (Array.isArray(state.availableAssets)) {
@@ -213,6 +224,9 @@ window.SettingsTabTrade = (function () {
             setUiValue(byId("assetLockedView"), fmtNum(locked, 8));
             setUiValue(byId("assetTotalView"), fmtNum(total, 8));
         }
+
+        // ✅ после state — актуализируем lock/unlock UI
+        setModeUi();
     }
 
     function setModeUi() {
@@ -376,7 +390,7 @@ window.SettingsTabTrade = (function () {
     // -----------------------------
     async function saveTradeSettings() {
         const ctx = getCtx();
-        if (!ctx?.type) return null;
+        if (!ctx?.type || !ctx?.chatId) return null;
 
         const asset = getAccountAsset();
         const symbol = normalizeUpper(byId("symbolHidden")?.value || "");
@@ -396,7 +410,6 @@ window.SettingsTabTrade = (function () {
             cachedCandlesLimit: candles
         };
 
-        // ✅ не надеемся на SettingsApi: сами разошлем state
         return await window.SettingsApi.postForm(url, payload);
     }
 
@@ -407,15 +420,31 @@ window.SettingsTabTrade = (function () {
 
     function init() {
         if (started) return;
-        started = true;
 
-        ensureCtx();
+        const api = window.SettingsApi;
+        if (!api?.getJson || !api?.postForm) {
+            console.warn("[trade] SettingsApi not ready -> skip init (will retry)");
+            return;
+        }
+
+        const ctx = ensureCtx();
+        if (!ctx?.chatId || !ctx?.type) {
+            console.warn("[trade] ctx not ready -> skip init (will retry)");
+            return;
+        }
 
         const list = byId("symbolList");
         const symbolHidden = byId("symbolHidden");
         const tfSelect = byId("tradeTimeframeSelect");
         const candlesInput = byId("tradeCachedCandlesLimit");
         const assetSelect = byId("accountAssetSelect");
+
+        if (!assetSelect || !symbolHidden || !tfSelect || !candlesInput) {
+            console.warn("[trade] required DOM not ready -> skip init (will retry)");
+            return;
+        }
+
+        started = true;
 
         const saveState = byId("tradeSaveState");
         const saveMeta = byId("tradeSaveMeta");
@@ -444,13 +473,9 @@ window.SettingsTabTrade = (function () {
             try {
                 const state = await saveTradeSettings();
 
-                if (state) {
+                if (looksLikeUiState(state)) {
                     applyUiState(state);
-
-                    // ✅ ключевое: раздать другим вкладкам
                     publishState(state);
-
-                    // ✅ и отдельное событие про смену актива (на случай если state не поймали)
                     dispatchAccountAssetChanged(state.accountAsset || getAccountAsset(), "trade_save_ok");
                 }
 
@@ -466,7 +491,7 @@ window.SettingsTabTrade = (function () {
 
         function scheduleSave(ms) {
             clearTimeout(timer);
-            timer = setTimeout(doSave, ms || 250);
+            timer = setTimeout(doSave, (ms ?? 250));
         }
 
         async function reloadSymbols() {
@@ -523,28 +548,21 @@ window.SettingsTabTrade = (function () {
         }
 
         // accountAsset change
-        if (assetSelect) {
-            assetSelect.addEventListener("change", async () => {
-                const asset = normalizeUpper(assetSelect.value || "");
-                setAccountAssetUi(asset);
+        assetSelect.addEventListener("change", async () => {
+            const asset = normalizeUpper(assetSelect.value || "");
+            setAccountAssetUi(asset);
 
-                // ✅ Событие сразу (Risk может пересчитать UI и дернуть refresh)
-                dispatchAccountAssetChanged(asset, "trade_asset_change");
+            dispatchAccountAssetChanged(asset, "trade_asset_change");
 
-                setSymbolUi("");
-                setLimitsUiEmpty();
+            setSymbolUi("");
+            setLimitsUiEmpty();
 
-                // ✅ Сразу сохраняем, чтобы сервер вернул state с балансом нового актива
-                scheduleSave(10);
-
-                await reloadSymbols();
-            });
-        }
+            scheduleSave(10);
+            await reloadSymbols();
+        });
 
         // timeframe
-        if (tfSelect) {
-            tfSelect.addEventListener("change", () => scheduleSave(180));
-        }
+        tfSelect.addEventListener("change", () => scheduleSave(180));
 
         // candles
         if (candlesInput) {
@@ -569,7 +587,8 @@ window.SettingsTabTrade = (function () {
 
         setAccountAssetUi(getAccountAsset());
 
-        const initialSymbol = normalizeUpper(symbolHidden?.value || byId("symbolLabel")?.textContent || "");
+        // ✅ ВАЖНО: initialSymbol только из hidden (не из label)
+        const initialSymbol = normalizeUpper(symbolHidden?.value || "");
         if (initialSymbol) loadLimits(initialSymbol).catch(() => {});
 
         reloadSymbols().catch(() => {});

@@ -73,9 +73,14 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
         if (chatId <= 0) throw new IllegalArgumentException("chatId must be positive");
         if (type == null) throw new IllegalArgumentException("type must be provided");
 
-        // ✅ можно сразу lock-методом — меньше гонок от autosave
-        return repo.findByChatIdAndTypeForUpdate(chatId, type)
-                .orElseGet(() -> createOne(chatId, type));
+        // ✅ ВАЖНО:
+        // НЕ используем FOR UPDATE (PESSIMISTIC_WRITE) тут,
+        // потому что getOrCreate может вызываться из afterCommit (apply tune),
+        // и тогда Hibernate ругается "Query requires transaction..."
+        StrategySettings existing = repo.findByChatIdAndType(chatId, type).orElse(null);
+        if (existing != null) return existing;
+
+        return createOne(chatId, type);
     }
 
     @Override
@@ -144,13 +149,14 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
             return saved;
 
         } catch (DataIntegrityViolationException dup) {
-            // ✅ критично для Hibernate: после ошибки уникальности чистим persistence context
+            // ✅ важно: после ошибки flush Hibernate может держать мусор в persistence context
             try { em.clear(); } catch (Exception ignored) {}
 
-            // если уже есть запись — возвращаем её (или “самую свежую”, если были дубли)
+            // если уже есть запись — возвращаем её
             StrategySettings existing = repo.findByChatIdAndType(chatId, type).orElse(null);
             if (existing != null) return existing;
 
+            // если в базе внезапно дубли — берём “самую свежую”
             List<StrategySettings> list = repo.findAllByChatIdAndTypeOrderByUpdatedAtDescIdDesc(chatId, type);
             if (!list.isEmpty()) return list.getFirst();
 

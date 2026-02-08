@@ -9,61 +9,41 @@
  */
 window.SettingsApi = (function () {
 
-
     // =====================================================
-    // 🔄 UI-state bus (общий стор для вкладок)
+    // 🚌 ensure global store exists (чтобы не зависеть от порядка скриптов)
     // =====================================================
-    function ensureStrategyStore() {
-        if (window.StrategySettingsStore && typeof window.StrategySettingsStore.subscribe === "function") {
-            return window.StrategySettingsStore;
+    function ensureStore() {
+        if (!window.StrategySettingsBus) {
+            window.StrategySettingsBus = {
+                emit(name, detail) {
+                    try {
+                        window.dispatchEvent(new CustomEvent(name, { detail }));
+                    } catch (e) {}
+                },
+                on(name, handler) {
+                    window.addEventListener(name, handler);
+                    return () => window.removeEventListener(name, handler);
+                }
+            };
         }
 
-        const listeners = new Set();
-
-        const store = {
-            _state: null,
-
-            getState() { return this._state; },
-
-            setState(state) {
-                this._state = state;
-
-                // 1) подписчики (вкладки)
-                listeners.forEach(fn => {
-                    try { fn(state); } catch (e) {}
-                });
-
-                // 2) событие на window (фолбэк)
-                try {
-                    window.dispatchEvent(new CustomEvent("strategy:state", { detail: state }));
-                } catch (e) {}
-            },
-
-            subscribe(fn) {
-                if (typeof fn !== "function") return () => {};
-                listeners.add(fn);
-
-                // сразу отдадим текущее состояние
-                if (this._state) {
-                    try { fn(this._state); } catch (e) {}
+        if (!window.StrategySettingsStore) {
+            let state = null;
+            const listeners = new Set();
+            window.StrategySettingsStore = {
+                set(next) {
+                    state = next;
+                    try { window.StrategySettingsBus.emit("strategy:state", state); } catch (e) {}
+                    listeners.forEach((fn) => { try { fn(state); } catch (e) {} });
+                },
+                get() { return state; },
+                subscribe(fn) {
+                    listeners.add(fn);
+                    if (state !== null) { try { fn(state); } catch (e) {} }
+                    return () => listeners.delete(fn);
                 }
-
-                return () => listeners.delete(fn);
-            }
-        };
-
-        window.StrategySettingsStore = store;
-        return store;
-    }
-
-    function looksLikeUiState(obj) {
-        if (!obj || typeof obj !== "object") return false;
-        return ("chatId" in obj) && ("type" in obj) && ("exchange" in obj) && ("network" in obj);
-    }
-
-    function publishUiStateIfAny(obj) {
-        if (!looksLikeUiState(obj)) return;
-        try { ensureStrategyStore().setState(obj); } catch (e) {}
+            };
+        }
     }
 
     function isBlank(s) {
@@ -214,10 +194,17 @@ window.SettingsApi = (function () {
             throw new Error(prettifyError(resp.status, body));
         }
 
-        // ✅ если вернулся JSON — отдадим его
-        if (body.kind === "json") return body.json;
+        // ✅ если вернулся JSON — отдадим его (и попробуем применить как UI-state)
+        if (body.kind === "json") {
+            const json = body.json;
+            tryPublishState(json);
+            // если это не state — всё равно попробуем подтянуть state отдельным запросом
+            await refreshUiStateIfConfig(url, data);
+            return json;
+        }
 
         // ✅ если HTML/пусто — считаем успехом
+        await refreshUiStateIfConfig(url, data);
         return { ok: true };
     }
 
@@ -248,6 +235,79 @@ window.SettingsApi = (function () {
 
         if (body.kind === "json") return body.json;
         return {};
+    }
+
+    // =====================================================
+    // ✅ UI State refresh helpers
+    // =====================================================
+
+    function tryPublishState(maybeState) {
+        ensureStore();
+        if (!maybeState || typeof maybeState !== "object") return false;
+
+        // минимальный признак, что это именно наш UI-state
+        if (!maybeState.chatId || !maybeState.type) return false;
+
+        // store > event
+        if (window.StrategySettingsStore && typeof window.StrategySettingsStore.set === "function") {
+            window.StrategySettingsStore.set(maybeState);
+            return true;
+        }
+        if (window.StrategySettingsBus && typeof window.StrategySettingsBus.emit === "function") {
+            window.StrategySettingsBus.emit("strategy:state", maybeState);
+            return true;
+        }
+        try {
+            window.dispatchEvent(new CustomEvent("strategy:state", { detail: maybeState }));
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function parseConfigCtx(url, data) {
+        try {
+            const u = new URL(url, window.location.origin);
+            const m = u.pathname.match(/\/strategies\/([^\/]+)\/config/i);
+            if (!m) return null;
+
+            const type = decodeURIComponent(m[1]);
+            const chatId = (u.searchParams.get("chatId") || data?.chatId || window.StrategySettingsContext?.chatId || "").toString();
+            if (!chatId) return null;
+
+            const exchange = (data?.exchange || u.searchParams.get("exchange") || window.StrategySettingsContext?.exchange || "").toString();
+            const network  = (data?.network  || u.searchParams.get("network")  || window.StrategySettingsContext?.network  || "").toString();
+
+            return { type, chatId, exchange, network };
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function buildStateUrl(ctx) {
+        if (!ctx) return null;
+        const params = new URLSearchParams();
+        params.set("chatId", String(ctx.chatId));
+        if (ctx.exchange) params.set("exchange", String(ctx.exchange));
+        if (ctx.network)  params.set("network", String(ctx.network));
+        return `/strategies/${encodeURIComponent(ctx.type)}/config/state?${params.toString()}`;
+    }
+
+    async function refreshUiStateIfConfig(url, data) {
+        ensureStore();
+        const ctx = parseConfigCtx(url, data);
+        if (!ctx) return;
+
+        const stateUrl = buildStateUrl(ctx);
+        if (!stateUrl) return;
+
+        try {
+            const state = await getJson(stateUrl);
+            tryPublishState(state);
+        } catch (e) {
+            // не валим сохранение из-за авто-refresh
+            if (console && console.debug) console.debug("state refresh failed", e);
+        }
     }
 
     return { getJson, postForm, postJson };
