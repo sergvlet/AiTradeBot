@@ -12,7 +12,8 @@ window.SettingsTabGeneral = (function () {
 
     function normalizeMode(v) {
         const m = String(v || "MANUAL").trim().toUpperCase();
-        return m ? m : "MANUAL";
+        if (m === "MANUAL" || m === "HYBRID" || m === "AI") return m;
+        return "MANUAL";
     }
 
     function nowHHmm() {
@@ -23,34 +24,12 @@ window.SettingsTabGeneral = (function () {
     }
 
     // =====================================================
-    // ✅ CONTEXT (сам восстанавливается из data-атрибутов)
+    // Context / URLs
     // =====================================================
-    function ensureCtx() {
-        if (window.StrategySettingsContext && window.StrategySettingsContext.chatId) {
-            return window.StrategySettingsContext;
-        }
-
-        const root = document.querySelector(".strategy-settings-page[data-chat-id][data-type]");
-        if (!root) return window.StrategySettingsContext || null;
-
-        const ctx = window.StrategySettingsContext || {};
-        ctx.chatId = ctx.chatId || root.getAttribute("data-chat-id");
-        ctx.type = ctx.type || root.getAttribute("data-type");
-        ctx.exchange = ctx.exchange || root.getAttribute("data-exchange");
-        ctx.network = ctx.network || root.getAttribute("data-network");
-        ctx.baseUrl = ctx.baseUrl || window.location.pathname;
-
-        window.StrategySettingsContext = ctx;
-        return ctx;
-    }
-
     function getCtx() {
-        return ensureCtx();
+        return window.StrategySettingsContext || null;
     }
 
-    // =====================================================
-    // URLs
-    // =====================================================
     function ctxQueryString(ctx) {
         const q = new URLSearchParams();
         if (ctx?.chatId) q.set("chatId", String(ctx.chatId));
@@ -60,35 +39,38 @@ window.SettingsTabGeneral = (function () {
     }
 
     function buildConfigUrl(ctx, tabName) {
-        const type = String(ctx?.type || "").trim();
-        const qs = ctxQueryString(ctx);
-        const q = new URLSearchParams(qs);
-        if (tabName) q.set("tab", String(tabName));
-        return `/strategies/${encodeURIComponent(type)}/config?` + q.toString();
+        const base = `/strategies/${encodeURIComponent(String(ctx.type || ""))}/config`;
+        const q = new URLSearchParams(ctxQueryString(ctx));
+        if (!isBlank(tabName)) q.set("tab", String(tabName));
+        const qs = q.toString();
+        return qs ? (base + "?" + qs) : base;
     }
 
     // =====================================================
-    // Confirm modal
+    // Confirm modal (Bootstrap) fallback -> window.confirm
     // =====================================================
     function showConfirm(title, text) {
-        return new Promise((resolve) => {
-            const modalEl = byId("generalConfirmModal");
-            const titleEl = byId("generalConfirmTitle");
-            const textEl  = byId("generalConfirmText");
-            const okBtn   = byId("generalConfirmOk");
+        if (!window.bootstrap || !window.bootstrap.Modal) {
+            const ok = window.confirm(text || "Подтвердить?");
+            return Promise.resolve(ok);
+        }
 
-            if (!modalEl || !window.bootstrap?.Modal || !okBtn) {
-                resolve(true);
+        return new Promise((resolve) => {
+            const modalEl = byId("confirmModal");
+            const titleEl = byId("confirmModalTitle");
+            const bodyEl  = byId("confirmModalBody");
+            const okBtn   = byId("confirmModalOk");
+
+            if (!modalEl || !titleEl || !bodyEl || !okBtn) {
+                const ok = window.confirm(text || "Подтвердить?");
+                resolve(ok);
                 return;
             }
 
-            if (titleEl) titleEl.textContent = title || "Подтверждение";
-            if (textEl)  textEl.textContent  = text  || "Сохранить изменения?";
+            titleEl.textContent = title || "Подтверждение";
+            bodyEl.textContent  = text || "Подтвердить действие?";
 
-            const modal = window.bootstrap.Modal.getOrCreateInstance(modalEl, {
-                backdrop: "static",
-                keyboard: false
-            });
+            const modal = new window.bootstrap.Modal(modalEl, { backdrop: "static", keyboard: false });
 
             let done = false;
 
@@ -101,7 +83,7 @@ window.SettingsTabGeneral = (function () {
                 if (done) return;
                 done = true;
                 cleanup();
-                modal.hide();
+                try { modal.hide(); } catch (_) {}
                 resolve(true);
             };
 
@@ -114,7 +96,8 @@ window.SettingsTabGeneral = (function () {
 
             okBtn.addEventListener("click", onOk);
             modalEl.addEventListener("hidden.bs.modal", onHide);
-            modal.show();
+
+            try { modal.show(); } catch (_) { resolve(window.confirm(text || "Подтвердить?")); }
         });
     }
 
@@ -123,12 +106,17 @@ window.SettingsTabGeneral = (function () {
     // =====================================================
     function setBadge(el, kind, text) {
         if (!el) return;
+
         el.textContent = text || "";
-        el.classList.remove("bg-success", "bg-warning", "bg-secondary", "bg-danger", "text-dark");
+        el.classList.remove(
+            "bg-success", "bg-warning", "bg-secondary", "bg-danger", "bg-info",
+            "text-dark"
+        );
 
         if (kind === "ok") el.classList.add("bg-success");
         else if (kind === "warn") { el.classList.add("bg-warning"); el.classList.add("text-dark"); }
         else if (kind === "err") el.classList.add("bg-danger");
+        else if (kind === "info") { el.classList.add("bg-info"); el.classList.add("text-dark"); }
         else el.classList.add("bg-secondary");
     }
 
@@ -175,7 +163,6 @@ window.SettingsTabGeneral = (function () {
     // MAIN INIT
     // =====================================================
     function init() {
-        // ⛔ не “убиваем” модуль навсегда, если ctx еще не готов
         if (started) return;
 
         const ctx = getCtx();
@@ -202,7 +189,6 @@ window.SettingsTabGeneral = (function () {
             return;
         }
 
-        // ✅ теперь можно фиксировать started
         started = true;
         console.log("[general] init OK, binding listeners…", ctx);
 
@@ -244,7 +230,6 @@ window.SettingsTabGeneral = (function () {
             });
         }
 
-        // ✅ apply: твой контроллер = POST /strategies/apply
         async function tryApplyMode(mode) {
             const url = "/strategies/apply";
 
@@ -261,7 +246,7 @@ window.SettingsTabGeneral = (function () {
                 if (api?.postJson) {
                     return await api.postJson(url, payload);
                 }
-                // fallback (на всякий)
+
                 const token  = document.querySelector('meta[name="_csrf"]')?.getAttribute("content") || "";
                 const header = document.querySelector('meta[name="_csrf_header"]')?.getAttribute("content") || "";
                 const headers = { "Content-Type": "application/json", "Accept": "application/json" };

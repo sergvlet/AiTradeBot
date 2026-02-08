@@ -23,11 +23,9 @@ import java.util.concurrent.ConcurrentHashMap;
 @RequiredArgsConstructor
 public class BinanceSpotWebSocketClient {
 
-    // ✅ MAINNET
     private static final String WS_MAIN_STREAM_TEMPLATE =
             "wss://stream.binance.com:9443/stream?streams=%s";
 
-    // ✅ TESTNET
     private static final String WS_TEST_STREAM_TEMPLATE =
             "wss://stream.testnet.binance.vision/stream?streams=%s";
 
@@ -37,14 +35,16 @@ public class BinanceSpotWebSocketClient {
 
     /**
      * key = BINANCE:NET:chatId:TYPE:symbol[:tf]:CHANNEL
-     * ⚠️ ВАЖНО:
-     * - AGG_TRADE НЕ зависит от tf → ключ без tf
-     * - KLINE зависит от tf → ключ с tf
+     * - AGG_TRADE без tf
+     * - KLINE с tf
      */
     private final Map<String, WebSocket> sockets = new ConcurrentHashMap<>();
 
+    // ✅ чтобы понять, приходят ли KLINE вообще (не спамим)
+    private final Map<String, Integer> klineRxCount = new ConcurrentHashMap<>();
+
     // =====================================================
-    // PUBLIC API (используется MarketDataStreamService)
+    // PUBLIC API
     // =====================================================
 
     public void subscribeAggTrade(NetworkType networkType,
@@ -58,7 +58,6 @@ public class BinanceSpotWebSocketClient {
         String sym = normSymbolLowerSafe(symbol);
         if (sym == null || strategyType == null) return;
 
-        // ✅ ключ БЕЗ tf
         String key = buildKeyAgg(chatId, strategyType, sym, net);
         if (sockets.containsKey(key)) return;
 
@@ -73,7 +72,6 @@ public class BinanceSpotWebSocketClient {
         WebSocket ws = client.newWebSocket(request,
                 new AggTradeListener(key, chatId, strategyType, sym, net));
 
-        // защита от гонок: если параллельно уже положили — закрываем лишний
         WebSocket prev = sockets.putIfAbsent(key, ws);
         if (prev != null) {
             try { ws.close(1000, "duplicate"); } catch (Exception ignored) {}
@@ -214,11 +212,9 @@ public class BinanceSpotWebSocketClient {
                 BigDecimal price = new BigDecimal(data.getString("p"));
                 BigDecimal qty   = new BigDecimal(data.getString("q"));
 
-                // Binance aggTrade: T = trade time
                 long ts = data.has("T") ? data.getLong("T")
                         : (data.has("E") ? data.getLong("E") : System.currentTimeMillis());
 
-                // ✅ НОВАЯ сигнатура: БЕЗ timeframe
                 marketStream.onAggTrade(
                         chatId,
                         type,
@@ -293,14 +289,39 @@ public class BinanceSpotWebSocketClient {
 
         private void handleKline(String raw) {
             try {
-                JSONObject root = new JSONObject(raw);
-                JSONObject data = root.has("data") ? root.getJSONObject("data") : root;
+                JSONObject root  = new JSONObject(raw);
+                JSONObject event = root.has("data") ? root.getJSONObject("data") : root;
 
-                String eventType = data.optString("e", "");
+                String eventType = event.optString("e", "");
                 if (!"kline".equalsIgnoreCase(eventType)) return;
 
-                UnifiedKline kline = klineParser.parse(data);
-                if (kline == null) return;
+                // ✅ очень редкий лог: чтобы доказать, что kline реально приходит
+                int cnt = klineRxCount.merge(key, 1, Integer::sum);
+                if (cnt == 1 || (cnt % 30 == 0)) {
+                    String stream = root.optString("stream", "");
+                    log.info("🕯️ WS KLINE RX key={} cnt={} stream={}", key, cnt, stream);
+                }
+
+                // ✅ КРИТИЧЕСКИЙ ФИКС:
+                // пробуем сначала распарсить объект k (саму свечу), если он есть.
+                JSONObject kObj = event.optJSONObject("k");
+                UnifiedKline kline = null;
+
+                if (kObj != null) {
+                    kline = klineParser.parse(kObj);
+                }
+                // fallback: если парсер ждал весь event
+                if (kline == null) {
+                    kline = klineParser.parse(event);
+                }
+                if (kline == null) {
+                    // не спамим: только debug
+                    if (log.isDebugEnabled()) {
+                        log.debug("WS kline parsed=null key={} sym={} tf={} keys={}",
+                                key, symLower, tfLower, event.keySet());
+                    }
+                    return;
+                }
 
                 String symUpper = symLower.toUpperCase(Locale.ROOT);
 
@@ -328,17 +349,11 @@ public class BinanceSpotWebSocketClient {
         WebSocket ws = sockets.remove(key);
         if (ws == null) return;
 
-        try {
-            ws.close(1000, reason);
-        } catch (Exception ignored) {}
+        try { ws.close(1000, reason); } catch (Exception ignored) {}
 
         log.info("🔌 WS DISCONNECT BINANCE key={} reason={}", key, reason);
     }
 
-    /**
-     * ✅ защита от гонок: удаляем сокет из map только если он тот же,
-     * который закрылся/упал (иначе можно удалить уже новый сокет при рестарте).
-     */
     private void removeIfSame(String key, WebSocket ws) {
         if (key == null || ws == null) return;
         sockets.compute(key, (k, cur) -> (cur == ws) ? null : cur);
@@ -365,7 +380,6 @@ public class BinanceSpotWebSocketClient {
         return String.format(tpl, streams);
     }
 
-    // ✅ безопасная нормализация без throw (чтобы рестарт не падал)
     private static String normSymbolLowerSafe(String symbol) {
         if (symbol == null) return null;
         String s = symbol.trim().toLowerCase(Locale.ROOT).replace("/", "");

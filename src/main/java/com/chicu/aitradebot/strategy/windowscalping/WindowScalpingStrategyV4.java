@@ -4,6 +4,7 @@ import com.chicu.aitradebot.ai.runtime.MlAutoTuneRuntime;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
+import com.chicu.aitradebot.domain.enums.AdvancedControlMode;
 import com.chicu.aitradebot.market.model.UnifiedKline;
 import com.chicu.aitradebot.orchestrator.AiStrategyOrchestrator;
 import com.chicu.aitradebot.service.StrategySettingsService;
@@ -213,11 +214,18 @@ public class WindowScalpingStrategyV4 implements
 
         ensureRuntimeContext(st, ss);
 
-        if (st.exchange != null && st.network != null) {
+        if (st.exchange != null && st.network != null && isAutoTuneAllowed(ss)) {
             safeAutoTune(() -> autoTuneRuntime.onStrategyStarted(chatId, StrategyType.WINDOW_SCALPING, st.exchange, st.network));
         } else {
-            log.warn("[WINDOW] 🧠 skip autoTuneRuntime.onStrategyStarted (нет exchange/network) chatId={} ex={} net={}",
-                    chatId, st.exchange, st.network);
+            if (st.exchange == null || st.network == null) {
+                log.warn("[WINDOW] 🧠 skip autoTuneRuntime.onStrategyStarted (нет exchange/network) chatId={} ex={} net={}",
+                        chatId, st.exchange, st.network);
+            } else {
+                if (log.isDebugEnabled()) {
+                    log.debug("[WINDOW] 🧠 skip autoTuneRuntime.onStrategyStarted (mode={}, autoTuneEnabled={}) chatId={} ex={} net={}",
+                            modeOrManual(ss), (ss != null && ss.isAutoTuneEnabled()), chatId, st.exchange, st.network);
+                }
+            }
         }
 
         if (ss != null) {
@@ -544,7 +552,7 @@ public class WindowScalpingStrategyV4 implements
                 // =====================================================
                 // ✅ ML gate
                 // =====================================================
-                if (mlEnabled) {
+                if (isMlGateAllowed(ss)) {
                     double threshold = resolveMlThreshold(ss);
 
                     Map<String, Object> feats = buildMlFeatures(
@@ -669,7 +677,7 @@ public class WindowScalpingStrategyV4 implements
 
                         ensureRuntimeContext(st, ss);
 
-                        if (st.exchange != null && st.network != null) {
+                        if (st.exchange != null && st.network != null && isAutoTuneAllowed(ss)) {
                             safeAutoTune(() -> autoTuneRuntime.onPositionClosed(
                                     chatId,
                                     StrategyType.WINDOW_SCALPING,
@@ -922,6 +930,33 @@ public class WindowScalpingStrategyV4 implements
     }
 
     // =====================================================
+    // MODE / FLAGS
+    // =====================================================
+
+    private static AdvancedControlMode modeOrManual(StrategySettings ss) {
+        if (ss == null) return AdvancedControlMode.MANUAL;
+        AdvancedControlMode m = ss.getAdvancedControlMode();
+        return (m != null ? m : AdvancedControlMode.MANUAL);
+    }
+
+    private static boolean isManualMode(StrategySettings ss) {
+        return modeOrManual(ss) == AdvancedControlMode.MANUAL;
+    }
+
+    private boolean isAutoTuneAllowed(StrategySettings ss) {
+        return ss != null && ss.isAutoTuneEnabled() && !isManualMode(ss);
+    }
+
+    private boolean isMlGateAllowed(StrategySettings ss) {
+        return mlEnabled && ss != null && ss.isMlGateEnabled() && !isManualMode(ss);
+    }
+
+    private boolean isCoarseAdjustAllowed(StrategySettings ss) {
+        return coarseAdjustEnabled && isAutoTuneAllowed(ss);
+    }
+
+
+    // =====================================================
     // ✅ COARSE-ADJUST
     // =====================================================
 
@@ -929,6 +964,7 @@ public class WindowScalpingStrategyV4 implements
         if (!coarseAdjustEnabled) return;
         if (chatId == null || st == null) return;
         if (st.inPosition) return;
+        if (!isCoarseAdjustAllowed(st.ss)) return;
 
         WindowScalpingStrategySettings cfg = st.cfg;
         if (cfg == null) return;
@@ -1276,6 +1312,7 @@ public class WindowScalpingStrategyV4 implements
         if (autoTuneRuntime == null) return;
         if (st == null) return;
         if (st.inPosition) return;
+        if (!isAutoTuneAllowed(st.ss)) return;
 
         ensureRuntimeContext(st, st.ss);
 

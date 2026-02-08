@@ -2,10 +2,11 @@
 
 /**
  * Trade tab (market.js)
- * - uses #accountAssetSelect + #accountAssetHidden
- * - loads symbols from /api/market/symbols?exchange&network&accountAsset&mode
- * - loads limits  from /api/market/symbol-info?exchange&network&accountAsset&symbol
- * - saves trade settings via POST /strategies/{type}/config (saveScope=trade)
+ *
+ * ✅ ВАЖНО:
+ * - после saveScope=trade мы ЯВНО публикуем strategy:state (Store + DOM event)
+ * - при смене актива кидаем strategy:accountAssetChanged (Risk ловит и обновляет баланс/preview без F5)
+ * - ctxQuery() содержит _ts чтобы не получать кэшированный state
  */
 window.SettingsTabTrade = (function () {
 
@@ -23,7 +24,7 @@ window.SettingsTabTrade = (function () {
         return isBlank(s) ? "" : String(s).trim();
     }
 
-    // ✅ 1) гарантируем StrategySettingsContext из data-* корня страницы
+    // ✅ гарантируем StrategySettingsContext из data-* корня страницы
     function ensureCtx() {
         if (window.StrategySettingsContext && window.StrategySettingsContext.chatId) return window.StrategySettingsContext;
 
@@ -44,6 +45,29 @@ window.SettingsTabTrade = (function () {
         return ensureCtx();
     }
 
+    // ✅ publish helpers (чтобы Risk/General гарантированно получали state)
+    function publishState(state) {
+        if (!state) return;
+
+        try {
+            if (window.StrategySettingsStore && typeof window.StrategySettingsStore.setState === "function") {
+                window.StrategySettingsStore.setState(state);
+            }
+        } catch (e) {}
+
+        try {
+            window.dispatchEvent(new CustomEvent("strategy:state", { detail: state }));
+        } catch (e) {}
+    }
+
+    function dispatchAccountAssetChanged(asset, source) {
+        try {
+            window.dispatchEvent(new CustomEvent("strategy:accountAssetChanged", {
+                detail: { asset: normalizeUpper(asset || ""), source: source || "trade" }
+            }));
+        } catch (e) {}
+    }
+
     function ctxQuery() {
         const ctx = getCtx();
         if (!ctx) return "";
@@ -51,6 +75,8 @@ window.SettingsTabTrade = (function () {
         if (ctx.chatId) q.set("chatId", String(ctx.chatId));
         if (ctx.exchange) q.set("exchange", String(ctx.exchange));
         if (ctx.network) q.set("network", String(ctx.network));
+        // ✅ cache-buster
+        q.set("_ts", String(Date.now()));
         return q.toString();
     }
 
@@ -65,10 +91,13 @@ window.SettingsTabTrade = (function () {
 
     function setUiValue(el, val) {
         if (!el) return;
-        const v = (val === null || val === undefined || val === "") ? "—" : String(val);
         const tag = (el.tagName || "").toUpperCase();
+
+        // ⚠️ В input нельзя пихать "—"
+        const v = (val === null || val === undefined || val === "") ? "" : String(val);
+
         if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") el.value = v;
-        else el.textContent = v;
+        else el.textContent = (v === "" ? "—" : v);
     }
 
     function fmtNum(v, digits) {
@@ -98,7 +127,7 @@ window.SettingsTabTrade = (function () {
         const ctx = getCtx();
         if (ctx?.accountAsset) return normalizeUpper(ctx.accountAsset);
 
-        // ✅ 2) если пусто — берём первый option
+        // если пусто — берём первый option
         if (sel && sel.options && sel.options.length > 0) {
             return normalizeUpper(sel.options[0].value);
         }
@@ -111,7 +140,6 @@ window.SettingsTabTrade = (function () {
         const hid = byId("accountAssetHidden");
 
         if (sel) {
-            // если такого значения нет — ставим первый option
             sel.value = a || "";
             if (a && sel.value !== a && sel.options && sel.options.length > 0) {
                 sel.value = sel.options[0].value;
@@ -127,6 +155,64 @@ window.SettingsTabTrade = (function () {
 
         const hint = byId("assetInHint");
         if (hint) hint.textContent = finalA || "—";
+
+        const ctx = getCtx();
+        if (ctx) ctx.accountAsset = finalA || "";
+    }
+
+    // =====================================================
+    // UI STATE (auto-refresh между вкладками)
+    // =====================================================
+    function rebuildAssetsIfNeeded(assetsUpper) {
+        const sel = byId("accountAssetSelect");
+        if (!sel || !Array.isArray(assetsUpper) || assetsUpper.length === 0) return;
+
+        const want = assetsUpper.map(normalizeUpper).filter(Boolean);
+        if (want.length === 0) return;
+
+        const have = Array.from(sel.options || []).map(o => normalizeUpper(o.value));
+        const same = have.length === want.length && want.every(a => have.includes(a));
+        if (same) return;
+
+        sel.innerHTML = "";
+        want.forEach(a => {
+            const opt = document.createElement("option");
+            opt.value = a;
+            opt.textContent = a;
+            sel.appendChild(opt);
+        });
+    }
+
+    function applyUiState(state) {
+        if (!state) return;
+
+        // список активов может поменяться
+        if (Array.isArray(state.availableAssets)) {
+            rebuildAssetsIfNeeded(state.availableAssets);
+        }
+
+        // выбранный актив
+        const bal = state.selectedBalance || state.balance || null;
+        const asset =
+            normalizeUpper(
+                state.accountAsset ||
+                (bal && (bal.asset || bal.currency || bal.code)) ||
+                ""
+            );
+
+        if (asset) setAccountAssetUi(asset);
+
+        // баланс (обновляем общие поля на странице)
+        if (bal) {
+            const free = (bal.free ?? null);
+            const locked = (bal.locked ?? null);
+
+            const total = (Number(free) || 0) + (Number(locked) || 0);
+
+            setUiValue(byId("assetFreeView"), fmtNum(free, 8));
+            setUiValue(byId("assetLockedView"), fmtNum(locked, 8));
+            setUiValue(byId("assetTotalView"), fmtNum(total, 8));
+        }
     }
 
     function setModeUi() {
@@ -290,7 +376,7 @@ window.SettingsTabTrade = (function () {
     // -----------------------------
     async function saveTradeSettings() {
         const ctx = getCtx();
-        if (!ctx?.type) return;
+        if (!ctx?.type) return null;
 
         const asset = getAccountAsset();
         const symbol = normalizeUpper(byId("symbolHidden")?.value || "");
@@ -310,7 +396,8 @@ window.SettingsTabTrade = (function () {
             cachedCandlesLimit: candles
         };
 
-        await window.SettingsApi.postForm(url, payload);
+        // ✅ не надеемся на SettingsApi: сами разошлем state
+        return await window.SettingsApi.postForm(url, payload);
     }
 
     // -----------------------------
@@ -321,6 +408,8 @@ window.SettingsTabTrade = (function () {
     function init() {
         if (started) return;
         started = true;
+
+        ensureCtx();
 
         const list = byId("symbolList");
         const symbolHidden = byId("symbolHidden");
@@ -353,7 +442,18 @@ window.SettingsTabTrade = (function () {
             inFlight = true;
             setSave("Сохраняю…", "info");
             try {
-                await saveTradeSettings();
+                const state = await saveTradeSettings();
+
+                if (state) {
+                    applyUiState(state);
+
+                    // ✅ ключевое: раздать другим вкладкам
+                    publishState(state);
+
+                    // ✅ и отдельное событие про смену актива (на случай если state не поймали)
+                    dispatchAccountAssetChanged(state.accountAsset || getAccountAsset(), "trade_save_ok");
+                }
+
                 setSave("Сохранено", "ok");
             } catch (e) {
                 setSave("Ошибка", "err");
@@ -428,10 +528,15 @@ window.SettingsTabTrade = (function () {
                 const asset = normalizeUpper(assetSelect.value || "");
                 setAccountAssetUi(asset);
 
+                // ✅ Событие сразу (Risk может пересчитать UI и дернуть refresh)
+                dispatchAccountAssetChanged(asset, "trade_asset_change");
+
                 setSymbolUi("");
                 setLimitsUiEmpty();
 
-                scheduleSave(120);
+                // ✅ Сразу сохраняем, чтобы сервер вернул state с балансом нового актива
+                scheduleSave(10);
+
                 await reloadSymbols();
             });
         }
@@ -468,6 +573,18 @@ window.SettingsTabTrade = (function () {
         if (initialSymbol) loadLimits(initialSymbol).catch(() => {});
 
         reloadSymbols().catch(() => {});
+
+        // =====================================================
+        // авто-обновление: другие вкладки меняют state
+        // =====================================================
+        const onState = (state) => {
+            try { applyUiState(state); } catch (e) {}
+        };
+
+        if (window.StrategySettingsStore && typeof window.StrategySettingsStore.subscribe === "function") {
+            window.StrategySettingsStore.subscribe(onState);
+        }
+        window.addEventListener("strategy:state", (ev) => onState(ev?.detail));
     }
 
     return { init };

@@ -34,6 +34,8 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 import org.springframework.ui.Model;
 import org.springframework.web.bind.annotation.*;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.util.HashMap;
@@ -62,7 +64,6 @@ public class StrategySettingsController {
 
     private static final List<String> AVAILABLE_EXCHANGES = List.of("BINANCE","BYBIT","OKX");
 
-    // runPhase (единая точка истины)
     private static final String PHASE_LIVE     = "LIVE";
     private static final String PHASE_PAPER    = "PAPER";
     private static final String PHASE_BACKTEST = "BACKTEST";
@@ -83,12 +84,12 @@ public class StrategySettingsController {
     ) {
         StrategyType strategyType = parseStrategyType(typeRaw);
 
-        String exchange = normalizeExchange(exchangeParam);
-        NetworkType network = parseNetworkOrDefault(networkParam, NetworkType.TESTNET);
-
-        // ✅ ОДНА строка на (chatId,type) — exchange/network храним в ней же (патчим)
         StrategySettings strategy = strategySettingsService.getOrCreate(chatId, strategyType);
+        String exchange = resolveExchange(exchangeParam, strategy);
+        NetworkType network = resolveNetwork(networkParam, strategy);
+
         patchContext(strategy, exchange, network);
+        syncRunPhaseWithContext(strategy);
         strategySettingsService.save(strategy);
 
         // runtime status (active)
@@ -99,9 +100,24 @@ public class StrategySettingsController {
             log.warn("⚠ Ошибка при получении статуса стратегии: {}", e.getMessage());
         }
 
-        // BALANCE
-        AccountBalanceSnapshot balance =
-                accountBalanceService.getSnapshot(chatId, strategyType, exchange, network);
+        // selected asset из настроек
+        String selectedAsset = normalizeAsset(strategy.getAccountAsset());
+
+        // ✅ СТАРАЯ ВЕРСИЯ: getSnapshot может быть только (chatId,type,exchange,network)
+        // ✅ НОВАЯ ВЕРСИЯ: если есть перегрузка с selectedAsset — используем её через reflection
+        AccountBalanceSnapshot balance = fetchSnapshotCompat(chatId, strategyType, exchange, network, selectedAsset);
+
+        // если в БД пусто — берём из snapshot и фиксируем
+        if (selectedAsset == null && balance != null) {
+            selectedAsset = normalizeAsset(balance.getSelectedAsset());
+            if (selectedAsset != null) {
+                strategy.setAccountAsset(selectedAsset);
+                try { strategySettingsService.save(strategy); } catch (Exception ignored) {}
+            }
+        }
+
+        // если актив известен — попросим snapshot “переключить” selectedBalance (если умеет)
+        ensureSelectedBalanceCompat(balance, selectedAsset);
 
         // KEYS + DIAG
         ExchangeSettings exchangeSettings =
@@ -118,16 +134,6 @@ public class StrategySettingsController {
             }
         }
         boolean connectionOk = diagnostics != null && diagnostics.isOk();
-
-        // selected asset: нормализуем и если пусто — берём из snapshot и фиксируем в БД
-        String selectedAsset = normalizeAsset(strategy.getAccountAsset());
-        if (selectedAsset == null && balance != null) {
-            selectedAsset = normalizeAsset(balance.getSelectedAsset());
-            if (selectedAsset != null) {
-                strategy.setAccountAsset(selectedAsset);
-                try { strategySettingsService.save(strategy); } catch (Exception ignored) {}
-            }
-        }
 
         // symbol info
         SymbolDescriptor symbolInfo = null;
@@ -169,7 +175,6 @@ public class StrategySettingsController {
         }
 
         model.addAttribute("page", "strategies/settings");
-
         model.addAttribute("chatId", chatId);
         model.addAttribute("type", strategyType);
         model.addAttribute("strategy", strategy);
@@ -185,29 +190,63 @@ public class StrategySettingsController {
         model.addAttribute("diagnostics", diagnosticsSupported ? diagnostics : null);
         model.addAttribute("connectionOk", diagnosticsSupported && connectionOk);
 
-        List<String> assets = (balance != null) ? balance.getAvailableAssets() : List.of();
+        List<String> assets = (balance != null && balance.getAvailableAssets() != null) ? balance.getAvailableAssets() : List.of();
         model.addAttribute("availableAssets", assets);
         model.addAttribute("selectedAsset", selectedAsset);
 
-        AccountBalanceSnapshot.AssetBalance ab = (balance != null) ? balance.getSelectedBalance() : null;
+        // баланс выбранного актива
+        AccountBalanceSnapshot.AssetBalance ab = null;
+        if (balance != null && selectedAsset != null) {
+            ab = findBalance(balance, selectedAsset);
+        }
+        if (ab == null && balance != null) {
+            ab = balance.getSelectedBalance();
+        }
+
         model.addAttribute("accountAssetBalance", ab);
         model.addAttribute("availableBalance", ab != null ? ab.getFree() : null);
 
         model.addAttribute("accountFees", accountFees);
         model.addAttribute("symbolInfo", symbolInfo);
-
         model.addAttribute("strategyAdvancedHtml", strategyAdvancedHtml);
 
         return "layout/app";
     }
 
     // =====================================================
-    // POST — СОХРАНЕНИЕ (AJAX/FETCH) ✅ БЕЗ РЕДИРЕКТА
+    // ✅ UI STATE (JSON) — для автообновления вкладок без F5
     // =====================================================
-    @PostMapping(value = "/{type}/config", headers = "X-Requested-With=fetch")
+    @GetMapping(value = "/{type}/config/state", produces = "application/json")
     @ResponseBody
     @Transactional
-    public ResponseEntity<?> saveSettingsFetch(
+    public ResponseEntity<StrategyUiState> getUiState(
+            @PathVariable("type") String typeRaw,
+            @RequestParam("chatId") long chatId,
+            @RequestParam(value = "exchange", required = false) String exchangeParam,
+            @RequestParam(value = "network", required = false) String networkParam,
+            @RequestParam(value = "diagnostics", required = false, defaultValue = "false") boolean diagnostics
+    ) {
+        StrategyType strategyType = parseStrategyType(typeRaw);
+
+        StrategySettings s = strategySettingsService.getOrCreate(chatId, strategyType);
+        String ex = resolveExchange(exchangeParam, s);
+        NetworkType net = resolveNetwork(networkParam, s);
+
+        patchContext(s, ex, net);
+        syncRunPhaseWithContext(s);
+        strategySettingsService.save(s);
+
+        StrategyUiState state = buildUiState(chatId, strategyType, s, diagnostics);
+        return ResponseEntity.ok(state);
+    }
+
+    // =====================================================
+    // POST — СОХРАНЕНИЕ (AJAX/FETCH) ✅ возвращаем JSON state
+    // =====================================================
+    @PostMapping(value = "/{type}/config", headers = "X-Requested-With=fetch", produces = "application/json")
+    @ResponseBody
+    @Transactional
+    public ResponseEntity<StrategyUiState> saveSettingsFetch(
             @PathVariable("type") String typeRaw,
             @RequestParam("chatId") long chatId,
             @RequestParam("saveScope") String saveScope,
@@ -215,35 +254,37 @@ public class StrategySettingsController {
     ) {
         StrategyType strategyType = parseStrategyType(typeRaw);
 
-        String exchange = normalizeExchange(params.get("exchange"));
-        NetworkType network = parseNetworkOrDefault(params.get("network"), NetworkType.TESTNET);
-
         StrategySettings s = strategySettingsService.getOrCreate(chatId, strategyType);
-        patchContext(s, exchange, network);
 
-        // ✅ снимок ДО изменения
         CtxSnap before = snap(s);
 
-        // CONTROL MODE + defaults
+        String exchange = resolveExchange(params.get("exchange"), s);
+        NetworkType network = resolveNetwork(params.get("network"), s);
+
+        patchContext(s, exchange, network);
+        syncRunPhaseWithContext(s);
+
         AdvancedControlMode requestedMode = parseModeOrNull(params.get("advancedControlMode"));
         AdvancedControlMode currentMode = s.getAdvancedControlMode();
+
         if (requestedMode != null && requestedMode != currentMode) {
             s.setAdvancedControlMode(requestedMode);
-            applyModeDefaults(s, requestedMode, network);
+            applyModeDefaults(s, requestedMode, s.getNetworkType());
+            syncRunPhaseWithContext(s);
+            strategySettingsService.save(s);
         }
 
         applySaveScope(chatId, strategyType, exchange, network, saveScope, params, s);
 
-        // ✅ снимок ПОСЛЕ изменения (s уже сохранён в applySaveScope, если надо)
         CtxSnap after = snap(s);
 
-        // кеш можно сразу инвалидировать
         settingsCache.invalidate(chatId, strategyType);
-
-        // ✅ атомарный рестарт ТОЛЬКО если реально поменялся контекст и стратегия запущена
         scheduleRestartAfterCommitIfNeeded(chatId, strategyType, saveScope, before, after);
 
-        return ResponseEntity.ok().build();
+        boolean includeDiagnostics = "network".equalsIgnoreCase(saveScope) || "keys".equalsIgnoreCase(saveScope);
+        StrategyUiState state = buildUiState(chatId, strategyType, s, includeDiagnostics);
+
+        return ResponseEntity.ok(state);
     }
 
     // =====================================================
@@ -259,31 +300,31 @@ public class StrategySettingsController {
     ) {
         StrategyType strategyType = parseStrategyType(typeRaw);
 
-        String exchange = normalizeExchange(params.get("exchange"));
-        NetworkType network = parseNetworkOrDefault(params.get("network"), NetworkType.TESTNET);
-
         StrategySettings s = strategySettingsService.getOrCreate(chatId, strategyType);
-        patchContext(s, exchange, network);
 
-        // ✅ снимок ДО изменения
         CtxSnap before = snap(s);
 
-        // CONTROL MODE + defaults
+        String exchange = resolveExchange(params.get("exchange"), s);
+        NetworkType network = resolveNetwork(params.get("network"), s);
+
+        patchContext(s, exchange, network);
+        syncRunPhaseWithContext(s);
+
         AdvancedControlMode requestedMode = parseModeOrNull(params.get("advancedControlMode"));
         AdvancedControlMode currentMode = s.getAdvancedControlMode();
+
         if (requestedMode != null && requestedMode != currentMode) {
             s.setAdvancedControlMode(requestedMode);
-            applyModeDefaults(s, requestedMode, network);
+            applyModeDefaults(s, requestedMode, s.getNetworkType());
+            syncRunPhaseWithContext(s);
+            strategySettingsService.save(s);
         }
 
         applySaveScope(chatId, strategyType, exchange, network, saveScope, params, s);
 
-        // ✅ снимок ПОСЛЕ изменения
         CtxSnap after = snap(s);
 
         settingsCache.invalidate(chatId, strategyType);
-
-        // ✅ рестарт после commit (чтобы start увидел новые настройки)
         scheduleRestartAfterCommitIfNeeded(chatId, strategyType, saveScope, before, after);
 
         String tab = params.getOrDefault("tab", "network");
@@ -298,17 +339,20 @@ public class StrategySettingsController {
     @Transactional
     public ResponseEntity<ApplyResponse> apply(@RequestBody ApplyRequest req) {
 
-        String ex = normalizeExchange(req.getExchange());
-        NetworkType net = (req.getNetwork() != null) ? req.getNetwork() : NetworkType.TESTNET;
-
         StrategySettings s = strategySettingsService.getOrCreate(req.getChatId(), req.getType());
+
+        String ex = resolveExchange(req.getExchange(), s);
+        NetworkType net = (req.getNetwork() != null) ? req.getNetwork() : resolveNetwork(null, s);
+
         patchContext(s, ex, net);
+        syncRunPhaseWithContext(s);
 
         AdvancedControlMode requested = parseModeOrNull(req.getAdvancedControlMode());
         AdvancedControlMode current = s.getAdvancedControlMode();
         if (requested != null && requested != current) {
             s.setAdvancedControlMode(requested);
-            applyModeDefaults(s, requested, net);
+            applyModeDefaults(s, requested, s.getNetworkType());
+            syncRunPhaseWithContext(s);
             strategySettingsService.save(s);
         }
 
@@ -405,25 +449,28 @@ public class StrategySettingsController {
     ) {
         if (s == null) return;
 
-        // ✅ всегда фиксируем контекст в сущности
         patchContext(s, exchange, network);
 
         switch (saveScope) {
 
             case "network" -> {
                 exchangeSettingsService.getOrCreate(chatId, exchange, network);
+                syncRunPhaseWithContext(s);
                 strategySettingsService.save(s);
             }
 
-            case "keys" -> exchangeSettingsService.saveKeys(
-                    chatId,
-                    exchange,
-                    network,
-                    params.get("apiKey"),
-                    params.get("apiSecret"),
-                    params.get("passphrase"),
-                    params.get("subAccount")
-            );
+            case "keys" -> {
+                exchangeSettingsService.saveKeys(
+                        chatId,
+                        exchange,
+                        network,
+                        params.get("apiKey"),
+                        params.get("apiSecret"),
+                        params.get("passphrase"),
+                        params.get("subAccount")
+                );
+                strategySettingsService.save(s);
+            }
 
             case "trade" -> {
                 String accountAsset = normalizeAsset(params.get("accountAsset"));
@@ -444,9 +491,6 @@ public class StrategySettingsController {
                 strategySettingsService.save(s);
             }
 
-            // =====================================================
-            // ✅ RISK: ТОЛЬКО capitalMode + capitalValue
-            // =====================================================
             case "risk" -> {
 
                 StrategySettings.CapitalMode mode = parseCapitalModeOrDefault(
@@ -481,7 +525,6 @@ public class StrategySettingsController {
                 if (currentMode == null) currentMode = AdvancedControlMode.MANUAL;
 
                 if (renderer != null && currentMode != AdvancedControlMode.AI) {
-                    // ✅ чистим системные поля, чтобы renderer не видел мусор
                     HashMap<String, String> clean = new HashMap<>(params);
                     clean.remove("chatId");
                     clean.remove("saveScope");
@@ -510,7 +553,7 @@ public class StrategySettingsController {
     }
 
     // =====================================================
-    // MODE DEFAULTS (без collectEnabled)
+    // MODE DEFAULTS
     // =====================================================
     private void applyModeDefaults(StrategySettings s, AdvancedControlMode mode, NetworkType net) {
         if (s == null || mode == null) return;
@@ -538,19 +581,159 @@ public class StrategySettingsController {
     }
 
     // =====================================================
-    // ✅ PATCH CONTEXT
+    // PATCH CONTEXT
     // =====================================================
     private void patchContext(StrategySettings s, String exchange, NetworkType network) {
         if (s == null) return;
 
         String ex = normalizeExchange(exchange);
-        NetworkType net = (network != null) ? network : NetworkType.TESTNET;
+        NetworkType net = (network != null)
+                ? network
+                : (s.getNetworkType() != null ? s.getNetworkType() : NetworkType.TESTNET);
+
         s.setExchangeName(ex);
         s.setNetworkType(net);
     }
 
+    private void syncRunPhaseWithContext(StrategySettings s) {
+        if (s == null) return;
+
+        String rp = (s.getRunPhase() == null) ? "" : s.getRunPhase().trim().toUpperCase(Locale.ROOT);
+
+        if (PHASE_BACKTEST.equals(rp) || PHASE_COLLECT.equals(rp)) return;
+
+        AdvancedControlMode mode = s.getAdvancedControlMode();
+        if (mode == null) mode = AdvancedControlMode.MANUAL;
+
+        NetworkType net = (s.getNetworkType() != null) ? s.getNetworkType() : NetworkType.TESTNET;
+
+        String desired = (mode == AdvancedControlMode.MANUAL)
+                ? PHASE_LIVE
+                : (net == NetworkType.TESTNET ? PHASE_PAPER : PHASE_LIVE);
+
+        if (s.getRunPhase() == null || !desired.equalsIgnoreCase(s.getRunPhase())) {
+            s.setRunPhase(desired);
+        }
+    }
+
     // =====================================================
-    // ✅ AUTO-RESTART after commit
+    // UI STATE builder (совместимость со старой версией баланса)
+    // =====================================================
+    private StrategyUiState buildUiState(long chatId, StrategyType type, StrategySettings s, boolean diagnostics) {
+
+        String ex = normalizeExchange(s.getExchangeName());
+        NetworkType net = (s.getNetworkType() != null) ? s.getNetworkType() : NetworkType.TESTNET;
+
+        boolean active = orchestrator.isRunning(chatId, type);
+
+        String selectedAsset = normalizeAsset(s.getAccountAsset());
+
+        AccountBalanceSnapshot snap = fetchSnapshotCompat(chatId, type, ex, net, selectedAsset);
+
+        ExchangeSettings es = null;
+        try {
+            es = exchangeSettingsService.getOrCreate(chatId, ex, net);
+        } catch (Exception ignored) {}
+
+        Boolean hasKeys = (es != null) ? es.hasBaseKeys() : null;
+
+        // если в БД пусто — можно добрать из snapshot и сохранить
+        if (selectedAsset == null && snap != null) {
+            selectedAsset = normalizeAsset(snap.getSelectedAsset());
+            if (selectedAsset != null) {
+                s.setAccountAsset(selectedAsset);
+                try { strategySettingsService.save(s); } catch (Exception ignored) {}
+            }
+        }
+
+        ensureSelectedBalanceCompat(snap, selectedAsset);
+
+        StrategyUiState.AssetBalance balance = null;
+        if (snap != null) {
+            AccountBalanceSnapshot.AssetBalance ab = null;
+
+            if (selectedAsset != null) ab = findBalance(snap, selectedAsset);
+            if (ab == null) ab = snap.getSelectedBalance();
+
+            if (ab != null) {
+                // ✅ СТАРАЯ ВЕРСИЯ: у AssetBalance может не быть getAsset()
+                String asset = normalizeAsset(selectedAsset != null ? selectedAsset : snap.getSelectedAsset());
+                balance = new StrategyUiState.AssetBalance(
+                        asset,
+                        ab.getFree(),
+                        ab.getLocked()
+                );
+            }
+        }
+
+        Boolean connectionOk = null;
+        AccountFees fees = null;
+
+        if (diagnostics && isDiagnosticsSupported(ex) && es != null && es.hasBaseKeys()) {
+            try {
+                ApiKeyDiagnostics d = exchangeSettingsService.testConnectionDetailed(es);
+                connectionOk = (d != null && d.isOk());
+                if (Boolean.TRUE.equals(connectionOk)) {
+                    try { fees = accountBalanceService.getAccountFees(chatId, ex, net); } catch (Exception ignored) {}
+                }
+            } catch (Exception e) {
+                connectionOk = false;
+            }
+        }
+
+        List<String> assets = (snap != null && snap.getAvailableAssets() != null) ? snap.getAvailableAssets() : List.of();
+
+        return new StrategyUiState(
+                chatId,
+                type,
+                ex,
+                net,
+                active,
+                s.getAdvancedControlMode(),
+                s.getRunPhase(),
+                s.isAutoTuneEnabled(),
+                s.isMlGateEnabled(),
+                normalizeAsset(s.getAccountAsset()),
+                normalizeSymbol(s.getSymbol()),
+                normalizeTimeframe(s.getTimeframe()),
+                s.getCachedCandlesLimit(),
+                s.getCapitalMode(),
+                s.getCapitalValue(),
+                assets,
+                balance,
+                hasKeys,
+                connectionOk,
+                fees
+        );
+    }
+
+    public record StrategyUiState(
+            long chatId,
+            StrategyType type,
+            String exchange,
+            NetworkType network,
+            boolean active,
+            AdvancedControlMode advancedControlMode,
+            String runPhase,
+            boolean autoTuneEnabled,
+            boolean mlGateEnabled,
+            String accountAsset,
+            String symbol,
+            String timeframe,
+            Integer cachedCandlesLimit,
+            StrategySettings.CapitalMode capitalMode,
+            BigDecimal capitalValue,
+            List<String> availableAssets,
+            AssetBalance selectedBalance,
+            Boolean hasKeys,
+            Boolean connectionOk,
+            AccountFees accountFees
+    ) {
+        public record AssetBalance(String asset, BigDecimal free, BigDecimal locked) {}
+    }
+
+    // =====================================================
+    // AUTO-RESTART after commit
     // =====================================================
     private void scheduleRestartAfterCommitIfNeeded(long chatId,
                                                     StrategyType type,
@@ -558,18 +741,13 @@ public class StrategySettingsController {
                                                     CtxSnap before,
                                                     CtxSnap after) {
 
-        // рестартуем только если изменились symbol/tf/ex/net
         if (!ctxChanged(before, after)) return;
-
-        // и только если стратегия запущена
         if (!orchestrator.isRunning(chatId, type)) return;
 
-        // exchange/network берём из "после"
         final String ex = (after.exchange != null ? after.exchange : "BINANCE");
         final NetworkType net = (after.network != null ? after.network : NetworkType.TESTNET);
         final String reason = "ui_settings_changed:" + (saveScope == null ? "unknown" : saveScope);
 
-        // чтобы start увидел новые settings — делаем рестарт после commit
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
                 @Override
@@ -585,7 +763,6 @@ public class StrategySettingsController {
             return;
         }
 
-        // fallback (на случай если кто-то вызовет без транзакции)
         try {
             orchestrator.restartStrategyAtomic(chatId, type, ex, net, reason);
         } catch (Exception e) {
@@ -645,8 +822,9 @@ public class StrategySettingsController {
     ) {
         StrategyType strategyType = parseStrategyType(typeRaw);
 
-        String exchange = normalizeExchange(params.get("exchange"));
-        NetworkType network = parseNetworkOrDefault(params.get("network"), NetworkType.TESTNET);
+        StrategySettings s = strategySettingsService.getOrCreate(chatId, strategyType);
+        String exchange = resolveExchange(params.get("exchange"), s);
+        NetworkType network = resolveNetwork(params.get("network"), s);
 
         DiagnoseResponse res = new DiagnoseResponse();
         res.ok = false;
@@ -708,6 +886,54 @@ public class StrategySettingsController {
         private Boolean tradingAllowed;
         private Boolean ipAllowed;
         private Boolean networkOk;
+    }
+
+    // =====================================================
+    // COMPAT: snapshot selectedAsset (старый/новый контракт)
+    // =====================================================
+    private AccountBalanceSnapshot fetchSnapshotCompat(long chatId,
+                                                       StrategyType type,
+                                                       String exchange,
+                                                       NetworkType network,
+                                                       String selectedAsset) {
+        // 1) пробуем новую перегрузку: getSnapshot(long, StrategyType, String, NetworkType, String)
+        AccountBalanceSnapshot snap = tryInvokeSnapshot(
+                new Class<?>[]{long.class, StrategyType.class, String.class, NetworkType.class, String.class},
+                new Object[]{chatId, type, exchange, network, selectedAsset}
+        );
+        if (snap != null) return snap;
+
+        // 2) старая версия: getSnapshot(long, StrategyType, String, NetworkType)
+        return tryInvokeSnapshot(
+                new Class<?>[]{long.class, StrategyType.class, String.class, NetworkType.class},
+                new Object[]{chatId, type, exchange, network}
+        );
+    }
+
+    private AccountBalanceSnapshot tryInvokeSnapshot(Class<?>[] sig, Object[] args) {
+        try {
+            Method m = accountBalanceService.getClass().getMethod("getSnapshot", sig);
+            Object r = m.invoke(accountBalanceService, args);
+            if (r instanceof AccountBalanceSnapshot s) return s;
+            return null;
+        } catch (NoSuchMethodException ignored) {
+            return null;
+        } catch (Exception e) {
+            log.warn("⚠ getSnapshot invoke failed: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    private void ensureSelectedBalanceCompat(AccountBalanceSnapshot snap, String selectedAsset) {
+        if (snap == null || selectedAsset == null || selectedAsset.isBlank()) return;
+
+        // если есть метод selectAsset(String) — зовём
+        try {
+            Method m = snap.getClass().getMethod("selectAsset", String.class);
+            m.invoke(snap, selectedAsset);
+        } catch (Exception ignored) {
+            // старая версия может не уметь “переключать” selectedBalance — тогда ок
+        }
     }
 
     // =====================================================
@@ -821,5 +1047,55 @@ public class StrategySettingsController {
         if (v == null) return null;
         if (v.compareTo(BigDecimal.ZERO) <= 0) return null;
         return v.setScale(6, RoundingMode.HALF_UP);
+    }
+
+    private String resolveExchange(String raw, StrategySettings s) {
+        if (raw != null && !raw.isBlank()) return normalizeExchange(raw);
+        if (s != null && s.getExchangeName() != null && !s.getExchangeName().isBlank())
+            return normalizeExchange(s.getExchangeName());
+        return "BINANCE";
+    }
+
+    private NetworkType resolveNetwork(String raw, StrategySettings s) {
+        if (raw != null && !raw.isBlank()) return parseNetworkOrDefault(raw, NetworkType.TESTNET);
+        if (s != null && s.getNetworkType() != null) return s.getNetworkType();
+        return NetworkType.TESTNET;
+    }
+
+    @SuppressWarnings("unchecked")
+    private AccountBalanceSnapshot.AssetBalance findBalance(AccountBalanceSnapshot snap, String asset) {
+        if (snap == null || asset == null || asset.isBlank()) return null;
+
+        String a = asset.trim().toUpperCase(Locale.ROOT);
+
+        // 1) пробуем достать balancesByAsset через getBalancesByAsset()
+        try {
+            Method m = snap.getClass().getMethod("getBalancesByAsset");
+            Object r = m.invoke(snap);
+
+            if (r instanceof Map<?, ?> map) {
+                Object v = map.get(a);
+                if (v instanceof AccountBalanceSnapshot.AssetBalance ab) return ab;
+            }
+        } catch (Exception ignored) {}
+
+        // 2) пробуем поле balancesByAsset напрямую
+        try {
+            Field f = snap.getClass().getDeclaredField("balancesByAsset");
+            f.setAccessible(true);
+            Object r = f.get(snap);
+
+            if (r instanceof Map<?, ?> map) {
+                Object v = map.get(a);
+                if (v instanceof AccountBalanceSnapshot.AssetBalance ab) return ab;
+            }
+        } catch (Exception ignored) {}
+
+        // 3) fallback: selectedBalance
+        try {
+            return snap.getSelectedBalance();
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 }

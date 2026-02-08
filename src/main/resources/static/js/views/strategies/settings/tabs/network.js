@@ -347,13 +347,25 @@ window.SettingsTabNetwork = (function () {
                 setAutosave("Сохранено", "ok");
                 showAlert("ok", "Биржа/сеть сохранены", `Биржа: ${ex}\nСеть: ${net}`);
 
-                // ✅ тут лучше делать reload, чтобы сервер заново отдал:
-                // - connectionOk
-                // - accountFees
-                // - exchangeSettings.hasBaseKeys()
-                // иначе UI будет полуправдой
-                const url = buildSettingsUrl(getChatId(), ex, net, "tab-network");
-                setTimeout(() => window.location.assign(url), 250);
+                // ✅ обновляем общий контекст без перезагрузки
+                if (btnDiagnose) {
+                    btnDiagnose.dataset.exchange = ex;
+                    btnDiagnose.dataset.network = net;
+                }
+
+                if (window.SettingsPage && window.SettingsPage.setCtx) {
+                    window.SettingsPage.setCtx({ exchange: ex, network: net }, "network_saved");
+                } else if (window.SettingsApi && window.SettingsApi.emit) {
+                    window.SettingsApi.emit(window.SettingsApi.EVT_CONTEXT_CHANGED, {
+                        exchange: ex,
+                        network: net,
+                        reason: "network_saved",
+                        ts: Date.now()
+                    });
+                }
+
+                // ✅ обновим диагностику сразу (чтобы пользователь видел актуальный connectionOk)
+                diagnose().catch(() => {});
 
             } catch (e) {
                 const pretty = prettifyError(e);

@@ -9,6 +9,63 @@
  */
 window.SettingsApi = (function () {
 
+
+    // =====================================================
+    // 🔄 UI-state bus (общий стор для вкладок)
+    // =====================================================
+    function ensureStrategyStore() {
+        if (window.StrategySettingsStore && typeof window.StrategySettingsStore.subscribe === "function") {
+            return window.StrategySettingsStore;
+        }
+
+        const listeners = new Set();
+
+        const store = {
+            _state: null,
+
+            getState() { return this._state; },
+
+            setState(state) {
+                this._state = state;
+
+                // 1) подписчики (вкладки)
+                listeners.forEach(fn => {
+                    try { fn(state); } catch (e) {}
+                });
+
+                // 2) событие на window (фолбэк)
+                try {
+                    window.dispatchEvent(new CustomEvent("strategy:state", { detail: state }));
+                } catch (e) {}
+            },
+
+            subscribe(fn) {
+                if (typeof fn !== "function") return () => {};
+                listeners.add(fn);
+
+                // сразу отдадим текущее состояние
+                if (this._state) {
+                    try { fn(this._state); } catch (e) {}
+                }
+
+                return () => listeners.delete(fn);
+            }
+        };
+
+        window.StrategySettingsStore = store;
+        return store;
+    }
+
+    function looksLikeUiState(obj) {
+        if (!obj || typeof obj !== "object") return false;
+        return ("chatId" in obj) && ("type" in obj) && ("exchange" in obj) && ("network" in obj);
+    }
+
+    function publishUiStateIfAny(obj) {
+        if (!looksLikeUiState(obj)) return;
+        try { ensureStrategyStore().setState(obj); } catch (e) {}
+    }
+
     function isBlank(s) {
         return s === null || s === undefined || String(s).trim() === "";
     }

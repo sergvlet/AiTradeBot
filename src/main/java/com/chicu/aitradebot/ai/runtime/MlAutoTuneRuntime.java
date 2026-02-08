@@ -6,6 +6,7 @@ import com.chicu.aitradebot.ai.tuning.eval.StrategyEnvResolver;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
+import com.chicu.aitradebot.domain.enums.AdvancedControlMode;
 import com.chicu.aitradebot.service.StrategySettingsService;
 import com.chicu.aitradebot.strategy.windowscalping.WindowScalpingStrategySettings;
 import com.chicu.aitradebot.strategy.windowscalping.WindowScalpingStrategySettingsService;
@@ -115,6 +116,19 @@ public class MlAutoTuneRuntime {
         ResolvedEnv env = resolveEnvSafe(chatId, type, exchange, network);
         if (!env.ok) return;
 
+        // ✅ В MANUAL режиме (и при autoTuneEnabled=false) никакой тюнинг/планировщики не запускаем
+        StrategySettings ss = strategySettingsService.getOrCreate(chatId, type);
+        if (!isTuningAllowed(ss)) {
+            String k = key(chatId, type, env.exchange, env.network);
+            ScheduledFuture<?> f = jobs.remove(k);
+            if (f != null) {
+                try { f.cancel(false); } catch (Exception ignore) {}
+            }
+            lastTriggerAtMs.remove(k);
+            running.remove(k);
+            return;
+        }
+
         String k = key(chatId, type, env.exchange, env.network);
 
         long initialDelayMs = Duration.ofMinutes(Math.max(0, periodicInitialDelayMinutes)).toMillis();
@@ -151,6 +165,9 @@ public class MlAutoTuneRuntime {
         ResolvedEnv env = resolveEnvSafe(chatId, type, exchange, network);
         if (!env.ok) return;
 
+        StrategySettings ss = strategySettingsService.getOrCreate(chatId, type);
+        if (!isTuningAllowed(ss)) return;
+
         scheduler.submit(() -> safeTune(chatId, type, env.exchange, env.network, "after-close"));
     }
 
@@ -167,6 +184,9 @@ public class MlAutoTuneRuntime {
 
         ResolvedEnv env = resolveEnvSafe(chatId, type, exchange, network);
         if (!env.ok) return;
+
+        StrategySettings ss = strategySettingsService.getOrCreate(chatId, type);
+        if (!isTuningAllowed(ss)) return;
 
         Duration debounce = Duration.ofSeconds(90);
 
@@ -187,6 +207,9 @@ public class MlAutoTuneRuntime {
         ResolvedEnv env = resolveEnvSafe(chatId, type, exchange, network);
         if (!env.ok) return;
 
+        StrategySettings ss = strategySettingsService.getOrCreate(chatId, type);
+        if (!isTuningAllowed(ss)) return;
+
         Duration debounce = Duration.ofSeconds(90);
         String r = "hold:" + safe(reason);
 
@@ -204,6 +227,9 @@ public class MlAutoTuneRuntime {
 
         ResolvedEnv env = resolveEnvSafe(chatId, type, exchange, network);
         if (!env.ok) return;
+
+        StrategySettings ss = strategySettingsService.getOrCreate(chatId, type);
+        if (!isTuningAllowed(ss)) return;
 
         String k = key(chatId, type, env.exchange, env.network);
 
@@ -228,6 +254,13 @@ public class MlAutoTuneRuntime {
     // INTERNAL
     // =====================================================
 
+    private boolean isTuningAllowed(StrategySettings ss) {
+        if (ss == null) return false;
+        if (!ss.isAutoTuneEnabled()) return false;
+
+        AdvancedControlMode m = (ss.getAdvancedControlMode() != null ? ss.getAdvancedControlMode() : AdvancedControlMode.MANUAL);
+        return m != AdvancedControlMode.MANUAL;
+    }
     private void safeTune(Long chatId, StrategyType type, String exchange, NetworkType network, String reason) {
         if (chatId == null || type == null) return;
 
@@ -249,8 +282,10 @@ public class MlAutoTuneRuntime {
             StrategySettings ss = strategySettingsService.getOrCreate(chatId, type);
             if (ss == null) return;
 
-            if (!ss.isAutoTuneEnabled()) {
-                log.debug("🧠 ML skip tune (autoTuneEnabled=false) chatId={} type={} ex={} net={}", chatId, type, env.exchange, env.network);
+            if (!isTuningAllowed(ss)) {
+                AdvancedControlMode m = (ss.getAdvancedControlMode() != null ? ss.getAdvancedControlMode() : AdvancedControlMode.MANUAL);
+                log.debug("🧠 ML skip tune (disabled) chatId={} type={} ex={} net={} mode={} autoTune={}",
+                        chatId, type, env.exchange, env.network, m, ss.isAutoTuneEnabled());
                 return;
             }
 

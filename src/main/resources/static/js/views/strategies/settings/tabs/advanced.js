@@ -45,6 +45,21 @@ window.SettingsTabAdvanced = (function () {
             network: String(globalCtx?.network ?? pageRoot.dataset.network ?? "MAINNET").trim()
         };
 
+        function syncCtxFromGlobal() {
+            try {
+                const g = window.StrategySettingsContext;
+                if (!g) return;
+                if (g.chatId != null) ctx.chatId = g.chatId;
+                if (g.type) ctx.type = String(g.type);
+                if (g.exchange) ctx.exchange = String(g.exchange);
+                if (g.network) ctx.network = String(g.network);
+                if (g.symbol) ctx.symbol = String(g.symbol);
+                if (g.timeframe) ctx.timeframe = String(g.timeframe);
+            } catch (e) {}
+        }
+
+
+
         const modeBadge = document.getElementById("advModeBadge");
         const activeBadge = document.getElementById("advActiveBadge");
         const loadState = document.getElementById("advLoadState");
@@ -377,6 +392,11 @@ window.SettingsTabAdvanced = (function () {
                     return;
                 }
 
+                // 🔔 сообщим остальным вкладкам, что данные изменились
+                if (window.SettingsApi && window.SettingsApi.emit) {
+                    window.SettingsApi.emit(window.SettingsApi.EVT_STATE_INVALIDATED, { reason: "advanced_submit", ts: Date.now() });
+                }
+
                 scheduleReload(220);
 
             } catch (e) {
@@ -384,6 +404,19 @@ window.SettingsTabAdvanced = (function () {
                 setLoadState("ERR", "danger");
             }
         }
+
+        // =====================================================
+        // 🔄 Смена биржи/сети — обновляем Advanced автоматически
+        // =====================================================
+        (function bindContextListener() {
+            const evt = (window.SettingsApi && window.SettingsApi.EVT_CONTEXT_CHANGED)
+                ? window.SettingsApi.EVT_CONTEXT_CHANGED
+                : "strategy:contextChanged";
+            document.addEventListener(evt, () => {
+                syncCtxFromGlobal();
+                if (isAdvancedTabActive()) scheduleReload(160);
+            });
+        })();
 
         // первичная загрузка
         load();

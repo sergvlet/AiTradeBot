@@ -1,5 +1,58 @@
 "use strict";
 
+// =====================================================
+// 🚌 Global Bus + Store (единое состояние страницы)
+// =====================================================
+(function initStrategySettingsBusAndStore() {
+    // Bus
+    if (!window.StrategySettingsBus) {
+        window.StrategySettingsBus = {
+            emit(name, detail) {
+                try {
+                    window.dispatchEvent(new CustomEvent(name, { detail }));
+                } catch (e) {
+                    // если CustomEvent недоступен/сломался — просто игнор
+                }
+            },
+            on(name, handler) {
+                if (!name || typeof handler !== "function") return () => {};
+                window.addEventListener(name, handler);
+                return () => window.removeEventListener(name, handler);
+            }
+        };
+    }
+
+    // Store
+    if (!window.StrategySettingsStore) {
+        let _state = null;
+        const listeners = new Set();
+
+        function set(next) {
+            _state = next || null;
+            // 1) event
+            window.StrategySettingsBus.emit("strategy:state", _state);
+            // 2) subscribers
+            listeners.forEach(fn => {
+                try { fn(_state); } catch (_) {}
+            });
+        }
+
+        function get() {
+            return _state;
+        }
+
+        function subscribe(fn) {
+            if (typeof fn !== "function") return () => {};
+            listeners.add(fn);
+            // push current immediately
+            try { fn(_state); } catch (_) {}
+            return () => listeners.delete(fn);
+        }
+
+        window.StrategySettingsStore = { set, get, subscribe };
+    }
+})();
+
 /**
  * Strategy Settings Page Bootstrap
  * - tabs persistence (per chatId/type/exchange/network)
@@ -41,6 +94,229 @@
         const c = (ctx?.exchange || "NA");
         const d = (ctx?.network || "NA");
         return `strategy_settings_active_tab::${a}::${b}::${c}::${d}`;
+    }
+
+    // =====================================================
+    // ✅ COMPAT: api.js ожидает window.SettingsPageStore
+    // =====================================================
+    function initCompatSettingsPageStore() {
+        if (window.SettingsPageStore) return;
+
+        // store + bus уже созданы в initStrategySettingsBusAndStore()
+        const Store = window.StrategySettingsStore;
+        const Bus = window.StrategySettingsBus;
+
+        // защита: если по какой-то причине не поднялись
+        if (!Store || !Bus) {
+            console.warn("⚠ StrategySettingsStore/Bus not found — compat store disabled");
+            return;
+        }
+
+        let hardRefreshInProgress = false;
+        let hardRefreshTimer = null;
+
+        function getContext() {
+            return window.StrategySettingsContext || null;
+        }
+
+        function buildStateUrl(ctx) {
+            if (!ctx) return null;
+            const q = new URLSearchParams();
+            q.set("chatId", String(ctx.chatId));
+            if (ctx.exchange) q.set("exchange", String(ctx.exchange));
+            if (ctx.network) q.set("network", String(ctx.network));
+            return `/strategies/${encodeURIComponent(ctx.type)}/config/state?${q.toString()}`;
+        }
+
+        async function hardRefreshNow() {
+            const ctx = getContext();
+            const url = buildStateUrl(ctx);
+            if (!url) return null;
+            if (hardRefreshInProgress) return null;
+            hardRefreshInProgress = true;
+            try {
+                // используем SettingsApi если есть
+                let st = null;
+                if (window.SettingsApi && typeof window.SettingsApi.getJson === "function") {
+                    st = await window.SettingsApi.getJson(url);
+                } else {
+                    const r = await fetch(url, { headers: { "Accept": "application/json" } });
+                    if (!r.ok) throw new Error(`state fetch failed: ${r.status}`);
+                    st = await r.json();
+                }
+                if (st) {
+                    // важно: не запускаем повторный hard refresh из этого применения
+                    window.SettingsPageStore.setStateFromServerState(st, { skipHardRefresh: true });
+                }
+                return st;
+            } catch (e) {
+                console.warn("⚠ hardRefreshNow failed:", e);
+                return null;
+            } finally {
+                hardRefreshInProgress = false;
+            }
+        }
+
+        function scheduleHardRefresh(delayMs) {
+            clearTimeout(hardRefreshTimer);
+            hardRefreshTimer = setTimeout(() => { hardRefreshNow(); }, Math.max(0, delayMs || 0));
+        }
+
+        function setStateFromServerState(serverState, opts) {
+            // кладём в общий store — это триггерит подписчиков
+            try {
+                Store.set(serverState);
+                Bus.emit("ui:state", serverState);
+            } catch (e) {
+                console.warn("⚠ failed to set store state:", e);
+            }
+
+            // ✅ после POST часто нужно дочитать свежий баланс/снапшот
+            if (!opts || !opts.skipHardRefresh) {
+                scheduleHardRefresh(80);
+            }
+        }
+
+        window.SettingsPageStore = {
+            getContext,
+            setStateFromServerState,
+            hardRefreshNow,
+        };
+    }
+
+    // =====================================================
+    // ✅ DOM AUTO-UPDATE (балансы / риск / кнопка active)
+    // =====================================================
+    function initDomAutoUpdate() {
+        const Store = window.StrategySettingsStore;
+        if (!Store || typeof Store.onChange !== "function") return;
+
+        function byId(id) { return document.getElementById(id); }
+
+        function text(el, v) {
+            if (!el) return;
+            el.textContent = (v === null || v === undefined || v === "") ? "—" : String(v);
+        }
+
+        function asNum(v) {
+            if (v === null || v === undefined || v === "") return null;
+            if (typeof v === "number") return v;
+            const s = String(v).replace(",", ".");
+            const n = Number(s);
+            return Number.isFinite(n) ? n : null;
+        }
+
+        function fmtMoney(v, scale) {
+            if (v === null || v === undefined || v === "") return "—";
+            const n = asNum(v);
+            if (n === null) return String(v);
+            const sc = (typeof scale === "number" ? scale : 8);
+            return n.toFixed(sc).replace(/\.0+$/, "").replace(/(\.\d*?)0+$/, "$1");
+        }
+
+        function applyStateToDom(state) {
+            if (!state) return;
+
+            // 1) badges / active
+            const activeBadge = byId("strategyActiveBadge");
+            const toggleBtn = byId("strategyToggleBtn");
+
+            if (activeBadge) {
+                const isOn = !!state.active;
+                activeBadge.textContent = isOn ? "RUNNING" : "STOPPED";
+                activeBadge.classList.toggle("bg-success", isOn);
+                activeBadge.classList.toggle("bg-secondary", !isOn);
+            }
+
+            if (toggleBtn) {
+                const isOn = !!state.active;
+                toggleBtn.textContent = isOn ? "Остановить" : "Запустить";
+                toggleBtn.classList.toggle("btn-danger", isOn);
+                toggleBtn.classList.toggle("btn-success", !isOn);
+            }
+
+            // 2) hidden inputs: exchange/network чтобы формы сохраняли актуальное
+            if (state.exchange) {
+                document.querySelectorAll("input[name='exchange']").forEach(i => i.value = state.exchange);
+            }
+            if (state.network) {
+                document.querySelectorAll("input[name='network']").forEach(i => i.value = state.network);
+            }
+
+            // 3) балансы (trade tab)
+            const bal = state.selectedBalance || null;
+            if (bal) {
+                const asset = bal.asset || state.accountAsset || "";
+                text(byId("selectedAssetText"), asset);
+                text(byId("assetFreeView"), fmtMoney(bal.free, 8));
+                text(byId("assetLockedView"), fmtMoney(bal.locked, 8));
+
+                // total: если пришёл с бэка — используем, иначе считаем
+                let total = bal.total;
+                if (total === undefined || total === null) {
+                    const f = asNum(bal.free);
+                    const l = asNum(bal.locked);
+                    if (f !== null && l !== null) total = f + l;
+                }
+                text(byId("assetTotalView"), fmtMoney(total, 8));
+            }
+
+            // 4) риск (available balance)
+            if (bal) {
+                const asset = bal.asset || state.accountAsset || "";
+                text(byId("riskAssetText"), asset);
+                text(byId("riskFreeBalanceText"), fmtMoney(bal.free, 8));
+                const freeVal = byId("riskFreeBalanceValue");
+                if (freeVal) freeVal.value = (bal.free !== null && bal.free !== undefined) ? String(bal.free) : "";
+                const sel = byId("riskSelectedAsset");
+                if (sel) sel.value = asset;
+            }
+
+            // 5) accountAsset hidden/select (если есть)
+            if (state.accountAsset) {
+                const h = byId("accountAssetHidden");
+                if (h) h.value = state.accountAsset;
+                const s = byId("accountAssetSelect");
+                if (s && s.value !== state.accountAsset) s.value = state.accountAsset;
+            }
+        }
+
+        // подписка
+        Store.onChange((st) => {
+            try { applyStateToDom(st); } catch (e) { console.warn("⚠ applyStateToDom failed:", e); }
+        });
+
+        // кнопка ручного refresh (trade tab)
+        const btn = document.getElementById("assetRefreshBtn");
+        if (btn && window.SettingsPageStore && typeof window.SettingsPageStore.hardRefreshNow === "function") {
+            btn.addEventListener("click", (e) => {
+                e.preventDefault();
+                window.SettingsPageStore.hardRefreshNow();
+            });
+        }
+
+        // active toggle: делаем AJAX + state refresh, без перезагрузки страницы
+        const toggleForm = document.getElementById("strategyToggleForm");
+        if (toggleForm) {
+            toggleForm.addEventListener("submit", async (e) => {
+                e.preventDefault();
+                try {
+                    await fetch(toggleForm.action, {
+                        method: "POST",
+                        headers: {
+                            "X-Requested-With": "fetch",
+                            "Accept": "application/json"
+                        },
+                        body: new FormData(toggleForm)
+                    });
+                } catch (err) {
+                    console.warn("⚠ toggle failed:", err);
+                }
+                if (window.SettingsPageStore && typeof window.SettingsPageStore.hardRefreshNow === "function") {
+                    await window.SettingsPageStore.hardRefreshNow();
+                }
+            });
+        }
     }
 
     function normalizeTabName(name) {
@@ -106,6 +382,11 @@
 
         window.StrategySettingsContext = ctx;
         console.log("[settings/page] boot ctx:", ctx);
+
+        // ✅ включаем единый стор обновления UI (балансы/риск/бейдж Active)
+        try { initCompatSettingsPageStore(); } catch (e) {
+            console.warn("[settings/page] initCompatSettingsPageStore failed:", e);
+        }
 
         const buttons = $all(".tab-btn");
         console.log("[settings/page] tab buttons:", buttons.map(b => b.dataset.tab));
