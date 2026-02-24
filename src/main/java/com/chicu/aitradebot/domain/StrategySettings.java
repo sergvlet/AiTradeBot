@@ -40,11 +40,10 @@ public class StrategySettings {
     @Column(nullable = false, length = 32)
     private StrategyType type;
 
-    // ✅ НЕ ключ, просто контекст
+    // контекст
     @Column(name = "exchange_name", nullable = false, length = 32)
     private String exchangeName;
 
-    // ✅ НЕ ключ, просто контекст
     @Enumerated(EnumType.STRING)
     @Column(name = "network_type", nullable = false, length = 16)
     private NetworkType networkType;
@@ -62,6 +61,8 @@ public class StrategySettings {
     @Column(name = "account_asset", length = 16)
     private String accountAsset;
 
+    public enum CapitalMode { ALL, FIX, PCT }
+
     @Enumerated(EnumType.STRING)
     @Column(name = "capital_mode", nullable = false, length = 8)
     @Builder.Default
@@ -69,8 +70,6 @@ public class StrategySettings {
 
     @Column(name = "capital_value", precision = 18, scale = 6)
     private BigDecimal capitalValue;
-
-    public enum CapitalMode { ALL, FIX, PCT }
 
     @Enumerated(EnumType.STRING)
     @Column(name = "advanced_control_mode", nullable = false, length = 16)
@@ -129,8 +128,7 @@ public class StrategySettings {
 
     public BigDecimal getEffectiveCapitalValueOrNull() {
         CapitalMode m = (capitalMode != null ? capitalMode : CapitalMode.ALL);
-        if (m == CapitalMode.ALL) return null;
-        return capitalValue;
+        return (m == CapitalMode.ALL) ? null : capitalValue;
     }
 
     @PrePersist
@@ -139,69 +137,78 @@ public class StrategySettings {
         this.createdAt = (this.createdAt != null) ? this.createdAt : now;
         this.updatedAt = (this.updatedAt != null) ? this.updatedAt : now;
 
-        if (this.symbol == null || this.symbol.trim().isEmpty()) this.symbol = "BTCUSDT";
-        this.symbol = this.symbol.trim().toUpperCase(Locale.ROOT);
-
-        if (this.timeframe == null || this.timeframe.trim().isEmpty()) this.timeframe = "1m";
-        this.timeframe = this.timeframe.trim().toLowerCase(Locale.ROOT);
-
-        if (this.cachedCandlesLimit == null || this.cachedCandlesLimit < 50) this.cachedCandlesLimit = 500;
-
-        this.exchangeName = normalizeUpperNullable(this.exchangeName);
-        if (this.exchangeName == null) this.exchangeName = "BINANCE";
-
-        this.networkType = (this.networkType != null) ? this.networkType : NetworkType.TESTNET;
-
-        this.accountAsset = normalizeUpperNullable(this.accountAsset);
-
-        if (this.advancedControlMode == null) this.advancedControlMode = AdvancedControlMode.MANUAL;
-        if (this.capitalMode == null) this.capitalMode = CapitalMode.ALL;
-
-        this.runPhase = normalizeUpperNullable(this.runPhase);
-        this.mlModelKey = normalizeTrimNullable(this.mlModelKey);
-        this.mlSchemaHash = normalizeTrimNullable(this.mlSchemaHash);
-        this.mlModelVersion = normalizeTrimNullable(this.mlModelVersion);
-
-        if (this.mlConfidence == null) this.mlConfidence = BigDecimal.ZERO;
-        if (this.totalProfitPct == null) this.totalProfitPct = BigDecimal.ZERO;
+        // только нормализация/валидация (дефолты задаёт сервис)
+        normalizeAll();
+        validateRequiredForDb();
 
         normalizeCapital();
+        enforceControlModeHardRules();
     }
 
     @PreUpdate
     protected void onUpdate() {
         this.updatedAt = LocalDateTime.now();
 
-        if (this.symbol != null && !this.symbol.trim().isEmpty()) {
-            this.symbol = this.symbol.trim().toUpperCase(Locale.ROOT);
-        }
-        if (this.timeframe != null && !this.timeframe.trim().isEmpty()) {
-            this.timeframe = this.timeframe.trim().toLowerCase(Locale.ROOT);
+        normalizeAll();
+        validateRequiredForDb();
+
+        normalizeCapital();
+        enforceControlModeHardRules();
+    }
+
+    private void enforceControlModeHardRules() {
+        AdvancedControlMode m = (advancedControlMode != null) ? advancedControlMode : AdvancedControlMode.MANUAL;
+
+        // MANUAL = жёстко выключаем “умные” флаги
+        if (m == AdvancedControlMode.MANUAL) {
+            this.autoTuneEnabled = false;
+            this.mlGateEnabled = false;
+            this.gateMinProb = null;
+            // runPhase оставляем как есть (контроллер/сервис решают), но нормализуем
         }
 
-        this.exchangeName = normalizeUpperNullable(this.exchangeName);
-        if (this.exchangeName == null) this.exchangeName = "BINANCE";
+        // AI = автотюн обязателен (иначе это не AI)
+        if (m == AdvancedControlMode.AI) {
+            this.autoTuneEnabled = true;
+            // mlGateEnabled оставляем как настройку пользователя (можно включить/выключить)
+        }
+    }
 
-        this.networkType = (this.networkType != null) ? this.networkType : NetworkType.TESTNET;
+    private void normalizeAll() {
+        this.exchangeName = normalizeUpperRequired(this.exchangeName);
+        this.symbol       = normalizeUpperRequired(this.symbol);
+        this.timeframe    = normalizeLowerRequired(this.timeframe);
 
         this.accountAsset = normalizeUpperNullable(this.accountAsset);
+        this.runPhase     = normalizeUpperNullable(this.runPhase);
+
+        this.mlModelKey      = normalizeTrimNullable(this.mlModelKey);
+        this.mlSchemaHash    = normalizeTrimNullable(this.mlSchemaHash);
+        this.mlModelVersion  = normalizeTrimNullable(this.mlModelVersion);
 
         if (this.cachedCandlesLimit != null && this.cachedCandlesLimit < 50) {
             this.cachedCandlesLimit = 50;
+        }
+        if (this.cachedCandlesLimit == null) {
+            this.cachedCandlesLimit = 500; // технический дефолт, НЕ бизнес-дефолт
         }
 
         if (this.advancedControlMode == null) this.advancedControlMode = AdvancedControlMode.MANUAL;
         if (this.capitalMode == null) this.capitalMode = CapitalMode.ALL;
 
-        this.runPhase = normalizeUpperNullable(this.runPhase);
-        this.mlModelKey = normalizeTrimNullable(this.mlModelKey);
-        this.mlSchemaHash = normalizeTrimNullable(this.mlSchemaHash);
-        this.mlModelVersion = normalizeTrimNullable(this.mlModelVersion);
-
         if (this.mlConfidence == null) this.mlConfidence = BigDecimal.ZERO;
         if (this.totalProfitPct == null) this.totalProfitPct = BigDecimal.ZERO;
+    }
 
-        normalizeCapital();
+    private void validateRequiredForDb() {
+        // поля nullable=false в БД: без сервиса пусть падает сразу и понятно
+        if (chatId == null) throw new IllegalStateException("StrategySettings.chatId is null");
+        if (type == null) throw new IllegalStateException("StrategySettings.type is null");
+        if (exchangeName == null) throw new IllegalStateException("StrategySettings.exchangeName is null (set defaults in StrategySettingsService)");
+        if (networkType == null) throw new IllegalStateException("StrategySettings.networkType is null (set defaults in StrategySettingsService)");
+        if (symbol == null) throw new IllegalStateException("StrategySettings.symbol is null (set defaults in StrategySettingsService)");
+        if (timeframe == null) throw new IllegalStateException("StrategySettings.timeframe is null (set defaults in StrategySettingsService)");
+        if (cachedCandlesLimit == null) throw new IllegalStateException("StrategySettings.cachedCandlesLimit is null");
     }
 
     private void normalizeCapital() {
@@ -219,10 +226,8 @@ public class StrategySettings {
             return;
         }
 
-        if (m == CapitalMode.PCT) {
-            if (this.capitalValue.compareTo(BigDecimal.valueOf(100)) > 0) {
-                this.capitalValue = BigDecimal.valueOf(100);
-            }
+        if (m == CapitalMode.PCT && this.capitalValue.compareTo(BigDecimal.valueOf(100)) > 0) {
+            this.capitalValue = BigDecimal.valueOf(100);
         }
     }
 
@@ -237,5 +242,17 @@ public class StrategySettings {
         String v = s.trim();
         if (v.isEmpty()) return null;
         return v.toUpperCase(Locale.ROOT);
+    }
+
+    private static String normalizeUpperRequired(String s) {
+        String v = normalizeTrimNullable(s);
+        if (v == null) return null;
+        return v.toUpperCase(Locale.ROOT);
+    }
+
+    private static String normalizeLowerRequired(String s) {
+        String v = normalizeTrimNullable(s);
+        if (v == null) return null;
+        return v.toLowerCase(Locale.ROOT);
     }
 }

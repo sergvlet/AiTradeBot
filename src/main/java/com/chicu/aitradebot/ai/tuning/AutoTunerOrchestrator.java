@@ -8,6 +8,7 @@ import org.springframework.stereotype.Service;
 
 import java.lang.reflect.Method;
 import java.util.EnumMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -21,18 +22,16 @@ public class AutoTunerOrchestrator {
     private final Map<StrategyType, StrategyAutoTuner> tuners = new EnumMap<>(StrategyType.class);
     private final StrategyEnvResolver envResolver;
 
-    /**
-     * ✅ 1 контекст (chatId/type/exchange/network) — 1 тюнинг одновременно.
-     */
+    /** ✅ 1 контекст (chatId/type/exchange/network) — 1 тюнинг одновременно. */
     private final Set<TuningKey> inFlight = ConcurrentHashMap.newKeySet();
 
-    /**
-     * ✅ Debounce/anti-spam по контексту (chatId/type/exchange/network) + signature.
-     */
+    /** ✅ Debounce/anti-spam по контексту (chatId/type/exchange/network) + signature. */
     private final Map<TuningKey, LastRun> lastRunByKey = new ConcurrentHashMap<>();
 
     /**
-     * cooldown для одинакового signature (кроме NO_TRADES)
+     * cooldown для одинакового signature:
+     * ✅ применяем ТОЛЬКО если прошлый результат был APPLIED или NO_IMPROVEMENT
+     * ❌ НЕ применяем для ERROR/NO_TRADES (чтобы можно было быстро повторить)
      */
     private static final long COOLDOWN_MS = 60_000L;
 
@@ -113,18 +112,18 @@ public class AutoTunerOrchestrator {
             signatureForCatch = signature;
 
             // ==========================
-            // ✅ Cooldown по signature (кроме NO_TRADES)
+            // ✅ Cooldown по signature (строгий, но НЕ блокируем ERROR/NO_TRADES)
             // ==========================
             LastRun last = lastRunByKey.get(key);
             long now = System.currentTimeMillis();
 
             boolean sameSignature = (last != null && signature.equals(last.signature()));
-            boolean notNoTrades = (last != null && last.outcome() != TuneOutcome.NO_TRADES);
             boolean withinCooldown = (last != null && (now - last.atMs()) < COOLDOWN_MS);
+            boolean cooldownApplies = (last != null && (last.outcome() == TuneOutcome.APPLIED || last.outcome() == TuneOutcome.NO_IMPROVEMENT));
 
-            if (sameSignature && notNoTrades && withinCooldown) {
-                log.info("🧠 TUNE SKIP (cooldown) chatId={} type={} ex={} net={} signature={} ageMs={}",
-                        chatId, type, env.exchange, env.network, signature, (now - last.atMs()));
+            if (sameSignature && withinCooldown && cooldownApplies) {
+                log.info("🧠 TUNE SKIP (cooldown) chatId={} type={} ex={} net={} signature={} ageMs={} lastOutcome={}",
+                        chatId, type, env.exchange, env.network, signature, (now - last.atMs()), last.outcome());
 
                 return TuningResult.builder()
                         .applied(false)
@@ -141,7 +140,7 @@ public class AutoTunerOrchestrator {
                     safe(normalized.reason())
             );
 
-            // фиксируем RUNNING сразу (анти-спам от автосейва)
+            // фиксируем RUNNING сразу (анти-спам от автосейва/триггеров)
             lastRunByKey.put(key, new LastRun(signature, now, null, TuneOutcome.RUNNING));
 
             TuningResult res = tuner.tune(normalized);
@@ -152,6 +151,10 @@ public class AutoTunerOrchestrator {
 
             long tookMs = System.currentTimeMillis() - startedAtMs;
 
+            // ==========================
+            // ✅ NO_TRADES: даём тюнеру разжать фильтры,
+            // и НЕ блокируем следующий прогон cooldown-ом.
+            // ==========================
             if (isNoTrades(res)) {
                 tryAdjustCoarseFilters(tuner, normalized);
 
@@ -162,16 +165,8 @@ public class AutoTunerOrchestrator {
                         tookMs
                 );
 
-                // ⚠️ NO_TRADES → cooldown НЕ блокирует следующий прогон
                 lastRunByKey.put(key, new LastRun(signature, System.currentTimeMillis(), safe(res.modelVersion()), TuneOutcome.NO_TRADES));
-
-                return TuningResult.builder()
-                        .applied(false)
-                        .scoreBefore(res.scoreBefore())
-                        .scoreAfter(res.scoreAfter())
-                        .modelVersion(res.modelVersion())
-                        .reason("no_trades")
-                        .build();
+                return res; // ✅ возвращаем оригинальный res
             }
 
             log.info("✅ TUNE DONE applied={} scoreBefore={} scoreAfter={} model={} tookMs={} reason={}",

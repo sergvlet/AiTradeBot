@@ -1,9 +1,10 @@
 package com.chicu.aitradebot.strategy.executor;
 
-import com.chicu.aitradebot.ai.ml.HttpMlSignalService;
-import com.chicu.aitradebot.ai.ml.MlFeatures;
-import com.chicu.aitradebot.ai.ml.MlPrediction;
 import com.chicu.aitradebot.ai.ml.ModelKeyFactory;
+import com.chicu.aitradebot.ai.ml.MlClient;
+import com.chicu.aitradebot.ai.ml.dto.MlHealthResponse;
+import com.chicu.aitradebot.ai.ml.dto.MlPredictRequest;
+import com.chicu.aitradebot.ai.ml.dto.MlPredictResponse;
 import com.chicu.aitradebot.domain.StrategySettings;
 import com.chicu.aitradebot.domain.enums.AdvancedControlMode;
 import com.chicu.aitradebot.strategy.core.context.StrategyContext;
@@ -15,8 +16,13 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.HashMap;
+import java.util.Locale;
+import java.util.Map;
 
 @Slf4j
 @Service
@@ -25,8 +31,7 @@ public class StrategySignalExecutorImpl implements StrategySignalExecutor {
 
     private final StrategyLivePublisher live;
 
-    // делаем зависимости опциональными (чтобы приложение не падало, если ML модуль выключен)
-    private final ObjectProvider<HttpMlSignalService> ml;
+    private final ObjectProvider<MlClient> mlClientProvider;
     private final ObjectProvider<ModelKeyFactory> modelKeyFactory;
 
     @Override
@@ -40,36 +45,17 @@ public class StrategySignalExecutorImpl implements StrategySignalExecutor {
             case BUY -> handleBuy(signal, ctx, state);
             case SELL -> handleSell(signal, ctx, state);
             case EXIT -> handleExit(signal, ctx, state);
-            case HOLD -> {
-                // ничего
-            }
+            case HOLD -> { /* no-op */ }
         }
     }
 
-    // =====================================================
-    // BUY
-    // =====================================================
-    private void handleBuy(Signal signal,
-                           StrategyContext ctx,
-                           StrategyRuntimeState state) {
-
-        if (state.hasOpenPosition()) {
-            log.debug("⛔ BUY skipped — position already open");
-            return;
-        }
-
-        if (!state.canEnterTrade()) {
-            log.debug("⛔ BUY skipped — canEnterTrade=false (cooldown/risk limits)");
-            return;
-        }
+    private void handleBuy(Signal signal, StrategyContext ctx, StrategyRuntimeState state) {
+        if (state.hasOpenPosition()) return;
+        if (!state.canEnterTrade()) return;
 
         BigDecimal price = safePrice(ctx.getPrice());
-        if (price == null) {
-            log.debug("⛔ BUY skipped — price is null/invalid");
-            return;
-        }
+        if (price == null) return;
 
-        // ML Gate (если включён)
         if (!passesMlGate(signal, ctx)) {
             log.info("🟡 BUY blocked by ML gate | {}", safeReason(signal));
             return;
@@ -78,85 +64,26 @@ public class StrategySignalExecutorImpl implements StrategySignalExecutor {
         state.setEntryPrice(price);
         state.openPosition();
 
-        // ===== TRADE MARKER =====
-        live.pushTrade(
-                ctx.getChatId(),
-                ctx.getStrategyType(),
-                ctx.getSymbol(),
-                "BUY",
-                price,
-                BigDecimal.ONE,
-                Instant.now()
-        );
+        live.pushTrade(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol(), "BUY", price, BigDecimal.ONE, Instant.now());
+        live.pushPriceLine(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol(), "ENTRY", price);
 
-        // ===== PRICE LINES =====
-        live.pushPriceLine(
-                ctx.getChatId(),
-                ctx.getStrategyType(),
-                ctx.getSymbol(),
-                "ENTRY",
-                price
-        );
-
-        if (state.getTakeProfit() != null) {
-            live.pushPriceLine(
-                    ctx.getChatId(),
-                    ctx.getStrategyType(),
-                    ctx.getSymbol(),
-                    "TP",
-                    state.getTakeProfit()
-            );
-        }
-
-        if (state.getStopLoss() != null) {
-            live.pushPriceLine(
-                    ctx.getChatId(),
-                    ctx.getStrategyType(),
-                    ctx.getSymbol(),
-                    "SL",
-                    state.getStopLoss()
-            );
-        }
+        if (state.getTakeProfit() != null) live.pushPriceLine(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol(), "TP", state.getTakeProfit());
+        if (state.getStopLoss() != null) live.pushPriceLine(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol(), "SL", state.getStopLoss());
 
         if (state.getWindowHigh() != null && state.getWindowLow() != null) {
-            live.pushWindowZone(
-                    ctx.getChatId(),
-                    ctx.getStrategyType(),
-                    ctx.getSymbol(),
-                    state.getWindowHigh(),
-                    state.getWindowLow()
-            );
+            live.pushWindowZone(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol(), state.getWindowHigh(), state.getWindowLow());
         } else {
             live.clearWindowZone(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol());
         }
-
-        log.info("🟢 BUY executed @ {} | {}", price, safeReason(signal));
     }
 
-    // =====================================================
-    // SELL
-    // =====================================================
-    private void handleSell(Signal signal,
-                            StrategyContext ctx,
-                            StrategyRuntimeState state) {
-
-        if (state.hasOpenPosition()) {
-            log.debug("⛔ SELL skipped — position already open");
-            return;
-        }
-
-        if (!state.canEnterTrade()) {
-            log.debug("⛔ SELL skipped — canEnterTrade=false (cooldown/risk limits)");
-            return;
-        }
+    private void handleSell(Signal signal, StrategyContext ctx, StrategyRuntimeState state) {
+        if (state.hasOpenPosition()) return;
+        if (!state.canEnterTrade()) return;
 
         BigDecimal price = safePrice(ctx.getPrice());
-        if (price == null) {
-            log.debug("⛔ SELL skipped — price is null/invalid");
-            return;
-        }
+        if (price == null) return;
 
-        // ML Gate (если включён)
         if (!passesMlGate(signal, ctx)) {
             log.info("🟡 SELL blocked by ML gate | {}", safeReason(signal));
             return;
@@ -165,156 +92,178 @@ public class StrategySignalExecutorImpl implements StrategySignalExecutor {
         state.setEntryPrice(price);
         state.openPosition();
 
-        live.pushTrade(
-                ctx.getChatId(),
-                ctx.getStrategyType(),
-                ctx.getSymbol(),
-                "SELL",
-                price,
-                BigDecimal.ONE,
-                Instant.now()
-        );
+        live.pushTrade(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol(), "SELL", price, BigDecimal.ONE, Instant.now());
+        live.pushPriceLine(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol(), "ENTRY", price);
 
-        live.pushPriceLine(
-                ctx.getChatId(),
-                ctx.getStrategyType(),
-                ctx.getSymbol(),
-                "ENTRY",
-                price
-        );
-
-        if (state.getTakeProfit() != null) {
-            live.pushPriceLine(
-                    ctx.getChatId(),
-                    ctx.getStrategyType(),
-                    ctx.getSymbol(),
-                    "TP",
-                    state.getTakeProfit()
-            );
-        }
-
-        if (state.getStopLoss() != null) {
-            live.pushPriceLine(
-                    ctx.getChatId(),
-                    ctx.getStrategyType(),
-                    ctx.getSymbol(),
-                    "SL",
-                    state.getStopLoss()
-            );
-        }
+        if (state.getTakeProfit() != null) live.pushPriceLine(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol(), "TP", state.getTakeProfit());
+        if (state.getStopLoss() != null) live.pushPriceLine(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol(), "SL", state.getStopLoss());
 
         if (state.getWindowHigh() != null && state.getWindowLow() != null) {
-            live.pushWindowZone(
-                    ctx.getChatId(),
-                    ctx.getStrategyType(),
-                    ctx.getSymbol(),
-                    state.getWindowHigh(),
-                    state.getWindowLow()
-            );
+            live.pushWindowZone(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol(), state.getWindowHigh(), state.getWindowLow());
         } else {
             live.clearWindowZone(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol());
         }
-
-        log.info("🔴 SELL executed @ {} | {}", price, safeReason(signal));
     }
 
-    // =====================================================
-    // EXIT
-    // =====================================================
-    private void handleExit(Signal signal,
-                            StrategyContext ctx,
-                            StrategyRuntimeState state) {
-
-        if (!state.hasOpenPosition()) {
-            return;
-        }
+    private void handleExit(Signal signal, StrategyContext ctx, StrategyRuntimeState state) {
+        if (!state.hasOpenPosition()) return;
 
         BigDecimal price = safePrice(ctx.getPrice());
-        if (price == null) {
-            state.closePosition();
-            clearUi(ctx);
-            log.info("🚪 EXIT position (no price) | {}", safeReason(signal));
-            return;
-        }
-
         state.closePosition();
 
-        live.pushTrade(
-                ctx.getChatId(),
-                ctx.getStrategyType(),
-                ctx.getSymbol(),
-                "EXIT",
-                price,
-                BigDecimal.ONE,
-                Instant.now()
-        );
+        if (price != null) {
+            live.pushTrade(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol(), "EXIT", price, BigDecimal.ONE, Instant.now());
+        }
 
         clearUi(ctx);
-
-        log.info("🚪 EXIT position | {}", safeReason(signal));
     }
 
-    // =====================================================
-    // ML GATE
-    // =====================================================
     private boolean passesMlGate(Signal signal, StrategyContext ctx) {
-        Object s = ctx.getSettings();
-        if (!(s instanceof StrategySettings ss)) {
-            // если в контексте не StrategySettings — гейт тут применить негде
-            return true;
-        }
+        Object raw = ctx.getSettings();
+        if (!(raw instanceof StrategySettings ss)) return true;
 
         if (!ss.isMlGateEnabled()) return true;
 
-        // если MANUAL — гейт не мешает ручному режиму
-        if (ss.getAdvancedControlMode() == AdvancedControlMode.MANUAL) return true;
+        AdvancedControlMode mode = ss.getAdvancedControlMode() != null ? ss.getAdvancedControlMode() : AdvancedControlMode.MANUAL;
+        if (mode == AdvancedControlMode.MANUAL) return true;
 
-        HttpMlSignalService svc = ml.getIfAvailable();
-        if (svc == null || !svc.isAvailable()) {
-            // если гейт включён — но ML недоступен => безопаснее НЕ входить
-            log.warn("⛔ ML Gate enabled, but ML service unavailable. Blocking entry.");
-            return false;
-        }
+        BigDecimal minProb = ss.getGateMinProb();
+        if (minProb == null || minProb.signum() <= 0) return true;
+
+        MlClient ml = mlClientProvider.getIfAvailable();
+        if (ml == null) return false;
+
+        if (!isMlHealthyAndReady(ml)) return false;
 
         String modelKey = resolveModelKey(ss, ctx);
 
-        MlFeatures features = buildFeatures(ctx);
-        MlPrediction pred = svc.predict(
-                ctx.getChatId(),
-                ctx.getSymbol(),
-                ss.getTimeframe(), // у тебя timeframe хранится в StrategySettings
-                modelKey,
-                features
-        );
+        MlPredictRequest req = new MlPredictRequest();
+        req.setChatId(ctx.getChatId());
+        req.setStrategyType(String.valueOf(ctx.getStrategyType() != null ? ctx.getStrategyType() : ss.getType()));
+        req.setSymbol(safeUpper(ctx.getSymbol()));
+        req.setTimeframe(ss.getTimeframe());
+        req.setModelKey(modelKey);
+        req.setFeatures(buildFeatures(ctx));
+        req.setTsMs(Instant.now().toEpochMilli());
+        req.setSchemaHash(ss.getMlSchemaHash());
 
-        if (pred == null) {
-            log.warn("⛔ ML prediction is null. Blocking entry.");
+        MlPredictResponse resp;
+        try {
+            resp = ml.predict(req);
+        } catch (Exception e) {
             return false;
         }
 
-        BigDecimal minProb = ss.getGateMinProb();
-        if (minProb == null) {
-            // если порог не задан — гейт включён, но фильтра нет => пропускаем
-            return true;
-        }
+        if (resp == null || !resp.isOk() || resp.getProba() == null) return false;
 
-        double p = switch (signal.getType()) {
-            case BUY -> pred.probBuy();
-            case SELL -> pred.probSell();
-            default -> 1.0d;
+        double proba = resp.getProba();
+        if (!Double.isFinite(proba)) proba = 0.0;
+
+        double pBuy = clamp01(proba);
+        double pSell = clamp01(1.0 - proba);
+
+        double threshold = minProb.doubleValue();
+
+        return switch (signal.getType()) {
+            case BUY -> (pBuy + 1e-12) >= threshold;
+            case SELL -> (pSell + 1e-12) >= threshold;
+            default -> true;
         };
+    }
 
-        boolean ok = BigDecimal.valueOf(p).compareTo(minProb) >= 0;
-
-        if (!ok) {
-            log.info("🟡 ML Gate reject: prob={} < minProb={} | modelVersion={}",
-                    p, minProb, pred.modelVersion());
-        } else {
-            log.debug("✅ ML Gate pass: prob={} >= minProb={} | modelVersion={}",
-                    p, minProb, pred.modelVersion());
+    private boolean isMlHealthyAndReady(MlClient ml) {
+        try {
+            MlHealthResponse h = ml.health();
+            boolean ok = mlOk(h);
+            boolean modelOk = mlModelExistsOrUnknown(h); // если поля нет — не валим
+            return ok && modelOk;
+        } catch (Exception e) {
+            return false;
         }
+    }
 
-        return ok;
+    /**
+     * ✅ Совместимая проверка ok:
+     * - isOk()
+     * - getOk()
+     * - поле ok
+     */
+    private static boolean mlOk(MlHealthResponse h) {
+        if (h == null) return false;
+
+        try {
+            Method m = h.getClass().getMethod("isOk");
+            Object v = m.invoke(h);
+            if (v instanceof Boolean b) return b;
+        } catch (Exception ignored) {}
+
+        try {
+            Method m = h.getClass().getMethod("getOk");
+            Object v = m.invoke(h);
+            if (v instanceof Boolean b) return b;
+        } catch (Exception ignored) {}
+
+        try {
+            Field f = h.getClass().getDeclaredField("ok");
+            f.setAccessible(true);
+            Object v = f.get(h);
+            if (v instanceof Boolean b) return b;
+        } catch (Exception ignored) {}
+
+        return false;
+    }
+
+    /**
+     * ✅ Совместимая проверка model_exists:
+     * - getModel_exists()/isModel_exists()
+     * - getModelExists()/isModelExists()
+     * - поле model_exists/modelExists
+     *
+     * Если этого поля нет в DTO — считаем "unknown" и НЕ блокируем.
+     */
+    private static boolean mlModelExistsOrUnknown(MlHealthResponse h) {
+        if (h == null) return true;
+
+        Boolean v = readBool(h, "getModel_exists");
+        if (v != null) return v;
+
+        v = readBool(h, "isModel_exists");
+        if (v != null) return v;
+
+        v = readBool(h, "getModelExists");
+        if (v != null) return v;
+
+        v = readBool(h, "isModelExists");
+        if (v != null) return v;
+
+        v = readBoolField(h, "model_exists");
+        if (v != null) return v;
+
+        v = readBoolField(h, "modelExists");
+        if (v != null) return v;
+
+        return true;
+    }
+
+    private static Boolean readBool(Object target, String method) {
+        try {
+            Method m = target.getClass().getMethod(method);
+            Object r = m.invoke(target);
+            return (r instanceof Boolean b) ? b : null;
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private static Boolean readBoolField(Object target, String field) {
+        try {
+            Field f = target.getClass().getDeclaredField(field);
+            f.setAccessible(true);
+            Object r = f.get(target);
+            return (r instanceof Boolean b) ? b : null;
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     private String resolveModelKey(StrategySettings ss, StrategyContext ctx) {
@@ -323,23 +272,19 @@ public class StrategySignalExecutorImpl implements StrategySignalExecutor {
         }
 
         ModelKeyFactory f = modelKeyFactory.getIfAvailable();
+        String type = String.valueOf(ctx.getStrategyType() != null ? ctx.getStrategyType() : ss.getType());
+        String symbol = safeUpper(ctx.getSymbol());
+        String tf = ss.getTimeframe();
+
         if (f == null) {
-            // если factory нет — вернём хоть какой-то стабильный ключ (минимум, чтобы ML мог матчиться по ключу)
-            return ctx.getStrategyType() + ":" + ctx.getSymbol() + ":" + ss.getTimeframe();
+            return type + ":" + symbol + ":" + tf;
         }
 
-        String schemaHash = ss.getMlSchemaHash() == null ? "" : ss.getMlSchemaHash();
-        return f.build(
-                ctx.getStrategyType(),
-                ctx.getSymbol(),
-                ss.getTimeframe(),
-                ctx.getExchange(),
-                ctx.getNetworkType(),
-                schemaHash
-        );
+        // ✅ ВАЖНО: build(String strategyType, String symbol, String timeframe)
+        return f.build(type, symbol, tf);
     }
 
-    private MlFeatures buildFeatures(StrategyContext ctx) {
+    private Map<String, Object> buildFeatures(StrategyContext ctx) {
         double[] closes = ctx.getCloses();
         BigDecimal priceBd = ctx.getPrice();
         double last = (priceBd != null ? priceBd.doubleValue() : lastClose(closes));
@@ -351,52 +296,52 @@ public class StrategySignalExecutorImpl implements StrategySignalExecutor {
 
         if (closes != null && closes.length >= 2) {
             double prev = closes[closes.length - 2];
-            if (prev > 0 && last > 0) {
-                momentum1 = (last / prev) - 1.0d;
-            }
+            if (prev > 0 && last > 0) momentum1 = (last / prev) - 1.0d;
 
             volatilityPct = stddevReturnsPct(closes);
             smaFastRel = smaRel(closes, last, Math.max(2, closes.length / 10));
             smaSlowRel = smaRel(closes, last, Math.max(3, closes.length / 3));
         }
 
-        // volumeRel сейчас не из чего взять в StrategyContext — оставляем null
-        return new MlFeatures(momentum1, volatilityPct, null, smaFastRel, smaSlowRel);
+        Map<String, Object> f = new HashMap<>();
+        f.put("momentum1", momentum1);
+        f.put("volatilityPct", volatilityPct);
+        f.put("smaFastRel", smaFastRel);
+        f.put("smaSlowRel", smaSlowRel);
+        f.put("lastPrice", last);
+        return f;
     }
 
-    private double lastClose(double[] closes) {
+    private static double lastClose(double[] closes) {
         if (closes == null || closes.length == 0) return 0.0d;
         return closes[closes.length - 1];
     }
 
-    private Double smaRel(double[] closes, double last, int period) {
+    private static Double smaRel(double[] closes, double last, int period) {
         if (closes == null || closes.length == 0) return null;
         int p = Math.min(period, closes.length);
         if (p <= 0) return null;
 
         double sum = 0.0d;
-        for (int i = closes.length - p; i < closes.length; i++) {
-            sum += closes[i];
-        }
+        for (int i = closes.length - p; i < closes.length; i++) sum += closes[i];
         double sma = sum / p;
         if (sma <= 0 || last <= 0) return null;
         return (last / sma) - 1.0d;
     }
 
-    private Double stddevReturnsPct(double[] closes) {
+    private static Double stddevReturnsPct(double[] closes) {
         if (closes == null || closes.length < 3) return null;
 
         int n = closes.length - 1;
         double[] r = new double[n];
-
         int k = 0;
+
         for (int i = 1; i < closes.length; i++) {
             double a = closes[i - 1];
             double b = closes[i];
             if (a <= 0 || b <= 0) continue;
             r[k++] = (b / a) - 1.0d;
         }
-
         if (k < 2) return null;
 
         double mean = 0.0d;
@@ -410,30 +355,39 @@ public class StrategySignalExecutorImpl implements StrategySignalExecutor {
         }
         var /= (k - 1);
 
-        double sd = Math.sqrt(var);
-        return sd * 100.0d;
+        return Math.sqrt(var) * 100.0d;
     }
 
-    // =====================================================
-    // HELPERS
-    // =====================================================
     private void clearUi(StrategyContext ctx) {
         live.clearPriceLines(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol());
         live.clearTpSl(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol());
         live.clearWindowZone(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol());
     }
 
-    private BigDecimal safePrice(BigDecimal price) {
+    private static BigDecimal safePrice(BigDecimal price) {
         if (price == null) return null;
         if (price.signum() <= 0) return null;
         return price;
     }
 
-    private String safeReason(Signal signal) {
+    private static String safeReason(Signal signal) {
         try {
             return signal.getReason() != null ? signal.getReason() : "";
         } catch (Exception e) {
             return "";
         }
+    }
+
+    private static String safeUpper(String s) {
+        if (s == null) return null;
+        String t = s.trim();
+        return t.isEmpty() ? null : t.toUpperCase(Locale.ROOT);
+    }
+
+    private static double clamp01(double v) {
+        if (!Double.isFinite(v)) return 0.0;
+        if (v < 0) return 0.0;
+        if (v > 1) return 1.0;
+        return v;
     }
 }

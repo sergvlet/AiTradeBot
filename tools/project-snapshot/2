@@ -1,0 +1,40 @@
+Чтобы режимы MANUAL / HYBRID / AI были “железно” (один источник правды + события + корректные флаги), покажи в таком порядке:
+
+StrategySettings.java
+com.chicu.aitradebot.domain.StrategySettings
+Нужно увидеть поля и правила:
+
+AdvancedControlMode advancedControlMode
+
+boolean mlGateEnabled
+
+boolean autoTuneEnabled
+
+BigDecimal gateMinProb (если есть)
+
+exchangeName / networkType / symbol / timeframe / cachedCandlesLimit
+
+@Version (если есть) — для hot-update
+
+AdvancedControlMode.java
+com.chicu.aitradebot.domain.enums.AdvancedControlMode
+Чтобы понять точные значения enum (MANUAL/HYBRID/AI) и нет ли “лишних” режимов.
+
+StrategySettingsServiceImpl.java (и интерфейс, если логика в нём)
+com.chicu.aitradebot.service.StrategySettingsServiceImpl
+Главное: где именно устанавливаются advancedControlMode/mlGateEnabled/autoTuneEnabled/gateMinProb и публикуется ли
+StrategySettingsUpdatedEvent(chatId, type) после сохранения.
+
+Класс, который принимает изменения из UI (контроллер/фасад)
+Обычно это что-то вроде:
+
+StrategySettingsController / StrategySettingsApiController
+
+StrategySettingsFacade
+
+или endpoint /strategies/{type}/config / /api/strategy/...
+Нужно увидеть: когда UI меняет режим — какие поля реально записываются в БД.
+
+StrategySettingsUpdatedEvent.java (и кто его слушает)
+com.chicu.aitradebot.events.StrategySettingsUpdatedEvent
+Проверяем payload: chatId, type, (возможно) exchange/network.

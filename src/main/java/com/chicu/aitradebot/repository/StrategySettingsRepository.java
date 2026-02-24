@@ -54,4 +54,7 @@ public interface StrategySettingsRepository extends JpaRepository<StrategySettin
             @Param("type") StrategyType type,
             @Param("keepId") long keepId
     );
+
+    @Query("select s.version from StrategySettings s where s.chatId = :chatId and s.type = :type")
+    Integer findVersion(@Param("chatId") Long chatId, @Param("type") StrategyType type);
 }

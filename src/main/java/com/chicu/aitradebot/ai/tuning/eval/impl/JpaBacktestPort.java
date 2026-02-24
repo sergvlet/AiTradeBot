@@ -29,11 +29,13 @@ public class JpaBacktestPort implements BacktestPort {
     private final StrategySettingsService strategySettingsService;
     private final BacktestCandlePort candlePort;
 
+    /**
+     * ✅ Сигнатура без exchange/network (как у BacktestPort / RealMlBacktestRunner).
+     * env берём из StrategySettings (но при выборе настроек учитываем symbol/timeframe override).
+     */
     @Override
     public BacktestMetrics backtest(Long chatId,
                                     StrategyType type,
-                                    String exchange,
-                                    NetworkType network,
                                     String symbolOverride,
                                     String timeframeOverride,
                                     Map<String, Object> candidateParams,
@@ -47,11 +49,8 @@ public class JpaBacktestPort implements BacktestPort {
             if (startAt == null || endAt == null) return BacktestMetrics.fail("startAt/endAt is null");
             if (!endAt.isAfter(startAt)) return BacktestMetrics.fail("endAt must be after startAt");
 
-            String ex = normalizeExchangeOrNull(exchange);
-            NetworkType net = network;
-
-            // ✅ выбираем настройки: если ex/net заданы — пытаемся найти именно под них
-            StrategySettings settings = pickBestSettings(chatId, type, ex, net);
+            // ✅ выбираем настройки: active first + freshest + match by override(sym/tf) if provided
+            StrategySettings settings = pickBestSettings(chatId, type, symbolOverride, timeframeOverride, candidateParams);
 
             // ✅ symbol/timeframe: override > settings
             String symbol = (symbolOverride != null && !symbolOverride.isBlank())
@@ -65,12 +64,12 @@ public class JpaBacktestPort implements BacktestPort {
             if (symbol == null || symbol.isBlank()) return BacktestMetrics.fail("symbol is null/blank");
             if (timeframe == null || timeframe.isBlank()) return BacktestMetrics.fail("timeframe is null/blank");
 
-            // ✅ env: аргументы имеют приоритет, иначе из settings
-            if (ex == null) ex = normalizeExchangeOrNull(settings.getExchangeName());
-            if (net == null) net = settings.getNetworkType();
+            // ✅ env: строго из settings (для текущего контекста)
+            String ex = normalizeExchangeOrNull(settings.getExchangeName());
+            NetworkType net = settings.getNetworkType();
 
-            if (ex == null) return BacktestMetrics.fail("exchange is null/blank (arg + StrategySettings)");
-            if (net == null) return BacktestMetrics.fail("network is null (arg + StrategySettings)");
+            if (ex == null) return BacktestMetrics.fail("exchange is null/blank (StrategySettings)");
+            if (net == null) return BacktestMetrics.fail("network is null (StrategySettings)");
 
             int limit = resolveLimit(settings, candidateParams);
 
@@ -79,8 +78,8 @@ public class JpaBacktestPort implements BacktestPort {
                     type,
                     ex,
                     net,
-                    symbol,
-                    timeframe,
+                    symbol.trim(),
+                    timeframe.trim(),
                     startAt,
                     endAt,
                     limit
@@ -92,7 +91,6 @@ public class JpaBacktestPort implements BacktestPort {
 
             Map<String, Object> p = (candidateParams != null) ? candidateParams : Map.of();
 
-            // ✅ реальный прогон
             return switch (type) {
                 case SCALPING -> runScalping(chatId, symbol, timeframe, p, startAt, endAt, candles);
                 case WINDOW_SCALPING -> runWindowScalping(chatId, symbol, timeframe, p, startAt, endAt, candles);
@@ -106,17 +104,33 @@ public class JpaBacktestPort implements BacktestPort {
     }
 
     // =====================================================
-    // StrategySettings pick (active first + freshest)
-    // + если передали ex/net — предпочтём совпадение
+    // StrategySettings pick: active first + freshest
+    // + prefer match by symbol/timeframe overrides (и при желании по env из candidateParams)
     // =====================================================
 
     private StrategySettings pickBestSettings(Long chatId,
                                               StrategyType type,
-                                              String exchangeOrNull,
-                                              NetworkType networkOrNull) {
+                                              String symbolOverride,
+                                              String timeframeOverride,
+                                              Map<String, Object> candidateParams) {
 
-        Function<StrategySettings, Boolean> isInactive =
-                s -> !Boolean.TRUE.equals(s.isActive());
+        List<StrategySettings> all = strategySettingsService.findAllByChatId(chatId)
+                .stream()
+                .filter(s -> s != null && s.getType() == type)
+                .toList();
+
+        if (all.isEmpty()) {
+            throw new IllegalStateException("StrategySettings not found: chatId=" + chatId + ", type=" + type);
+        }
+
+        String symHint = normSymbolOrNull(symbolOverride);
+        String tfHint = normTfOrNull(timeframeOverride);
+
+        // (опционально) если кто-то положит в params exchange/network — тоже учтём при выборе
+        String exHint = normalizeExchangeOrNull(firstString(candidateParams, "exchange", "exchangeName"));
+        NetworkType netHint = firstNetwork(candidateParams, "network", "networkType");
+
+        Function<StrategySettings, Boolean> isInactive = s -> !Boolean.TRUE.equals(s.isActive());
 
         Comparator<StrategySettings> byFreshDesc =
                 Comparator.comparing(
@@ -130,28 +144,9 @@ public class JpaBacktestPort implements BacktestPort {
                         .reversed();
 
         Comparator<StrategySettings> pickBest =
-                Comparator.comparing(isInactive) // active(false) раньше inactive(true)
+                Comparator.comparing(isInactive) // active(true) раньше inactive(false)
+                        .thenComparingInt(s -> matchPenalty(s, symHint, tfHint, exHint, netHint))
                         .thenComparing(byFreshDesc);
-
-        List<StrategySettings> all = strategySettingsService.findAllByChatId(chatId)
-                .stream()
-                .filter(s -> s.getType() == type)
-                .toList();
-
-        if (all.isEmpty()) {
-            throw new IllegalStateException("StrategySettings not found: chatId=" + chatId + ", type=" + type);
-        }
-
-        // ✅ если env задан — сначала ищем совпадение, иначе fallback на “лучшие”
-        if (exchangeOrNull != null && networkOrNull != null) {
-            Optional<StrategySettings> exact = all.stream()
-                    .filter(s -> exchangeOrNull.equalsIgnoreCase(safeTrimUpper(s.getExchangeName())))
-                    .filter(s -> networkOrNull == s.getNetworkType())
-                    .sorted(pickBest)
-                    .findFirst();
-
-            if (exact.isPresent()) return exact.get();
-        }
 
         return all.stream()
                 .sorted(pickBest)
@@ -159,10 +154,68 @@ public class JpaBacktestPort implements BacktestPort {
                 .orElseThrow(() -> new IllegalStateException("StrategySettings not found after sort"));
     }
 
-    private static String safeTrimUpper(String s) {
+    private static int matchPenalty(StrategySettings s,
+                                    String symHint,
+                                    String tfHint,
+                                    String exHint,
+                                    NetworkType netHint) {
+        int p = 0;
+
+        if (symHint != null) {
+            String sym = normSymbolOrNull(s.getSymbol());
+            if (sym == null || !symHint.equalsIgnoreCase(sym)) p += 10;
+        }
+
+        if (tfHint != null) {
+            String tf = normTfOrNull(s.getTimeframe());
+            if (tf == null || !tfHint.equalsIgnoreCase(tf)) p += 5;
+        }
+
+        if (exHint != null) {
+            String ex = normalizeExchangeOrNull(s.getExchangeName());
+            if (ex == null || !exHint.equalsIgnoreCase(ex)) p += 2;
+        }
+
+        if (netHint != null) {
+            NetworkType n = s.getNetworkType();
+            if (n == null || n != netHint) p += 2;
+        }
+
+        return p;
+    }
+
+    private static String firstString(Map<String, Object> p, String... keys) {
+        if (p == null || keys == null) return null;
+        for (String k : keys) {
+            if (k == null) continue;
+            Object v = p.get(k);
+            if (v == null) continue;
+            String s = String.valueOf(v).trim();
+            if (!s.isEmpty() && !"null".equalsIgnoreCase(s)) return s;
+        }
+        return null;
+    }
+
+    private static NetworkType firstNetwork(Map<String, Object> p, String... keys) {
+        String s = firstString(p, keys);
         if (s == null) return null;
-        String x = s.trim();
-        return x.isEmpty() ? null : x.toUpperCase(Locale.ROOT);
+        try {
+            return NetworkType.valueOf(s.trim().toUpperCase(Locale.ROOT));
+        } catch (Exception ignore) {
+            return null;
+        }
+    }
+
+    private static String normSymbolOrNull(String symbol) {
+        if (symbol == null) return null;
+        String s = symbol.trim().toUpperCase(Locale.ROOT);
+        return s.isEmpty() ? null : s;
+    }
+
+    private static String normTfOrNull(String timeframe) {
+        if (timeframe == null) return null;
+        String s = timeframe.trim().toLowerCase(Locale.ROOT);
+        return s.isEmpty() ? null : s;
     }
 
     private static String normalizeExchangeOrNull(String exchange) {
@@ -172,7 +225,6 @@ public class JpaBacktestPort implements BacktestPort {
     }
 
     private static int resolveLimit(StrategySettings settings, Map<String, Object> candidateParams) {
-        // 1) тюнер может передать candlesLimit
         if (candidateParams != null) {
             Integer a = tryInt(candidateParams.get("cachedCandlesLimit"));
             if (a != null && a > 0) return a;
@@ -184,11 +236,9 @@ public class JpaBacktestPort implements BacktestPort {
             if (c != null && c > 0) return c;
         }
 
-        // 2) StrategySettings.cachedCandlesLimit
         Integer cached = settings.getCachedCandlesLimit();
         if (cached != null && cached > 0) return cached;
 
-        // 3) default
         return 1000;
     }
 
@@ -429,12 +479,14 @@ public class JpaBacktestPort implements BacktestPort {
                                               List<CandleBar> candles) {
 
         int window = intParam(p, "windowSize", 30, 5, 2000);
-        BigDecimal entryLowPct = bdParam(p, "entryFromLowPct", new BigDecimal("20"), "0", "100");
-        BigDecimal minRangePct = bdParam(p, "minRangePct", new BigDecimal("0.25"), "0.01", "50");
-        BigDecimal maxSpreadPct = bdParam(p, "maxSpreadPct", new BigDecimal("0.08"), "0.0", "50");
 
-        BigDecimal tpPct = bdParam(p, "takeProfitPct", new BigDecimal("0.40"), "0.01", "50");
-        BigDecimal slPct = bdParam(p, "stopLossPct", new BigDecimal("0.25"), "0.01", "50");
+        BigDecimal entryLowPct  = bdParam(p, "entryFromLowPct",  new BigDecimal("20"), "0", "100");
+        BigDecimal entryHighPct = bdParam(p, "entryFromHighPct", new BigDecimal("20"), "0", "100"); // ✅ теперь реально участвует
+        BigDecimal minRangePct  = bdParam(p, "minRangePct",      new BigDecimal("0.25"), "0.01", "50");
+        BigDecimal maxSpreadPct = bdParam(p, "maxSpreadPct",     new BigDecimal("0.08"), "0.0", "50");
+
+        BigDecimal tpPct  = bdParam(p, "takeProfitPct", new BigDecimal("0.40"), "0.01", "50");
+        BigDecimal slPct  = bdParam(p, "stopLossPct",   new BigDecimal("0.25"), "0.01", "50");
         BigDecimal feePct = bdParam(p, "commissionPct", new BigDecimal("0.10"), "0.0", "1.0");
 
         RiskTradeCfg rt = RiskTradeCfg.from(p);
@@ -481,6 +533,7 @@ public class JpaBacktestPort implements BacktestPort {
             if (ts == null) continue;
 
             BigDecimal close = nz(cur.close());
+
             BigDecimal highW = BigDecimal.ZERO;
             BigDecimal lowW = null;
 
@@ -515,8 +568,14 @@ public class JpaBacktestPort implements BacktestPort {
                     if (consecLoss >= rt.maxConsecutiveLosses) continue;
                 }
 
+                // ✅ зона входа: near low + (не near high) через entryFromHighPct
                 BigDecimal lowZoneTop = lowW.add(range.multiply(entryLowPct.divide(new BigDecimal("100"), mc), mc), mc);
-                if (close.compareTo(lowZoneTop) <= 0) {
+                BigDecimal highGuard  = highW.subtract(range.multiply(entryHighPct.divide(new BigDecimal("100"), mc), mc), mc);
+
+                // итоговый потолок зоны входа — минимум из двух границ
+                BigDecimal entryTop = lowZoneTop.min(highGuard);
+
+                if (close.compareTo(entryTop) <= 0) {
                     inPos = true;
                     entry = close;
                     posUnits = 1;
@@ -525,6 +584,7 @@ public class JpaBacktestPort implements BacktestPort {
                 continue;
             }
 
+            // averaging (упрощённо)
             if (!averaged && rt.allowAveraging && (rt.maxOpenOrders == null || rt.maxOpenOrders >= 2)) {
                 BigDecimal slLine = entry.multiply(BigDecimal.ONE.subtract(slPct.divide(new BigDecimal("100"), mc)), mc);
                 BigDecimal trigger = entry.subtract(entry.subtract(slLine, mc).divide(new BigDecimal("2"), mc), mc);

@@ -31,15 +31,14 @@ public class MlAutoTuneRuntime {
     private static final String PHASE_COLLECT  = "COLLECT";
     private static final String PHASE_BACKTEST = "BACKTEST";
     private static final String PHASE_PAPER    = "PAPER";
+    private static final String PHASE_LIVE     = "LIVE";
 
     private final AutoTunerOrchestrator autoTuner;
     private final StrategySettingsService strategySettingsService;
     private final StrategyEnvResolver envResolver;
     private final PositionStore positionStore;
 
-    /**
-     * ✅ Writer для WINDOW_SCALPING: чтобы тюнер реально менял БД.
-     */
+    /** ✅ Writer для WINDOW_SCALPING: чтобы тюнер реально менял БД. */
     private final WindowScalpingStrategySettingsService windowSettingsService;
 
     // =====================================================
@@ -52,11 +51,7 @@ public class MlAutoTuneRuntime {
     @Value("${ai.autotune.periodicEveryHours:6}")
     private long periodicEveryHours;
 
-    /**
-     * Какие фазы надо пропускать (верхний регистр, через запятую).
-     * Пример: COLLECT,BACKTEST
-     */
-    @Value("${ai.autotune.skipPhases:COLLECT,BACKTEST}")
+    @Value("${ai.autotune.skipPhases:BACKTEST}")
     private String skipPhases;
 
     @Value("${ai.autotune.defaultDebounceSeconds:120}")
@@ -72,15 +67,22 @@ public class MlAutoTuneRuntime {
                 return t;
             });
 
+    /** key(chatId,type,exchange,network) -> periodic job */
     private final Map<String, ScheduledFuture<?>> jobs = new ConcurrentHashMap<>();
+
+    /** ключи, которые сейчас в тюне (чтобы не запускать параллельно) */
     private final Set<String> running = ConcurrentHashMap.newKeySet();
 
-    // debounce для ручных/авто триггеров
+    /** debounce для ручных/авто триггеров */
     private final Map<String, Long> lastTriggerAtMs = new ConcurrentHashMap<>();
 
-    // cache для skipPhases
+    /** cache для skipPhases */
     private volatile String skipPhasesRawCache = null;
-    private volatile Set<String> skipPhasesCache = Set.of(PHASE_COLLECT, PHASE_BACKTEST);
+
+    /** дефолтный фоллбек, если конфиг битый */
+    private static final Set<String> DEFAULT_SKIP_PHASES = Set.of(PHASE_BACKTEST);
+
+    private volatile Set<String> skipPhasesCache = DEFAULT_SKIP_PHASES;
 
     @PreDestroy
     public void shutdown() {
@@ -104,17 +106,11 @@ public class MlAutoTuneRuntime {
         ResolvedEnv env = resolveEnvSafe(chatId, type, exchange, network);
         if (!env.ok) return;
 
-        StrategySettings ss = strategySettingsService.getOrCreate(chatId, type);
+        StrategySettings ss = loadSettingsSoft(chatId, type);
 
-        // ✅ В MANUAL (и при autoTuneEnabled=false) не запускаем тюнинг/планировщики
-        if (!isTuningAllowed(ss)) {
-            String k = key(chatId, type, env.exchange, env.network);
-            ScheduledFuture<?> f = jobs.remove(k);
-            if (f != null) {
-                try { f.cancel(false); } catch (Exception ignore) {}
-            }
-            lastTriggerAtMs.remove(k);
-            running.remove(k);
+        // ✅ если тюнинг НЕ разрешён — гарантированно выключаем всё по этому ключу
+        if (!tuningGate(ss).allowed) {
+            cancelAllForKey(key(chatId, type, env.exchange, env.network));
             return;
         }
 
@@ -132,6 +128,7 @@ public class MlAutoTuneRuntime {
                 )
         );
 
+        // ✅ warmup — отдельной задачей, но тоже через gate внутри safeTune
         scheduler.submit(() -> safeTune(chatId, type, env.exchange, env.network, "warmup"));
     }
 
@@ -139,23 +136,15 @@ public class MlAutoTuneRuntime {
         ResolvedEnv env = resolveEnvSafe(chatId, type, exchange, network);
         if (!env.ok) return;
 
-        String k = key(chatId, type, env.exchange, env.network);
-
-        ScheduledFuture<?> f = jobs.remove(k);
-        if (f != null) {
-            try { f.cancel(false); } catch (Exception ignore) {}
-        }
-
-        lastTriggerAtMs.remove(k);
-        running.remove(k);
+        cancelAllForKey(key(chatId, type, env.exchange, env.network));
     }
 
     public void onPositionClosed(Long chatId, StrategyType type, String exchange, NetworkType network) {
         ResolvedEnv env = resolveEnvSafe(chatId, type, exchange, network);
         if (!env.ok) return;
 
-        StrategySettings ss = strategySettingsService.getOrCreate(chatId, type);
-        if (!isTuningAllowed(ss)) return;
+        StrategySettings ss = loadSettingsSoft(chatId, type);
+        if (!tuningGate(ss).allowed) return;
 
         scheduler.submit(() -> safeTune(chatId, type, env.exchange, env.network, "after-close"));
     }
@@ -174,8 +163,8 @@ public class MlAutoTuneRuntime {
         ResolvedEnv env = resolveEnvSafe(chatId, type, exchange, network);
         if (!env.ok) return;
 
-        StrategySettings ss = strategySettingsService.getOrCreate(chatId, type);
-        if (!isTuningAllowed(ss)) return;
+        StrategySettings ss = loadSettingsSoft(chatId, type);
+        if (!tuningGate(ss).allowed) return;
 
         Duration debounce = Duration.ofSeconds(90);
 
@@ -196,8 +185,8 @@ public class MlAutoTuneRuntime {
         ResolvedEnv env = resolveEnvSafe(chatId, type, exchange, network);
         if (!env.ok) return;
 
-        StrategySettings ss = strategySettingsService.getOrCreate(chatId, type);
-        if (!isTuningAllowed(ss)) return;
+        StrategySettings ss = loadSettingsSoft(chatId, type);
+        if (!tuningGate(ss).allowed) return;
 
         Duration debounce = Duration.ofSeconds(90);
         String r = "hold:" + safe(reason);
@@ -217,8 +206,8 @@ public class MlAutoTuneRuntime {
         ResolvedEnv env = resolveEnvSafe(chatId, type, exchange, network);
         if (!env.ok) return;
 
-        StrategySettings ss = strategySettingsService.getOrCreate(chatId, type);
-        if (!isTuningAllowed(ss)) return;
+        StrategySettings ss = loadSettingsSoft(chatId, type);
+        if (!tuningGate(ss).allowed) return;
 
         String k = key(chatId, type, env.exchange, env.network);
 
@@ -243,12 +232,47 @@ public class MlAutoTuneRuntime {
     // INTERNAL
     // =====================================================
 
-    private boolean isTuningAllowed(StrategySettings ss) {
-        if (ss == null) return false;
-        if (!ss.isAutoTuneEnabled()) return false;
+    private void cancelAllForKey(String k) {
+        ScheduledFuture<?> f = jobs.remove(k);
+        if (f != null) {
+            try { f.cancel(false); } catch (Exception ignore) {}
+        }
+        lastTriggerAtMs.remove(k);
+        running.remove(k);
+    }
 
-        AdvancedControlMode m = (ss.getAdvancedControlMode() != null ? ss.getAdvancedControlMode() : AdvancedControlMode.MANUAL);
-        return m != AdvancedControlMode.MANUAL;
+    private record Gate(boolean allowed, AdvancedControlMode mode, boolean autoTuneEnabled, String phase, String reason) {}
+
+    private Gate tuningGate(StrategySettings ss) {
+        if (ss == null) {
+            return new Gate(false, AdvancedControlMode.MANUAL, false, null, "no_settings");
+        }
+
+        AdvancedControlMode mode = (ss.getAdvancedControlMode() != null)
+                ? ss.getAdvancedControlMode()
+                : AdvancedControlMode.MANUAL;
+
+        String phase = normalizeUpperNullable(ss.getRunPhase());
+
+        // ✅ ВАЖНО: читаем флаг авто-тюнинга безопасно (is/get/поле)
+        boolean autoTuneEnabled = readBool(ss,
+                "autoTuneEnabled", "isAutoTuneEnabled", "getAutoTuneEnabled",
+                "mlAutoTuneEnabled", "isMlAutoTuneEnabled", "getMlAutoTuneEnabled"
+        );
+
+        if (mode == AdvancedControlMode.MANUAL) {
+            return new Gate(false, mode, autoTuneEnabled, phase, "manual_mode");
+        }
+
+        if (!autoTuneEnabled) {
+            return new Gate(false, mode, false, phase, "autoTuneDisabled");
+        }
+
+        if (phase != null && parsedSkipPhases().contains(phase)) {
+            return new Gate(false, mode, true, phase, "skipPhase:" + phase);
+        }
+
+        return new Gate(true, mode, true, phase, "ok");
     }
 
     private void safeTune(Long chatId, StrategyType type, String exchange, NetworkType network, String reason) {
@@ -261,34 +285,24 @@ public class MlAutoTuneRuntime {
         if (!running.add(k)) return;
 
         try {
-            // 1) НЕ тюним, если стратегия в позиции
+            StrategySettings ss = loadSettingsSoft(chatId, type);
+            Gate gate = tuningGate(ss);
+            if (!gate.allowed) {
+                log.debug("🧠 ML skip tune chatId={} type={} ex={} net={} gate={}",
+                        chatId, type, env.exchange, env.network, gate.reason);
+                return;
+            }
+
+            // ✅ НЕ тюним, если стратегия в позиции
             if (positionStore.isInPosition(chatId, type, env.exchange, env.network)) {
-                log.debug("🧠 ML skip tune (in position) chatId={} type={} ex={} net={}", chatId, type, env.exchange, env.network);
+                log.debug("🧠 ML skip tune (in position) chatId={} type={} ex={} net={}",
+                        chatId, type, env.exchange, env.network);
                 return;
             }
 
-            // 2) Берём настройки
-            StrategySettings ss = strategySettingsService.getOrCreate(chatId, type);
-            if (ss == null) return;
-
-            if (!isTuningAllowed(ss)) {
-                AdvancedControlMode m = (ss.getAdvancedControlMode() != null ? ss.getAdvancedControlMode() : AdvancedControlMode.MANUAL);
-                log.debug("🧠 ML skip tune (disabled) chatId={} type={} ex={} net={} mode={} autoTune={}",
-                        chatId, type, env.exchange, env.network, m, ss.isAutoTuneEnabled());
-                return;
-            }
-
-            // 3) Пропуск фаз (конфигом)
-            String phase = normalizeUpperNullable(ss.getRunPhase());
-            if (phase != null && parsedSkipPhases().contains(phase)) {
-                log.debug("🧠 ML skip tune (phase={}) chatId={} type={} ex={} net={}", phase, chatId, type, env.exchange, env.network);
-                return;
-            }
-
-            // 4) Минимальные параметры
-            String symbol = safeUpperNullable(ss.getSymbol());
-            String timeframe = safeLowerNullable(ss.getTimeframe());
-            Integer candlesLimit = ss.getCachedCandlesLimit();
+            String symbol = (ss != null) ? safeUpperNullable(ss.getSymbol()) : null;
+            String timeframe = (ss != null) ? safeLowerNullable(ss.getTimeframe()) : null;
+            Integer candlesLimit = (ss != null) ? ss.getCachedCandlesLimit() : null;
 
             if (symbol == null || timeframe == null || candlesLimit == null || candlesLimit <= 0) {
                 log.warn("🧠 ML skip tune (bad settings) chatId={} type={} ex={} net={} symbol={} tf={} limit={}",
@@ -296,7 +310,7 @@ public class MlAutoTuneRuntime {
                 return;
             }
 
-            String beforeFp = fingerprintBefore(type, chatId, env.exchange, env.network);
+            String beforeFp = fingerprintBefore(type, chatId);
 
             TuningRequest req = TuningRequest.builder()
                     .chatId(chatId)
@@ -314,19 +328,18 @@ public class MlAutoTuneRuntime {
             boolean appliedFlag = readBool(result, "applied", "isApplied", "getApplied");
             String resultReason = readString(result, "reason", "getReason", "message", "getMessage");
 
-            // ✅ если AutoTuner сам НЕ применил — пробуем применить патч в БД здесь
             boolean appliedByRuntime = false;
             if (!appliedFlag) {
-                appliedByRuntime = tryApplyResultToDb(type, chatId, env.exchange, env.network, result);
+                appliedByRuntime = tryApplyResultToDb(type, chatId, result);
                 if (appliedByRuntime) appliedFlag = true;
             }
 
-            String afterFp = fingerprintAfter(type, chatId, env.exchange, env.network);
+            String afterFp = fingerprintAfter(type, chatId);
 
             if (appliedFlag) {
-                log.info("🧠 ML tune done chatId={} type={} ex={} net={} applied={} appliedByRuntime={} reason={} changed={}",
+                log.info("🧠 ML tune done chatId={} type={} ex={} net={} applied=true appliedByRuntime={} reason={} changed={}",
                         chatId, type, env.exchange, env.network,
-                        true, appliedByRuntime,
+                        appliedByRuntime,
                         (resultReason != null ? resultReason : "ok"),
                         (!Objects.equals(beforeFp, afterFp))
                 );
@@ -339,7 +352,7 @@ public class MlAutoTuneRuntime {
 
         } catch (Exception e) {
             log.error("🧠 ML tune FAILED chatId={} type={} ex={} net={}: {}",
-                    chatId, type, env.exchange, env.network, e.getMessage(), e);
+                    chatId, type, env.exchange, env.network, safeMsg(e), e);
         } finally {
             running.remove(k);
         }
@@ -349,13 +362,12 @@ public class MlAutoTuneRuntime {
     // APPLY RESULT → DB (WINDOW_SCALPING)
     // =====================================================
 
-    private boolean tryApplyResultToDb(StrategyType type, long chatId, String exchange, NetworkType network, Object result) {
-        if (result == null) return false;
+    private boolean tryApplyResultToDb(StrategyType type, long chatId, Object result) {
+        if (result == null || type == null) return false;
 
         try {
             if (type == StrategyType.WINDOW_SCALPING) {
 
-                // 1) Иногда AutoTuner возвращает прям объект настроек
                 Object maybeCfg = readAnyNonNull(result,
                         "windowSettings", "getWindowSettings",
                         "bestWindowSettings", "getBestWindowSettings",
@@ -370,7 +382,6 @@ public class MlAutoTuneRuntime {
                     return true;
                 }
 
-                // 2) Или Map с параметрами
                 Object maybeMap = readAnyNonNull(result,
                         "params", "getParams",
                         "bestParams", "getBestParams",
@@ -393,8 +404,8 @@ public class MlAutoTuneRuntime {
             }
 
         } catch (Exception e) {
-            log.warn("🧠 ML apply patch failed type={} chatId={} ex={} net={} err={}",
-                    type, chatId, exchange, network, safeMsg(e));
+            log.warn("🧠 ML apply patch failed type={} chatId={} err={}",
+                    type, chatId, safeMsg(e));
         }
 
         return false;
@@ -443,7 +454,7 @@ public class MlAutoTuneRuntime {
         return b.build();
     }
 
-    private String fingerprintBefore(StrategyType type, long chatId, String exchange, NetworkType network) {
+    private String fingerprintBefore(StrategyType type, long chatId) {
         try {
             if (type == StrategyType.WINDOW_SCALPING) {
                 WindowScalpingStrategySettings cfg = windowSettingsService.getOrCreate(chatId);
@@ -453,7 +464,7 @@ public class MlAutoTuneRuntime {
         return null;
     }
 
-    private String fingerprintAfter(StrategyType type, long chatId, String exchange, NetworkType network) {
+    private String fingerprintAfter(StrategyType type, long chatId) {
         try {
             if (type == StrategyType.WINDOW_SCALPING) {
                 WindowScalpingStrategySettings cfg = windowSettingsService.getOrCreate(chatId);
@@ -466,11 +477,11 @@ public class MlAutoTuneRuntime {
     private String fp(WindowScalpingStrategySettings cfg) {
         if (cfg == null) return "null";
         return String.valueOf(cfg.getWindowSize()) + "|" +
-               String.valueOf(cfg.getEntryFromLowPct()) + "|" +
-               String.valueOf(cfg.getEntryFromHighPct()) + "|" +
-               String.valueOf(cfg.getMinRangePct()) + "|" +
-               (cfg.getTakeProfitPct() != null ? cfg.getTakeProfitPct().stripTrailingZeros().toPlainString() : "null") + "|" +
-               (cfg.getStopLossPct() != null ? cfg.getStopLossPct().stripTrailingZeros().toPlainString() : "null");
+                String.valueOf(cfg.getEntryFromLowPct()) + "|" +
+                String.valueOf(cfg.getEntryFromHighPct()) + "|" +
+                String.valueOf(cfg.getMinRangePct()) + "|" +
+                (cfg.getTakeProfitPct() != null ? cfg.getTakeProfitPct().stripTrailingZeros().toPlainString() : "null") + "|" +
+                (cfg.getStopLossPct() != null ? cfg.getStopLossPct().stripTrailingZeros().toPlainString() : "null");
     }
 
     // =====================================================
@@ -534,7 +545,7 @@ public class MlAutoTuneRuntime {
                 parsed = Collections.unmodifiableSet(out);
             }
         } catch (Exception ignore) {
-            parsed = Set.of(PHASE_COLLECT, PHASE_BACKTEST);
+            parsed = DEFAULT_SKIP_PHASES;
         }
 
         skipPhasesRawCache = raw;
@@ -577,13 +588,33 @@ public class MlAutoTuneRuntime {
     }
 
     // =====================================================
-    // REFLECTION HELPERS (result)
+    // SETTINGS LOAD (soft, without forcing writes)
     // =====================================================
 
-    /**
-     * ✅ ВАЖНО: ищем ПЕРВОЕ НЕ-null значение среди методов/полей.
-     * Раньше можно было "попасть" в существующий getter, который вернул null, и не попробовать остальные варианты.
-     */
+    private StrategySettings loadSettingsSoft(Long chatId, StrategyType type) {
+        if (chatId == null || chatId <= 0 || type == null) return null;
+
+        StrategySettings s = null;
+        try {
+            s = strategySettingsService.getSettings(chatId, type);
+        } catch (Exception ignored) {}
+
+        if (s == null) {
+            try {
+                s = strategySettingsService.getOrCreate(chatId, type);
+            } catch (Exception ignored) {
+                return null;
+            }
+        }
+
+        return s;
+    }
+
+    // =====================================================
+    // REFLECTION HELPERS (result + settings)
+    // =====================================================
+
+    /** ✅ Ищем ПЕРВОЕ НЕ-null значение среди методов/полей. */
     private static Object readAnyNonNull(Object obj, String... gettersOrFields) {
         if (obj == null) return null;
 
@@ -592,40 +623,30 @@ public class MlAutoTuneRuntime {
         for (String n : gettersOrFields) {
             if (n == null || n.isBlank()) continue;
 
-            // method (no-arg)
             try {
                 Method m = findNoArgMethod(c, n);
                 if (m != null) {
                     Object v = m.invoke(obj);
                     if (v != null) return v;
                 }
-            } catch (Exception ignore) {
-                // ignore
-            }
+            } catch (Exception ignore) {}
 
-            // field
             try {
                 var f = c.getDeclaredField(n);
                 f.setAccessible(true);
                 Object v = f.get(obj);
                 if (v != null) return v;
-            } catch (Exception ignore) {
-                // ignore
-            }
+            } catch (Exception ignore) {}
         }
 
         return null;
-    }
-
-    private static Object readAny(Object obj, String... gettersOrFields) {
-        // оставим для обратной совместимости, но используем в коде readAnyNonNull
-        return readAnyNonNull(obj, gettersOrFields);
     }
 
     private static boolean readBool(Object obj, String... names) {
         Object v = readAnyNonNull(obj, names);
         if (v == null) return false;
         if (v instanceof Boolean b) return b;
+        if (v instanceof Number n) return n.intValue() != 0;
         String s = String.valueOf(v).trim().toLowerCase(Locale.ROOT);
         return "true".equals(s) || "1".equals(s) || "yes".equals(s);
     }
@@ -655,7 +676,7 @@ public class MlAutoTuneRuntime {
         if (v == null) return null;
         if (v instanceof BigDecimal bd) return bd;
         if (v instanceof Number n) return BigDecimal.valueOf(n.doubleValue());
-        try { return new BigDecimal(String.valueOf(v).trim()); } catch (Exception ignored) {}
+        try { return new BigDecimal(String.valueOf(v).trim().replace(",", ".")); } catch (Exception ignored) {}
         return null;
     }
 

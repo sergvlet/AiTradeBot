@@ -15,6 +15,7 @@ import com.chicu.aitradebot.strategy.registry.StrategyRegistry;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 
 import java.lang.reflect.Method;
@@ -23,9 +24,11 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -40,8 +43,17 @@ public class AiStrategyOrchestrator {
     private final StrategySettingsService settingsService;
     private final StrategyRegistry strategyRegistry;
 
-    // ✅ ML autotune runtime (оркестратор — главный lifecycle хаб)
-    private final MlAutoTuneRuntime mlAutoTuneRuntime;
+    /**
+     * ✅ ML autotune runtime (оркестратор — главный lifecycle хаб)
+     * ✅ сделано через ObjectProvider, чтобы:
+     *  - не ловить циклические зависимости при старте контекста
+     *  - переживать временное отсутствие ML-бина во время пересборки ML-слоя
+     */
+    private final ObjectProvider<MlAutoTuneRuntime> mlAutoTuneRuntime;
+
+    private MlAutoTuneRuntime ml() {
+        return mlAutoTuneRuntime != null ? mlAutoTuneRuntime.getIfAvailable() : null;
+    }
 
     // =====================================================================
     // ✅ RUN CONTEXT (источник истины)
@@ -104,7 +116,7 @@ public class AiStrategyOrchestrator {
 
     @PostConstruct
     public void init() {
-        log.info("🧠 AiStrategyOrchestrator v4 initialized");
+        log.info("🧠 AiStrategyOrchestrator v4 initialized | mlRuntime={}", (ml() != null ? "ON" : "OFF"));
     }
 
     public Optional<RunBinding> getBinding(long chatId, StrategyType type) {
@@ -136,19 +148,70 @@ public class AiStrategyOrchestrator {
         return true;
     }
 
+    // =====================================================================
+    // ✅ RUNTIME POLICY (единые правила режима/фазы)
+    // =====================================================================
+
+    /**
+     * Единая точка принятия решения:
+     * - обновляет runtimePhases cache
+     * - включает/выключает MlAutoTuneRuntime в зависимости от mode/flags
+     */
+    private void applyRuntimePolicy(long chatId,
+                                    StrategyType type,
+                                    String exchange,
+                                    NetworkType network,
+                                    StrategySettings s) {
+        if (type == null) return;
+
+        RunKey key = new RunKey(chatId, type);
+
+        // 1) обновить кеш фаз/режима
+        RuntimePhase rp = phaseOf(s);
+        runtimePhases.put(key, rp);
+
+        AdvancedControlMode mode = rp.mode() != null ? rp.mode() : AdvancedControlMode.MANUAL;
+
+        // 2) MANUAL -> autotune всегда стоп
+        if (mode == AdvancedControlMode.MANUAL) {
+            safeAutotuneStop(chatId, type, exchange, network);
+            return;
+        }
+
+        // 3) HYBRID/AI -> autotune старт только если включен флаг autoTuneEnabled
+        // ✅ НЕ используем прямой вызов s.isAutoTuneEnabled() (может отличаться геттер)
+        boolean autoTuneEnabled = readBool(s,
+                "autoTuneEnabled", "isAutoTuneEnabled", "getAutoTuneEnabled",
+                "mlAutoTuneEnabled", "isMlAutoTuneEnabled", "getMlAutoTuneEnabled"
+        );
+
+        if (autoTuneEnabled) safeAutotuneStart(chatId, type, exchange, network);
+        else safeAutotuneStop(chatId, type, exchange, network);
+    }
+
     /**
      * ✅ Обновить runtime фазу/режим без рестарта (важно при переключении MANUAL/HYBRID/AI).
      * Вызывается из UI после сохранения.
      */
-    public void refreshRuntimePhase(Long chatId, StrategyType type, String exchange, NetworkType network) {
-        if (chatId == null || chatId <= 0 || type == null) return;
+    public void refreshRuntimePhase(long chatId, StrategyType type, String exchange, NetworkType network) {
+        if (type == null) return;
 
         RunKey key = new RunKey(chatId, type);
-        if (!running.containsKey(key)) return;
+        RunBinding b = running.get(key);
+        if (b == null) return;
+
+        String ex = sanitizeExchange(exchange);
+        NetworkType net = network;
+
+        if (ex == null) ex = b.exchange();
+        if (net == null) net = b.network();
+        if (ex == null || net == null) return;
 
         try {
-            StrategySettings s = loadSettingsStrict(chatId, type, exchange, network);
-            if (s != null) runtimePhases.put(key, phaseOf(s));
+            StrategySettings s = loadSettingsStrict(chatId, type, ex, net);
+            if (s == null) return;
+
+            applyRuntimePolicy(chatId, type, ex, net, s);
         } catch (Exception e) {
             log.debug("⚠ [ORCH] refreshRuntimePhase failed: {}", e.getMessage());
         }
@@ -158,10 +221,6 @@ public class AiStrategyOrchestrator {
     // 🔄 ATOMIC RESTART (главный метод)
     // =====================================================================
 
-    /**
-     * ✅ Атомарный рестарт (stop(old) -> bind(new) -> start(new)).
-     * Должен вызываться после сохранения StrategySettings (symbol/tf/ex/net).
-     */
     public StrategyRunInfo restartStrategyAtomic(Long chatId,
                                                  StrategyType type,
                                                  String exchange,
@@ -186,7 +245,6 @@ public class AiStrategyOrchestrator {
         try {
             RunBinding current = running.get(key);
             if (current == null) {
-                // не запущено — ничего рестартить
                 return getStatus(chatId, type, exchange, network);
             }
 
@@ -228,8 +286,8 @@ public class AiStrategyOrchestrator {
                     || !eq(current.timeframe(), desired.timeframe());
 
             if (!changed) {
-                // контекст тот же — но фазу/режим всё равно обновим (на случай переключения MANUAL/HYBRID/AI)
-                runtimePhases.put(key, phaseOf(s));
+                // контекст тот же — обновляем runtime-policy (режим/фаза/автотюн)
+                applyRuntimePolicy(chatId, type, current.exchange(), current.network(), s);
                 return buildRunInfoFromBinding(s, current, true, "Контекст не изменился (рестарт не нужен)");
             }
 
@@ -256,7 +314,6 @@ public class AiStrategyOrchestrator {
             running.put(key, desired);
             ignoreCounters.remove(key);
             lastTuneTriggerAtMs.remove(key);
-            runtimePhases.put(key, phaseOf(s));
 
             // 3) START нового binding
             try {
@@ -264,7 +321,7 @@ public class AiStrategyOrchestrator {
             } catch (Exception e) {
                 // откат binding если старт не удался
                 running.put(key, current);
-                runtimePhases.put(key, phaseOf(s)); // пусть останется актуальная фаза (не критично)
+                runtimePhases.put(key, phaseOf(s)); // пусть будет хотя бы актуально по БД
                 log.error("❌ [ORCH] start(new) failed chatId={} type={} ex={} net={} sym={} tf={}",
                         chatId, type, desired.exchange(), desired.network(), desired.symbol(), desired.timeframe(), e);
                 return buildRunInfoFromBinding(s, current, true, "Ошибка рестарта: не удалось запустить новый контекст");
@@ -279,7 +336,8 @@ public class AiStrategyOrchestrator {
                 settingsService.save(s);
             }
 
-            safeAutotuneStart(chatId, type, desired.exchange(), desired.network());
+            // ✅ применяем policy уже в новом контексте
+            applyRuntimePolicy(chatId, type, desired.exchange(), desired.network(), s);
 
             return buildRunInfoFromBinding(s, desired, true, "Контекст изменён — стратегия перезапущена");
 
@@ -357,8 +415,9 @@ public class AiStrategyOrchestrator {
                     settingsService.save(s);
                 }
 
-                runtimePhases.put(key, phaseOf(s));
-                safeAutotuneStart(chatId, type, ex, net);
+                // ✅ policy + phase cache
+                applyRuntimePolicy(chatId, type, ex, net, s);
+
                 return buildRunInfo(s, true, "Стратегия уже запущена");
             }
 
@@ -382,7 +441,6 @@ public class AiStrategyOrchestrator {
             running.put(key, newBinding);
             ignoreCounters.remove(key);
             lastTuneTriggerAtMs.remove(key);
-            runtimePhases.put(key, phaseOf(s));
 
             try {
                 strategy.start(chatId, sym, ex, net);
@@ -404,7 +462,9 @@ public class AiStrategyOrchestrator {
             log.info("▶️ [ORCH] START {} chatId={} ex={} net={} symbol={} tf={}",
                     type, chatId, ex, net, sym, tf);
 
-            safeAutotuneStart(chatId, type, ex, net);
+            // ✅ policy + phase cache + autotune on/off
+            applyRuntimePolicy(chatId, type, ex, net, s);
+
             return buildRunInfo(s, true, "Стратегия запущена");
 
         } finally {
@@ -534,10 +594,8 @@ public class AiStrategyOrchestrator {
         RunBinding b = running.get(key);
 
         if (b == null) {
-            // стратегия остановлена
             StrategyRunInfo info = buildRunInfo(s, false, "Стратегия остановлена");
 
-            // аккуратно подставим контекст в DTO (но не в БД)
             String ex = sanitizeExchange(exchange);
             if (ex == null) ex = sanitizeExchange(s.getExchangeName());
             if (ex == null) ex = "BINANCE";
@@ -549,7 +607,6 @@ public class AiStrategyOrchestrator {
             return info;
         }
 
-        // стратегия запущена
         String reqEx = sanitizeExchange(exchange);
         NetworkType reqNet = network;
 
@@ -570,8 +627,10 @@ public class AiStrategyOrchestrator {
 
     private void safeAutotuneStart(Long chatId, StrategyType type, String exchange, NetworkType network) {
         try {
+            MlAutoTuneRuntime rt = ml();
+            if (rt == null) return;
             if (chatId == null || type == null || exchange == null || network == null) return;
-            mlAutoTuneRuntime.onStrategyStarted(chatId, type, exchange, network);
+            rt.onStrategyStarted(chatId, type, exchange, network);
         } catch (Exception e) {
             log.warn("🧠 [ORCH] autotune start failed: {}", e.getMessage());
         }
@@ -579,8 +638,10 @@ public class AiStrategyOrchestrator {
 
     private void safeAutotuneStop(Long chatId, StrategyType type, String exchange, NetworkType network) {
         try {
+            MlAutoTuneRuntime rt = ml();
+            if (rt == null) return;
             if (chatId == null || type == null || exchange == null || network == null) return;
-            mlAutoTuneRuntime.onStrategyStopped(chatId, type, exchange, network);
+            rt.onStrategyStopped(chatId, type, exchange, network);
         } catch (Exception e) {
             log.warn("🧠 [ORCH] autotune stop failed: {}", e.getMessage());
         }
@@ -588,8 +649,10 @@ public class AiStrategyOrchestrator {
 
     public void onPositionClosed(Long chatId, StrategyType type, String exchange, NetworkType network) {
         try {
+            MlAutoTuneRuntime rt = ml();
+            if (rt == null) return;
             if (chatId == null || type == null || exchange == null || network == null) return;
-            mlAutoTuneRuntime.onPositionClosed(chatId, type, exchange, network);
+            rt.onPositionClosed(chatId, type, exchange, network);
         } catch (Exception e) {
             log.warn("🧠 [ORCH] onPositionClosed hook failed: {}", e.getMessage());
         }
@@ -601,6 +664,9 @@ public class AiStrategyOrchestrator {
                                      NetworkType network,
                                      String reason,
                                      Duration debounce) {
+
+        MlAutoTuneRuntime rt = ml();
+        if (rt == null) return;
 
         if (chatId == null || type == null || exchange == null || network == null) return;
 
@@ -614,7 +680,7 @@ public class AiStrategyOrchestrator {
         lastTuneTriggerAtMs.put(key, now);
 
         try {
-            mlAutoTuneRuntime.triggerTuneDebounced(chatId, type, exchange, network,
+            rt.triggerTuneDebounced(chatId, type, exchange, network,
                     reason != null ? reason : "orch-trigger", Duration.ofMillis(d));
         } catch (Exception e) {
             log.warn("🧠 [ORCH] triggerTuneDebounced failed: {}", e.getMessage());
@@ -640,18 +706,22 @@ public class AiStrategyOrchestrator {
         RunBinding b = running.get(key);
         if (b == null) return;
 
+        // ✅ если exchange/network не передали (старый/частичный вызов) — берём из binding
+        String ex = sanitizeExchange(exchange);
+        if (ex == null) ex = b.exchange();
+        NetworkType net = (network != null ? network : b.network());
+
         String sym = sanitizeSymbol(symbol);
         String tf  = sanitizeTf(timeframe);
-        String ex  = sanitizeExchange(exchange);
 
-        if (!eq(ex, b.exchange()) || network != b.network() || !eq(sym, b.symbol()) || !eq(tf, b.timeframe())) {
+        if (!eq(ex, b.exchange()) || net != b.network() || !eq(sym, b.symbol()) || !eq(tf, b.timeframe())) {
             logIgnore(key, "TICK_IGNORED",
-                    "пришло ex=" + ex + " net=" + network + " " + sym + " " + tf
+                    "пришло ex=" + ex + " net=" + net + " " + sym + " " + tf
                     + " | ожидаю ex=" + b.exchange() + " net=" + b.network() + " " + b.symbol() + " " + b.timeframe());
             return;
         }
 
-        // ✅ AI/COLLECT или BACKTEST: не отдаём событие стратегии → исключаем торговлю
+        // ✅ COLLECT/BACKTEST: не отдаём событие стратегии → исключаем торговлю
         if (isMarketEventsBlocked(key)) return;
 
         TradingStrategy strategy = strategyRegistry.get(type);
@@ -712,18 +782,21 @@ public class AiStrategyOrchestrator {
         RunBinding b = running.get(key);
         if (b == null) return;
 
+        // ✅ если exchange/network не передали — берём из binding
+        String ex = sanitizeExchange(exchange);
+        if (ex == null) ex = b.exchange();
+        NetworkType net = (network != null ? network : b.network());
+
         String sym = sanitizeSymbol(symbol);
         String tf  = sanitizeTf(timeframe);
-        String ex  = sanitizeExchange(exchange);
 
-        if (!eq(ex, b.exchange()) || network != b.network() || !eq(sym, b.symbol()) || !eq(tf, b.timeframe())) {
+        if (!eq(ex, b.exchange()) || net != b.network() || !eq(sym, b.symbol()) || !eq(tf, b.timeframe())) {
             logIgnore(key, "CANDLE_IGNORED",
-                    "пришло ex=" + ex + " net=" + network + " " + sym + " " + tf
+                    "пришло ex=" + ex + " net=" + net + " " + sym + " " + tf
                     + " | ожидаю ex=" + b.exchange() + " net=" + b.network() + " " + b.symbol() + " " + b.timeframe());
             return;
         }
 
-        // ✅ AI/COLLECT или BACKTEST: не отдаём событие стратегии → исключаем торговлю
         if (isMarketEventsBlocked(key)) return;
 
         TradingStrategy strategy = strategyRegistry.get(type);
@@ -773,7 +846,7 @@ public class AiStrategyOrchestrator {
 
         if (n <= 3 || (n % 200 == 0)) {
             log.warn("⚠️ [ORCH] {} chatId={} type={} #{} | {}",
-                    code, key.chatId, key.type, n, details);
+                    code, key.chatId(), key.type(), n, details);
         }
     }
 
@@ -791,7 +864,7 @@ public class AiStrategyOrchestrator {
         if (chatId == null || chatId <= 0) {
             active = 0;
         } else {
-            long cnt = running.keySet().stream().filter(k -> k.chatId == chatId).count();
+            long cnt = running.keySet().stream().filter(k -> k.chatId() == chatId).count();
             active = (int) Math.min(Integer.MAX_VALUE, cnt);
         }
         return new GlobalState(BigDecimal.ZERO, BigDecimal.ZERO, active);
@@ -841,13 +914,11 @@ public class AiStrategyOrchestrator {
             }
         }
 
-        // ✅ сначала берём из параметров, если они есть, иначе — из БД
         String ex = sanitizeExchange(exchange);
         if (ex == null) ex = sanitizeExchange(s.getExchangeName());
 
         NetworkType net = (network != null ? network : s.getNetworkType());
 
-        // ✅ синхронизируем только если реально есть значения
         if (ex != null || net != null) {
             syncSettingsContextIfNeeded(s, ex, net);
         }
@@ -877,39 +948,7 @@ public class AiStrategyOrchestrator {
                 log.debug("⚠ [ORCH] syncSettingsContextIfNeeded failed: {}", e.getMessage());
             }
         }
-
     }
-
-    /**
-     * ✅ Обновить runtime-режим без рестарта.
-     * Нужен когда переключили MANUAL/HYBRID/AI, но symbol/tf/ex/net не менялись.
-     */
-    public void refreshRuntimePhase(long chatId, StrategyType type, String exchange, NetworkType network) {
-        if (type == null) return;
-
-        RunKey key = new RunKey(chatId, type);
-        RunBinding b = running.get(key);
-        if (b == null) return;
-
-        String ex = sanitizeExchange(exchange);
-        NetworkType net = network;
-
-        if (ex == null) ex = b.exchange();
-        if (net == null) net = b.network();
-        if (ex == null || net == null) return;
-
-        StrategySettings s = loadSettingsStrict(chatId, type, ex, net);
-        if (s == null) return;
-
-        AdvancedControlMode mode = s.getAdvancedControlMode();
-        if (mode == null) mode = AdvancedControlMode.MANUAL;
-
-        boolean shouldAutoTune = s.isAutoTuneEnabled() && mode != AdvancedControlMode.MANUAL;
-
-        if (shouldAutoTune) safeAutotuneStart(chatId, type, ex, net);
-        else safeAutotuneStop(chatId, type, ex, net);
-    }
-
 
     // =====================================================================
     // 🧱 RUN INFO (DTO)
@@ -1161,5 +1200,53 @@ public class AiStrategyOrchestrator {
         if (exchange == null) return null;
         String s = exchange.trim().toUpperCase(Locale.ROOT);
         return s.isEmpty() ? null : s;
+    }
+
+    // =====================================================================
+    // ✅ SAFE READ BOOL (settings)
+    // =====================================================================
+
+    private static Object readAnyNonNull(Object obj, String... gettersOrFields) {
+        if (obj == null) return null;
+
+        Class<?> c = obj.getClass();
+
+        for (String n : gettersOrFields) {
+            if (n == null || n.isBlank()) continue;
+
+            try {
+                Method m = findNoArgMethod(c, n);
+                if (m != null) {
+                    Object v = m.invoke(obj);
+                    if (v != null) return v;
+                }
+            } catch (Exception ignore) {}
+
+            try {
+                var f = c.getDeclaredField(n);
+                f.setAccessible(true);
+                Object v = f.get(obj);
+                if (v != null) return v;
+            } catch (Exception ignore) {}
+        }
+
+        return null;
+    }
+
+    private static boolean readBool(Object obj, String... names) {
+        Object v = readAnyNonNull(obj, names);
+        if (v == null) return false;
+        if (v instanceof Boolean b) return b;
+        if (v instanceof Number n) return n.intValue() != 0;
+        String s = String.valueOf(v).trim().toLowerCase(Locale.ROOT);
+        return "true".equals(s) || "1".equals(s) || "yes".equals(s);
+    }
+
+    private static Method findNoArgMethod(Class<?> c, String name) {
+        try { return c.getMethod(name); } catch (Exception ignored) {}
+        String cap = name.length() > 0 ? Character.toUpperCase(name.charAt(0)) + name.substring(1) : name;
+        try { return c.getMethod("get" + cap); } catch (Exception ignored) {}
+        try { return c.getMethod("is" + cap); } catch (Exception ignored) {}
+        return null;
     }
 }

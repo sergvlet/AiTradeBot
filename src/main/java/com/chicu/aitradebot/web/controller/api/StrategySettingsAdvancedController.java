@@ -26,12 +26,16 @@ import java.util.Map;
 @RequestMapping("/api/strategy/settings")
 public class StrategySettingsAdvancedController {
 
-    private static final String PHASE_COLLECT = "COLLECT";
-    private static final String PHASE_PAPER   = "PAPER";
-    private static final String PHASE_LIVE    = "LIVE";
+    // “Железные” фазы (UI ставит только безопасные, runtime может менять сам)
+    private static final String PHASE_PAPER = "PAPER";
+    private static final String PHASE_LIVE  = "LIVE";
 
     private final StrategySettingsService strategySettingsService;
     private final StrategyAdvancedRegistry advancedRegistry;
+
+    // =========================================================
+    // helpers
+    // =========================================================
 
     private static String normalizeExchange(String exchange) {
         if (exchange == null) return "BINANCE";
@@ -48,63 +52,76 @@ public class StrategySettingsAdvancedController {
         if (raw == null) return null;
         String v = raw.trim().toUpperCase(Locale.ROOT);
         if (v.isEmpty()) return null;
-        try {
-            return AdvancedControlMode.valueOf(v);
-        } catch (Exception ignored) {
-            return null;
-        }
+        try { return AdvancedControlMode.valueOf(v); }
+        catch (Exception ignored) { return null; }
     }
 
     /**
-     * ✅ StrategySettingsService пока без (exchange, network),
-     * поэтому берём settings по (chatId, type) и синхронизируем контекст в самой сущности.
+     * Контекст — не ключ, но нужен UI.
+     * Синхронизируем exchange/network в одной записи settings (chatId+type).
+     *
+     * ВАЖНО: тут НЕ сохраняем. Сохранение делаем снаружи единым save(),
+     * чтобы не плодить лишние события/гонки.
      */
-    private void syncContextIfNeeded(StrategySettings ss, String exchange, NetworkType network) {
-        if (ss == null) return;
+    private boolean syncContextIfNeeded(StrategySettings ss, String exchange, NetworkType network) {
+        if (ss == null) return false;
 
         boolean changed = false;
 
-        if (exchange != null) {
-            String ex = exchange.trim().toUpperCase(Locale.ROOT);
-            if (!ex.isEmpty() && (ss.getExchangeName() == null || !ss.getExchangeName().equalsIgnoreCase(ex))) {
-                ss.setExchangeName(ex);
-                changed = true;
-            }
-        }
-
-        if (network != null && ss.getNetworkType() != network) {
-            ss.setNetworkType(network);
+        String ex = normalizeExchange(exchange);
+        if (ss.getExchangeName() == null || !ss.getExchangeName().equalsIgnoreCase(ex)) {
+            ss.setExchangeName(ex);
             changed = true;
         }
 
-        if (changed) {
-            try {
-                strategySettingsService.save(ss);
-            } catch (Exception ignored) {
-                // синхронизация для консистентности UI — не ломаем ответ
-            }
+        NetworkType net = (network != null ? network : NetworkType.TESTNET);
+        if (ss.getNetworkType() != net) {
+            ss.setNetworkType(net);
+            changed = true;
         }
+
+        return changed;
     }
 
-    private static void applyModeFlags(StrategySettings ss, AdvancedControlMode mode, NetworkType network) {
+    /**
+     * ✅ “ЖЕЛЕЗНО”:
+     * MANUAL: autotune=false, mlGate=false, runPhase=LIVE, чистим ML-хвосты (gate/model/schema).
+     * HYBRID: autotune=true,  mlGate=true,  runPhase=PAPER на testnet иначе LIVE.
+     * AI:     autotune=true,  mlGate=true,  runPhase=PAPER на testnet иначе LIVE.
+     *
+     * Почему AI НЕ ставит COLLECT:
+     * - UI не должен фиксировать внутренние фазы рантайма (COLLECT/BACKTEST/…).
+     * - Иначе легко “заклинить” тюнинг/гейт настройками (особенно если где-то COLLECT скипается).
+     * - COLLECT должен выставляться/сниматься runtime’ом по реальным условиям (данные/модель/тюнинг).
+     */
+    private static void enforceModeRules(StrategySettings ss, AdvancedControlMode mode, NetworkType network) {
         if (ss == null || mode == null) return;
+
+        NetworkType net = (network != null ? network : NetworkType.TESTNET);
+        String safePhase = (net == NetworkType.TESTNET ? PHASE_PAPER : PHASE_LIVE);
 
         switch (mode) {
             case MANUAL -> {
                 ss.setAutoTuneEnabled(false);
                 ss.setMlGateEnabled(false);
                 ss.setRunPhase(PHASE_LIVE);
+
+                // важное: не оставлять “AI хвосты” в MANUAL
+                ss.setGateMinProb(null);
+                ss.setMlModelKey(null);
+                ss.setMlSchemaHash(null);
+                ss.setMlModelVersion(null);
+                // mlConfidence можно оставить как статистику (не сбрасываем)
             }
             case HYBRID -> {
                 ss.setAutoTuneEnabled(true);
                 ss.setMlGateEnabled(true);
-                ss.setRunPhase(network == NetworkType.TESTNET ? PHASE_PAPER : PHASE_LIVE);
+                ss.setRunPhase(safePhase);
             }
             case AI -> {
                 ss.setAutoTuneEnabled(true);
                 ss.setMlGateEnabled(true);
-                // AI запускается с фазы COLLECT (дальше цикл докрутим отдельным рантаймом)
-                ss.setRunPhase(PHASE_COLLECT);
+                ss.setRunPhase(safePhase);
             }
         }
     }
@@ -116,19 +133,23 @@ public class StrategySettingsAdvancedController {
     public AdvancedTabDto getAdvanced(
             @RequestParam long chatId,
             @RequestParam StrategyType type,
-            @RequestParam String exchange,
-            @RequestParam NetworkType network
+            @RequestParam(required = false) String exchange,
+            @RequestParam(required = false) NetworkType network
     ) {
         String ex = normalizeExchange(exchange);
+        NetworkType net = (network != null ? network : NetworkType.TESTNET);
 
         StrategySettings ss = strategySettingsService.getOrCreate(chatId, type);
 
-        // ✅ синхронизируем exchange/network в StrategySettings (иначе вкладки живут разной жизнью)
-        syncContextIfNeeded(ss, ex, network);
+        boolean ctxChanged = syncContextIfNeeded(ss, ex, net);
+        if (ctxChanged) {
+            // save чтобы UI контекст не “прыгал”, но это единичное сохранение
+            strategySettingsService.save(ss);
+        }
 
         StrategyAdvancedRenderer renderer = advancedRegistry.get(type);
 
-        AdvancedControlMode mode = ss.getAdvancedControlMode() != null
+        AdvancedControlMode mode = (ss.getAdvancedControlMode() != null)
                 ? ss.getAdvancedControlMode()
                 : AdvancedControlMode.MANUAL;
 
@@ -136,7 +157,7 @@ public class StrategySettingsAdvancedController {
                 .chatId(chatId)
                 .strategyType(type)
                 .exchange(ex)
-                .networkType(network)
+                .networkType(net)
                 .controlMode(mode)
                 .params(Map.of())
                 .build();
@@ -165,41 +186,35 @@ public class StrategySettingsAdvancedController {
     }
 
     // =========================================================
-    // POST /advanced/submit
+    // POST /advanced/submit (FORM)
     // =========================================================
     @Transactional
     @PostMapping(value = "/advanced/submit", consumes = MediaType.APPLICATION_FORM_URLENCODED_VALUE)
     public Map<String, Object> submitAdvanced(
             @RequestParam long chatId,
             @RequestParam StrategyType type,
-            @RequestParam String exchange,
-            @RequestParam NetworkType network,
+            @RequestParam(required = false) String exchange,
+            @RequestParam(required = false) NetworkType network,
             @RequestParam Map<String, String> allParams
     ) {
         String ex = normalizeExchange(exchange);
+        NetworkType net = (network != null ? network : NetworkType.TESTNET);
 
         StrategySettings ss = strategySettingsService.getOrCreate(chatId, type);
 
-        // ✅ синхронизируем контекст (чтобы не терялось при сохранениях вкладок)
-        syncContextIfNeeded(ss, ex, network);
+        boolean dirty = syncContextIfNeeded(ss, ex, net);
 
-        // ✅ 1) сохраняем режим, если пришёл (accept: advancedControlMode / controlMode)
+        // 1) режим (если пришёл)
         AdvancedControlMode requestedMode = parseModeOrNull(allParams.get("advancedControlMode"));
-        if (requestedMode == null) {
-            requestedMode = parseModeOrNull(allParams.get("controlMode"));
-        }
+        if (requestedMode == null) requestedMode = parseModeOrNull(allParams.get("controlMode"));
 
         if (requestedMode != null && requestedMode != ss.getAdvancedControlMode()) {
             ss.setAdvancedControlMode(requestedMode);
-
-            // ✅ флаги режима + фаза
-            applyModeFlags(ss, requestedMode, network);
-
-            strategySettingsService.save(ss);
+            enforceModeRules(ss, requestedMode, net);
+            dirty = true;
         }
 
-        // текущий режим после возможного сохранения
-        AdvancedControlMode mode = ss.getAdvancedControlMode() != null
+        AdvancedControlMode mode = (ss.getAdvancedControlMode() != null)
                 ? ss.getAdvancedControlMode()
                 : AdvancedControlMode.MANUAL;
 
@@ -208,7 +223,7 @@ public class StrategySettingsAdvancedController {
             return Map.of("ok", false, "message", "Нет renderer для стратегии " + type);
         }
 
-        // чистим системные поля (и режим тоже не отдаём в params рендерера)
+        // 2) params -> renderer (без системных ключей)
         HashMap<String, String> clean = new HashMap<>(allParams);
         clean.remove("chatId");
         clean.remove("type");
@@ -221,20 +236,72 @@ public class StrategySettingsAdvancedController {
                 .chatId(chatId)
                 .strategyType(type)
                 .exchange(ex)
-                .networkType(network)
+                .networkType(net)
                 .controlMode(mode)
                 .params(clean)
                 .build();
 
+        // “железно”: AI не принимает ручные параметры
         if (!ctx.canSubmit()) {
             return Map.of("ok", false, "message", "Режим AI: ручные параметры запрещены");
         }
 
         renderer.handleSubmit(ctx);
 
-        // ✅ подстрахуем сохранение базовых полей
-        strategySettingsService.save(ss);
+        // сохраняем базовые поля (если renderer их трогал внутри)
+        // + сохраняем смену режима/контекста одной операцией
+        if (dirty) {
+            strategySettingsService.save(ss);
+        } else {
+            // renderer мог поменять ss внутри — сохраняем в любом случае (без лишней логики)
+            strategySettingsService.save(ss);
+        }
 
         return Map.of("ok", true);
+    }
+
+    // =========================================================
+    // POST /apply (JSON) — отдельный apply для UI
+    // =========================================================
+    public record ApplyModeRequest(
+            long chatId,
+            StrategyType type,
+            String exchange,
+            NetworkType network,
+            String advancedControlMode,
+            String reason
+    ) {}
+
+    @Transactional
+    @PostMapping(value = "/apply", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
+    public Map<String, Object> applyMode(@RequestBody ApplyModeRequest req) {
+
+        String ex = normalizeExchange(req.exchange());
+        NetworkType net = (req.network() != null ? req.network() : NetworkType.TESTNET);
+
+        StrategySettings ss = strategySettingsService.getOrCreate(req.chatId(), req.type());
+
+        boolean dirty = syncContextIfNeeded(ss, ex, net);
+
+        AdvancedControlMode requested = parseModeOrNull(req.advancedControlMode());
+        if (requested == null) {
+            return Map.of("applied", false, "reason", "invalid_mode");
+        }
+
+        boolean changedMode = (ss.getAdvancedControlMode() != requested);
+        ss.setAdvancedControlMode(requested);
+        enforceModeRules(ss, requested, net);
+
+        strategySettingsService.save(ss);
+
+        return Map.of(
+                "applied", true,
+                "changed", (dirty || changedMode),
+                "mode", requested.name(),
+                "runPhase", ss.getRunPhase(),
+                "autoTuneEnabled", ss.isAutoTuneEnabled(),
+                "mlGateEnabled", ss.isMlGateEnabled(),
+                "reason", (req.reason() != null ? req.reason() : "apply")
+        );
     }
 }

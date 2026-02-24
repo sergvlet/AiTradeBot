@@ -5,4 +5,7 @@ public interface WindowScalpingStrategySettingsService {
     WindowScalpingStrategySettings getOrCreate(Long chatId);
 
     WindowScalpingStrategySettings update(Long chatId, WindowScalpingStrategySettings incoming);
+
+    Long getVersion(Long chatId);
+
 }

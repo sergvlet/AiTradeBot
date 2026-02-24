@@ -113,7 +113,7 @@ public class StrategySettingsController {
 
         AccountBalanceSnapshot balance = fetchSnapshotCompat(chatId, strategyType, exchange, network, selectedAsset);
 
-        // если в БД пусто — берём из snapshot и фиксируем (ОК: разовая “починка” данных)
+        // если в БД пусто — берём из snapshot и фиксируем (разовая “починка” данных)
         if (selectedAsset == null && balance != null) {
             selectedAsset = normalizeAsset(balance.getSelectedAsset());
             if (selectedAsset != null) {
@@ -125,8 +125,7 @@ public class StrategySettingsController {
         ensureSelectedBalanceCompat(balance, selectedAsset);
 
         // KEYS + DIAG
-        ExchangeSettings exchangeSettings =
-                exchangeSettingsService.getOrCreate(chatId, exchange, network);
+        ExchangeSettings exchangeSettings = exchangeSettingsService.getOrCreate(chatId, exchange, network);
 
         boolean diagnosticsSupported = isDiagnosticsSupported(exchange);
 
@@ -280,7 +279,7 @@ public class StrategySettingsController {
 
         if (requestedMode != null && requestedMode != currentMode) {
             s.setAdvancedControlMode(requestedMode);
-            applyModeDefaults(s, requestedMode, s.getNetworkType());
+            applyModeDefaultsHard(s, requestedMode, s.getNetworkType()); // ✅ железно
             syncRunPhaseWithContext(s);
             strategySettingsService.save(s);
         }
@@ -330,7 +329,7 @@ public class StrategySettingsController {
 
         if (requestedMode != null && requestedMode != currentMode) {
             s.setAdvancedControlMode(requestedMode);
-            applyModeDefaults(s, requestedMode, s.getNetworkType());
+            applyModeDefaultsHard(s, requestedMode, s.getNetworkType()); // ✅ железно
             syncRunPhaseWithContext(s);
             strategySettingsService.save(s);
         }
@@ -370,7 +369,7 @@ public class StrategySettingsController {
         AdvancedControlMode current = s.getAdvancedControlMode();
         if (requested != null && requested != current) {
             s.setAdvancedControlMode(requested);
-            applyModeDefaults(s, requested, s.getNetworkType());
+            applyModeDefaultsHard(s, requested, s.getNetworkType()); // ✅ железно
             syncRunPhaseWithContext(s);
             strategySettingsService.save(s);
         }
@@ -416,7 +415,7 @@ public class StrategySettingsController {
                         .accepted(true)
                         .mode(mode)
                         .applied(false)
-                        .reason("Apply принят: тюнинг запущен после сохранения (afterCommit)")
+                        .reason("Apply принят: тюнинг запущен afterCommit")
                         .build()
         );
     }
@@ -433,7 +432,7 @@ public class StrategySettingsController {
             syncRunPhaseWithContext(s);
             try { strategySettingsService.save(s); } catch (Exception ignored) {}
 
-            // ✅ обновим runtime фазу сразу (без рестарта) — важно для AI/COLLECT блокировки
+            // ✅ обновим runtime фазу сразу (без рестарта)
             try { orchestrator.refreshRuntimePhase(chatId, type, exchange, network); } catch (Exception ignored) {}
 
             String symbol = normalizeSymbol(s.getSymbol());
@@ -632,30 +631,38 @@ public class StrategySettingsController {
     }
 
     // =====================================================
-    // MODE DEFAULTS ✅ FIXED (AI -> COLLECT)
+    // MODE DEFAULTS ✅ “ЖЕЛЕЗНО”
     // =====================================================
-    private void applyModeDefaults(StrategySettings s, AdvancedControlMode mode, NetworkType net) {
+    private void applyModeDefaultsHard(StrategySettings s, AdvancedControlMode mode, NetworkType net) {
         if (s == null || mode == null) return;
+
+        NetworkType n = (net != null) ? net : (s.getNetworkType() != null ? s.getNetworkType() : NetworkType.TESTNET);
 
         switch (mode) {
             case MANUAL -> {
                 s.setAutoTuneEnabled(false);
                 s.setMlGateEnabled(false);
                 s.setRunPhase(PHASE_LIVE);
+
+                // ✅ чистим AI/ML хвосты, чтобы MANUAL был реально MANUAL
+                s.setGateMinProb(null);
+                s.setMlModelKey(null);
+                s.setMlSchemaHash(null);
+                s.setMlModelVersion(null);
             }
             case HYBRID -> {
                 s.setAutoTuneEnabled(true);
                 s.setMlGateEnabled(true);
-                s.setRunPhase(net == NetworkType.TESTNET ? PHASE_PAPER : PHASE_LIVE);
+                s.setRunPhase(n == NetworkType.TESTNET ? PHASE_PAPER : PHASE_LIVE);
             }
             case AI -> {
                 s.setAutoTuneEnabled(true);
                 s.setMlGateEnabled(true);
                 s.setRunPhase(PHASE_COLLECT);
             }
-            default -> s.setRunPhase(PHASE_LIVE);
         }
 
+        // BACKTEST руками не держим как "режим по умолчанию"
         if (PHASE_BACKTEST.equalsIgnoreCase(s.getRunPhase())) {
             s.setRunPhase(PHASE_LIVE);
         }
@@ -686,7 +693,7 @@ public class StrategySettingsController {
         if (s == null) return false;
 
         String ex = (exchange == null || exchange.isBlank()) ? null : normalizeExchange(exchange);
-        if (ex == null) ex = normalizeExchange(s.getExchangeName()); // fallback на текущее
+        if (ex == null) ex = normalizeExchange(s.getExchangeName());
 
         NetworkType net = (network != null) ? network : s.getNetworkType();
 
@@ -719,7 +726,7 @@ public class StrategySettingsController {
     /**
      * ✅ ВАЖНО:
      * - если runPhase = COLLECT/BACKTEST → не трогаем
-     * - если mode = AI → держим COLLECT (AI цикл начинается оттуда)
+     * - если mode = AI → держим COLLECT
      * - иначе: MANUAL -> LIVE, HYBRID -> PAPER/LIVE по net
      */
     private void syncRunPhaseWithContext(StrategySettings s) {
@@ -758,7 +765,6 @@ public class StrategySettingsController {
         ex = normalizeExchange(ex);
         net = (net != null) ? net : (s.getNetworkType() != null ? s.getNetworkType() : NetworkType.TESTNET);
 
-        // ✅ активность строго по контексту
         boolean active = orchestrator.isRunning(chatId, type, ex, net);
 
         String selectedAsset = normalizeAsset(s.getAccountAsset());
@@ -772,7 +778,6 @@ public class StrategySettingsController {
 
         Boolean hasKeys = (es != null) ? es.hasBaseKeys() : null;
 
-        // ✅ НЕ сохраняем тут ничего в БД (state — read-only)
         if (selectedAsset == null && snap != null) {
             selectedAsset = normalizeAsset(snap.getSelectedAsset());
         }
@@ -788,11 +793,7 @@ public class StrategySettingsController {
 
             if (ab != null) {
                 String asset = normalizeAsset(selectedAsset != null ? selectedAsset : snap.getSelectedAsset());
-                balance = new StrategyUiState.AssetBalance(
-                        asset,
-                        ab.getFree(),
-                        ab.getLocked()
-                );
+                balance = new StrategyUiState.AssetBalance(asset, ab.getFree(), ab.getLocked());
             }
         }
 
@@ -901,10 +902,6 @@ public class StrategySettingsController {
         }
     }
 
-    /**
-     * ✅ Если контекст НЕ менялся, но менялись режим/фаза — нужно обновить runtime cache оркестратора.
-     * Это закрывает кейс: MANUAL/HYBRID/AI переключили, а рестарт не нужен.
-     */
     private void scheduleRefreshRuntimeAfterCommitIfNeeded(long chatId,
                                                            StrategyType type,
                                                            CtxSnap before,
@@ -912,7 +909,6 @@ public class StrategySettingsController {
                                                            String exchange,
                                                            NetworkType network) {
 
-        // если будет рестарт — refresh не обязателен (рестарт сам обновит кэш), но и не вреден
         if (ctxChanged(before, after)) return;
         if (!orchestrator.isRunning(chatId, type)) return;
 
@@ -1144,6 +1140,7 @@ public class StrategySettingsController {
         return StrategyType.valueOf(raw.trim().toUpperCase(Locale.ROOT));
     }
 
+    // ✅ ОСТАВЛЯЕМ ТОЛЬКО ОДНУ normalizeExchange (раньше у тебя было ДВЕ -> не компилилось)
     private String normalizeExchange(String exchange) {
         return (exchange == null || exchange.isBlank())
                 ? "BINANCE"

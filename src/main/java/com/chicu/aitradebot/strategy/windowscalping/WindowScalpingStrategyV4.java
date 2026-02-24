@@ -5,6 +5,8 @@ import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
 import com.chicu.aitradebot.domain.enums.AdvancedControlMode;
+import com.chicu.aitradebot.events.StrategySettingsUpdatedEvent;
+import com.chicu.aitradebot.events.WindowScalpingSettingsUpdatedEvent;
 import com.chicu.aitradebot.market.model.UnifiedKline;
 import com.chicu.aitradebot.orchestrator.AiStrategyOrchestrator;
 import com.chicu.aitradebot.service.StrategySettingsService;
@@ -18,6 +20,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.ApplicationContext;
+import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
 
 import java.lang.reflect.Method;
@@ -39,6 +42,10 @@ public class WindowScalpingStrategyV4 implements
 
     @Value("${strategy.window.settingsRefreshSeconds:10}")
     private long settingsRefreshSeconds;
+
+    // ✅ hot-update: как часто проверять version в сервисах (если методы getVersion есть)
+    @Value("${strategy.window.settingsVersionCheckMs:1000}")
+    private long settingsVersionCheckMs;
 
     @Value("${strategy.window.tickLogEveryTicks:800}")
     private long tickLogEveryTicks;
@@ -127,6 +134,11 @@ public class WindowScalpingStrategyV4 implements
         Instant lastSettingsLoadAt;
         String lastFingerprint;
 
+        // ✅ hot-update: отслеживание версии (без рестарта)
+        Instant lastVersionCheckAt;
+        Long lastSsVersion;
+        Long lastCfgVersion;
+
         Deque<BigDecimal> window = new ArrayDeque<>();
 
         boolean inPosition;
@@ -155,6 +167,10 @@ public class WindowScalpingStrategyV4 implements
         // ✅ для coarse-adjust
         int consecutiveRangeTooSmall;
         Instant lastCoarseAdjustAt;
+
+        // ✅ throttled persist ML confidence (чтобы не спамить БД)
+        Instant lastMlConfidenceSaveAt;
+        Double lastMlConfidenceSaved;
     }
 
     // =====================================================
@@ -171,7 +187,7 @@ public class WindowScalpingStrategyV4 implements
 
         String hintEx = normalizeExchangeOrNull(exchange);
 
-        // ✅ FIX: settings грузим всегда (без зависимости от exchange/network)
+        // ✅ settings грузим всегда (без зависимости от exchange/network)
         StrategySettings ss = loadStrategySettingsAuto(chatId, hintEx, network);
         WindowScalpingStrategySettings cfg = windowSettingsService.getOrCreate(chatId);
 
@@ -185,14 +201,20 @@ public class WindowScalpingStrategyV4 implements
         st.exchange = normalizeExchangeOrNull(ss != null ? ss.getExchangeName() : hintEx);
         st.network = ss != null ? ss.getNetworkType() : network;
 
-        // ✅ символ: только из StrategySettings (если есть), иначе из hint.
-        // НИКАКИХ дефолтов вроде BTCTUSD.
+        // ✅ символ: только из StrategySettings (если есть), иначе из hint
         String sym = ss != null ? normalizeSymbolOrNull(ss.getSymbol()) : null;
         if (sym == null) sym = normalizeSymbolOrNull(symbolHint);
         st.symbol = sym;
 
         st.lastSettingsLoadAt = Instant.now();
         st.lastFingerprint = buildFingerprint(ss, cfg);
+
+        // ✅ init versions
+        st.lastSsVersion = extractEntityVersion(ss);
+        st.lastCfgVersion = extractEntityVersion(cfg);
+        st.lastVersionCheckAt = st.lastSettingsLoadAt;
+
+        st.window.clear();
 
         st.inPosition = false;
         st.isLong = true;
@@ -205,26 +227,36 @@ public class WindowScalpingStrategyV4 implements
 
         st.lastTradeClosedAt = null;
         st.lastEntryAt = null;
+
+        st.lastHoldReason = null;
+        st.lastHoldAt = null;
+
+        st.lastDiagAt = null;
         st.lastAutoTuneRequestAt = null;
 
+        // ✅ для coarse-adjust
         st.consecutiveRangeTooSmall = 0;
         st.lastCoarseAdjustAt = null;
+
+        // ✅ throttled persist ML confidence
+        st.lastMlConfidenceSaveAt = null;
+        st.lastMlConfidenceSaved = null;
 
         states.put(chatId, st);
 
         ensureRuntimeContext(st, ss);
 
         if (st.exchange != null && st.network != null && isAutoTuneAllowed(ss)) {
-            safeAutoTune(() -> autoTuneRuntime.onStrategyStarted(chatId, StrategyType.WINDOW_SCALPING, st.exchange, st.network));
+            safeAutoTune(() -> autoTuneRuntime.onStrategyStarted(
+                    chatId, StrategyType.WINDOW_SCALPING, st.exchange, st.network
+            ));
         } else {
             if (st.exchange == null || st.network == null) {
                 log.warn("[WINDOW] 🧠 skip autoTuneRuntime.onStrategyStarted (нет exchange/network) chatId={} ex={} net={}",
                         chatId, st.exchange, st.network);
-            } else {
-                if (log.isDebugEnabled()) {
-                    log.debug("[WINDOW] 🧠 skip autoTuneRuntime.onStrategyStarted (mode={}, autoTuneEnabled={}) chatId={} ex={} net={}",
-                            modeOrManual(ss), (ss != null && ss.isAutoTuneEnabled()), chatId, st.exchange, st.network);
-                }
+            } else if (log.isDebugEnabled()) {
+                log.debug("[WINDOW] 🧠 skip autoTuneRuntime.onStrategyStarted (mode={}, autoTuneEnabled={}) chatId={} ex={} net={}",
+                        modeOrManual(ss), (ss != null && ss.isAutoTuneEnabled()), chatId, st.exchange, st.network);
             }
         }
 
@@ -252,7 +284,8 @@ public class WindowScalpingStrategyV4 implements
         if (st.symbol != null) {
             final String symFinal = st.symbol;
             safeLive(() -> live.pushState(chatId, StrategyType.WINDOW_SCALPING, symFinal, true));
-            safeLive(() -> live.pushSignal(chatId, StrategyType.WINDOW_SCALPING, symFinal, null, Signal.hold("Стратегия запущена")));
+            safeLive(() -> live.pushSignal(chatId, StrategyType.WINDOW_SCALPING, symFinal, null,
+                    Signal.hold("Стратегия запущена")));
         }
 
         // ✅ восстановим позицию после рестарта/перезапуска
@@ -328,14 +361,11 @@ public class WindowScalpingStrategyV4 implements
             if (network != null) st.network = network;
 
             // ✅ FIX: НЕ перезаписываем st.symbol чужим символом.
-            // Если символ уже задан (из настроек) — принимаем только совпадающий.
-            // Если st.symbol == null — тогда можно принять из события.
             String incoming = normalizeSymbolOrNull(symbol);
             String current = normalizeSymbolOrNull(st.symbol);
             if (current == null && incoming != null) {
                 st.symbol = incoming;
             } else if (current != null && incoming != null && !current.equals(incoming)) {
-                // можно логнуть редко, чтобы видеть реальную причину "почему нет свечей"
                 if (st.ticks % Math.max(1, tickLogEveryTicks) == 0) {
                     log.warn("[WINDOW] ⚠ drop price event due to symbol mismatch chatId={} currentSym={} incomingSym={} ex={} net={}",
                             chatId, current, incoming, ex, network);
@@ -372,7 +402,6 @@ public class WindowScalpingStrategyV4 implements
             if (ex != null) st.exchange = ex;
             if (network != null) st.network = network;
 
-            // ✅ FIX: то же правило, что и для тиков.
             String incoming = normalizeSymbolOrNull(symbol);
             String current = normalizeSymbolOrNull(st.symbol);
             if (current == null && incoming != null) {
@@ -416,12 +445,10 @@ public class WindowScalpingStrategyV4 implements
         String tickSymbol = normalizeSymbolOrNull(symbolFromTick);
         String cfgSymbol = normalizeSymbolOrNull(st.symbol);
 
-        // ✅ если настроечный символ есть — принимаем только совпадающий тик
         if (cfgSymbol != null && tickSymbol != null && !cfgSymbol.equals(tickSymbol)) {
             return;
         }
 
-        // ✅ если символ ещё не известен — можно принять
         if (cfgSymbol == null && tickSymbol != null) st.symbol = tickSymbol;
 
         final String symLive = normalizeSymbolOrNull(st.symbol);
@@ -572,7 +599,11 @@ public class WindowScalpingStrategyV4 implements
                                     chatId, sym, pred.reason);
                         }
                     } else {
+                        // ✅ локально обновим (для UI/логов)
                         try { ss.setMlConfidence(BigDecimal.valueOf(pred.proba)); } catch (Exception ignored) {}
+
+                        // ✅ ВАЖНО: throttled persist в БД (иначе не увидишь обновления)
+                        maybePersistMlConfidence(st, ss, pred.proba, time);
 
                         if (st.ticks % logEvery == 0) {
                             log.info("[WINDOW] 🤖 ML proba chatId={} sym={} model={} proba={} threshold={}",
@@ -733,20 +764,21 @@ public class WindowScalpingStrategyV4 implements
     }
 
     // =====================================================
-    // SETTINGS REFRESH
+    // SETTINGS REFRESH (HOT-UPDATE)
     // =====================================================
 
     private void refreshSettingsIfNeeded(Long chatId, LocalState st, Instant now) {
 
         Duration refreshEvery = Duration.ofSeconds(Math.max(1, settingsRefreshSeconds));
 
-        if (st.lastSettingsLoadAt != null &&
-            Duration.between(st.lastSettingsLoadAt, now).compareTo(refreshEvery) < 0) {
-            return;
-        }
+        boolean timeDue = (st.lastSettingsLoadAt == null) ||
+                          Duration.between(st.lastSettingsLoadAt, now).compareTo(refreshEvery) >= 0;
+
+        boolean versionDue = externalSettingsChanged(chatId, st, now);
+
+        if (!timeDue && !versionDue) return;
 
         try {
-            // ✅ FIX: грузим всегда
             StrategySettings loaded = loadStrategySettingsAuto(chatId, st.exchange, st.network);
             WindowScalpingStrategySettings cfg = windowSettingsService.getOrCreate(chatId);
 
@@ -758,9 +790,12 @@ public class WindowScalpingStrategyV4 implements
             if (loaded != null) st.ss = loaded;
             if (cfg != null) st.cfg = cfg;
 
+            // ✅ обновим кеш версий после успешной загрузки
+            st.lastSsVersion = extractEntityVersion(st.ss);
+            st.lastCfgVersion = extractEntityVersion(st.cfg);
+
             if (loaded != null) {
                 String loadedSymbol = normalizeSymbolOrNull(loaded.getSymbol());
-                // ✅ символ меняем только если НЕ в позиции (как и было)
                 if (!st.inPosition && loadedSymbol != null) st.symbol = loadedSymbol;
 
                 if (loaded.getExchangeName() != null) st.exchange = normalizeExchangeOrNull(loaded.getExchangeName());
@@ -798,6 +833,62 @@ public class WindowScalpingStrategyV4 implements
         } catch (Exception e) {
             st.lastSettingsLoadAt = now;
             log.warn("[WINDOW] ⚠️ settings refresh failed chatId={} msg={}", chatId, e.toString());
+        }
+    }
+
+    // ✅ version-driven refresh trigger (если сервисы реализуют getVersion)
+    private boolean externalSettingsChanged(Long chatId, LocalState st, Instant now) {
+        long checkMs = Math.max(250, settingsVersionCheckMs);
+
+        if (st.lastVersionCheckAt != null) {
+            long passed = Duration.between(st.lastVersionCheckAt, now).toMillis();
+            if (passed < checkMs) return false;
+        }
+        st.lastVersionCheckAt = now;
+
+        Long ssVer = tryCallLong(
+                strategySettingsService,
+                "getVersion",
+                new Class<?>[]{Long.class, StrategyType.class},
+                chatId, StrategyType.WINDOW_SCALPING
+        );
+
+        Long cfgVer = tryCallLong(
+                windowSettingsService,
+                "getVersion",
+                new Class<?>[]{Long.class},
+                chatId
+        );
+
+        if (ssVer != null && st.lastSsVersion != null && !ssVer.equals(st.lastSsVersion)) return true;
+        if (cfgVer != null && st.lastCfgVersion != null && !cfgVer.equals(st.lastCfgVersion)) return true;
+
+        if (st.lastSsVersion == null && ssVer != null) st.lastSsVersion = ssVer;
+        if (st.lastCfgVersion == null && cfgVer != null) st.lastCfgVersion = cfgVer;
+
+        return false;
+    }
+
+    private Long extractEntityVersion(Object entity) {
+        if (entity == null) return null;
+        Object v = tryInvoke(entity, Long.class, Number.class, "getVersion", "version");
+        if (v == null) return null;
+        if (v instanceof Long l) return l;
+        if (v instanceof Number n) return n.longValue();
+        try { return Long.parseLong(String.valueOf(v).trim()); } catch (Exception ignored) { return null; }
+    }
+
+    private Long tryCallLong(Object target, String methodName, Class<?>[] paramTypes, Object... args) {
+        if (target == null) return null;
+        try {
+            Method m = target.getClass().getMethod(methodName, paramTypes);
+            Object out = m.invoke(target, args);
+            if (out == null) return null;
+            if (out instanceof Long l) return l;
+            if (out instanceof Number n) return n.longValue();
+            return Long.parseLong(String.valueOf(out).trim());
+        } catch (Exception ignored) {
+            return null;
         }
     }
 
@@ -902,7 +993,6 @@ public class WindowScalpingStrategyV4 implements
     private StrategySettings loadStrategySettingsAuto(Long chatId, String exchange, NetworkType network) {
         if (chatId == null) return null;
 
-        // ✅ FIX: здесь никаких условий — настройки и так keyed by (chatId, type)
         try {
             return strategySettingsService.getOrCreate(chatId, StrategyType.WINDOW_SCALPING);
         } catch (Exception e) {
@@ -955,7 +1045,6 @@ public class WindowScalpingStrategyV4 implements
         return coarseAdjustEnabled && isAutoTuneAllowed(ss);
     }
 
-
     // =====================================================
     // ✅ COARSE-ADJUST
     // =====================================================
@@ -1000,6 +1089,8 @@ public class WindowScalpingStrategyV4 implements
             windowSettingsService.update(chatId, patch);
 
             st.cfg = windowSettingsService.getOrCreate(chatId);
+            st.lastCfgVersion = extractEntityVersion(st.cfg);
+
             st.lastFingerprint = buildFingerprint(st.ss, st.cfg);
             st.lastSettingsLoadAt = now;
 
@@ -1521,8 +1612,67 @@ public class WindowScalpingStrategyV4 implements
         }
     }
 
+    @EventListener
+    public void onWindowScalpingSettingsUpdated(WindowScalpingSettingsUpdatedEvent e) {
+        LocalState st = states.get(e.chatId());
+        if (st == null) return;
+        synchronized (st) {
+            st.lastSettingsLoadAt = Instant.EPOCH;   // форс refresh
+            st.lastFingerprint = null;              // changed=true
+            st.lastSsVersion = null;                // сброс версии
+            st.lastCfgVersion = null;               // сброс версии
+            st.lastVersionCheckAt = Instant.EPOCH;  // форс version check
+        }
+    }
+
+    @EventListener
+    public void onStrategySettingsUpdated(StrategySettingsUpdatedEvent e) {
+        if (e == null || e.type() != StrategyType.WINDOW_SCALPING) return;
+        LocalState st = states.get(e.chatId());
+        if (st == null) return;
+        synchronized (st) {
+            st.lastSettingsLoadAt = Instant.EPOCH;
+            st.lastFingerprint = null;
+            st.lastSsVersion = null;
+            st.lastCfgVersion = null;
+            st.lastVersionCheckAt = Instant.EPOCH;
+        }
+    }
+
+    // ✅ throttled persist ML confidence (чтобы не спамить БД)
+    private void maybePersistMlConfidence(LocalState st, StrategySettings ss, double proba, Instant now) {
+        if (st == null || ss == null || now == null) return;
+        if (isManualMode(ss)) return;
+
+        // сохраняем не чаще чем раз в 20 секунд
+        long minIntervalMs = 20_000L;
+
+        if (st.lastMlConfidenceSaveAt != null) {
+            long passed = Duration.between(st.lastMlConfidenceSaveAt, now).toMillis();
+            if (passed < minIntervalMs) return;
+        }
+
+        // если почти то же самое — не сохраняем
+        if (st.lastMlConfidenceSaved != null && Math.abs(st.lastMlConfidenceSaved - proba) < 1e-6) {
+            return;
+        }
+
+        try {
+            ss.setMlConfidence(BigDecimal.valueOf(proba));
+
+            // ✅ важно: сохранить и подменить ссылку, чтобы версия/состояние были актуальны
+            StrategySettings saved = strategySettingsService.save(ss);
+            if (saved != null) st.ss = saved;
+
+            st.lastMlConfidenceSaveAt = now;
+            st.lastMlConfidenceSaved = proba;
+
+        } catch (Exception ignored) {
+        }
+    }
+
     // =====================================================
-    // UTILS (fixed)
+    // UTILS
     // =====================================================
 
     private static String safeNullable(Object v) {

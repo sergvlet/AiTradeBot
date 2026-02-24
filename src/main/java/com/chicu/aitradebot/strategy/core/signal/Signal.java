@@ -12,9 +12,12 @@ public class Signal {
     private final double confidence;   // 0..1
     private final String reason;
 
-    // ================================
-    // FACTORY METHODS
-    // ================================
+    public boolean isHold() { return type == SignalType.HOLD; }
+    public boolean isBuy()  { return type == SignalType.BUY; }
+    public boolean isSell() { return type == SignalType.SELL; }
+    public boolean isExit() { return type == SignalType.EXIT; }
+
+    // FACTORY
     public static Signal buy(double price, String reason) {
         return new Signal(SignalType.BUY, price, 1.0, reason);
     }

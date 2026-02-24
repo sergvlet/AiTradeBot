@@ -4,111 +4,138 @@ import com.chicu.aitradebot.ai.tuning.eval.BacktestCandlePort;
 import com.chicu.aitradebot.ai.tuning.eval.CandleBar;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.context.annotation.Primary;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 
+import java.lang.reflect.Method;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 
 @Slf4j
-@Primary
-@Service("compositeBacktestCandlePort")
+@Service
+@RequiredArgsConstructor
 public class CompositeBacktestCandlePort implements BacktestCandlePort {
 
-    private final BacktestCandlePort marketStream;
-    private final BacktestCandlePort hybrid;
+    private final ObjectProvider<BacktestCandlePort> ports;
 
-    public CompositeBacktestCandlePort(
-            @Qualifier("marketStreamBacktestCandlePort") BacktestCandlePort marketStream,
-            @Qualifier("hybridBacktestCandlePort") BacktestCandlePort hybrid
-    ) {
-        this.marketStream = marketStream;
-        this.hybrid = hybrid;
-    }
+    // =====================================================
+    // ✅ OLD SIGNATURE
+    // =====================================================
 
-    @Override
     public List<CandleBar> load(long chatId,
-                               StrategyType type,
-                               String exchange,
-                               NetworkType network,
-                               String symbol,
-                               String timeframe,
-                               Instant startAt,
-                               Instant endAt,
-                               int limit) {
+                                StrategyType type,
+                                String symbol,
+                                String timeframe,
+                                Instant startAt,
+                                Instant endAt,
+                                int limit) {
 
-        // ❗ НЕ подставляем дефолтную сеть/биржу здесь.
-        // Если exchange/network=null — порты сами резолвят env через StrategyEnvResolver.
-        String ex = normalizeExchangeOrNull(exchange);
-        NetworkType net = network;
-
-        // 1) быстрый источник (кеш/WS)
-        List<CandleBar> cached = safeLoad(marketStream, chatId, type, ex, net, symbol, timeframe, startAt, endAt, limit);
-        if (isGoodEnough(cached, limit)) return cached;
-
-        // 2) надёжный источник (REST/гибрид)
-        List<CandleBar> hist = safeLoad(hybrid, chatId, type, ex, net, symbol, timeframe, startAt, endAt, limit);
-        if (isGoodEnough(hist, limit)) return hist;
-
-        // 3) fallback: берём что больше
-        List<CandleBar> best = size(hist) >= size(cached) ? hist : cached;
-
-        if (best == null || best.isEmpty()) {
-            log.warn("🧪 Backtest candles: both sources empty (chatId={}, type={}, ex={}, net={}, symbol={}, tf={}, limit={})",
-                    chatId, type, safe(ex), String.valueOf(net), safe(symbol), safe(timeframe), limit);
-        }
-
-        return best != null ? best : List.of();
+        return load(chatId, type, null, null, symbol, timeframe, startAt, endAt, limit);
     }
 
-    private List<CandleBar> safeLoad(BacktestCandlePort port,
-                                    long chatId,
-                                    StrategyType type,
-                                    String exchange,
-                                    NetworkType network,
-                                    String symbol,
-                                    String timeframe,
-                                    Instant startAt,
-                                    Instant endAt,
-                                    int limit) {
+    // =====================================================
+    // ✅ NEW SIGNATURE (exchange/network)
+    // =====================================================
+
+    public List<CandleBar> load(long chatId,
+                                StrategyType type,
+                                String exchange,
+                                NetworkType network,
+                                String symbol,
+                                String timeframe,
+                                Instant startAt,
+                                Instant endAt,
+                                int limit) {
+
+        if (chatId <= 0 || type == null) return List.of();
+        if (symbol == null || symbol.isBlank()) return List.of();
+        if (timeframe == null || timeframe.isBlank()) return List.of();
+        if (startAt == null || endAt == null || !endAt.isAfter(startAt)) return List.of();
+        if (limit <= 0) return List.of();
+
+        List<BacktestCandlePort> list = ports != null ? ports.orderedStream().toList() : List.of();
+        if (list.isEmpty()) return List.of();
+
+        List<String> errors = new ArrayList<>();
+
+        for (BacktestCandlePort p : list) {
+            if (p == null) continue;
+
+            // защита от рекурсии
+            if (p == this) continue;
+            if (p.getClass() == CompositeBacktestCandlePort.class) continue;
+
+            try {
+                List<CandleBar> out = invokePort(p, chatId, type, exchange, network, symbol, timeframe, startAt, endAt, limit);
+                if (out != null && !out.isEmpty()) {
+                    return out;
+                }
+            } catch (Exception e) {
+                errors.add(p.getClass().getSimpleName() + ":" + e.getClass().getSimpleName());
+                if (log.isDebugEnabled()) {
+                    log.debug("CompositeBacktestCandlePort: delegate {} failed: {}",
+                            p.getClass().getSimpleName(), e.getMessage());
+                }
+            }
+        }
+
+        if (!errors.isEmpty() && log.isDebugEnabled()) {
+            log.debug("CompositeBacktestCandlePort: all delegates returned empty. errors={}", errors);
+        }
+
+        return List.of();
+    }
+
+    // =====================================================
+    // invoke (compat): new signature -> fallback old signature
+    // =====================================================
+
+    @SuppressWarnings("unchecked")
+    private List<CandleBar> invokePort(BacktestCandlePort port,
+                                       long chatId,
+                                       StrategyType type,
+                                       String exchange,
+                                       NetworkType network,
+                                       String symbol,
+                                       String timeframe,
+                                       Instant startAt,
+                                       Instant endAt,
+                                       int limit) throws Exception {
+
+        // 1) try NEW
+        Method mNew = findMethod(port.getClass(),
+                "load",
+                long.class, StrategyType.class, String.class, NetworkType.class,
+                String.class, String.class, Instant.class, Instant.class, int.class);
+
+        if (mNew != null) {
+            Object res = mNew.invoke(port, chatId, type, exchange, network, symbol, timeframe, startAt, endAt, limit);
+            return (res instanceof List<?> l) ? (List<CandleBar>) l : List.of();
+        }
+
+        // 2) fallback OLD
+        Method mOld = findMethod(port.getClass(),
+                "load",
+                long.class, StrategyType.class,
+                String.class, String.class,
+                Instant.class, Instant.class, int.class);
+
+        if (mOld != null) {
+            Object res = mOld.invoke(port, chatId, type, symbol, timeframe, startAt, endAt, limit);
+            return (res instanceof List<?> l) ? (List<CandleBar>) l : List.of();
+        }
+
+        return List.of();
+    }
+
+    private Method findMethod(Class<?> c, String name, Class<?>... sig) {
         try {
-            return port.load(chatId, type, exchange, network, symbol, timeframe, startAt, endAt, limit);
-        } catch (Exception e) {
-            log.warn("🧪 BacktestCandlePort failed: {} -> {}", port.getClass().getSimpleName(), safeMsg(e));
-            return List.of();
+            return c.getMethod(name, sig);
+        } catch (Exception ignored) {
+            return null;
         }
-    }
-
-    private static boolean isGoodEnough(List<CandleBar> bars, int limit) {
-        if (bars == null || bars.isEmpty()) return false;
-        int min = Math.max(50, Math.min(limit, 200));
-        return bars.size() >= min;
-    }
-
-    private static int size(List<CandleBar> v) {
-        return v != null ? v.size() : 0;
-    }
-
-    private static String normalizeExchangeOrNull(String exchange) {
-        if (exchange == null) return null;
-        String s = exchange.trim().toUpperCase(Locale.ROOT);
-        return s.isEmpty() ? null : s;
-    }
-
-    private static String safe(String s) {
-        if (s == null) return "null";
-        String x = s.trim();
-        if (x.isEmpty()) return "null";
-        return x.length() > 64 ? x.substring(0, 64) : x;
-    }
-
-    private static String safeMsg(Throwable e) {
-        if (e == null) return "null";
-        String m = e.getMessage();
-        if (m == null || m.isBlank()) return e.getClass().getSimpleName();
-        return m;
     }
 }

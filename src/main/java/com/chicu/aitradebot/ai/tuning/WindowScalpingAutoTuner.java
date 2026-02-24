@@ -12,11 +12,18 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
-import java.time.*;
-import java.util.*;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneId;
+import java.util.HashMap;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Random;
 
 @Slf4j
 @Service
@@ -39,13 +46,12 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
     @Override
     public TuningResult tune(TuningRequest request) {
 
-        // ✅ FAIL-SAFE: тюнер должен работать только с реальным раннером
+        // FAIL-SAFE: тюнер должен работать только с реальным раннером
         String runnerName = (backtestRunner != null)
                 ? backtestRunner.getClass().getSimpleName()
                 : "null";
         if (runnerName.toLowerCase(Locale.ROOT).contains("stub")) {
-            log.warn("[WS-TUNER] ❌ MlBacktestRunner выглядит как STUB: {}. Тюнинг отключён, нужен реальный бэктест-раннер.",
-                    runnerName);
+            log.warn("[WS-TUNER] ❌ MlBacktestRunner выглядит как STUB: {}. Тюнинг отключён.", runnerName);
             return TuningResult.builder()
                     .applied(false)
                     .reason("stub_backtest_runner")
@@ -62,12 +68,19 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
             return TuningResult.builder().applied(false).reason("bad chatId").build();
         }
 
-        String ex = normalizeExchange(request.exchange());
-        NetworkType net = request.network() != null ? request.network() : NetworkType.MAINNET;
+        // никаких скрытых дефолтов — env должен быть задан оркестратором
+        String ex = normalizeExchangeOrNull(request.exchange());
+        NetworkType net = request.network();
+        if (ex == null || net == null) {
+            return TuningResult.builder()
+                    .applied(false)
+                    .reason("env_missing(exchange/network)")
+                    .modelVersion(safe(props.getModelVersion()))
+                    .build();
+        }
 
         StrategySettings ss = strategySettingsService.getOrCreate(chatId, StrategyType.WINDOW_SCALPING);
         WindowScalpingStrategySettings cfg = windowSettingsService.getOrCreate(chatId);
-
         if (ss == null || cfg == null) {
             return TuningResult.builder().applied(false).reason("no_settings").build();
         }
@@ -94,23 +107,25 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
 
         BacktestMetrics baseMetrics = safeRunBacktest(chatId, ex, net, symbol, tf, baselineParams, start, end);
 
-        // ✅ FIX: score() может быть BigDecimal → всегда приводим к double безопасно
         double baseScore = (baseMetrics != null && baseMetrics.score() != null)
                 ? baseMetrics.score().doubleValue()
                 : -1.0;
 
         Integer baseTrades = (baseMetrics != null ? baseMetrics.trades() : null);
 
-        // ✅ если базово сделок нет — разжимаем грубые фильтры 1 раз
+        // если базово сделок нет — разжимаем грубые фильтры 1 раз (меняем ТОЛЬКО cfg)
         if (baseTrades != null && baseTrades <= 0) {
             log.warn("[WS-TUNER] baseline NO_TRADES chatId={} ex={} net={} sym={} tf={} cl={} -> coarse adjust",
                     chatId, ex, net, symbol, tf, cl);
 
-            boolean changed = adjustCoarseFiltersInternal(chatId, ex, net, symbol, tf, ss, cfg, "baseline_no_trades");
-            if (changed) {
-                persistSafe(strategySettingsService, ss);
-                persistSafe(windowSettingsService, cfg);
+            boolean changedCfg = adjustCoarseFiltersInternal(chatId, ex, net, symbol, tf, cfg, "baseline_no_trades");
+            if (changedCfg) {
+                persistSafe(windowSettingsService, chatId, cfg); // ✅ только cfg
             }
+
+            // пересчёт baseline после coarse
+            ss = strategySettingsService.getOrCreate(chatId, StrategyType.WINDOW_SCALPING);
+            cfg = windowSettingsService.getOrCreate(chatId);
 
             baselineParams = buildParamsFromCurrent(ss, cfg);
             baselineParams.put("candlesLimit", cl);
@@ -140,7 +155,6 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
 
             BacktestMetrics m = safeRunBacktest(chatId, ex, net, symbol, tf, cand, start, end);
 
-            // ✅ FIX: score() BigDecimal → double
             double sc = (m != null && m.score() != null)
                     ? m.score().doubleValue()
                     : -1.0;
@@ -176,11 +190,44 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
                     .build();
         }
 
-        // ✅ применяем лучший
-        applyToSettings(ss, cfg, best.params);
+        // =====================================================
+        // ✅ APPLY: берём свежие сущности -> применяем -> сохраняем
+        // =====================================================
 
-        persistSafe(strategySettingsService, ss);
-        persistSafe(windowSettingsService, cfg);
+        StrategySettings ssToSave = strategySettingsService.getOrCreate(chatId, StrategyType.WINDOW_SCALPING);
+        WindowScalpingStrategySettings cfgToSave = windowSettingsService.getOrCreate(chatId);
+
+        if (ssToSave == null || cfgToSave == null) {
+            return TuningResult.builder()
+                    .applied(false)
+                    .scoreBefore(base)
+                    .scoreAfter(bestSc)
+                    .modelVersion(modelVersion)
+                    .reason("no_settings_after_refresh")
+                    .build();
+        }
+
+        applyToWindowSettings(cfgToSave, best.params);
+        applyToStrategySettings(ssToSave, best.params);
+
+        boolean okCfg = persistSafe(windowSettingsService, chatId, cfgToSave);
+        boolean okSs = persistSafe(strategySettingsService, chatId, ssToSave);
+
+        // retry на stale (очень часто вылезает на ss при старте/тоггле)
+        if (!okCfg) {
+            WindowScalpingStrategySettings fresh = windowSettingsService.getOrCreate(chatId);
+            if (fresh != null) {
+                applyToWindowSettings(fresh, best.params);
+                persistSafe(windowSettingsService, chatId, fresh);
+            }
+        }
+        if (!okSs) {
+            StrategySettings fresh = strategySettingsService.getOrCreate(chatId, StrategyType.WINDOW_SCALPING);
+            if (fresh != null) {
+                applyToStrategySettings(fresh, best.params);
+                persistSafe(strategySettingsService, chatId, fresh);
+            }
+        }
 
         log.info("[WS-TUNER] ✅ APPLIED chatId={} ex={} net={} sym={} tf={} base={} best={} delta={} trades={} model={}",
                 chatId, ex, net, symbol, tf,
@@ -217,27 +264,26 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         if (request == null || request.chatId() == null || request.chatId() <= 0) return false;
 
         Long chatId = request.chatId();
-        String ex = normalizeExchange(request.exchange());
-        NetworkType net = request.network() != null ? request.network() : NetworkType.MAINNET;
 
-        StrategySettings ss = strategySettingsService.getOrCreate(chatId, StrategyType.WINDOW_SCALPING);
+        String ex = normalizeExchangeOrNull(request.exchange());
+        NetworkType net = request.network();
+        if (ex == null || net == null) return false;
+
         WindowScalpingStrategySettings cfg = windowSettingsService.getOrCreate(chatId);
-
-        if (ss == null || cfg == null) return false;
+        if (cfg == null) return false;
 
         String symbol = safeSym(request.symbol());
         String tf = safeTf(request.timeframe());
 
-        boolean applied = adjustCoarseFiltersInternal(chatId, ex, net, symbol, tf, ss, cfg, reason);
+        boolean applied = adjustCoarseFiltersInternal(chatId, ex, net, symbol, tf, cfg, reason);
         if (applied) {
-            persistSafe(strategySettingsService, ss);
-            persistSafe(windowSettingsService, cfg);
+            persistSafe(windowSettingsService, chatId, cfg); // ✅ только cfg
         }
         return applied;
     }
 
     // =====================================================
-    // coarse adjust
+    // coarse adjust (Только cfg!)
     // =====================================================
 
     private boolean adjustCoarseFiltersInternal(Long chatId,
@@ -245,7 +291,6 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
                                                 NetworkType net,
                                                 String symbol,
                                                 String tf,
-                                                StrategySettings ss,
                                                 WindowScalpingStrategySettings cfg,
                                                 String reason) {
 
@@ -392,6 +437,7 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         maxSp = clampD(maxSp + rndD(rnd, -spreadJitter, spreadJitter), 0.0, 5.0);
         p.put("maxSpreadPct", maxSp);
 
+        // ss поля
         BigDecimal risk = bd(p.get("riskPerTradePct"));
         if (risk == null) risk = new BigDecimal("1.0");
         risk = clampBD(risk.add(bd(rndD(rnd, -riskJitter, riskJitter))),
@@ -433,7 +479,7 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
     private Map<String, Object> buildParamsFromCurrent(StrategySettings ss, WindowScalpingStrategySettings cfg) {
         Map<String, Object> p = new HashMap<>();
 
-        // cfg (может быть double/Double/BigDecimal — нам всё равно, кладём как есть)
+        // cfg
         p.put("windowSize", cfg.getWindowSize());
         p.put("entryFromLowPct", readGetter(cfg, "getEntryFromLowPct"));
         p.put("entryFromHighPct", readGetter(cfg, "getEntryFromHighPct"));
@@ -443,12 +489,17 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         p.put("stopLossPct", cfg.getStopLossPct());
 
         // ss
-
+        p.put("riskPerTradePct", readGetter(ss, "getRiskPerTradePct"));
+        p.put("minRiskReward", readGetter(ss, "getMinRiskReward"));
+        p.put("leverage", readGetter(ss, "getLeverage"));
+        p.put("allowAveraging", readGetter(ss, "isAllowAveraging"));
+        p.put("cooldownAfterLossSeconds", readGetter(ss, "getCooldownAfterLossSeconds"));
+        p.put("maxConsecutiveLosses", readGetter(ss, "getMaxConsecutiveLosses"));
 
         return p;
     }
 
-    private void applyToSettings(StrategySettings ss, WindowScalpingStrategySettings cfg, Map<String, Object> p) {
+    private void applyToWindowSettings(WindowScalpingStrategySettings cfg, Map<String, Object> p) {
 
         Integer w = intObjOf(p.get("windowSize"));
         if (w != null && w > 0) cfg.setWindowSize(w);
@@ -462,8 +513,24 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         BigDecimal sl = bd(p.get("stopLossPct"));
         if (tp != null && tp.signum() > 0) cfg.setTakeProfitPct(tp);
         if (sl != null && sl.signum() > 0) cfg.setStopLossPct(sl);
+    }
 
+    private void applyToStrategySettings(StrategySettings ss, Map<String, Object> p) {
 
+        setNumeric(ss, "setRiskPerTradePct", dblOf(p.get("riskPerTradePct"), toDouble(readGetter(ss, "getRiskPerTradePct"))));
+        setNumeric(ss, "setMinRiskReward", dblOf(p.get("minRiskReward"), toDouble(readGetter(ss, "getMinRiskReward"))));
+
+        Integer lev = intObjOf(p.get("leverage"));
+        if (lev != null) trySetAssignable(ss, "setLeverage", lev);
+
+        Boolean avg = boolOf(p.get("allowAveraging"));
+        if (avg != null) trySetAssignable(ss, "setAllowAveraging", avg);
+
+        Integer cd = intObjOf(p.get("cooldownAfterLossSeconds"));
+        if (cd != null) trySetAssignable(ss, "setCooldownAfterLossSeconds", cd);
+
+        Integer mcl = intObjOf(p.get("maxConsecutiveLosses"));
+        if (mcl != null) trySetAssignable(ss, "setMaxConsecutiveLosses", mcl);
     }
 
     // =====================================================
@@ -498,29 +565,83 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
     }
 
     // =====================================================
-    // persist (reflection-safe)
+    // persist (return boolean)
     // =====================================================
 
-    private void persistSafe(Object service, Object entity) {
-        if (service == null || entity == null) return;
+    private boolean persistSafe(Object service, Long chatId, Object entity) {
+        if (service == null || entity == null || chatId == null) return false;
 
-        String[] methods = {"save", "saveOrUpdate", "update", "persist"};
-        for (String m : methods) {
-            if (tryInvoke1(service, m, entity)) return;
-        }
+        Throwable lastErr = null;
+
+        InvokeRes r;
+
+        r = tryInvoke2(service, "update", chatId, entity);
+        if (r.ok) return true; else lastErr = pick(lastErr, r.err);
+
+        r = tryInvoke2(service, "saveOrUpdate", chatId, entity);
+        if (r.ok) return true; else lastErr = pick(lastErr, r.err);
+
+        r = tryInvoke1(service, "save", entity);
+        if (r.ok) return true; else lastErr = pick(lastErr, r.err);
+
+        r = tryInvoke1(service, "saveOrUpdate", entity);
+        if (r.ok) return true; else lastErr = pick(lastErr, r.err);
+
+        r = tryInvoke1(service, "persist", entity);
+        if (r.ok) return true; else lastErr = pick(lastErr, r.err);
 
         try {
             Method getRepo = service.getClass().getMethod("getRepository");
             Object repo = getRepo.invoke(service);
             if (repo != null) {
-                if (tryInvoke1(repo, "save", entity)) return;
+                r = tryInvoke1(repo, "save", entity);
+                if (r.ok) return true; else lastErr = pick(lastErr, r.err);
             }
-        } catch (Exception ignore) {
-            // ignore
+        } catch (Exception e) {
+            lastErr = pick(lastErr, e);
         }
+
+        if (lastErr != null) {
+            Throwable root = rootCause(lastErr);
+            log.warn("[WS-TUNER] persistSafe FAILED: service={} entity={} cause={} msg={}",
+                    service.getClass().getSimpleName(),
+                    entity.getClass().getSimpleName(),
+                    root != null ? root.getClass().getSimpleName() : "null",
+                    root != null ? String.valueOf(root.getMessage()) : "null"
+            );
+        } else {
+            log.warn("[WS-TUNER] persistSafe FAILED: no save method: service={} entity={}",
+                    service.getClass().getSimpleName(), entity.getClass().getSimpleName());
+        }
+
+        return false;
     }
 
-    private boolean tryInvoke1(Object target, String method, Object arg) {
+    private record InvokeRes(boolean ok, Throwable err) {}
+
+    private InvokeRes tryInvoke2(Object target, String method, Long chatId, Object entity) {
+        try {
+            for (Method m : target.getClass().getMethods()) {
+                if (!m.getName().equals(method)) continue;
+                if (m.getParameterCount() != 2) continue;
+
+                Class<?> p0 = m.getParameterTypes()[0];
+                Class<?> p1 = m.getParameterTypes()[1];
+
+                boolean ok0 = (p0 == long.class || p0 == Long.class) && (chatId != null);
+                boolean ok1 = p1.isAssignableFrom(entity.getClass());
+                if (!ok0 || !ok1) continue;
+
+                m.invoke(target, chatId, entity);
+                return new InvokeRes(true, null);
+            }
+        } catch (Exception e) {
+            return new InvokeRes(false, e);
+        }
+        return new InvokeRes(false, null);
+    }
+
+    private InvokeRes tryInvoke1(Object target, String method, Object arg) {
         try {
             for (Method m : target.getClass().getMethods()) {
                 if (!m.getName().equals(method)) continue;
@@ -530,12 +651,30 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
                 if (!pt.isAssignableFrom(arg.getClass())) continue;
 
                 m.invoke(target, arg);
-                return true;
+                return new InvokeRes(true, null);
             }
-        } catch (Exception ignore) {
-            // ignore
+        } catch (Exception e) {
+            return new InvokeRes(false, e);
         }
-        return false;
+        return new InvokeRes(false, null);
+    }
+
+    private static Throwable pick(Throwable prev, Throwable next) {
+        return (next != null) ? next : prev;
+    }
+
+    private static Throwable rootCause(Throwable t) {
+        if (t == null) return null;
+        Throwable cur = t;
+
+        if (cur instanceof InvocationTargetException ite && ite.getTargetException() != null) {
+            cur = ite.getTargetException();
+        }
+
+        while (cur.getCause() != null && cur.getCause() != cur) {
+            cur = cur.getCause();
+        }
+        return cur;
     }
 
     // =====================================================
@@ -558,10 +697,10 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
     // utils
     // =====================================================
 
-    private static String normalizeExchange(String exchange) {
-        if (exchange == null) return "BINANCE";
+    private static String normalizeExchangeOrNull(String exchange) {
+        if (exchange == null) return null;
         String ex = exchange.trim().toUpperCase(Locale.ROOT);
-        return ex.isEmpty() ? "BINANCE" : ex;
+        return ex.isEmpty() ? null : ex;
     }
 
     private static String safeSym(String s) {
@@ -673,7 +812,7 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
     }
 
     // =====================================================
-    // ✅ reflection numeric setters (поддержка double/Double/BigDecimal)
+    // reflection numeric setters
     // =====================================================
 
     private static Object readGetter(Object target, String getterName) {
@@ -705,17 +844,13 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
     private static boolean setNumeric(Object target, String setterName, double value) {
         if (target == null || setterName == null) return false;
 
-        // пробуем double/Double/BigDecimal
         if (trySet(target, setterName, value, double.class)) return true;
         if (trySet(target, setterName, value, Double.class)) return true;
 
         BigDecimal bd = BigDecimal.valueOf(value);
         if (trySet(target, setterName, bd, BigDecimal.class)) return true;
 
-        // fallback: Number
-        if (trySetAssignable(target, setterName, Double.valueOf(value))) return true;
-
-        return false;
+        return trySetAssignable(target, setterName, Double.valueOf(value));
     }
 
     private static boolean trySet(Object target, String setterName, Object arg, Class<?> paramType) {
@@ -753,27 +888,22 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
 
         if (targetType.isInstance(value)) return value;
 
-        if (targetType == double.class || targetType == Double.class) {
-            return toDouble(value);
-        }
-        if (targetType == float.class || targetType == Float.class) {
-            return (float) toDouble(value);
-        }
-        if (targetType == int.class || targetType == Integer.class) {
-            return (int) Math.round(toDouble(value));
-        }
-        if (targetType == long.class || targetType == Long.class) {
-            return (long) Math.round(toDouble(value));
-        }
-        if (targetType == BigDecimal.class) {
-            return toBigDecimal(value);
-        }
+        if (targetType == double.class || targetType == Double.class) return toDouble(value);
+        if (targetType == float.class || targetType == Float.class) return (float) toDouble(value);
+        if (targetType == int.class || targetType == Integer.class) return (int) Math.round(toDouble(value));
+        if (targetType == long.class || targetType == Long.class) return (long) Math.round(toDouble(value));
+        if (targetType == BigDecimal.class) return toBigDecimal(value);
 
         if (Number.class.isAssignableFrom(targetType)) {
             double d = toDouble(value);
             if (targetType == Short.class) return (short) Math.round(d);
             if (targetType == Byte.class) return (byte) Math.round(d);
             return Double.valueOf(d);
+        }
+
+        if (targetType == boolean.class || targetType == Boolean.class) {
+            if (value instanceof Boolean b) return b;
+            if (value instanceof Number n) return n.intValue() != 0;
         }
 
         return null;

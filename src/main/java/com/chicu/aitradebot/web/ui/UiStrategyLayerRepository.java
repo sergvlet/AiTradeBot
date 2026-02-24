@@ -13,8 +13,7 @@ import java.time.Instant;
 import java.util.List;
 
 @Repository
-public interface UiStrategyLayerRepository
-        extends JpaRepository<UiStrategyLayerEntity, Long> {
+public interface UiStrategyLayerRepository extends JpaRepository<UiStrategyLayerEntity, Long> {
 
     // =====================================================
     // 📊 ДЛЯ ГРАФИКА (FULL SNAPSHOT)
@@ -35,7 +34,7 @@ public interface UiStrategyLayerRepository
     );
 
     // =====================================================
-    // 🔁 REPLAY (ПОСЛЕДНЕЕ СОСТОЯНИЕ)
+    // ✅ ПОСЛЕДНИЙ СНАПШОТ (одна запись)
     // =====================================================
 
     @Query("""
@@ -59,7 +58,7 @@ public interface UiStrategyLayerRepository
     // =====================================================
 
     @Transactional
-    @Modifying
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("""
         delete from UiStrategyLayerEntity l
         where l.createdAt < :before
@@ -67,21 +66,21 @@ public interface UiStrategyLayerRepository
     int deleteOlderThan(@Param("before") Instant before);
 
     @Transactional
-    @Modifying
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("""
         delete from UiStrategyLayerEntity l
         where l.chatId = :chatId
           and l.strategyType = :strategyType
           and l.symbol = :symbol
     """)
-    void deleteForStrategy(
+    int deleteForStrategy(
             @Param("chatId") Long chatId,
             @Param("strategyType") StrategyType strategyType,
             @Param("symbol") String symbol
     );
 
     @Transactional
-    @Modifying
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("""
         delete from UiStrategyLayerEntity l
         where l.chatId = :chatId
@@ -89,7 +88,7 @@ public interface UiStrategyLayerRepository
           and l.symbol = :symbol
           and l.layerType = :layerType
     """)
-    void deleteByType(
+    int deleteByType(
             @Param("chatId") Long chatId,
             @Param("strategyType") StrategyType strategyType,
             @Param("symbol") String symbol,

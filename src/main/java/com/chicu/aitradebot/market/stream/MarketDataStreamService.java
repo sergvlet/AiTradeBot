@@ -3,6 +3,7 @@ package com.chicu.aitradebot.market.stream;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.exchange.binance.ws.BinanceSpotWebSocketClient;
+import com.chicu.aitradebot.market.MarketStreamManager;
 import com.chicu.aitradebot.market.model.Candle;
 import com.chicu.aitradebot.market.model.UnifiedKline;
 import lombok.extern.slf4j.Slf4j;
@@ -12,13 +13,15 @@ import org.springframework.stereotype.Service;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.Deque;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
 
 @Slf4j
@@ -27,61 +30,54 @@ public class MarketDataStreamService {
 
     private static final int MAX_CANDLES = 2_000;
 
-    /**
-     * ✅ цикл разорван — берём лениво
-     */
+    /** ✅ цикл разорван — берём лениво */
     private final ObjectProvider<BinanceSpotWebSocketClient> binanceWsProvider;
 
-    /**
-     * seq для логов/троттлинга
-     */
+    /** ✅ общий кэш свечей для бэктеста/дашборда (env-aware если умеет) */
+    private final MarketStreamManager streamManager;
+
+    /** seq для логов/троттлинга */
     private final AtomicLong seq = new AtomicLong(0);
 
     /**
      * ✅ Хранилище свечей строго по ключу:
      * (chatId, type, ex, net, symbol, tf)
+     *
+     * ⚡️ ВАЖНО: Deque быстрее/дешевле чем CopyOnWriteArrayList при частых апдейтах.
      */
-    private final ConcurrentMap<CandleStoreKey, CopyOnWriteArrayList<Candle>> candleStorage = new ConcurrentHashMap<>();
+    private final ConcurrentMap<CandleStoreKey, Deque<Candle>> candleStorage = new ConcurrentHashMap<>();
 
-    /**
-     * chatId → set of подписок (строго с ex+net+sym+tf)
-     */
+    /** chatId → set of подписок (строго с ex+net+sym+tf) */
     private final ConcurrentMap<Long, Set<SubscriptionKey>> activeSubscriptions = new ConcurrentHashMap<>();
 
-    public MarketDataStreamService(ObjectProvider<BinanceSpotWebSocketClient> binanceWsProvider) {
+    public MarketDataStreamService(ObjectProvider<BinanceSpotWebSocketClient> binanceWsProvider,
+                                   MarketStreamManager streamManager) {
         this.binanceWsProvider = binanceWsProvider;
+        this.streamManager = streamManager;
     }
 
     // =====================================================================
     // ✅ API ДЛЯ MarketStreamServiceImpl
     // =====================================================================
 
-    /**
-     * Подписка на нужный поток.
-     * Внутри — строгий dedupe по chatId+type+ex+net+sym+tf.
-     */
-    public void subscribe(
-            String exchange,
-            NetworkType networkType,
-            long chatId,
-            StrategyType strategyType,
-            String symbol,
-            String timeframe
-    ) {
+    /** Подписка на нужный поток. Внутри — строгий dedupe по chatId+type+ex+net+sym+tf. */
+    public void subscribe(String exchange,
+                          NetworkType networkType,
+                          long chatId,
+                          StrategyType strategyType,
+                          String symbol,
+                          String timeframe) {
         subscribeCandles(exchange, networkType, chatId, strategyType, symbol, timeframe);
     }
 
-    /**
-     * ✅ Явная отписка (нужна для корректного рестарта).
-     */
-    public void unsubscribe(
-            String exchange,
-            NetworkType networkType,
-            long chatId,
-            StrategyType strategyType,
-            String symbol,
-            String timeframe
-    ) {
+    /** ✅ Явная отписка (нужна для корректного рестарта). */
+    public void unsubscribe(String exchange,
+                            NetworkType networkType,
+                            long chatId,
+                            StrategyType strategyType,
+                            String symbol,
+                            String timeframe) {
+
         String ex  = normExchange(exchange);
         String sym = normSymbol(symbol);
         String tf  = normTf(timeframe);
@@ -97,15 +93,17 @@ public class MarketDataStreamService {
         boolean removed = subs.remove(key);
         if (!removed) return;
 
-        // ✅ чистим кэш свечей независимо от результата закрытия WS
+        // ✅ чистим локальный кэш свечей
         candleStorage.remove(new CandleStoreKey(chatId, strategyType, ex, networkType, sym, tf));
 
         // ✅ закрываем WS
         if ("BINANCE".equalsIgnoreCase(ex)) {
-            BinanceSpotWebSocketClient ws = binanceWsProvider.getObject();
-            try { ws.unsubscribeKline(networkType, sym, tf, chatId, strategyType); } catch (Exception ignored) {}
-            // AggTrade не зависит от tf, но сигнатура оставлена совместимой (timeframeIgnored)
-            try { ws.unsubscribeAggTrade(networkType, sym, tf, chatId, strategyType); } catch (Exception ignored) {}
+            BinanceSpotWebSocketClient ws = binanceWsProvider.getIfAvailable();
+            if (ws != null) {
+                try { ws.unsubscribeKline(networkType, sym, tf, chatId, strategyType); } catch (Exception ignored) {}
+                // AggTrade не зависит от tf, но сигнатура оставлена совместимой (timeframeIgnored)
+                try { ws.unsubscribeAggTrade(networkType, sym, tf, chatId, strategyType); } catch (Exception ignored) {}
+            }
         }
 
         // ✅ подчистим пустой set, чтобы map не рос
@@ -117,17 +115,16 @@ public class MarketDataStreamService {
                 chatId, strategyType, ex, networkType, sym, tf);
     }
 
-    public MarketPushResult pushAggTrade(
-            String exchange,
-            NetworkType networkType,
-            long chatId,
-            StrategyType strategyType,
-            String symbol,
-            String timeframe,
-            BigDecimal price,
-            BigDecimal qty,
-            long tradeTsMs
-    ) {
+    public MarketPushResult pushAggTrade(String exchange,
+                                         NetworkType networkType,
+                                         long chatId,
+                                         StrategyType strategyType,
+                                         String symbol,
+                                         String timeframe,
+                                         BigDecimal price,
+                                         BigDecimal qty,
+                                         long tradeTsMs) {
+
         long n = seq.incrementAndGet();
 
         // Сейчас свечи берём из kline потока, поэтому тут только ack для логики/троттлинга.
@@ -140,15 +137,14 @@ public class MarketDataStreamService {
         );
     }
 
-    public void pushKline(
-            String exchange,
-            NetworkType networkType,
-            long chatId,
-            StrategyType strategyType,
-            String symbol,
-            String timeframe,
-            UnifiedKline kline
-    ) {
+    public void pushKline(String exchange,
+                          NetworkType networkType,
+                          long chatId,
+                          StrategyType strategyType,
+                          String symbol,
+                          String timeframe,
+                          UnifiedKline kline) {
+
         if (kline == null || strategyType == null) return;
 
         String ex  = normExchange(exchange);
@@ -168,13 +164,12 @@ public class MarketDataStreamService {
         onCandle(chatId, strategyType, ex, networkType, sym, tf, candle);
     }
 
-    public void pushKline(
-            String exchange,
-            NetworkType networkType,
-            long chatId,
-            StrategyType strategyType,
-            UnifiedKline kline
-    ) {
+    public void pushKline(String exchange,
+                          NetworkType networkType,
+                          long chatId,
+                          StrategyType strategyType,
+                          UnifiedKline kline) {
+
         if (kline == null || strategyType == null) return;
 
         String ex = normExchange(exchange);
@@ -216,14 +211,13 @@ public class MarketDataStreamService {
      * - гарантируем dedupe через subs.add(key) ДО subscribe
      * - удаляем старые подписки того же type (для этого chatId) перед новой
      */
-    public void subscribeCandles(
-            String exchange,
-            NetworkType networkType,
-            long chatId,
-            StrategyType strategyType,
-            String symbol,
-            String timeframe
-    ) {
+    public void subscribeCandles(String exchange,
+                                 NetworkType networkType,
+                                 long chatId,
+                                 StrategyType strategyType,
+                                 String symbol,
+                                 String timeframe) {
+
         String ex  = normExchange(exchange);
         String sym = normSymbol(symbol);
         String tf  = normTf(timeframe);
@@ -240,7 +234,7 @@ public class MarketDataStreamService {
         // 2) создаём хранилище свечей
         candleStorage.computeIfAbsent(
                 new CandleStoreKey(chatId, strategyType, ex, networkType, sym, tf),
-                __ -> new CopyOnWriteArrayList<>()
+                __ -> new ConcurrentLinkedDeque<>()
         );
 
         Set<SubscriptionKey> subs =
@@ -263,7 +257,13 @@ public class MarketDataStreamService {
             return;
         }
 
-        BinanceSpotWebSocketClient ws = binanceWsProvider.getObject();
+        BinanceSpotWebSocketClient ws = binanceWsProvider.getIfAvailable();
+        if (ws == null) {
+            subs.remove(key);
+            candleStorage.remove(new CandleStoreKey(chatId, strategyType, ex, networkType, sym, tf));
+            log.error("❌ [STREAM] BINANCE ws client отсутствует (bean not available) chatId={} type={}", chatId, strategyType);
+            return;
+        }
 
         try {
             ws.subscribeKline(networkType, sym, tf, chatId, strategyType);
@@ -286,14 +286,13 @@ public class MarketDataStreamService {
      * Удаляет все подписки этого chatId по этому type, кроме keep.
      * ⚠️ Не создаём пустые set'ы: используем get() вместо computeIfAbsent().
      */
-    private void dropOtherSubscriptionsSameType(
-            long chatId,
-            StrategyType type,
-            String ex,
-            NetworkType net,
-            String sym,
-            String tf
-    ) {
+    private void dropOtherSubscriptionsSameType(long chatId,
+                                                StrategyType type,
+                                                String ex,
+                                                NetworkType net,
+                                                String sym,
+                                                String tf) {
+
         Set<SubscriptionKey> subs = activeSubscriptions.get(chatId);
         if (subs == null || subs.isEmpty()) return;
 
@@ -315,15 +314,14 @@ public class MarketDataStreamService {
     // 🕯 CALLBACK ДЛЯ LIVE СВЕЧЕЙ
     // =====================================================================
 
-    public void onCandle(
-            long chatId,
-            StrategyType strategyType,
-            String exchange,
-            NetworkType networkType,
-            String symbol,
-            String timeframe,
-            Candle candle
-    ) {
+    public void onCandle(long chatId,
+                         StrategyType strategyType,
+                         String exchange,
+                         NetworkType networkType,
+                         String symbol,
+                         String timeframe,
+                         Candle candle) {
+
         String ex  = normExchange(exchange);
         String sym = normSymbol(symbol);
         String tf  = normTf(timeframe);
@@ -331,10 +329,25 @@ public class MarketDataStreamService {
         if (ex == null || networkType == null || strategyType == null || sym == null || tf == null || candle == null) return;
 
         CandleStoreKey key = new CandleStoreKey(chatId, strategyType, ex, networkType, sym, tf);
-        CopyOnWriteArrayList<Candle> candles = candleStorage.computeIfAbsent(key, __ -> new CopyOnWriteArrayList<>());
+        Deque<Candle> deque = candleStorage.computeIfAbsent(key, __ -> new ConcurrentLinkedDeque<>());
 
-        candles.add(candle);
-        if (candles.size() > MAX_CANDLES) candles.remove(0);
+        synchronized (deque) {
+            Candle last = deque.peekLast();
+
+            // обновление текущей свечи (same openTime)
+            if (last != null && last.getTime() == candle.getTime()) {
+                deque.pollLast();
+            }
+
+            deque.addLast(candle);
+
+            while (deque.size() > MAX_CANDLES) {
+                deque.pollFirst();
+            }
+        }
+
+        // ✅ КРИТИЧНО: складываем также в MarketStreamManager (для бэктеста/дашборда)
+        pushToStreamManager(ex, networkType, sym, tf, candle);
 
         if (log.isDebugEnabled()) {
             log.debug("🕯 [STREAM] CANDLE IN chatId={} type={} ex={} net={} {} {} time={}",
@@ -355,10 +368,12 @@ public class MarketDataStreamService {
 
         if (ex == null || networkType == null || strategyType == null || sym == null || tf == null) return List.of();
 
-        return candleStorage.getOrDefault(
-                new CandleStoreKey(chatId, strategyType, ex, networkType, sym, tf),
-                new CopyOnWriteArrayList<>()
-        );
+        Deque<Candle> deque = candleStorage.get(new CandleStoreKey(chatId, strategyType, ex, networkType, sym, tf));
+        if (deque == null || deque.isEmpty()) return List.of();
+
+        synchronized (deque) {
+            return new ArrayList<>(deque);
+        }
     }
 
     public void putCandles(long chatId,
@@ -376,13 +391,21 @@ public class MarketDataStreamService {
         if (ex == null || networkType == null || strategyType == null || sym == null || tf == null) return;
 
         CandleStoreKey key = new CandleStoreKey(chatId, strategyType, ex, networkType, sym, tf);
-        CopyOnWriteArrayList<Candle> target = candleStorage.computeIfAbsent(key, __ -> new CopyOnWriteArrayList<>());
+        Deque<Candle> deque = candleStorage.computeIfAbsent(key, __ -> new ConcurrentLinkedDeque<>());
 
-        target.clear();
-        if (candles != null && !candles.isEmpty()) target.addAll(candles);
+        synchronized (deque) {
+            deque.clear();
+            if (candles != null && !candles.isEmpty()) {
+                for (Candle c : candles) {
+                    if (c == null) continue;
+                    deque.addLast(c);
+                    while (deque.size() > MAX_CANDLES) deque.pollFirst();
+                }
+            }
+        }
 
         log.info("📦 [STREAM] Cache initialized: {} candles для chatId={} type={} ex={} net={} {} {}",
-                target.size(), chatId, strategyType, ex, networkType, sym, tf);
+                deque.size(), chatId, strategyType, ex, networkType, sym, tf);
     }
 
     public synchronized void unsubscribeAll(long chatId) {
@@ -407,6 +430,40 @@ public class MarketDataStreamService {
         candleStorage.keySet().removeIf(k -> k.chatId() == chatId);
 
         log.info("🧹 [STREAM] UNSUBSCRIBE ALL for chatId={}", chatId);
+    }
+
+    // =====================================================================
+    // MarketStreamManager compat (reflection, чтобы не ломать сборку)
+    // =====================================================================
+
+    private void pushToStreamManager(String exchange, NetworkType network, String symbol, String timeframe, Candle candle) {
+        if (streamManager == null) return;
+
+        try {
+            // 1) new signature: addCandle(String ex, NetworkType net, String sym, String tf, Candle c)
+            Method m5 = findMethod(streamManager.getClass(), "addCandle", 5);
+            if (m5 != null) {
+                m5.invoke(streamManager, exchange, network, symbol, timeframe, candle);
+                return;
+            }
+
+            // 2) old signature: addCandle(String sym, String tf, Candle c)
+            Method m3 = findMethod(streamManager.getClass(), "addCandle", 3);
+            if (m3 != null) {
+                m3.invoke(streamManager, symbol, timeframe, candle);
+            }
+        } catch (Exception ignored) {
+            // не шумим: это best-effort
+        }
+    }
+
+    private Method findMethod(Class<?> cls, String name, int paramCount) {
+        for (Method m : cls.getMethods()) {
+            if (!m.getName().equals(name)) continue;
+            if (m.getParameterCount() != paramCount) continue;
+            return m;
+        }
+        return null;
     }
 
     // =====================================================================

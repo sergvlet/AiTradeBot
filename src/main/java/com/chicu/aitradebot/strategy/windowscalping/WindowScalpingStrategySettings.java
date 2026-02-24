@@ -9,7 +9,13 @@ import java.time.Instant;
 @Entity
 @Table(
         name = "window_scalping_strategy_settings",
-        indexes = @Index(name = "ix_window_scalping_chat", columnList = "chat_id")
+        uniqueConstraints = @UniqueConstraint(
+                name = "uk_window_scalping_settings_chat",
+                columnNames = {"chat_id"}
+        ),
+        indexes = {
+                @Index(name = "ix_window_scalping_chat", columnList = "chat_id")
+        }
 )
 @Getter
 @Setter
@@ -73,7 +79,7 @@ public class WindowScalpingStrategySettings {
     // =====================================================
 
     @Version
-    private Integer version = 0;
+    private Integer version;
 
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
@@ -84,7 +90,7 @@ public class WindowScalpingStrategySettings {
     @PrePersist
     void prePersist() {
         Instant now = Instant.now();
-        createdAt = now;
+        if (createdAt == null) createdAt = now;
         updatedAt = now;
     }
 

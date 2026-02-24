@@ -30,17 +30,17 @@ window.SettingsTabGeneral = (function () {
         return window.StrategySettingsContext || null;
     }
 
-    function ctxQueryString(ctx) {
+    function ctxQueryParams(ctx) {
         const q = new URLSearchParams();
         if (ctx?.chatId) q.set("chatId", String(ctx.chatId));
-        if (ctx?.exchange) q.set("exchange", String(ctx.exchange));
-        if (ctx?.network) q.set("network", String(ctx.network));
-        return q.toString();
+        if (!isBlank(ctx?.exchange)) q.set("exchange", String(ctx.exchange));
+        if (!isBlank(ctx?.network)) q.set("network", String(ctx.network));
+        return q;
     }
 
     function buildConfigUrl(ctx, tabName) {
         const base = `/strategies/${encodeURIComponent(String(ctx.type || ""))}/config`;
-        const q = new URLSearchParams(ctxQueryString(ctx));
+        const q = ctxQueryParams(ctx);
         if (!isBlank(tabName)) q.set("tab", String(tabName));
         const qs = q.toString();
         return qs ? (base + "?" + qs) : base;
@@ -176,6 +176,41 @@ window.SettingsTabGeneral = (function () {
     }
 
     // =====================================================
+    // ✅ “железно” применяем режим к UI (без ожидания сервера)
+    // =====================================================
+    function applyControlModeUi(mode) {
+        const m = normalizeMode(mode);
+
+        // общие ID (если есть на странице)
+        const autoTuneCb = byId("autoTuneEnabled");
+        const mlGateCb   = byId("mlGateEnabled");
+        const gateMin    = byId("gateMinProb");
+
+        // MANUAL: запретить/сбросить
+        if (m === "MANUAL") {
+            if (autoTuneCb) { autoTuneCb.checked = false; autoTuneCb.disabled = true; }
+            if (mlGateCb)   { mlGateCb.checked = false;   mlGateCb.disabled = true; }
+            if (gateMin)    { gateMin.value = ""; gateMin.disabled = true; }
+            return;
+        }
+
+        // HYBRID: разрешаем ручное (но система может менять после тюнинга)
+        if (m === "HYBRID") {
+            if (autoTuneCb) autoTuneCb.disabled = false;
+            if (mlGateCb)   mlGateCb.disabled = false;
+            if (gateMin)    gateMin.disabled = false;
+            return;
+        }
+
+        // AI: autotune обязателен (UI), ml-gate по желанию
+        if (m === "AI") {
+            if (autoTuneCb) { autoTuneCb.checked = true; autoTuneCb.disabled = true; }
+            if (mlGateCb)   mlGateCb.disabled = false;
+            if (gateMin)    gateMin.disabled = false;
+        }
+    }
+
+    // =====================================================
     // State sync
     // =====================================================
     function isObj(x) { return x && typeof x === "object"; }
@@ -192,7 +227,6 @@ window.SettingsTabGeneral = (function () {
         if (typeof st.autoTuneEnabled === "boolean") ctx.autoTuneEnabled = st.autoTuneEnabled;
         if (typeof st.mlGateEnabled === "boolean") ctx.mlGateEnabled = st.mlGateEnabled;
 
-        // можно расширять при надобности (symbol/timeframe/limit)
         if (!isBlank(st.symbol)) ctx.symbol = String(st.symbol);
         if (!isBlank(st.timeframe)) ctx.timeframe = String(st.timeframe);
         if (typeof st.cachedCandlesLimit === "number") ctx.cachedCandlesLimit = st.cachedCandlesLimit;
@@ -200,12 +234,10 @@ window.SettingsTabGeneral = (function () {
 
     async function fetchUiState(ctx) {
         const api = window.SettingsApi;
-
         const url = buildStateUrl(ctx, false);
+
         try {
-            if (api?.getJson) {
-                return await api.getJson(url);
-            }
+            if (api?.getJson) return await api.getJson(url);
 
             const resp = await fetch(url, {
                 method: "GET",
@@ -251,7 +283,6 @@ window.SettingsTabGeneral = (function () {
         }
 
         started = true;
-        console.log("[general] init OK, binding listeners…", ctx);
 
         const saveState = byId("controlSaveState") || byId("generalSaveState");
         const saveMeta  = byId("controlSaveMeta")  || byId("generalSaveMeta");
@@ -261,6 +292,7 @@ window.SettingsTabGeneral = (function () {
         modeSelect.dataset.prevValue = initialMode;
 
         setModeHint(initialMode);
+        applyControlModeUi(initialMode);
         setBadge(saveState, "info", "Готово");
         if (saveMeta) saveMeta.textContent = "";
         dispatchMode(initialMode);
@@ -282,19 +314,17 @@ window.SettingsTabGeneral = (function () {
 
         async function saveModeToServer(mode) {
             const url = buildConfigUrl(ctx, "control");
-            // важно: ожидаем, что postForm вернет JSON (StrategyUiState). Если нет — ок.
             return await api.postForm(url, {
                 saveScope: "general",
                 tab: "control",
                 exchange: ctx.exchange || "",
                 network: ctx.network || "",
-                advancedControlMode: mode
+                advancedControlMode: String(mode)
             });
         }
 
         async function tryApplyMode(mode) {
             const url = "/strategies/apply";
-
             const payload = {
                 chatId: Number(ctx.chatId),
                 type: String(ctx.type),
@@ -305,9 +335,7 @@ window.SettingsTabGeneral = (function () {
             };
 
             try {
-                if (api?.postJson) {
-                    return await api.postJson(url, payload);
-                }
+                if (api?.postJson) return await api.postJson(url, payload);
 
                 const token  = document.querySelector('meta[name="_csrf"]')?.getAttribute("content") || "";
                 const header = document.querySelector('meta[name="_csrf_header"]')?.getAttribute("content") || "";
@@ -334,6 +362,7 @@ window.SettingsTabGeneral = (function () {
             ctx.advancedControlMode = prev;
             modeSelect.dataset.prevValue = prev;
             setModeHint(prev);
+            applyControlModeUi(prev);
             dispatchMode(prev);
         }
 
@@ -342,20 +371,17 @@ window.SettingsTabGeneral = (function () {
         modeSelect.addEventListener("change", async () => {
             if (inFlight) return;
 
-            const prev = normalizeMode(modeSelect.dataset.prevValue || modeSelect.value || "MANUAL");
+            const prev = normalizeMode(modeSelect.dataset.prevValue || "MANUAL");
             const next = normalizeMode(modeSelect.value || "MANUAL");
             if (next === prev) return;
 
-            // ✅ подтверждение ДО изменения UI
+            // подтверждение
             if (next === "HYBRID") {
                 const ok = await showConfirm(
                     "Подтверждение",
                     "Включить HYBRID режим? Бот сможет применять/перезаписывать параметры после тюнинга/бэктеста."
                 );
-                if (!ok) {
-                    modeSelect.value = prev;
-                    return;
-                }
+                if (!ok) { revertToPrev(prev); return; }
             }
 
             if (next === "AI") {
@@ -363,15 +389,13 @@ window.SettingsTabGeneral = (function () {
                     "Внимание",
                     "В режиме AI система может менять параметры автоматически и блокировать ручное редактирование. Включить AI?"
                 );
-                if (!ok) {
-                    modeSelect.value = prev;
-                    return;
-                }
+                if (!ok) { revertToPrev(prev); return; }
             }
 
-            // ✅ теперь меняем UI
+            // ✅ UI сразу
             ctx.advancedControlMode = next;
             setModeHint(next);
+            applyControlModeUi(next);
             dispatchMode(next);
 
             inFlight = true;
@@ -381,8 +405,8 @@ window.SettingsTabGeneral = (function () {
             try {
                 const saved = await saveModeToServer(next);
 
-                // ✅ подтянуть реальный state (если postForm не вернул json — добираем GET’ом)
-                let state = (isObj(saved) && saved.type) ? saved : null;
+                // подтянуть реальный state
+                let state = (isObj(saved) && (saved.type || saved.advancedControlMode)) ? saved : null;
                 if (!state) state = await fetchUiState(ctx);
 
                 if (state) {
@@ -393,23 +417,28 @@ window.SettingsTabGeneral = (function () {
                     modeSelect.dataset.prevValue = realMode;
 
                     setModeHint(realMode);
+                    applyControlModeUi(realMode);
                     dispatchMode(realMode);
                     dispatchUiState(state);
                 } else {
                     modeSelect.dataset.prevValue = next;
                 }
 
-                // ✅ apply для HYBRID/AI
+                // apply только для HYBRID/AI
                 if (next === "HYBRID" || next === "AI") {
                     const r = await tryApplyMode(next);
                     const applied = (r && r.applied === true);
                     const reason = (r && r.reason) ? String(r.reason) : "";
                     setSavedUi(nowHHmm() + (applied ? " • применено" : (reason ? (" • " + reason) : "")));
 
-                    // после apply тоже можно обновить state (фазы/флаги могут сдвинуться)
                     const st2 = await fetchUiState(ctx);
                     if (st2) {
                         applyStateToCtx(ctx, st2);
+                        // важное: если сервер “зажал” правила, UI должен подстроиться
+                        const m2 = normalizeMode(st2.advancedControlMode || next);
+                        modeSelect.value = m2;
+                        modeSelect.dataset.prevValue = m2;
+                        applyControlModeUi(m2);
                         dispatchUiState(st2);
                     }
                 } else {
@@ -420,9 +449,7 @@ window.SettingsTabGeneral = (function () {
 
             } catch (e) {
                 console.error("[general] save control mode failed:", e);
-
                 revertToPrev(prev);
-
                 setProgress(false);
                 setErrorUi(String(e?.message || "ошибка"));
             } finally {

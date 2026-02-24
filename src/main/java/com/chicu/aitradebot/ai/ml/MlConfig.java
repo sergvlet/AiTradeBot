@@ -1,77 +1,49 @@
 package com.chicu.aitradebot.ai.ml;
 
-import com.chicu.aitradebot.ai.ml.dataset.MlStorageProperties;
+
 import com.fasterxml.jackson.databind.ObjectMapper;
+import okhttp3.Interceptor;
 import okhttp3.OkHttpClient;
-import org.springframework.beans.factory.ObjectProvider;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
-import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import okhttp3.Request;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
-import java.time.Duration;
-
 @Configuration
-@EnableConfigurationProperties({
-        MlStorageProperties.class,
-        MlProperties.class
-})
 public class MlConfig {
 
-    /**
-     * KeyFactory нужен как bean (иначе могут падать сервисы, если они ждут DI).
-     */
     @Bean
-    @ConditionalOnMissingBean
-    public ModelKeyFactory modelKeyFactory() {
-        return new ModelKeyFactory();
-    }
+    @ConditionalOnProperty(prefix = "ml", name = "enabled", havingValue = "true")
+    public MlClient mlClient(MlProperties props, ObjectMapper om) {
 
-    /**
-     * ML HTTP клиент (для /health, /predict и любых вызовов ML).
-     *
-     * Зачем здесь таймауты:
-     * - чтобы python sidecar НЕ мог повесить торговлю,
-     * - но при этом не ронять приложение, если ML выключен или недоступен.
-     *
-     * Важно:
-     * - OkHttpClient берём из общего HttpClientConfig (пул, DNS, keep-alive и т.д.)
-     * - если его нет — создаём локальный fallback.
-     */
-    @Bean
-    @ConditionalOnMissingBean
-    public MlClient mlClient(ObjectProvider<OkHttpClient> okProvider,
-                             ObjectMapper om,
-                             MlProperties props) {
-
-        OkHttpClient base = okProvider.getIfAvailable(() ->
-                new OkHttpClient.Builder()
-                        .connectTimeout(Duration.ofMillis(1500))
-                        .readTimeout(Duration.ofMillis(8000))
-                        .callTimeout(Duration.ofSeconds(15))
-                        .build()
+        OkHttpClient http = MlHttpClient.defaultHttp(
+                props.getConnectTimeoutMs(),
+                props.getReadTimeoutMs(),
+                props.getReadTimeoutMs() // writeTimeout = readTimeout
         );
 
-        // Берём таймауты из ml.* (новая схема)
-        int connectMs = clamp(props.getConnectTimeoutMs(), 200, 30_000);
-        int readMs    = clamp(props.getReadTimeoutMs(), 200, 120_000);
+        String apiKey = props.getApiKey();
 
-        // callTimeout — верхняя граница на весь вызов.
-        // Делаем чуть больше readTimeout, чтобы не обрубало на ровном месте.
-        int callMs = clamp(readMs + 1000, 500, 180_000);
+        // Можно оставить interceptor (не мешает), но тогда главное — не задублировать заголовок.
+        // Если MlHttpClient сам добавляет X-API-KEY — interceptor не нужен.
+        if (apiKey != null && !apiKey.isBlank()) {
+            String key = apiKey.trim();
+            Interceptor auth = chain -> {
+                Request req = chain.request().newBuilder()
+                        .header("X-API-KEY", key)
+                        .build();
+                return chain.proceed(req);
+            };
+            http = http.newBuilder().addInterceptor(auth).build();
+        }
 
-        OkHttpClient tuned = base.newBuilder()
-                .connectTimeout(Duration.ofMillis(connectMs))
-                .readTimeout(Duration.ofMillis(readMs))
-                .callTimeout(Duration.ofMillis(callMs))
-                .build();
-
-        return new MlClient(tuned, om, props);
+        return new MlHttpClient(http, om, trimSlash(props.getBaseUrl()), apiKey);
     }
 
-    private static int clamp(int v, int min, int max) {
-        if (v < min) return min;
-        if (v > max) return max;
-        return v;
+    private static String trimSlash(String s) {
+        if (s == null) return "";
+        String t = s.trim();
+        while (t.endsWith("/")) t = t.substring(0, t.length() - 1);
+        return t;
     }
 }

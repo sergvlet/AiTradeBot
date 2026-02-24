@@ -1,8 +1,7 @@
+// src/main/java/com/chicu/aitradebot/strategy/ml/MlClassificationStrategyV4.java
 package com.chicu.aitradebot.strategy.ml;
 
-import com.chicu.aitradebot.ai.ml.MlFeatures;
-import com.chicu.aitradebot.ai.ml.MlPrediction;
-import com.chicu.aitradebot.ai.ml.MlSignalService;
+import com.chicu.aitradebot.ai.ml.dto.MlPrediction;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
@@ -21,6 +20,7 @@ import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Comparator;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
@@ -113,12 +113,13 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
 
         states.put(chatId, st);
 
-        log.info("[ML_CLASSIFICATION] ▶ START chatId={} symbol={} threshold={} lookback={} modelKey={}",
+        log.info("[ML_CLASSIFICATION] ▶ START chatId={} symbol={} threshold={} lookback={} modelKey={} schemaHash={}",
                 chatId,
                 st.symbol,
                 fmtBd(cfg.getDecisionThreshold()),
                 nz(cfg.getLookbackCandles(), 200),
-                safe(cfg.getModelKey())
+                safe(cfg.getModelKey()),
+                safe(resolveSchemaHash(ss, cfg))
         );
 
         safeLive(() -> live.pushState(chatId, StrategyType.ML_CLASSIFICATION, st.symbol, true));
@@ -204,25 +205,30 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
             // 1) EXIT TP/SL
             if (st.inPosition && st.entryQty != null && st.tp != null && st.sl != null) {
                 try {
-                    var ex = tradeExecutionService.executeExitIfHit(
+                    String ex = (st.exchange != null ? st.exchange : ss.getExchangeName());
+                    NetworkType net = (st.network != null ? st.network : ss.getNetworkType());
+
+                    var exRes = tradeExecutionService.executeExitIfHit(
                             chatId,
                             StrategyType.ML_CLASSIFICATION,
                             symFinal,
                             price,
                             time,
-                            false,
+                            true,           // ✅ spot long
                             st.entryQty,
                             st.tp,
-                            st.sl
+                            st.sl,
+                            ex,
+                            net
                     );
 
-                    if (ex.executed()) {
+                    if (exRes != null && exRes.executed()) {
                         clearPosition(st);
 
                         safeLive(() -> live.clearTpSl(chatId, StrategyType.ML_CLASSIFICATION, symFinal));
                         safeLive(() -> live.clearPriceLines(chatId, StrategyType.ML_CLASSIFICATION, symFinal));
                         safeLive(() -> live.pushSignal(chatId, StrategyType.ML_CLASSIFICATION, symFinal, null,
-                                Signal.sell(1.0, "tp_sl_exit")));
+                                Signal.sell(price.doubleValue(), exRes.tpHit() ? "TP" : "SL")));
                         return;
                     }
                 } catch (Exception e) {
@@ -236,14 +242,17 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
                 int lookback = nz(cfg.getLookbackCandles(), 200);
                 if (lookback < 50) lookback = 50;
 
-                var candles = candleProvider.getRecentCandles(chatId, symFinal, ss.getTimeframe(), lookback);
+                List<CandleProvider.Candle> candles =
+                        candleProvider.getRecentCandles(chatId, symFinal, ss.getTimeframe(), lookback);
+
                 if (candles == null || candles.size() < Math.min(30, lookback / 2)) {
                     pushHoldThrottled(chatId, symFinal, st, "not_enough_candles", time);
                     return;
                 }
 
-                // ✅ ВАЖНО: используем твой универсальный билд признаков (там уже есть reflection/Map)
+                // ✅ фичи
                 MlFeatures features = MlFeatures.fromCandles(candles, price);
+                Map<String, Object> featureMap = (features != null ? features.toMap() : Map.of());
 
                 double threshold = normalizeThreshold(cfg.getDecisionThreshold());
 
@@ -255,12 +264,16 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
 
                 if (mlOk) {
                     try {
+                        String modelKey = safeEmptyToNull(cfg.getModelKey());
+                        String schemaHash = resolveSchemaHash(ss, cfg);
+
                         pred = mlSignalService.predict(
                                 chatId,
                                 symFinal,
                                 ss.getTimeframe(),
-                                cfg.getModelKey(),
-                                features
+                                modelKey,
+                                schemaHash,
+                                featureMap
                         );
                     } catch (Exception e) {
                         warnMlOncePer(st, time,
@@ -285,7 +298,6 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
                     pBuy = clamp01(fb);
                     pSell = clamp01(1.0 - fb);
 
-                    // один HOLD “объяснение”, но throttled (UI не засоряем)
                     pushHoldThrottled(chatId, symFinal, st, "ml_off_fallback", time);
                 }
 
@@ -300,6 +312,7 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
                 final double scoreFinal = score;
 
                 try {
+                    // ⚠️ если у тебя executeEntry требует tpPct/slPct — подгони здесь вызов
                     var res = tradeExecutionService.executeEntry(
                             chatId,
                             StrategyType.ML_CLASSIFICATION,
@@ -310,8 +323,8 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
                             ss
                     );
 
-                    if (!res.executed()) {
-                        pushHoldThrottled(chatId, symFinal, st, res.reason(), time);
+                    if (res == null || !res.executed()) {
+                        pushHoldThrottled(chatId, symFinal, st, res != null ? res.reason() : "entry_null", time);
                         return;
                     }
 
@@ -322,7 +335,7 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
                     st.sl = res.sl();
 
                     safeLive(() -> live.pushSignal(chatId, StrategyType.ML_CLASSIFICATION, symFinal, null,
-                            Signal.buy(scoreFinal, "buy pBuy=" + round2(pBuy))));
+                            Signal.buy(price.doubleValue(), "buy pBuy=" + round2(pBuy))));
                     return;
 
                 } catch (Exception e) {
@@ -339,7 +352,7 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
     private void warnMlOncePer(LocalState st, Instant now, String msg) {
         if (st.lastMlWarnAt != null) {
             long ms = Duration.between(st.lastMlWarnAt, now).toMillis();
-            if (ms < 15_000) return; // раз в 15 секунд максимум
+            if (ms < 15_000) return;
         }
         st.lastMlWarnAt = now;
         log.warn(msg);
@@ -383,12 +396,13 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
 
             if (changed) {
                 st.lastFingerprint = fp;
-                log.info("[ML_CLASSIFICATION] ⚙️ settings updated chatId={} symbol={} threshold={} lookback={} modelKey={}",
+                log.info("[ML_CLASSIFICATION] ⚙️ settings updated chatId={} symbol={} threshold={} lookback={} modelKey={} schemaHash={}",
                         chatId,
                         st.symbol,
                         fmtBd(cfg.getDecisionThreshold()),
                         cfg.getLookbackCandles(),
-                        safe(cfg.getModelKey())
+                        safe(cfg.getModelKey()),
+                        safe(resolveSchemaHash(loaded, cfg))
                 );
 
                 String newSymbol = safeUpper(st.symbol);
@@ -416,8 +430,34 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
         String look = cfg != null ? String.valueOf(cfg.getLookbackCandles()) : "null";
         String thr = cfg != null ? String.valueOf(cfg.getDecisionThreshold()) : "null";
         String model = cfg != null ? safe(cfg.getModelKey()) : "null";
+        String schemaHash = safe(resolveSchemaHash(ss, cfg));
 
-        return symbol + "|" + ex + "|" + net + "|" + tf + "|" + candles + "|" + look + "|" + thr + "|" + model;
+        return symbol + "|" + ex + "|" + net + "|" + tf + "|" + candles + "|" + look + "|" + thr + "|" + model + "|" + schemaHash;
+    }
+
+    /**
+     * schemaHash нужен для версионирования фич/моделей.
+     * Источники:
+     *  1) MlClassificationSettings.getSchemaHash() (если есть)
+     *  2) StrategySettings.getMlSchemaHash()
+     *  3) ""
+     */
+    private String resolveSchemaHash(StrategySettings ss, MlClassificationSettings cfg) {
+        if (cfg != null) {
+            try {
+                var m = cfg.getClass().getMethod("getSchemaHash");
+                Object v = m.invoke(cfg);
+                String s = (v != null ? String.valueOf(v).trim() : "");
+                if (!s.isEmpty()) return s;
+            } catch (Exception ignored) {}
+        }
+        if (ss != null) {
+            try {
+                String s = ss.getMlSchemaHash();
+                if (s != null && !s.trim().isEmpty()) return s.trim();
+            } catch (Exception ignored) {}
+        }
+        return "";
     }
 
     /**
@@ -469,7 +509,7 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
         double v = safeD(f.volatilityPct());  // 0..N
 
         double base = 0.50 + (m * 0.25);
-        if (v < 0.0005) base -= 0.05; // слишком “тихо” — чуть хуже
+        if (v < 0.0005) base -= 0.05;
 
         return clamp01(base);
     }
@@ -493,6 +533,12 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
         return t.isEmpty() ? null : t.toUpperCase(Locale.ROOT);
     }
 
+    private static String safeEmptyToNull(String s) {
+        if (s == null) return null;
+        String x = s.trim();
+        return x.isEmpty() ? null : x;
+    }
+
     private static int nz(Integer v, int def) {
         return v != null ? v : def;
     }
@@ -505,7 +551,6 @@ public class MlClassificationStrategyV4 implements TradingStrategy {
     private static double normalizeThreshold(BigDecimal v) {
         if (v == null) return 0.65;
         double d = v.doubleValue();
-        // если вдруг хранишь как 65 вместо 0.65
         if (d > 1.0 && d <= 100.0) d = d / 100.0;
         if (d < 0.50) d = 0.50;
         if (d > 0.95) d = 0.95;

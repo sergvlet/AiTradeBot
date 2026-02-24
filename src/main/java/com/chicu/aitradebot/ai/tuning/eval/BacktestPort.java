@@ -9,14 +9,12 @@ import java.util.Map;
 public interface BacktestPort {
 
     /**
-     * ✅ Новый контракт:
-     * Выполнить бэктест в конкретном окружении (exchange + network).
-     * symbol/timeframe можно передать override, иначе адаптер возьмёт из StrategySettings.
+     * ✅ Базовый контракт (обязательный):
+     * Выполнить бэктест.
+     * symbol/timeframe можно передать override, иначе адаптер/порт возьмёт из StrategySettings.
      */
     BacktestMetrics backtest(Long chatId,
                              StrategyType type,
-                             String exchange,
-                             NetworkType network,
                              String symbolOverride,
                              String timeframeOverride,
                              Map<String, Object> candidateParams,
@@ -24,18 +22,22 @@ public interface BacktestPort {
                              Instant endAt);
 
     /**
-     * ✅ BACKWARD COMPAT:
-     * Старый метод оставляем, чтобы не ломать существующие вызовы.
-     * exchange/network резолвятся внутри адаптера (например, из StrategySettings).
+     * ✅ Расширенный контракт (опциональный):
+     * Позволяет вызывать бэктест в конкретном окружении (exchange + network).
+     *
+     * По умолчанию делегирует в базовый метод (т.е. может игнорировать env),
+     * а реализация, которой важно env — просто override-ит этот метод.
      */
     default BacktestMetrics backtest(Long chatId,
                                      StrategyType type,
+                                     String exchange,
+                                     NetworkType network,
                                      String symbolOverride,
                                      String timeframeOverride,
                                      Map<String, Object> candidateParams,
                                      Instant startAt,
                                      Instant endAt) {
 
-        return backtest(chatId, type, null, null, symbolOverride, timeframeOverride, candidateParams, startAt, endAt);
+        return backtest(chatId, type, symbolOverride, timeframeOverride, candidateParams, startAt, endAt);
     }
 }

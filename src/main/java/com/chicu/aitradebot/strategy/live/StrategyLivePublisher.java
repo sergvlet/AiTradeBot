@@ -6,9 +6,11 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 
 @Slf4j
@@ -28,13 +30,13 @@ public class StrategyLivePublisher {
 
     private static String sanitizeSymbol(String symbol) {
         if (symbol == null) return null;
-        String s = symbol.trim().toUpperCase(); // ✅ КРИТИЧНО: единый формат символа
+        String s = symbol.trim().toUpperCase(Locale.ROOT); // ✅ единый формат символа
         return s.isEmpty() ? null : s;
     }
 
     private static String sanitizeTf(String tf) {
         if (tf == null) return null;
-        String s = tf.trim().toLowerCase();
+        String s = tf.trim().toLowerCase(Locale.ROOT);
         return s.isBlank() ? null : s;
     }
 
@@ -59,12 +61,27 @@ public class StrategyLivePublisher {
     }
 
     /**
-     * ✅ ЕДИНАЯ публикация с нормализацией (чтобы символ/таймфрейм/время всегда были валидны)
+     * ✅ ЕДИНАЯ публикация с нормализацией
      */
     private void publish(StrategyLiveEvent ev) {
         if (ev == null) return;
-        ev.normalize();               // ✅ ВОТ ЭТОГО ТЕБЕ НЕ ХВАТАЛО
+        ev.normalize();
         bridge.publish(ev);
+    }
+
+    private static double safeSignalConfidence(Signal signal) {
+        if (signal == null) return 0.0;
+        try {
+            Method m = signal.getClass().getMethod("getConfidence");
+            Object v = m.invoke(signal);
+            if (v == null) return 0.0;
+            if (v instanceof Number n) return n.doubleValue();
+            String s = String.valueOf(v).trim();
+            if (s.isEmpty() || "null".equalsIgnoreCase(s)) return 0.0;
+            return Double.parseDouble(s);
+        } catch (Exception ignore) {
+            return 0.0;
+        }
     }
 
     // =====================================================
@@ -88,7 +105,7 @@ public class StrategyLivePublisher {
         if (!guard(chatId, strategyType, symbol, "candle")) return;
 
         if (open == null || high == null || low == null || close == null) {
-            log.warn("❌ LIVE CANDLE invalid OHLC chatId={} symbol={}", chatId, symbol);
+            log.warn("❌ LIVE CANDLE invalid OHLC chatId={} symbol={} tf={}", chatId, symbol, timeframe);
             return;
         }
 
@@ -109,7 +126,7 @@ public class StrategyLivePublisher {
                                         .low(low)
                                         .close(close)
                                         .volume(volume)
-                                        .timeframe(timeframe) // ✅ полезно для UI/диагностики
+                                        .timeframe(timeframe)
                                         .build()
                         )
                         .build();
@@ -132,9 +149,6 @@ public class StrategyLivePublisher {
         timeframe = sanitizeTf(timeframe);
         if (!guard(chatId, strategyType, symbol, "price")) return;
         if (price == null) return;
-
-        log.debug("📤 LIVE PUBLISH PRICE chatId={} {} {} tf={} price={}",
-                chatId, strategyType, symbol, timeframe, price);
 
         publish(
                 StrategyLiveEvent.builder()
@@ -165,6 +179,9 @@ public class StrategyLivePublisher {
     // 🟣 LEVELS
     // =====================================================
 
+    /**
+     * ✅ ВАЖНО: пустой список = CLEAR на UI.
+     */
     public void pushLevels(Long chatId,
                            StrategyType strategyType,
                            String symbol,
@@ -172,7 +189,7 @@ public class StrategyLivePublisher {
 
         symbol = sanitizeSymbol(symbol);
         if (!guard(chatId, strategyType, symbol, "levels")) return;
-        if (levels == null || levels.isEmpty()) return;
+        if (levels == null) return;
 
         List<StrategyLiveEvent.LevelPayload> payload =
                 levels.stream()
@@ -186,7 +203,7 @@ public class StrategyLivePublisher {
                         .chatId(chatId)
                         .strategyType(strategyType)
                         .symbol(symbol)
-                        .levels(payload)
+                        .levels(payload) // может быть пустым -> clear
                         .time(nowMs(null))
                         .build()
         );
@@ -469,17 +486,20 @@ public class StrategyLivePublisher {
         if (!guard(chatId, strategyType, symbol, "signal")) return;
         if (signal == null) return;
 
+        Double conf = Double.valueOf(safeSignalConfidence(signal));
+
         publish(
                 StrategyLiveEvent.builder()
                         .type("signal")
                         .chatId(chatId)
                         .strategyType(strategyType)
                         .symbol(symbol)
+                        .timeframe(timeframe)
                         .signal(
                                 StrategyLiveEvent.SignalPayload.builder()
                                         .name(signal.getType().name())
                                         .reason(signal.getReason())
-                                        .confidence(signal.getConfidence())
+                                        .confidence(conf)
                                         .timeframe(timeframe)
                                         .build()
                         )
@@ -644,35 +664,11 @@ public class StrategyLivePublisher {
                         .build()
         );
     }
-    private void logCandleClosed(Long chatId,
-                                 StrategyType strategyType,
-                                 String symbol,
-                                 String timeframe,
-                                 long time,
-                                 BigDecimal open,
-                                 BigDecimal high,
-                                 BigDecimal low,
-                                 BigDecimal close,
-                                 BigDecimal volume) {
-
-        log.info(
-                "🕯 CANDLE CLOSED [{}] {} {} tf={} O={} H={} L={} C={} V={}",
-                chatId,
-                strategyType,
-                symbol,
-                timeframe,
-                open, high, low, close, volume
-        );
-    }
 
     // =====================================================
-    // ✅ ADAPTERS for MarketStreamServiceImpl (compile fix)
+    // ✅ ADAPTERS for MarketStreamServiceImpl
     // =====================================================
 
-    /**
-     * MarketStreamServiceImpl ожидает publishAggTick(...).
-     * В текущем UI достаточно price tick (qty можно не публиковать отдельным событием).
-     */
     public void publishAggTick(long chatId,
                                StrategyType strategyType,
                                String symbol,
@@ -680,16 +676,21 @@ public class StrategyLivePublisher {
                                BigDecimal price,
                                BigDecimal qty,
                                long tradeTsMs) {
-        // qty пока не используем — при желании можно добавить отдельный "trade" event
-        pushPriceTick(chatId, strategyType, symbol, timeframe, price,
-                tradeTsMs > 0 ? Instant.ofEpochMilli(tradeTsMs) : null);
+
+        pushPriceTick(
+                chatId,
+                strategyType,
+                symbol,
+                timeframe,
+                price,
+                tradeTsMs > 0 ? Instant.ofEpochMilli(tradeTsMs) : null
+        );
     }
 
-    /**
-     * MarketStreamServiceImpl ожидает publishCandle(chatId, type, UnifiedKline).
-     * UnifiedKline у тебя, судя по ошибкам, без record-аксессоров, поэтому читаем через reflection.
-     */
-    public void publishCandle(long chatId, StrategyType strategyType, com.chicu.aitradebot.market.model.UnifiedKline kline) {
+    public void publishCandle(long chatId,
+                              StrategyType strategyType,
+                              com.chicu.aitradebot.market.model.UnifiedKline kline) {
+
         if (kline == null) return;
 
         String symbol = asString(readAny(kline, "symbol", "getSymbol"));
@@ -708,6 +709,8 @@ public class StrategyLivePublisher {
                 "closeTime", "getCloseTime"
         ));
 
+        if (open == null || high == null || low == null || close == null) return;
+
         pushCandleOhlc(
                 chatId,
                 strategyType,
@@ -723,7 +726,7 @@ public class StrategyLivePublisher {
     }
 
     // =====================================================
-    // 🧩 Reflection helpers (compile-safe for any UnifiedKline shape)
+    // 🧩 Reflection helpers
     // =====================================================
 
     private static Object readAny(Object target, String... methodNames) {
@@ -733,11 +736,9 @@ public class StrategyLivePublisher {
         for (String name : methodNames) {
             if (name == null || name.isBlank()) continue;
             try {
-                // 1) method with no args
                 var m = c.getMethod(name);
                 return m.invoke(target);
             } catch (NoSuchMethodException ignore) {
-                // 2) try boolean getter style for fields, e.g. isClosed()
                 if (!name.startsWith("get") && !name.startsWith("is")) {
                     String cap = Character.toUpperCase(name.charAt(0)) + name.substring(1);
                     try {
@@ -752,8 +753,8 @@ public class StrategyLivePublisher {
                         }
                     }
                 }
-            } catch (Exception e) {
-                // если метод есть, но падает — просто пропускаем
+            } catch (Exception ignored) {
+                // ignore
             }
         }
         return null;
@@ -769,7 +770,7 @@ public class StrategyLivePublisher {
         if (v == null) return null;
         if (v instanceof Long l) return l;
         if (v instanceof Integer i) return i.longValue();
-        if (v instanceof java.time.Instant it) return it.toEpochMilli();
+        if (v instanceof Instant it) return it.toEpochMilli();
         if (v instanceof java.util.Date d) return d.getTime();
         if (v instanceof Number n) return n.longValue();
         try {
@@ -789,7 +790,4 @@ public class StrategyLivePublisher {
             return null;
         }
     }
-
-
-
 }

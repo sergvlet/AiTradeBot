@@ -33,6 +33,9 @@ public interface StrategySettingsService {
             NetworkType network
     );
 
+    Long getVersion(Long chatId, StrategyType type);
+
+
     /**
      * Патч контекста в уже существующей сущности.
      */
