@@ -20,15 +20,14 @@ import org.springframework.stereotype.Component;
 
 import java.lang.reflect.Method;
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -39,15 +38,17 @@ import java.util.concurrent.locks.ReentrantLock;
 @RequiredArgsConstructor
 public class AiStrategyOrchestrator {
 
+    private static final BigDecimal PROB_MIN = BigDecimal.ZERO.setScale(6, RoundingMode.HALF_UP);
+    private static final BigDecimal PROB_MAX = BigDecimal.ONE.setScale(6, RoundingMode.HALF_UP);
+    private static final BigDecimal DEFAULT_GATE_MIN_PROB = new BigDecimal("0.550000");
+
     private final OrderService orderService;
     private final StrategySettingsService settingsService;
     private final StrategyRegistry strategyRegistry;
 
     /**
      * ✅ ML autotune runtime (оркестратор — главный lifecycle хаб)
-     * ✅ сделано через ObjectProvider, чтобы:
-     *  - не ловить циклические зависимости при старте контекста
-     *  - переживать временное отсутствие ML-бина во время пересборки ML-слоя
+     * ✅ ObjectProvider — защита от циклов и от временного отсутствия ML-слоя
      */
     private final ObjectProvider<MlAutoTuneRuntime> mlAutoTuneRuntime;
 
@@ -86,11 +87,19 @@ public class AiStrategyOrchestrator {
     }
 
     // =====================================================================
-    // ✅ RUNTIME PHASE CACHE (чтобы не лезть в БД на каждый тик)
+    // ✅ RUNTIME POLICY CACHE (чтобы не лезть в БД на каждый тик)
     // =====================================================================
 
-    private record RuntimePhase(AdvancedControlMode mode, String runPhase) {}
-    private final ConcurrentMap<RunKey, RuntimePhase> runtimePhases = new ConcurrentHashMap<>();
+    private record RuntimePolicy(
+            AdvancedControlMode mode,
+            String runPhase,
+            boolean autoTuneEnabled,
+            boolean mlGateEnabled,
+            BigDecimal gateMinProb,
+            String mlModelVersion
+    ) {}
+
+    private final ConcurrentMap<RunKey, RuntimePolicy> runtimePolicyCache = new ConcurrentHashMap<>();
 
     private static String sanitizePhase(String p) {
         if (p == null) return "LIVE";
@@ -98,17 +107,24 @@ public class AiStrategyOrchestrator {
         return x.isEmpty() ? "LIVE" : x;
     }
 
-    private RuntimePhase phaseOf(StrategySettings s) {
+    private RuntimePolicy policyOf(StrategySettings s) {
         AdvancedControlMode m = (s != null && s.getAdvancedControlMode() != null)
                 ? s.getAdvancedControlMode()
                 : AdvancedControlMode.MANUAL;
+
         String rp = sanitizePhase(s != null ? s.getRunPhase() : null);
-        return new RuntimePhase(m, rp);
+
+        boolean autoTune = (s != null) && s.isAutoTuneEnabled();
+        boolean gate = (s != null) && s.isMlGateEnabled();
+        BigDecimal thr = (s != null) ? s.getGateMinProb() : null;
+        String modelVer = (s != null) ? s.getMlModelVersion() : null;
+
+        return new RuntimePolicy(m, rp, autoTune, gate, thr, modelVer);
     }
 
     /** ✅ блокируем торговые события для фаз COLLECT/BACKTEST */
     private boolean isMarketEventsBlocked(RunKey key) {
-        RuntimePhase rp = runtimePhases.get(key);
+        RuntimePolicy rp = runtimePolicyCache.get(key);
         if (rp == null) return false;
         String phase = rp.runPhase();
         return "COLLECT".equalsIgnoreCase(phase) || "BACKTEST".equalsIgnoreCase(phase);
@@ -152,41 +168,121 @@ public class AiStrategyOrchestrator {
     // ✅ RUNTIME POLICY (единые правила режима/фазы)
     // =====================================================================
 
+    private static AdvancedControlMode safeMode(StrategySettings s) {
+        return (s != null && s.getAdvancedControlMode() != null)
+                ? s.getAdvancedControlMode()
+                : AdvancedControlMode.MANUAL;
+    }
+
+    private static BigDecimal clampProb(BigDecimal v) {
+        if (v == null) return null;
+        BigDecimal x = v.setScale(6, RoundingMode.HALF_UP);
+        if (x.compareTo(PROB_MIN) < 0) return PROB_MIN;
+        if (x.compareTo(PROB_MAX) > 0) return PROB_MAX;
+        return x;
+    }
+
     /**
      * Единая точка принятия решения:
-     * - обновляет runtimePhases cache
-     * - включает/выключает MlAutoTuneRuntime в зависимости от mode/flags
+     * - приводит настройки к жёстким правилам MANUAL/HYBRID/AI (и сохраняет при необходимости)
+     * - обновляет runtimePolicyCache
+     * - включает/выключает MlAutoTuneRuntime
      */
     private void applyRuntimePolicy(long chatId,
                                     StrategyType type,
                                     String exchange,
                                     NetworkType network,
                                     StrategySettings s) {
-        if (type == null) return;
+        if (type == null || s == null) return;
 
         RunKey key = new RunKey(chatId, type);
 
-        // 1) обновить кеш фаз/режима
-        RuntimePhase rp = phaseOf(s);
-        runtimePhases.put(key, rp);
+        AdvancedControlMode mode = safeMode(s);
+        String phase = sanitizePhase(s.getRunPhase());
 
-        AdvancedControlMode mode = rp.mode() != null ? rp.mode() : AdvancedControlMode.MANUAL;
+        // ===== desired state по правилам
+        boolean desiredAutoTune;
+        boolean desiredGateEnabled;
+        BigDecimal desiredGateMinProb;
 
-        // 2) MANUAL -> autotune всегда стоп
         if (mode == AdvancedControlMode.MANUAL) {
-            safeAutotuneStop(chatId, type, exchange, network);
-            return;
+            desiredAutoTune = false;
+            desiredGateEnabled = false;
+            desiredGateMinProb = null;
+        } else if (mode == AdvancedControlMode.HYBRID) {
+            desiredAutoTune = false;               // HYBRID = без автотюна
+            desiredGateEnabled = true;             // HYBRID = gate обязателен
+            desiredGateMinProb = clampProb(s.getGateMinProb() != null ? s.getGateMinProb() : DEFAULT_GATE_MIN_PROB);
+        } else {
+            // AI
+            desiredAutoTune = true;                // AI = автотюн обязателен
+            desiredGateEnabled = s.isMlGateEnabled(); // gate по желанию
+            desiredGateMinProb = desiredGateEnabled
+                    ? clampProb(s.getGateMinProb() != null ? s.getGateMinProb() : DEFAULT_GATE_MIN_PROB)
+                    : null;
         }
 
-        // 3) HYBRID/AI -> autotune старт только если включен флаг autoTuneEnabled
-        // ✅ НЕ используем прямой вызов s.isAutoTuneEnabled() (может отличаться геттер)
-        boolean autoTuneEnabled = readBool(s,
-                "autoTuneEnabled", "isAutoTuneEnabled", "getAutoTuneEnabled",
-                "mlAutoTuneEnabled", "isMlAutoTuneEnabled", "getMlAutoTuneEnabled"
-        );
+        // ===== привести entity к desired (чтобы стратегия увидела правильные значения из БД)
+        boolean changed = false;
 
-        if (autoTuneEnabled) safeAutotuneStart(chatId, type, exchange, network);
-        else safeAutotuneStop(chatId, type, exchange, network);
+        if (s.isAutoTuneEnabled() != desiredAutoTune) {
+            s.setAutoTuneEnabled(desiredAutoTune);
+            changed = true;
+        }
+        if (s.isMlGateEnabled() != desiredGateEnabled) {
+            s.setMlGateEnabled(desiredGateEnabled);
+            changed = true;
+        }
+
+        BigDecimal currentThr = s.getGateMinProb();
+        if (desiredGateMinProb == null) {
+            if (currentThr != null) {
+                s.setGateMinProb(null);
+                changed = true;
+            }
+        } else {
+            BigDecimal cur = (currentThr == null) ? null : clampProb(currentThr);
+            if (cur == null || cur.compareTo(desiredGateMinProb) != 0) {
+                s.setGateMinProb(desiredGateMinProb);
+                changed = true;
+            }
+        }
+
+        if (changed) {
+            try {
+                settingsService.save(s);
+            } catch (Exception e) {
+                log.warn("⚠️ [ORCH] applyRuntimePolicy save failed chatId={} type={} : {}", chatId, type, e.getMessage());
+            }
+        }
+
+        // ===== обновить кеш (после возможной коррекции)
+        BigDecimal effThr = desiredGateEnabled ? desiredGateMinProb : null;
+        RuntimePolicy rp = new RuntimePolicy(
+                mode,
+                phase,
+                desiredAutoTune,
+                desiredGateEnabled,
+                effThr,
+                s.getMlModelVersion()
+        );
+        runtimePolicyCache.put(key, rp);
+
+        // ===== AUTOTUNE lifecycle
+        if (mode == AdvancedControlMode.MANUAL) {
+            safeAutotuneStop(chatId, type, exchange, network);
+        } else {
+            if (desiredAutoTune) safeAutotuneStart(chatId, type, exchange, network);
+            else safeAutotuneStop(chatId, type, exchange, network);
+        }
+
+        log.info("🧩 [ORCH] policy chatId={} type={} mode={} phase={} autoTune={} mlGate={} thr={} modelVer={}",
+                chatId, type, mode, phase,
+                desiredAutoTune,
+                desiredGateEnabled,
+                (effThr != null ? effThr.toPlainString() : "null"),
+                (s.getMlModelVersion() != null ? s.getMlModelVersion() : "null")
+        );
     }
 
     /**
@@ -210,7 +306,6 @@ public class AiStrategyOrchestrator {
         try {
             StrategySettings s = loadSettingsStrict(chatId, type, ex, net);
             if (s == null) return;
-
             applyRuntimePolicy(chatId, type, ex, net, s);
         } catch (Exception e) {
             log.debug("⚠ [ORCH] refreshRuntimePhase failed: {}", e.getMessage());
@@ -321,13 +416,13 @@ public class AiStrategyOrchestrator {
             } catch (Exception e) {
                 // откат binding если старт не удался
                 running.put(key, current);
-                runtimePhases.put(key, phaseOf(s)); // пусть будет хотя бы актуально по БД
+                runtimePolicyCache.put(key, policyOf(s));
                 log.error("❌ [ORCH] start(new) failed chatId={} type={} ex={} net={} sym={} tf={}",
                         chatId, type, desired.exchange(), desired.network(), desired.symbol(), desired.timeframe(), e);
                 return buildRunInfoFromBinding(s, current, true, "Ошибка рестарта: не удалось запустить новый контекст");
             }
 
-            // ✅ фиксируем контекст и active=true в БД (косметика/консистентность)
+            // ✅ фиксируем контекст и active=true в БД (консистентность)
             syncSettingsContextIfNeeded(s, desired.exchange(), desired.network());
             if (!s.isActive()) {
                 s.setActive(true);
@@ -338,6 +433,9 @@ public class AiStrategyOrchestrator {
 
             // ✅ применяем policy уже в новом контексте
             applyRuntimePolicy(chatId, type, desired.exchange(), desired.network(), s);
+
+            log.info("▶️ [ORCH] RUN {} chatId={} ex={} net={} symbol={} tf={} mode={}",
+                    type, chatId, desired.exchange(), desired.network(), desired.symbol(), desired.timeframe(), safeMode(s));
 
             return buildRunInfoFromBinding(s, desired, true, "Контекст изменён — стратегия перезапущена");
 
@@ -404,8 +502,8 @@ public class AiStrategyOrchestrator {
                 && eq(existing.symbol(), newBinding.symbol())
                 && eq(existing.timeframe(), newBinding.timeframe())) {
 
-                log.info("⏭ [ORCH] Уже запущено: {} chatId={} ex={} net={} {} {}",
-                        type, chatId, ex, net, sym, tf);
+                log.info("⏭ [ORCH] Уже запущено: {} chatId={} ex={} net={} {} {} mode={}",
+                        type, chatId, ex, net, sym, tf, safeMode(s));
 
                 syncSettingsContextIfNeeded(s, ex, net);
                 if (!s.isActive()) {
@@ -415,9 +513,7 @@ public class AiStrategyOrchestrator {
                     settingsService.save(s);
                 }
 
-                // ✅ policy + phase cache
                 applyRuntimePolicy(chatId, type, ex, net, s);
-
                 return buildRunInfo(s, true, "Стратегия уже запущена");
             }
 
@@ -446,7 +542,7 @@ public class AiStrategyOrchestrator {
                 strategy.start(chatId, sym, ex, net);
             } catch (Exception e) {
                 running.remove(key, newBinding);
-                runtimePhases.remove(key);
+                runtimePolicyCache.remove(key);
                 log.error("❌ [ORCH] startStrategy failed type={} chatId={} ex={} net={} sym={} tf={}",
                         type, chatId, ex, net, sym, tf, e);
                 return buildRunInfo(s, false, "Ошибка запуска стратегии");
@@ -459,12 +555,10 @@ public class AiStrategyOrchestrator {
             s.setStoppedAt(null);
             settingsService.save(s);
 
-            log.info("▶️ [ORCH] START {} chatId={} ex={} net={} symbol={} tf={}",
-                    type, chatId, ex, net, sym, tf);
+            log.info("▶️ [ORCH] START {} chatId={} ex={} net={} symbol={} tf={} mode={}",
+                    type, chatId, ex, net, sym, tf, safeMode(s));
 
-            // ✅ policy + phase cache + autotune on/off
             applyRuntimePolicy(chatId, type, ex, net, s);
-
             return buildRunInfo(s, true, "Стратегия запущена");
 
         } finally {
@@ -511,7 +605,7 @@ public class AiStrategyOrchestrator {
             RunBinding removed = running.remove(key);
             ignoreCounters.remove(key);
             lastTuneTriggerAtMs.remove(key);
-            runtimePhases.remove(key);
+            runtimePolicyCache.remove(key);
 
             String ex = removed != null ? removed.exchange() : sanitizeExchange(exchange);
             if (ex == null) ex = sanitizeExchange(s.getExchangeName());
@@ -1203,7 +1297,7 @@ public class AiStrategyOrchestrator {
     }
 
     // =====================================================================
-    // ✅ SAFE READ BOOL (settings)
+    // ✅ SAFE READ BOOL (осталось на всякий случай, но сейчас не используется)
     // =====================================================================
 
     private static Object readAnyNonNull(Object obj, String... gettersOrFields) {

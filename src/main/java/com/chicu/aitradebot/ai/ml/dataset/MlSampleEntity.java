@@ -8,6 +8,7 @@ import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
 
 import java.time.Instant;
+import java.util.Locale;
 
 @Entity
 @Table(
@@ -74,4 +75,49 @@ public class MlSampleEntity {
     // audit
     @Column(name = "created_at", nullable = false)
     private Instant createdAt;
+
+    @PrePersist
+    protected void prePersist() {
+        if (createdAt == null) createdAt = Instant.now();
+        normalize();
+        validate();
+    }
+
+    @PreUpdate
+    protected void preUpdate() {
+        normalize();
+        validate();
+    }
+
+    private void normalize() {
+        this.exchange = normalizeUpperNullable(this.exchange);
+        this.network = normalizeUpperNullable(this.network);
+        this.symbol = normalizeUpperNullable(this.symbol);
+        this.timeframe = normalizeLowerNullable(this.timeframe);
+
+        this.label = normalizeTrimNullable(this.label);
+        this.target = normalizeTrimNullable(this.target);
+    }
+
+    private void validate() {
+        if (chatId == null) throw new IllegalStateException("MlSampleEntity.chatId is null");
+        if (strategyType == null) throw new IllegalStateException("MlSampleEntity.strategyType is null");
+        if (symbol == null) throw new IllegalStateException("MlSampleEntity.symbol is null");
+    }
+
+    private static String normalizeTrimNullable(String s) {
+        if (s == null) return null;
+        String v = s.trim();
+        return v.isEmpty() ? null : v;
+    }
+
+    private static String normalizeUpperNullable(String s) {
+        String v = normalizeTrimNullable(s);
+        return v == null ? null : v.toUpperCase(Locale.ROOT);
+    }
+
+    private static String normalizeLowerNullable(String s) {
+        String v = normalizeTrimNullable(s);
+        return v == null ? null : v.toLowerCase(Locale.ROOT);
+    }
 }

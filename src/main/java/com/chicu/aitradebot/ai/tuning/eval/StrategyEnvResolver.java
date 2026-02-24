@@ -12,7 +12,6 @@ public interface StrategyEnvResolver {
     record Env(String exchangeName, NetworkType networkType) {
 
         public Env {
-            // ✅ нормализация + дефолты, чтобы дальше не ловить null/blank
             String ex = (exchangeName == null) ? "" : exchangeName.trim().toUpperCase(Locale.ROOT);
             exchangeName = ex.isEmpty() ? "BINANCE" : ex;
 

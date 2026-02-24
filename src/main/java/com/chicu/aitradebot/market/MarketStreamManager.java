@@ -57,7 +57,6 @@ public class MarketStreamManager {
             x = x.substring(6);
         }
 
-        // защита от мусора
         while (x.endsWith("_")) {
             x = x.substring(0, x.length() - 1);
         }
@@ -91,7 +90,6 @@ public class MarketStreamManager {
 
     public void addCandle(String exchange, NetworkType network, String symbol, String timeframe, Candle candle) {
         if (exchange == null || network == null) {
-            // ✅ без дефолтов: если env не передали — это legacy запись
             addCandle(symbol, timeframe, candle);
             return;
         }
@@ -122,20 +120,17 @@ public class MarketStreamManager {
 
             Candle last = deque.peekLast();
 
-            // первая свеча
             if (last == null) {
                 deque.addLast(candle);
                 return;
             }
 
-            // обновление текущей
             if (last.getTime() == candle.getTime()) {
                 deque.pollLast();
                 deque.addLast(candle);
                 return;
             }
 
-            // защита от старых данных
             if (candle.getTime() < last.getTime()) {
                 if (log.isDebugEnabled()) {
                     log.debug("⏪ Skip old candle {} < {}", candle.getTime(), last.getTime());
@@ -143,7 +138,6 @@ public class MarketStreamManager {
                 return;
             }
 
-            // новая свеча
             deque.addLast(candle);
 
             while (deque.size() > maxCandles) {
@@ -178,6 +172,11 @@ public class MarketStreamManager {
         return readFromDeque(deque, limit);
     }
 
+    // ✅ alias (семантически “кэш”)
+    public List<Candle> getCachedCandles(String symbol, String timeframe, int limit) {
+        return getCandles(symbol, timeframe, limit);
+    }
+
     // ============================
     // READ (ENV)
     // ============================
@@ -185,7 +184,6 @@ public class MarketStreamManager {
     public List<Candle> getCandles(String exchange, NetworkType network, String symbol, String timeframe, int limit) {
 
         if (exchange == null || network == null) {
-            // ✅ без дефолтов: если env нет — только legacy
             return getCandles(symbol, timeframe, limit);
         }
 
@@ -197,7 +195,6 @@ public class MarketStreamManager {
         Deque<Candle> deque = getEnvDeque(ex, network, sym, tf, false);
 
         if (deque == null || deque.isEmpty()) {
-            // ✅ мягкий fallback на legacy, чтобы не ломать тюнинг/бэктест до миграции всех вызовов addCandle(...)
             List<Candle> legacy = getCandles(sym, tf, limit);
             if (!legacy.isEmpty() && log.isDebugEnabled()) {
                 log.debug("🟡 Using LEGACY candles as fallback (ex={}, net={}, sym={}, tf={}, size={})",
@@ -207,6 +204,11 @@ public class MarketStreamManager {
         }
 
         return readFromDeque(deque, limit);
+    }
+
+    // ✅ alias (семантически “кэш”)
+    public List<Candle> getCachedCandles(String exchange, NetworkType network, String symbol, String timeframe, int limit) {
+        return getCandles(exchange, network, symbol, timeframe, limit);
     }
 
     private List<Candle> readFromDeque(Deque<Candle> deque, int limit) {
@@ -259,7 +261,7 @@ public class MarketStreamManager {
 
         Deque<Candle> deque = getEnvDeque(ex, network, sym, tf, false);
         if (deque == null || deque.isEmpty()) {
-            return getLast(sym, tf); // мягкий fallback
+            return getLast(sym, tf);
         }
 
         synchronized (deque) {
@@ -273,7 +275,6 @@ public class MarketStreamManager {
 
         legacyCache.remove(sym);
 
-        // удаляем этот symbol из envCache во всех ex/net
         for (Map<NetworkType, Map<String, Map<String, Deque<Candle>>>> netMap : envCache.values()) {
             if (netMap == null) continue;
             for (Map<String, Map<String, Deque<Candle>>> symMap : netMap.values()) {
@@ -301,7 +302,6 @@ public class MarketStreamManager {
         if (max < 200) max = 200;
         this.maxCandles = max;
 
-        // (опционально) подчистим текущие деки
         trimAllDeques(legacyCache);
         trimAllDequesEnv();
     }
@@ -340,13 +340,11 @@ public class MarketStreamManager {
     public Map<String, Integer> stats() {
         Map<String, Integer> m = new HashMap<>();
 
-        // legacy
         for (var e : legacyCache.entrySet()) {
             int sum = e.getValue().values().stream().mapToInt(Deque::size).sum();
             m.put("LEGACY:" + e.getKey(), sum);
         }
 
-        // env
         for (var exE : envCache.entrySet()) {
             String ex = exE.getKey();
             Map<NetworkType, Map<String, Map<String, Deque<Candle>>>> netMap = exE.getValue();
@@ -370,10 +368,6 @@ public class MarketStreamManager {
 
         return m;
     }
-
-    // ============================
-    // internals
-    // ============================
 
     private Deque<Candle> getEnvDeque(String exchange,
                                      NetworkType network,

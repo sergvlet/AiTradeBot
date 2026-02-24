@@ -13,12 +13,7 @@ import org.springframework.stereotype.Service;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.math.BigDecimal;
-import java.util.ArrayList;
-import java.util.Deque;
-import java.util.List;
-import java.util.Locale;
-import java.util.Optional;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ConcurrentMap;
@@ -42,8 +37,6 @@ public class MarketDataStreamService {
     /**
      * ✅ Хранилище свечей строго по ключу:
      * (chatId, type, ex, net, symbol, tf)
-     *
-     * ⚡️ ВАЖНО: Deque быстрее/дешевле чем CopyOnWriteArrayList при частых апдейтах.
      */
     private final ConcurrentMap<CandleStoreKey, Deque<Candle>> candleStorage = new ConcurrentHashMap<>();
 
@@ -60,7 +53,6 @@ public class MarketDataStreamService {
     // ✅ API ДЛЯ MarketStreamServiceImpl
     // =====================================================================
 
-    /** Подписка на нужный поток. Внутри — строгий dedupe по chatId+type+ex+net+sym+tf. */
     public void subscribe(String exchange,
                           NetworkType networkType,
                           long chatId,
@@ -70,7 +62,6 @@ public class MarketDataStreamService {
         subscribeCandles(exchange, networkType, chatId, strategyType, symbol, timeframe);
     }
 
-    /** ✅ Явная отписка (нужна для корректного рестарта). */
     public void unsubscribe(String exchange,
                             NetworkType networkType,
                             long chatId,
@@ -89,24 +80,19 @@ public class MarketDataStreamService {
 
         SubscriptionKey key = new SubscriptionKey(strategyType, ex, networkType, sym, tf);
 
-        // ✅ сначала убираем из set — чтобы параллельный subscribe видел правду
         boolean removed = subs.remove(key);
         if (!removed) return;
 
-        // ✅ чистим локальный кэш свечей
         candleStorage.remove(new CandleStoreKey(chatId, strategyType, ex, networkType, sym, tf));
 
-        // ✅ закрываем WS
         if ("BINANCE".equalsIgnoreCase(ex)) {
             BinanceSpotWebSocketClient ws = binanceWsProvider.getIfAvailable();
             if (ws != null) {
                 try { ws.unsubscribeKline(networkType, sym, tf, chatId, strategyType); } catch (Exception ignored) {}
-                // AggTrade не зависит от tf, но сигнатура оставлена совместимой (timeframeIgnored)
                 try { ws.unsubscribeAggTrade(networkType, sym, tf, chatId, strategyType); } catch (Exception ignored) {}
             }
         }
 
-        // ✅ подчистим пустой set, чтобы map не рос
         if (subs.isEmpty()) {
             activeSubscriptions.remove(chatId, subs);
         }
@@ -126,15 +112,7 @@ public class MarketDataStreamService {
                                          long tradeTsMs) {
 
         long n = seq.incrementAndGet();
-
-        // Сейчас свечи берём из kline потока, поэтому тут только ack для логики/троттлинга.
-        return new MarketPushResult(
-                n,
-                true,   // pushedTick
-                false,  // pushedCandle
-                false,  // createdCandle
-                null    // candleClosed
-        );
+        return new MarketPushResult(n, true, false, false, null);
     }
 
     public void pushKline(String exchange,
@@ -206,11 +184,6 @@ public class MarketDataStreamService {
     // 🕯 + 🔥 Подписка на свечи и live ticks
     // =====================================================================
 
-    /**
-     * ✅ ВАЖНО:
-     * - гарантируем dedupe через subs.add(key) ДО subscribe
-     * - удаляем старые подписки того же type (для этого chatId) перед новой
-     */
     public void subscribeCandles(String exchange,
                                  NetworkType networkType,
                                  long chatId,
@@ -228,10 +201,8 @@ public class MarketDataStreamService {
             return;
         }
 
-        // 1) сначала убираем другие подписки ЭТОГО type у chatId
         dropOtherSubscriptionsSameType(chatId, strategyType, ex, networkType, sym, tf);
 
-        // 2) создаём хранилище свечей
         candleStorage.computeIfAbsent(
                 new CandleStoreKey(chatId, strategyType, ex, networkType, sym, tf),
                 __ -> new ConcurrentLinkedDeque<>()
@@ -242,14 +213,12 @@ public class MarketDataStreamService {
 
         SubscriptionKey key = new SubscriptionKey(strategyType, ex, networkType, sym, tf);
 
-        // ✅ дедуп: если уже есть — выходим
         if (!subs.add(key)) {
             log.debug("⏭ [STREAM] Уже подписаны: chatId={} type={} ex={} net={} {} {}",
                     chatId, strategyType, ex, networkType, sym, tf);
             return;
         }
 
-        // 3) подписка WS (если не поддерживаем биржу — откатываем subs.add)
         if (!"BINANCE".equalsIgnoreCase(ex)) {
             subs.remove(key);
             candleStorage.remove(new CandleStoreKey(chatId, strategyType, ex, networkType, sym, tf));
@@ -267,13 +236,11 @@ public class MarketDataStreamService {
 
         try {
             ws.subscribeKline(networkType, sym, tf, chatId, strategyType);
-            // AggTrade не зависит от tf, но сигнатура совместимая (timeframeIgnored)
             ws.subscribeAggTrade(networkType, sym, tf, chatId, strategyType);
 
             log.info("📡 [STREAM] SUBSCRIBE WS: chatId={} type={} ex={} net={} {} {} (KLINE+AGGTRADE)",
                     chatId, strategyType, ex, networkType, sym, tf);
         } catch (Exception e) {
-            // ❗ если подписка упала — откатываем key/кэш, чтобы можно было попробовать снова
             subs.remove(key);
             candleStorage.remove(new CandleStoreKey(chatId, strategyType, ex, networkType, sym, tf));
 
@@ -282,10 +249,6 @@ public class MarketDataStreamService {
         }
     }
 
-    /**
-     * Удаляет все подписки этого chatId по этому type, кроме keep.
-     * ⚠️ Не создаём пустые set'ы: используем get() вместо computeIfAbsent().
-     */
     private void dropOtherSubscriptionsSameType(long chatId,
                                                 StrategyType type,
                                                 String ex,
@@ -303,7 +266,6 @@ public class MarketDataStreamService {
             if (k.strategyType() != type) continue;
             if (k.equals(keep)) continue;
 
-            // ✅ единый путь отписки (уберёт из subs + почистит storage + закроет WS)
             try {
                 unsubscribe(k.exchange(), k.networkType(), chatId, k.strategyType(), k.symbol(), k.timeframe());
             } catch (Exception ignored) {}
@@ -334,7 +296,6 @@ public class MarketDataStreamService {
         synchronized (deque) {
             Candle last = deque.peekLast();
 
-            // обновление текущей свечи (same openTime)
             if (last != null && last.getTime() == candle.getTime()) {
                 deque.pollLast();
             }
@@ -346,7 +307,6 @@ public class MarketDataStreamService {
             }
         }
 
-        // ✅ КРИТИЧНО: складываем также в MarketStreamManager (для бэктеста/дашборда)
         pushToStreamManager(ex, networkType, sym, tf, candle);
 
         if (log.isDebugEnabled()) {
@@ -354,6 +314,106 @@ public class MarketDataStreamService {
                     chatId, strategyType, ex, networkType, sym, tf, candle.getTime());
         }
     }
+
+    // =====================================================================
+    // ✅ ПУБЛИЧНЫЙ API ДЛЯ БЭКТЕСТА/ТЮНЕРА (КЭШ С LIMIT)
+    // =====================================================================
+
+    /**
+     * ✅ Сигнатура, которую ищет MarketStreamBacktestCandlePort в первую очередь.
+     */
+    public List<Candle> getCachedCandles(long chatId,
+                                         StrategyType strategyType,
+                                         String exchange,
+                                         NetworkType networkType,
+                                         String symbol,
+                                         String timeframe,
+                                         int limit) {
+
+        String ex  = normExchange(exchange);
+        String sym = normSymbol(symbol);
+        String tf  = normTf(timeframe);
+
+        if (chatId <= 0 || strategyType == null || ex == null || networkType == null || sym == null || tf == null) {
+            return List.of();
+        }
+
+        Deque<Candle> deque = candleStorage.get(new CandleStoreKey(chatId, strategyType, ex, networkType, sym, tf));
+        if (deque != null && !deque.isEmpty()) {
+            return copyTail(deque, limit);
+        }
+
+        // ✅ fallback: общий streamManager (там warmup пишет свечи тоже)
+        if (streamManager != null) {
+            return streamManager.getCandles(ex, networkType, sym, tf, limit);
+        }
+
+        return List.of();
+    }
+
+    /**
+     * ✅ Backward: без env — пробуем найти “лучший” deque по chatId/type/sym/tf,
+     * иначе падаем в streamManager legacy.
+     */
+    public List<Candle> getCachedCandles(long chatId,
+                                         StrategyType strategyType,
+                                         String symbol,
+                                         String timeframe,
+                                         int limit) {
+
+        String sym = normSymbol(symbol);
+        String tf = normTf(timeframe);
+
+        if (chatId <= 0 || strategyType == null || sym == null || tf == null) return List.of();
+
+        Deque<Candle> best = null;
+        int bestSize = 0;
+
+        for (Map.Entry<CandleStoreKey, Deque<Candle>> e : candleStorage.entrySet()) {
+            CandleStoreKey k = e.getKey();
+            if (k == null) continue;
+            if (k.chatId != chatId) continue;
+            if (k.strategyType != strategyType) continue;
+            if (!sym.equals(k.symbol)) continue;
+            if (!tf.equals(k.timeframe)) continue;
+
+            Deque<Candle> d = e.getValue();
+            if (d == null) continue;
+
+            int size = d.size();
+            if (size > bestSize) {
+                bestSize = size;
+                best = d;
+            }
+        }
+
+        if (best != null && !best.isEmpty()) {
+            return copyTail(best, limit);
+        }
+
+        if (streamManager != null) {
+            return streamManager.getCandles(sym, tf, limit);
+        }
+
+        return List.of();
+    }
+
+    /**
+     * ✅ Удобный алиас (некоторые места ищут getCandles(..., limit)).
+     */
+    public List<Candle> getCandles(long chatId,
+                                   StrategyType strategyType,
+                                   String exchange,
+                                   NetworkType networkType,
+                                   String symbol,
+                                   String timeframe,
+                                   int limit) {
+        return getCachedCandles(chatId, strategyType, exchange, networkType, symbol, timeframe, limit);
+    }
+
+    // =====================================================================
+    // (старый) getCandles без limit — оставляем
+    // =====================================================================
 
     public List<Candle> getCandles(long chatId,
                                    StrategyType strategyType,
@@ -404,6 +464,14 @@ public class MarketDataStreamService {
             }
         }
 
+        // ✅ важно: если мы прогрели историю — положим также в streamManager
+        if (candles != null && !candles.isEmpty()) {
+            for (Candle c : candles) {
+                if (c == null) continue;
+                pushToStreamManager(ex, networkType, sym, tf, c);
+            }
+        }
+
         log.info("📦 [STREAM] Cache initialized: {} candles для chatId={} type={} ex={} net={} {} {}",
                 deque.size(), chatId, strategyType, ex, networkType, sym, tf);
     }
@@ -412,7 +480,6 @@ public class MarketDataStreamService {
 
         Set<SubscriptionKey> subs = activeSubscriptions.get(chatId);
         if (subs == null || subs.isEmpty()) {
-            // на всякий случай подчистим storage
             candleStorage.keySet().removeIf(k -> k.chatId() == chatId);
             return;
         }
@@ -423,13 +490,31 @@ public class MarketDataStreamService {
             } catch (Exception ignored) {}
         }
 
-        // финально удаляем пустой set
         activeSubscriptions.remove(chatId);
-
-        // ✅ удаляем ВСЕ свечи этого chatId
         candleStorage.keySet().removeIf(k -> k.chatId() == chatId);
 
         log.info("🧹 [STREAM] UNSUBSCRIBE ALL for chatId={}", chatId);
+    }
+
+    // =====================================================================
+    // internals: copy tail
+    // =====================================================================
+
+    private List<Candle> copyTail(Deque<Candle> deque, int limit) {
+        if (deque == null || deque.isEmpty()) return List.of();
+
+        int lim = Math.max(1, limit);
+
+        synchronized (deque) {
+            int size = deque.size();
+            if (size <= lim) return new ArrayList<>(deque);
+
+            ArrayList<Candle> out = new ArrayList<>(lim);
+            Iterator<Candle> it = deque.descendingIterator();
+            while (it.hasNext() && out.size() < lim) out.add(it.next());
+            Collections.reverse(out);
+            return out;
+        }
     }
 
     // =====================================================================
@@ -440,20 +525,17 @@ public class MarketDataStreamService {
         if (streamManager == null) return;
 
         try {
-            // 1) new signature: addCandle(String ex, NetworkType net, String sym, String tf, Candle c)
             Method m5 = findMethod(streamManager.getClass(), "addCandle", 5);
             if (m5 != null) {
                 m5.invoke(streamManager, exchange, network, symbol, timeframe, candle);
                 return;
             }
 
-            // 2) old signature: addCandle(String sym, String tf, Candle c)
             Method m3 = findMethod(streamManager.getClass(), "addCandle", 3);
             if (m3 != null) {
                 m3.invoke(streamManager, symbol, timeframe, candle);
             }
         } catch (Exception ignored) {
-            // не шумим: это best-effort
         }
     }
 

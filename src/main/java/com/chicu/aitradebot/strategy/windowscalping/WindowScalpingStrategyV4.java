@@ -1,6 +1,7 @@
 package com.chicu.aitradebot.strategy.windowscalping;
 
-import com.chicu.aitradebot.ai.runtime.MlAutoTuneRuntime;
+import com.chicu.aitradebot.ai.ml.MlGateway;
+import com.chicu.aitradebot.ai.ml.dto.MlPredictResponse;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
@@ -18,8 +19,8 @@ import com.chicu.aitradebot.trade.PositionStore;
 import com.chicu.aitradebot.trade.TradeExecutionService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.context.ApplicationContext;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
 
@@ -43,7 +44,6 @@ public class WindowScalpingStrategyV4 implements
     @Value("${strategy.window.settingsRefreshSeconds:10}")
     private long settingsRefreshSeconds;
 
-    // ✅ hot-update: как часто проверять version в сервисах (если методы getVersion есть)
     @Value("${strategy.window.settingsVersionCheckMs:1000}")
     private long settingsVersionCheckMs;
 
@@ -104,18 +104,27 @@ public class WindowScalpingStrategyV4 implements
     private final StrategySettingsService strategySettingsService;
     private final TradeExecutionService tradeExecutionService;
 
-    private final ApplicationContext appContext;
-    private final MlAutoTuneRuntime autoTuneRuntime;
     private final PositionStore positionStore;
+
+    /** ✅ ML gateway берём лениво (чтобы не падать при ml.enabled=false / без MlClient) */
+    private final ObjectProvider<MlGateway> mlGatewayProvider;
+
+    private MlGateway ml() {
+        return mlGatewayProvider != null ? mlGatewayProvider.getIfAvailable() : null;
+    }
+
+    /** ✅ чтобы не было циклов orchestrator->registry->strategy->orchestrator */
+    private final ObjectProvider<AiStrategyOrchestrator> orchestratorProvider;
+
+    private AiStrategyOrchestrator orch() {
+        return orchestratorProvider != null ? orchestratorProvider.getIfAvailable() : null;
+    }
 
     private final Map<Long, LocalState> states = new ConcurrentHashMap<>();
 
     // =====================================================
     // ✅ КЭШИ
     // =====================================================
-
-    private volatile Object cachedMlBean;
-    private volatile boolean mlBeanResolved;
 
     private volatile String cachedHoldReasonsRaw;
     private volatile Set<String> cachedHoldReasonsSet;
@@ -134,7 +143,6 @@ public class WindowScalpingStrategyV4 implements
         Instant lastSettingsLoadAt;
         String lastFingerprint;
 
-        // ✅ hot-update: отслеживание версии (без рестарта)
         Instant lastVersionCheckAt;
         Long lastSsVersion;
         Long lastCfgVersion;
@@ -164,11 +172,9 @@ public class WindowScalpingStrategyV4 implements
         Instant lastDiagAt;
         Instant lastAutoTuneRequestAt;
 
-        // ✅ для coarse-adjust
         int consecutiveRangeTooSmall;
         Instant lastCoarseAdjustAt;
 
-        // ✅ throttled persist ML confidence (чтобы не спамить БД)
         Instant lastMlConfidenceSaveAt;
         Double lastMlConfidenceSaved;
     }
@@ -187,7 +193,6 @@ public class WindowScalpingStrategyV4 implements
 
         String hintEx = normalizeExchangeOrNull(exchange);
 
-        // ✅ settings грузим всегда (без зависимости от exchange/network)
         StrategySettings ss = loadStrategySettingsAuto(chatId, hintEx, network);
         WindowScalpingStrategySettings cfg = windowSettingsService.getOrCreate(chatId);
 
@@ -201,7 +206,6 @@ public class WindowScalpingStrategyV4 implements
         st.exchange = normalizeExchangeOrNull(ss != null ? ss.getExchangeName() : hintEx);
         st.network = ss != null ? ss.getNetworkType() : network;
 
-        // ✅ символ: только из StrategySettings (если есть), иначе из hint
         String sym = ss != null ? normalizeSymbolOrNull(ss.getSymbol()) : null;
         if (sym == null) sym = normalizeSymbolOrNull(symbolHint);
         st.symbol = sym;
@@ -209,7 +213,6 @@ public class WindowScalpingStrategyV4 implements
         st.lastSettingsLoadAt = Instant.now();
         st.lastFingerprint = buildFingerprint(ss, cfg);
 
-        // ✅ init versions
         st.lastSsVersion = extractEntityVersion(ss);
         st.lastCfgVersion = extractEntityVersion(cfg);
         st.lastVersionCheckAt = st.lastSettingsLoadAt;
@@ -234,11 +237,9 @@ public class WindowScalpingStrategyV4 implements
         st.lastDiagAt = null;
         st.lastAutoTuneRequestAt = null;
 
-        // ✅ для coarse-adjust
         st.consecutiveRangeTooSmall = 0;
         st.lastCoarseAdjustAt = null;
 
-        // ✅ throttled persist ML confidence
         st.lastMlConfidenceSaveAt = null;
         st.lastMlConfidenceSaved = null;
 
@@ -246,40 +247,34 @@ public class WindowScalpingStrategyV4 implements
 
         ensureRuntimeContext(st, ss);
 
-        if (st.exchange != null && st.network != null && isAutoTuneAllowed(ss)) {
-            safeAutoTune(() -> autoTuneRuntime.onStrategyStarted(
-                    chatId, StrategyType.WINDOW_SCALPING, st.exchange, st.network
-            ));
-        } else {
-            if (st.exchange == null || st.network == null) {
-                log.warn("[WINDOW] 🧠 skip autoTuneRuntime.onStrategyStarted (нет exchange/network) chatId={} ex={} net={}",
-                        chatId, st.exchange, st.network);
-            } else if (log.isDebugEnabled()) {
-                log.debug("[WINDOW] 🧠 skip autoTuneRuntime.onStrategyStarted (mode={}, autoTuneEnabled={}) chatId={} ex={} net={}",
-                        modeOrManual(ss), (ss != null && ss.isAutoTuneEnabled()), chatId, st.exchange, st.network);
-            }
+        AdvancedControlMode mode = modeOrManual(ss);
+        boolean gate = (ss != null && ss.isMlGateEnabled() && mode != AdvancedControlMode.MANUAL);
+        BigDecimal thrBd = (ss != null ? ss.getGateMinProb() : null);
+
+        if (mode != AdvancedControlMode.MANUAL && gate && !mlEnabled) {
+            log.warn("[WINDOW] ⚠ ML выключен через property (strategy.window.mlEnabled=false), но mode={} и mlGateEnabled=true => gate НЕ будет применён",
+                    mode);
         }
 
-        if (ss != null) {
-            log.info("[WINDOW] ▶ START chatId={} ex={} net={} symbol={} window={} entryLow%={} minRange%={} TP%={} SL%={} ML={} failOpen={} mlMinFallback={} coarseAdjust={}",
-                    chatId,
-                    fmtEnumOrString(ss.getExchangeName()),
-                    fmtEnumOrString(ss.getNetworkType()),
-                    ss.getSymbol(),
-                    cfg != null ? cfg.getWindowSize() : null,
-                    safeToStr(tryInvoke(cfg, Double.class, BigDecimal.class, "getEntryFromLowPct", "getEntryLowPct", "getEntryLow")),
-                    safeToStr(tryInvoke(cfg, Double.class, BigDecimal.class, "getMinRangePct", "getMinRangePctForEntry")),
-                    cfg != null ? cfg.getTakeProfitPct() : null,
-                    cfg != null ? cfg.getStopLossPct() : null,
-                    mlEnabled,
-                    mlFailOpen,
-                    fmt(mlMinProba),
-                    coarseAdjustEnabled
-            );
-        } else {
-            log.warn("[WINDOW] ▶ START chatId={} ex={} net={} symbol={} (StrategySettings не найден — будет HOLD до появления настроек)",
-                    chatId, st.exchange, st.network, st.symbol);
-        }
+        log.info("[WINDOW] ▶ START chatId={} ex={} net={} symbol={} mode={} autoTune={} mlGate={} gateMinProb={} modelVer={} window={} minRange%={} TP%={} SL%={} mlEnabled={} failOpen={} mlMinFallback={} coarseAdjust={}",
+                chatId,
+                fmtEnumOrString(ss != null ? ss.getExchangeName() : st.exchange),
+                fmtEnumOrString(ss != null ? ss.getNetworkType() : st.network),
+                st.symbol,
+                mode,
+                (ss != null && ss.isAutoTuneEnabled()),
+                gate,
+                (thrBd != null ? thrBd.stripTrailingZeros().toPlainString() : "null"),
+                (ss != null ? safeNullable(ss.getMlModelVersion()) : "null"),
+                cfg != null ? cfg.getWindowSize() : null,
+                safeToStr(tryInvoke(cfg, Double.class, BigDecimal.class, "getMinRangePct", "getMinRangePctForEntry")),
+                cfg != null ? cfg.getTakeProfitPct() : null,
+                cfg != null ? cfg.getStopLossPct() : null,
+                mlEnabled,
+                mlFailOpen,
+                fmt(mlMinProba),
+                coarseAdjustEnabled
+        );
 
         if (st.symbol != null) {
             final String symFinal = st.symbol;
@@ -288,7 +283,6 @@ public class WindowScalpingStrategyV4 implements
                     Signal.hold("Стратегия запущена")));
         }
 
-        // ✅ восстановим позицию после рестарта/перезапуска
         if (st.symbol != null) {
             synchronized (st) {
                 maybeRestorePositionFromStore(chatId, st, st.symbol, Instant.now());
@@ -309,10 +303,6 @@ public class WindowScalpingStrategyV4 implements
 
         ensureRuntimeContext(st, st.ss);
         st.lastEntryAt = null;
-
-        if (st.exchange != null && st.network != null) {
-            safeAutoTune(() -> autoTuneRuntime.onStrategyStopped(chatId, StrategyType.WINDOW_SCALPING, st.exchange, st.network));
-        }
 
         final String sym = st.symbol;
 
@@ -360,7 +350,6 @@ public class WindowScalpingStrategyV4 implements
             if (ex != null) st.exchange = ex;
             if (network != null) st.network = network;
 
-            // ✅ FIX: НЕ перезаписываем st.symbol чужим символом.
             String incoming = normalizeSymbolOrNull(symbol);
             String current = normalizeSymbolOrNull(st.symbol);
             if (current == null && incoming != null) {
@@ -547,17 +536,6 @@ public class WindowScalpingStrategyV4 implements
             double lowZone = clamp01(entryLowPct / 100.0);
             double highZone = clamp01(1.0 - (entryHighPct / 100.0));
 
-            if (log.isDebugEnabled() && st.ticks % logEvery == 0) {
-                log.debug("[WINDOW] tick chatId={} sym={} price={} low={} high={} rangePct={} posPct={}",
-                        chatId,
-                        sym,
-                        fmtBd(price),
-                        fmtBd(low),
-                        fmtBd(high),
-                        fmt(rangePct),
-                        fmt(pos * 100.0));
-            }
-
             // =====================================================
             // ENTRY (SPOT LONG)
             // =====================================================
@@ -577,9 +555,10 @@ public class WindowScalpingStrategyV4 implements
                 }
 
                 // =====================================================
-                // ✅ ML gate
+                // ✅ ML gate (через MlGateway)
                 // =====================================================
                 if (isMlGateAllowed(ss)) {
+
                     double threshold = resolveMlThreshold(ss);
 
                     Map<String, Object> feats = buildMlFeatures(
@@ -591,27 +570,27 @@ public class WindowScalpingStrategyV4 implements
                     Prediction pred = tryPredict(feats);
 
                     if (!pred.ok) {
+                        String r = (pred.reason != null ? pred.reason : "predict_failed");
                         if (!mlFailOpen) {
+                            log.warn("[WINDOW] 🤖 ML FAIL-CLOSED chatId={} sym={} reason={}", chatId, sym, r);
                             pushHoldThrottled(chatId, sym, st, "predict_failed", time, holdMs);
                             return;
-                        } else if (st.ticks % logEvery == 0) {
-                            log.warn("[WINDOW] 🤖 ML недоступен (fail-open) chatId={} sym={} reason={}",
-                                    chatId, sym, pred.reason);
+                        } else {
+                            log.warn("[WINDOW] 🤖 ML FAIL-OPEN chatId={} sym={} reason={}", chatId, sym, r);
                         }
                     } else {
-                        // ✅ локально обновим (для UI/логов)
                         try { ss.setMlConfidence(BigDecimal.valueOf(pred.proba)); } catch (Exception ignored) {}
 
-                        // ✅ ВАЖНО: throttled persist в БД (иначе не увидишь обновления)
                         maybePersistMlConfidence(st, ss, pred.proba, time);
 
-                        if (st.ticks % logEvery == 0) {
-                            log.info("[WINDOW] 🤖 ML proba chatId={} sym={} model={} proba={} threshold={}",
-                                    chatId, sym, pred.modelKey, fmt(pred.proba), fmt(threshold));
-                        }
                         if (pred.proba + 1e-12 < threshold) {
+                            log.info("[WINDOW] 🤖 ML BLOCK chatId={} sym={} model={} proba={} < thr={}",
+                                    chatId, sym, pred.modelKey, fmt(pred.proba), fmt(threshold));
                             pushHoldThrottled(chatId, sym, st, "ml_below_threshold", time, holdMs);
                             return;
+                        } else if (st.ticks % logEvery == 0) {
+                            log.info("[WINDOW] 🤖 ML ALLOW chatId={} sym={} model={} proba={} >= thr={}",
+                                    chatId, sym, pred.modelKey, fmt(pred.proba), fmt(threshold));
                         }
                     }
                 }
@@ -678,6 +657,13 @@ public class WindowScalpingStrategyV4 implements
                     return;
                 }
 
+                // ✅ важный guard: exchange/network обязаны быть, иначе exit-call может упасть
+                ensureRuntimeContext(st, ss);
+                if (st.exchange == null || st.network == null) {
+                    pushHoldThrottled(chatId, sym, st, "no_settings", time, holdMs);
+                    return;
+                }
+
                 try {
                     var exRes = tradeExecutionService.executeExitIfHit(
                             chatId,
@@ -709,12 +695,10 @@ public class WindowScalpingStrategyV4 implements
                         ensureRuntimeContext(st, ss);
 
                         if (st.exchange != null && st.network != null && isAutoTuneAllowed(ss)) {
-                            safeAutoTune(() -> autoTuneRuntime.onPositionClosed(
-                                    chatId,
-                                    StrategyType.WINDOW_SCALPING,
-                                    st.exchange,
-                                    st.network
-                            ));
+                            AiStrategyOrchestrator o = orch();
+                            if (o != null) {
+                                o.onPositionClosed(chatId, StrategyType.WINDOW_SCALPING, st.exchange, st.network);
+                            }
                         }
 
                         safeLive(() -> live.clearTpSl(chatId, StrategyType.WINDOW_SCALPING, sym));
@@ -790,7 +774,6 @@ public class WindowScalpingStrategyV4 implements
             if (loaded != null) st.ss = loaded;
             if (cfg != null) st.cfg = cfg;
 
-            // ✅ обновим кеш версий после успешной загрузки
             st.lastSsVersion = extractEntityVersion(st.ss);
             st.lastCfgVersion = extractEntityVersion(st.cfg);
 
@@ -836,7 +819,6 @@ public class WindowScalpingStrategyV4 implements
         }
     }
 
-    // ✅ version-driven refresh trigger (если сервисы реализуют getVersion)
     private boolean externalSettingsChanged(Long chatId, LocalState st, Instant now) {
         long checkMs = Math.max(250, settingsVersionCheckMs);
 
@@ -893,7 +875,7 @@ public class WindowScalpingStrategyV4 implements
     }
 
     // =====================================================
-    // 🔎 Fingerprint helpers (safe across different entity versions)
+    // 🔎 Fingerprint helpers
     // =====================================================
 
     private static String fmtEnumOrString(Object v) {
@@ -970,19 +952,12 @@ public class WindowScalpingStrategyV4 implements
         String tpPct = (cfg != null) ? fmtNum(cfg.getTakeProfitPct()) : "null";
         String slPct = (cfg != null) ? fmtNum(cfg.getStopLossPct()) : "null";
 
-        String coarseAdjust = (cfg != null) ? fmtEnumOrString(tryInvoke(cfg, Boolean.class, null, "isCoarseAdjustEnabled", "getCoarseAdjustEnabled", "isCoarseAdjust")) : "null";
-        String failOpen     = (cfg != null) ? fmtEnumOrString(tryInvoke(cfg, Boolean.class, null, "isFailOpen", "getFailOpen")) : "null";
-        String mlEnabledCfg = (cfg != null) ? fmtEnumOrString(tryInvoke(cfg, Boolean.class, null, "isMlEnabled", "getMlEnabled")) : "null";
-        String mlMinConf    = (cfg != null) ? fmtNum(tryInvoke(cfg, Double.class, BigDecimal.class, "getMlMinConfidence", "getMlMinConf")) : "null";
-        String mlFallback   = (cfg != null) ? fmtNum(tryInvoke(cfg, Double.class, BigDecimal.class, "getMlMinFallback", "getMlFallback")) : "null";
-
         return String.join("|",
                 "WINDOW_SCALPING",
                 ex, net,
                 (symbol != null ? symbol : "null"),
                 tf, candles,
-                w, low, high, minRange, maxSpread, tpPct, slPct,
-                coarseAdjust, failOpen, mlEnabledCfg, mlMinConf, mlFallback
+                w, low, high, minRange, maxSpread, tpPct, slPct
         );
     }
 
@@ -1107,7 +1082,7 @@ public class WindowScalpingStrategyV4 implements
     }
 
     // =====================================================
-    // ML (reflection-safe)
+    // ML (через MlGateway)
     // =====================================================
 
     private static class Prediction {
@@ -1143,6 +1118,37 @@ public class WindowScalpingStrategyV4 implements
         return mlMinProba;
     }
 
+    private Prediction tryPredict(Map<String, Object> features) {
+
+        try {
+            MlGateway gw = ml();
+            if (gw == null) return Prediction.fail("ml_gateway_missing");
+
+            // дополнительный флажок стратегии
+            if (!mlEnabled) return Prediction.fail("ml_disabled_by_strategy");
+
+            MlPredictResponse r = gw.predict(features);
+            if (r == null) return Prediction.fail("predict_null");
+
+            if (!r.isOk()) {
+                return Prediction.fail(r.getError() != null ? r.getError() : "predict_not_ok");
+            }
+
+            Double p = r.getProba();
+            if (p == null || !Double.isFinite(p)) return Prediction.fail("no_proba");
+
+            double proba = Math.max(0.0, Math.min(1.0, p));
+            String mk = (r.getModelKey() != null && !r.getModelKey().isBlank())
+                    ? r.getModelKey()
+                    : (r.getModelVersion() != null && !r.getModelVersion().isBlank() ? r.getModelVersion() : "unknown");
+
+            return Prediction.ok(mk, proba);
+
+        } catch (Exception e) {
+            return Prediction.fail("predict_exception:" + e.getClass().getSimpleName());
+        }
+    }
+
     private Map<String, Object> buildMlFeatures(
             Long chatId,
             LocalState st,
@@ -1162,7 +1168,7 @@ public class WindowScalpingStrategyV4 implements
         Map<String, Object> f = new HashMap<>();
 
         f.put("chatId", chatId);
-        f.put("strategy", StrategyType.WINDOW_SCALPING.name());
+        f.put("strategyType", StrategyType.WINDOW_SCALPING.name());
         f.put("symbol", symbol);
         f.put("exchange", st.exchange);
         f.put("network", st.network != null ? st.network.name() : null);
@@ -1198,172 +1204,11 @@ public class WindowScalpingStrategyV4 implements
         return f;
     }
 
-    private Prediction tryPredict(Map<String, Object> features) {
-        try {
-            Object bean = findMlBean();
-            if (bean == null) return Prediction.fail("ml_bean_not_found");
-
-            Object resp = invokePredict(bean, features);
-            if (resp == null) return Prediction.fail("predict_return_null");
-
-            Boolean ok = (Boolean) readAny(resp, "ok", "isOk", "success", "isSuccess");
-            if (ok != null && !ok) {
-                Object reason = readAny(resp, "reason", "message", "error");
-                return Prediction.fail(reason != null ? String.valueOf(reason) : "predict_not_ok");
-            }
-
-            Double proba = readNumber(resp, "proba", "probability", "confidence", "score");
-            if (proba == null) return Prediction.fail("no_proba_in_response");
-
-            String modelKey = (String) readAny(resp, "modelKey", "modelId", "key", "model");
-            if (modelKey == null) modelKey = "unknown";
-
-            return Prediction.ok(modelKey, proba);
-
-        } catch (Exception e) {
-            return Prediction.fail("predict_exception:" + e.getClass().getSimpleName());
-        }
-    }
-
-    private Object findMlBean() {
-        if (mlBeanResolved) return cachedMlBean;
-
-        synchronized (this) {
-            if (mlBeanResolved) return cachedMlBean;
-
-            Object bean = null;
-
-            try {
-                if (appContext.containsBean("mlPredictionService")) bean = appContext.getBean("mlPredictionService");
-                else if (appContext.containsBean("mlService")) bean = appContext.getBean("mlService");
-            } catch (Exception ignored) {
-            }
-
-            if (bean == null) {
-                try {
-                    String[] names = appContext.getBeanDefinitionNames();
-                    for (String n : names) {
-                        Object b;
-                        try {
-                            b = appContext.getBean(n);
-                        } catch (Exception ignored) {
-                            continue;
-                        }
-                        if (hasSupportedPredictMethod(b.getClass())) {
-                            bean = b;
-                            break;
-                        }
-                    }
-                } catch (Exception ignored) {
-                }
-            }
-
-            cachedMlBean = bean;
-            mlBeanResolved = true;
-            return cachedMlBean;
-        }
-    }
-
-    private boolean hasSupportedPredictMethod(Class<?> c) {
-        for (Method m : c.getMethods()) {
-            String name = m.getName().toLowerCase(Locale.ROOT);
-            if (!name.contains("predict")) continue;
-
-            int pc = m.getParameterCount();
-            Class<?>[] pt = m.getParameterTypes();
-
-            if (pc == 1 && Map.class.isAssignableFrom(pt[0])) return true;
-            if (pc == 5 && pt[2] == String.class && Map.class.isAssignableFrom(pt[3]) && pt[4] == Instant.class) return true;
-            if (pc == 4 && pt[1] == String.class && Map.class.isAssignableFrom(pt[2]) && pt[3] == Instant.class) return true;
-        }
-        return false;
-    }
-
-    private Object invokePredict(Object bean, Map<String, Object> features) throws Exception {
-        Class<?> c = bean.getClass();
-
-        Long chatId = (Long) features.get("chatId");
-        String symbol = (String) features.get("symbol");
-        Instant ts = Instant.ofEpochMilli(((Number) features.getOrDefault("ts", System.currentTimeMillis())).longValue());
-
-        for (Method m : c.getMethods()) {
-            if (!m.getName().equals("predictWindowScalping")) continue;
-            if (m.getParameterCount() != 4) continue;
-            return m.invoke(bean, chatId, symbol, features, ts);
-        }
-
-        for (Method m : c.getMethods()) {
-            if (!m.getName().equals("predict")) continue;
-            if (m.getParameterCount() != 5) continue;
-            return m.invoke(bean, StrategyType.WINDOW_SCALPING, chatId, symbol, features, ts);
-        }
-
-        for (Method m : c.getMethods()) {
-            if (!m.getName().equals("predict")) continue;
-            if (m.getParameterCount() != 1) continue;
-            if (!Map.class.isAssignableFrom(m.getParameterTypes()[0])) continue;
-            return m.invoke(bean, features);
-        }
-
-        return null;
-    }
-
-    private Object readAny(Object obj, String... gettersOrFields) {
-        try {
-            Class<?> c = obj.getClass();
-            for (String n : gettersOrFields) {
-                Method m = findNoArgMethod(c, n);
-                if (m != null) return m.invoke(obj);
-
-                try {
-                    var f = c.getDeclaredField(n);
-                    f.setAccessible(true);
-                    return f.get(obj);
-                } catch (Exception ignored) {
-                }
-            }
-        } catch (Exception ignored) {
-        }
-        return null;
-    }
-
-    private Double readNumber(Object obj, String... gettersOrFields) {
-        Object v = readAny(obj, gettersOrFields);
-        if (v == null) return null;
-        if (v instanceof Number n) return n.doubleValue();
-        try {
-            return Double.parseDouble(String.valueOf(v));
-        } catch (Exception ignored) {
-        }
-        return null;
-    }
-
-    private Method findNoArgMethod(Class<?> c, String name) {
-        try {
-            return c.getMethod(name);
-        } catch (Exception ignored) {
-        }
-        String cap = !name.isEmpty() ? Character.toUpperCase(name.charAt(0)) + name.substring(1) : name;
-        try {
-            return c.getMethod("get" + cap);
-        } catch (Exception ignored) {
-        }
-        try {
-            return c.getMethod("is" + cap);
-        } catch (Exception ignored) {
-        }
-        return null;
-    }
-
     // =====================================================
-    // LIVE HELPERS + AUTO-TUNE on HOLD
+    // LIVE HELPERS + AUTO-TUNE on HOLD (через Orchestrator)
     // =====================================================
 
     private void safeLive(Runnable r) {
-        try { r.run(); } catch (Exception ignored) {}
-    }
-
-    private void safeAutoTune(Runnable r) {
         try { r.run(); } catch (Exception ignored) {}
     }
 
@@ -1400,7 +1245,6 @@ public class WindowScalpingStrategyV4 implements
 
     private void maybeRequestAutoTuneOnHold(Long chatId, String symbol, LocalState st, String reason, Instant now) {
         if (!autoTuneOnHold) return;
-        if (autoTuneRuntime == null) return;
         if (st == null) return;
         if (st.inPosition) return;
         if (!isAutoTuneAllowed(st.ss)) return;
@@ -1420,17 +1264,20 @@ public class WindowScalpingStrategyV4 implements
 
         st.lastAutoTuneRequestAt = now;
 
+        AiStrategyOrchestrator o = orch();
+        if (o == null) return;
+
         log.warn("[WINDOW] 🧠 AUTO-TUNE(HOLD) chatId={} sym={} reason={} cooldown={}s",
                 chatId, symbol, reason, cdSec);
 
-        safeAutoTune(() -> autoTuneRuntime.triggerTuneDebounced(
+        o.triggerTuneDebounced(
                 chatId,
                 StrategyType.WINDOW_SCALPING,
                 st.exchange,
                 st.network,
                 "hold:" + reason,
                 Duration.ofSeconds(cdSec)
-        ));
+        );
     }
 
     private void pushHoldThrottled(Long chatId, String symbol, LocalState st, String reason, Instant now, long holdMs) {
@@ -1617,11 +1464,11 @@ public class WindowScalpingStrategyV4 implements
         LocalState st = states.get(e.chatId());
         if (st == null) return;
         synchronized (st) {
-            st.lastSettingsLoadAt = Instant.EPOCH;   // форс refresh
-            st.lastFingerprint = null;              // changed=true
-            st.lastSsVersion = null;                // сброс версии
-            st.lastCfgVersion = null;               // сброс версии
-            st.lastVersionCheckAt = Instant.EPOCH;  // форс version check
+            st.lastSettingsLoadAt = Instant.EPOCH;
+            st.lastFingerprint = null;
+            st.lastSsVersion = null;
+            st.lastCfgVersion = null;
+            st.lastVersionCheckAt = Instant.EPOCH;
         }
     }
 
@@ -1639,12 +1486,10 @@ public class WindowScalpingStrategyV4 implements
         }
     }
 
-    // ✅ throttled persist ML confidence (чтобы не спамить БД)
     private void maybePersistMlConfidence(LocalState st, StrategySettings ss, double proba, Instant now) {
         if (st == null || ss == null || now == null) return;
         if (isManualMode(ss)) return;
 
-        // сохраняем не чаще чем раз в 20 секунд
         long minIntervalMs = 20_000L;
 
         if (st.lastMlConfidenceSaveAt != null) {
@@ -1652,15 +1497,12 @@ public class WindowScalpingStrategyV4 implements
             if (passed < minIntervalMs) return;
         }
 
-        // если почти то же самое — не сохраняем
         if (st.lastMlConfidenceSaved != null && Math.abs(st.lastMlConfidenceSaved - proba) < 1e-6) {
             return;
         }
 
         try {
             ss.setMlConfidence(BigDecimal.valueOf(proba));
-
-            // ✅ важно: сохранить и подменить ссылку, чтобы версия/состояние были актуальны
             StrategySettings saved = strategySettingsService.save(ss);
             if (saved != null) st.ss = saved;
 

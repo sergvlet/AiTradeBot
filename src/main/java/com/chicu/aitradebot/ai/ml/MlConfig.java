@@ -1,41 +1,31 @@
 package com.chicu.aitradebot.ai.ml;
 
-
 import com.fasterxml.jackson.databind.ObjectMapper;
-import okhttp3.Interceptor;
 import okhttp3.OkHttpClient;
-import okhttp3.Request;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 @Configuration
+@EnableConfigurationProperties({
+        MlProperties.class,
+        MlTrainProperties.class
+})
 public class MlConfig {
 
     @Bean
     @ConditionalOnProperty(prefix = "ml", name = "enabled", havingValue = "true")
     public MlClient mlClient(MlProperties props, ObjectMapper om) {
 
-        OkHttpClient http = MlHttpClient.defaultHttp(
-                props.getConnectTimeoutMs(),
-                props.getReadTimeoutMs(),
-                props.getReadTimeoutMs() // writeTimeout = readTimeout
-        );
+        long connect = Math.max(1, props.getConnectTimeoutMs());
+        long read = Math.max(1, props.getReadTimeoutMs());
+        long write = props.getWriteTimeoutMs() > 0 ? props.getWriteTimeoutMs() : read;
+
+        OkHttpClient http = MlHttpClient.defaultHttp(connect, read, write);
 
         String apiKey = props.getApiKey();
-
-        // Можно оставить interceptor (не мешает), но тогда главное — не задублировать заголовок.
-        // Если MlHttpClient сам добавляет X-API-KEY — interceptor не нужен.
-        if (apiKey != null && !apiKey.isBlank()) {
-            String key = apiKey.trim();
-            Interceptor auth = chain -> {
-                Request req = chain.request().newBuilder()
-                        .header("X-API-KEY", key)
-                        .build();
-                return chain.proceed(req);
-            };
-            http = http.newBuilder().addInterceptor(auth).build();
-        }
+        if (apiKey != null && apiKey.isBlank()) apiKey = null;
 
         return new MlHttpClient(http, om, trimSlash(props.getBaseUrl()), apiKey);
     }

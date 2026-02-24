@@ -1,5 +1,6 @@
 package com.chicu.aitradebot.ai.ml.features;
 
+import com.chicu.aitradebot.common.enums.StrategyType;
 import org.springframework.stereotype.Component;
 
 import java.util.LinkedHashMap;
@@ -8,6 +9,36 @@ import java.util.Map;
 
 @Component
 public class DefaultMlFeatureBuilder implements MlFeatureBuilder {
+
+    /**
+     * ✅ Стабильный FeatureSpec для дефолтного билдера (без extra).
+     * Extra остаётся в build(), но в dataset будет сохранено только то,
+     * что перечислено в spec (если collector его использует).
+     */
+    private static final List<String> SPEC_V1 = List.of(
+            // meta
+            "chat_id", "strategy", "symbol", "timeframe", "action",
+            // candle
+            "ts", "open", "high", "low", "close", "volume",
+            // candle-derived
+            "range_pct", "body_pct", "wick_up_pct", "wick_dn_pct",
+            // returns
+            "ret_1", "ret_3", "ret_5", "ret_10",
+            // volume
+            "vol_avg_20", "vol_ratio_20",
+            // indicators
+            "rsi_14", "ema_12", "ema_26", "ema_diff_12_26", "atr_14_pct"
+    );
+
+    @Override
+    public List<String> featureSpec(MlFeatureContext ctx) {
+        return SPEC_V1;
+    }
+
+    @Override
+    public List<String> featureSpec(StrategyType type) {
+        return SPEC_V1;
+    }
 
     @Override
     public Map<String, Object> build(MlFeatureContext ctx) {

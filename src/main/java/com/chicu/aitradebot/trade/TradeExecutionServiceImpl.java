@@ -20,7 +20,6 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 
-import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -125,12 +124,15 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         // ML Gate (простая версия: ss.mlConfidence vs ss.gateMinProb)
         // =====================================================
         if (ss.isMlGateEnabled()) {
-            BigDecimal minProb = ss.getGateMinProb();
-            if (minProb != null && minProb.signum() > 0) {
-                BigDecimal conf = (ss.getMlConfidence() != null ? ss.getMlConfidence() : BigDecimal.ZERO);
-                if (conf.compareTo(minProb) < 0) {
-                    safeLive(() -> live.pushSignal(chatId, strategyType, sym, null, Signal.hold("ml_gate_reject")));
-                    return EntryResult.fail("ml_gate_reject");
+            AdvancedControlMode mode = ss.getAdvancedControlMode() != null ? ss.getAdvancedControlMode() : AdvancedControlMode.MANUAL;
+            if (mode != AdvancedControlMode.MANUAL) {
+                BigDecimal minProb = ss.getGateMinProb();
+                if (minProb != null && minProb.signum() > 0) {
+                    BigDecimal conf = (ss.getMlConfidence() != null ? ss.getMlConfidence() : BigDecimal.ZERO);
+                    if (conf.compareTo(minProb) < 0) {
+                        safeLive(() -> live.pushSignal(chatId, strategyType, sym, null, Signal.hold("ml_gate_reject")));
+                        return EntryResult.fail("ml_gate_reject");
+                    }
                 }
             }
         }
@@ -277,9 +279,6 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
     // EXIT
     // =====================================================
 
-    /**
-     * ✅ ЭТО ИМЕННО СИГНАТУРА ИНТЕРФЕЙСА (из ошибки компиляции).
-     */
     @Override
     public ExitResult executeExitIfHit(Long chatId,
                                        StrategyType strategyType,
@@ -313,9 +312,6 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         return doExitIfHitInternal(chatId, strategyType, symbol, price, time, isLong, entryQty, tp, sl, ss, ex, net);
     }
 
-    /**
-     * Удобный overload (не @Override), если у тебя где-то ещё вызывается короткая форма.
-     */
     public ExitResult executeExitIfHit(Long chatId,
                                        StrategyType strategyType,
                                        String symbol,
@@ -332,17 +328,17 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
     }
 
     private ExitResult doExitIfHitInternal(Long chatId,
-                                          StrategyType strategyType,
-                                          String symbol,
-                                          BigDecimal price,
-                                          Instant time,
-                                          boolean isLong,
-                                          BigDecimal entryQty,
-                                          BigDecimal tp,
-                                          BigDecimal sl,
-                                          StrategySettings ss,
-                                          String exchange,
-                                          NetworkType network) {
+                                           StrategyType strategyType,
+                                           String symbol,
+                                           BigDecimal price,
+                                           Instant time,
+                                           boolean isLong,
+                                           BigDecimal entryQty,
+                                           BigDecimal tp,
+                                           BigDecimal sl,
+                                           StrategySettings ss,
+                                           String exchange,
+                                           NetworkType network) {
 
         String sym = normalizeSymbol(symbol);
         if (sym == null) return ExitResult.fail("symbol пустой");
@@ -376,7 +372,6 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             return ExitResult.fail("cooldown");
         }
 
-        // tp/sl/qty/entryPrice из PositionStore (приоритет)
         BigDecimal effQty = entryQty;
         BigDecimal effTp  = tp;
         BigDecimal effSl  = sl;
@@ -421,21 +416,28 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                 net
         );
 
-        // FREE баланс базового актива
+        // FREE баланс базового актива (если смогли определить) — иначе НЕ блокируем выход
         BigDecimal freeBase = resolveFreeBaseQty(chatId, strategyType, ss, ex, net, sym);
 
-        if (QtyMath.isPositive(freeBase)) {
-            if (freeBase.compareTo(effQty) < 0) {
-                log.warn("[TRADE] EXIT ADJUST by FREE balance {} chatId={} ex={} net={} baseFree={} plannedQty={} tpHit={} slHit={}",
-                        sym, chatId, ex, net, QtyMath.strip(freeBase), QtyMath.strip(effQty), tpHit, slHit);
-                effQty = freeBase;
+        if (freeBase != null) {
+            if (QtyMath.isPositive(freeBase)) {
+                if (freeBase.compareTo(effQty) < 0) {
+                    log.warn("[TRADE] EXIT ADJUST by FREE balance {} chatId={} ex={} net={} baseFree={} plannedQty={} tpHit={} slHit={}",
+                            sym, chatId, ex, net, QtyMath.strip(freeBase), QtyMath.strip(effQty), tpHit, slHit);
+                    effQty = freeBase;
+                }
+            } else {
+                failCooldown.recordFailure(exitKey, "balance", "base_free=0 for " + sym);
+                log.error("[TRADE] EXIT BLOCKED (NO BASE FREE) {} chatId={} ex={} net={} qty={} tpHit={} slHit={}",
+                        sym, chatId, ex, net, QtyMath.strip(effQty), tpHit, slHit);
+                try { positionStore.clearPosition(chatId, strategyType, ex, net, sym); } catch (Exception ignored) {}
+                return ExitResult.fail("balance");
             }
         } else {
-            failCooldown.recordFailure(exitKey, "balance", "base_free=0 for " + sym);
-            log.error("[TRADE] EXIT BLOCKED (NO BASE FREE) {} chatId={} ex={} net={} qty={} tpHit={} slHit={}",
-                    sym, chatId, ex, net, QtyMath.strip(effQty), tpHit, slHit);
-            try { positionStore.clearPosition(chatId, strategyType, ex, net, sym); } catch (Exception ignored) {}
-            return ExitResult.fail("balance");
+            // нет информации о free-base (не смогли определить baseAsset/нет snapshot) -> пробуем SELL как есть
+            if (log.isDebugEnabled()) {
+                log.debug("[TRADE] EXIT baseFree unknown -> proceed without balance adjust chatId={} ex={} net={} sym={}", chatId, ex, net, sym);
+            }
         }
 
         // stepSize-normalize перед SELL
@@ -487,26 +489,27 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             try { positionStore.clearPosition(chatId, strategyType, ex, net, sym); } catch (Exception ignored) {}
             failCooldown.clear(exitKey);
 
-            // ✅ EVENT (без compile-зависимости): публикуем TradeClosedEvent, если класс реально есть
-            publishTradeClosedEventSafely(
+            // ✅ ВАЖНО: публикуем РЕАЛЬНЫЙ com.chicu.aitradebot.trade.TradeClosedEvent (а не несуществующий ai.ml.dataset.*)
+            publishTradeClosedEvent(
                     chatId,
                     strategyType,
                     sym,
                     (ss != null ? ss.getTimeframe() : null),
-                    pnlPct,
+                    ex,
+                    net,
+                    (time != null ? time : Instant.now()),
                     tpHit ? "TP" : "SL",
-                    (time != null ? time : Instant.now())
+                    pnlPct,
+                    executedExitPrice
             );
 
-            // ✅ AUTO-RETRAIN/TRIGGER:
-            // - триггерим тюнинг ТОЛЬКО при SL или при отрицательном PnL (даже если причина TP, но по факту минус)
+            // ✅ AUTO-TUNE: только на SL/убытке
             boolean isLoss = (pnlPct != null && pnlPct.signum() < 0);
 
             if ((slHit || isLoss) && allowAutoTune(ss)) {
                 String reason = slHit ? "after-close:sl" : "after-close:loss";
                 if (pnlPct != null) reason += ":pnlPct=" + pnlPct.stripTrailingZeros().toPlainString();
 
-                // на лоссе/SL — быстро, но с мини-дебаунсом
                 mlAutoTuneRuntime.triggerTuneDebounced(
                         chatId,
                         strategyType,
@@ -532,44 +535,33 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
     }
 
     // =====================================================
-    // TradeClosedEvent via reflection (чтобы не падать компиляцией)
+    // TradeClosedEvent (реальный)
     // =====================================================
 
-    private void publishTradeClosedEventSafely(Long chatId,
-                                               StrategyType strategyType,
-                                               String symbol,
-                                               String timeframe,
-                                               BigDecimal pnlPct,
-                                               String exitReason,
-                                               Instant closedAt) {
+    private void publishTradeClosedEvent(Long chatId,
+                                         StrategyType strategyType,
+                                         String symbol,
+                                         String timeframe,
+                                         String exchange,
+                                         NetworkType network,
+                                         Instant closedAt,
+                                         String exitReason,
+                                         BigDecimal pnlPct,
+                                         BigDecimal exitPrice) {
         if (eventPublisher == null) return;
-
         try {
-            Class<?> cls = Class.forName("com.chicu.aitradebot.ai.ml.dataset.TradeClosedEvent");
-            Constructor<?> ctor = cls.getDeclaredConstructor(
-                    Long.class,
-                    StrategyType.class,
-                    String.class,
-                    String.class,
-                    BigDecimal.class,
-                    String.class,
-                    Instant.class
-            );
-
-            Object ev = ctor.newInstance(
+            eventPublisher.publishEvent(new TradeClosedEvent(
                     chatId,
                     strategyType,
                     symbol,
                     timeframe,
-                    pnlPct,
+                    exchange,
+                    network,
+                    closedAt,
                     exitReason,
-                    closedAt
-            );
-
-            eventPublisher.publishEvent(ev);
-
-        } catch (ClassNotFoundException e) {
-            log.debug("[TRADE] TradeClosedEvent not found on classpath -> skip");
+                    pnlPct,
+                    exitPrice
+            ));
         } catch (Exception e) {
             log.warn("[TRADE] TradeClosedEvent publish failed chatId={} type={} sym={} err={}",
                     chatId, strategyType, symbol, e.toString());
@@ -652,9 +644,9 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
     }
 
     /**
-     * ✅ gate для тюнинга/переобучения:
+     * gate для тюнинга/переобучения:
      *  - MANUAL -> false
-     *  - autoTuneEnabled=false -> false (через reflection, чтобы не зависеть от точного геттера)
+     *  - autoTuneEnabled=false -> false (через reflection)
      *  - phase BACKTEST/COLLECT -> false
      */
     private boolean allowAutoTune(StrategySettings s) {
@@ -668,13 +660,10 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             boolean phaseBlocks = PHASE_BACKTEST.equals(phase) || PHASE_COLLECT.equals(phase);
             if (phaseBlocks) return false;
 
-            boolean enabled = readBool(s,
+            return readBool(s,
                     "autoTuneEnabled", "isAutoTuneEnabled", "getAutoTuneEnabled",
                     "mlAutoTuneEnabled", "isMlAutoTuneEnabled", "getMlAutoTuneEnabled"
             );
-
-            return enabled;
-
         } catch (Exception ignored) {
             return false;
         }
@@ -751,29 +740,25 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             AccountBalanceSnapshot snap = accountBalanceService.getSnapshot(chatId, strategyType, ex, net);
             if (snap == null || !snap.isConnectionOk()) return null;
 
-            Object balObj = reflectObj(snap, "getBalance",
-                    new Class<?>[]{String.class},
-                    new Object[]{baseAsset});
+            Object balObj = reflectObj(snap, "getBalance", new Class<?>[]{String.class}, new Object[]{baseAsset});
             BigDecimal free = extractFreeFromBalanceObj(balObj);
-            if (QtyMath.isPositive(free)) return free;
+            if (QtyMath.isPositive(free) || free != null) return free;
 
-            balObj = reflectObj(snap, "getAssetBalance",
-                    new Class<?>[]{String.class},
-                    new Object[]{baseAsset});
+            balObj = reflectObj(snap, "getAssetBalance", new Class<?>[]{String.class}, new Object[]{baseAsset});
             free = extractFreeFromBalanceObj(balObj);
-            if (QtyMath.isPositive(free)) return free;
+            if (QtyMath.isPositive(free) || free != null) return free;
 
             Object mapObj = reflectObj(snap, "getBalances", new Class<?>[]{}, new Object[]{});
             free = extractFreeFromBalancesMap(mapObj, baseAsset);
-            if (QtyMath.isPositive(free)) return free;
+            if (QtyMath.isPositive(free) || free != null) return free;
 
             mapObj = reflectObj(snap, "getFullBalance", new Class<?>[]{}, new Object[]{});
             free = extractFreeFromBalancesMap(mapObj, baseAsset);
-            if (QtyMath.isPositive(free)) return free;
+            return free;
 
-        } catch (Exception ignored) {}
-
-        return null;
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     private String guessBaseAsset(String symbol) {
@@ -802,15 +787,13 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         if (balObj == null) return null;
 
         BigDecimal free = reflectBd(balObj, "getFree", new Class<?>[]{}, new Object[]{});
-        if (QtyMath.isPositive(free)) return free;
+        if (QtyMath.isPositive(free) || free != null) return free;
 
         free = reflectBd(balObj, "getAvailable", new Class<?>[]{}, new Object[]{});
-        if (QtyMath.isPositive(free)) return free;
+        if (QtyMath.isPositive(free) || free != null) return free;
 
         free = reflectBd(balObj, "getFreeQty", new Class<?>[]{}, new Object[]{});
-        if (QtyMath.isPositive(free)) return free;
-
-        return null;
+        return free;
     }
 
     private BigDecimal extractFreeFromBalancesMap(Object mapObj, String asset) {
@@ -981,7 +964,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
     }
 
     // =====================================================
-    // reflection bool helper (чтобы не зависеть от точного геттера)
+    // reflection bool helper
     // =====================================================
 
     private static boolean readBool(Object obj, String... names) {

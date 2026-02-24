@@ -7,6 +7,7 @@ import jakarta.persistence.*;
 import lombok.*;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.LocalDateTime;
 import java.util.Locale;
 
@@ -28,6 +29,15 @@ import java.util.Locale;
 @AllArgsConstructor
 @Builder
 public class StrategySettings {
+
+    private static final BigDecimal PROB_MIN = BigDecimal.ZERO.setScale(6, RoundingMode.HALF_UP);
+    private static final BigDecimal PROB_MAX = BigDecimal.ONE.setScale(6, RoundingMode.HALF_UP);
+
+    /**
+     * Технический дефолт для ML-gate, если включили gate, но threshold ещё не задан.
+     * Бизнес-дефолт всё равно должен выставлять сервис, но entity не даст сохранить "пустой gate".
+     */
+    private static final BigDecimal DEFAULT_GATE_MIN_PROB = new BigDecimal("0.550000");
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -71,6 +81,12 @@ public class StrategySettings {
     @Column(name = "capital_value", precision = 18, scale = 6)
     private BigDecimal capitalValue;
 
+    /**
+     * Единый режим управления:
+     * MANUAL  — без ML и без автотюна
+     * HYBRID  — ML-gate обязателен, автотюн запрещён
+     * AI      — автотюн обязателен, ML-gate по желанию (но если включён — threshold обязателен)
+     */
     @Enumerated(EnumType.STRING)
     @Column(name = "advanced_control_mode", nullable = false, length = 16)
     @Builder.Default
@@ -126,10 +142,48 @@ public class StrategySettings {
     @Version
     private Integer version;
 
+    // ===========================
+    // Convenience (для стратегии)
+    // ===========================
+
+    public boolean isManualMode() {
+        return getControlModeSafe() == AdvancedControlMode.MANUAL;
+    }
+
+    public boolean isHybridMode() {
+        return getControlModeSafe() == AdvancedControlMode.HYBRID;
+    }
+
+    public boolean isAiMode() {
+        return getControlModeSafe() == AdvancedControlMode.AI;
+    }
+
+    /**
+     * Реально ли включён ML-gate в принятии решений (не просто флаг в БД).
+     */
+    public boolean isMlGateEffective() {
+        AdvancedControlMode m = getControlModeSafe();
+        return m != AdvancedControlMode.MANUAL && mlGateEnabled;
+    }
+
+    /**
+     * Гарантированно валидный threshold для ML-gate, если gate активен.
+     * Если gate не активен — вернёт null.
+     */
+    public BigDecimal getEffectiveGateMinProbOrNull() {
+        if (!isMlGateEffective()) return null;
+        BigDecimal v = (gateMinProb != null) ? gateMinProb : DEFAULT_GATE_MIN_PROB;
+        return clampProb(v);
+    }
+
     public BigDecimal getEffectiveCapitalValueOrNull() {
         CapitalMode m = (capitalMode != null ? capitalMode : CapitalMode.ALL);
         return (m == CapitalMode.ALL) ? null : capitalValue;
     }
+
+    // ===========================
+    // JPA hooks
+    // ===========================
 
     @PrePersist
     protected void onCreate() {
@@ -156,21 +210,38 @@ public class StrategySettings {
         enforceControlModeHardRules();
     }
 
+    /**
+     * Жёсткие правила, чтобы режим управления не превращался в "всё включено всегда".
+     */
     private void enforceControlModeHardRules() {
-        AdvancedControlMode m = (advancedControlMode != null) ? advancedControlMode : AdvancedControlMode.MANUAL;
+        AdvancedControlMode m = getControlModeSafe();
 
-        // MANUAL = жёстко выключаем “умные” флаги
+        // MANUAL = жёстко выключаем “умные” флаги и пороги
         if (m == AdvancedControlMode.MANUAL) {
             this.autoTuneEnabled = false;
             this.mlGateEnabled = false;
             this.gateMinProb = null;
-            // runPhase оставляем как есть (контроллер/сервис решают), но нормализуем
+            return;
         }
 
-        // AI = автотюн обязателен (иначе это не AI)
+        // HYBRID = ML-gate обязателен, автотюн запрещён
+        if (m == AdvancedControlMode.HYBRID) {
+            this.autoTuneEnabled = false;
+            this.mlGateEnabled = true;
+            this.gateMinProb = clampProb(this.gateMinProb != null ? this.gateMinProb : DEFAULT_GATE_MIN_PROB);
+            return;
+        }
+
+        // AI = автотюн обязателен
         if (m == AdvancedControlMode.AI) {
             this.autoTuneEnabled = true;
-            // mlGateEnabled оставляем как настройку пользователя (можно включить/выключить)
+
+            // threshold нужен только если gate включён
+            if (this.mlGateEnabled) {
+                this.gateMinProb = clampProb(this.gateMinProb != null ? this.gateMinProb : DEFAULT_GATE_MIN_PROB);
+            } else {
+                this.gateMinProb = null;
+            }
         }
     }
 
@@ -182,9 +253,9 @@ public class StrategySettings {
         this.accountAsset = normalizeUpperNullable(this.accountAsset);
         this.runPhase     = normalizeUpperNullable(this.runPhase);
 
-        this.mlModelKey      = normalizeTrimNullable(this.mlModelKey);
-        this.mlSchemaHash    = normalizeTrimNullable(this.mlSchemaHash);
-        this.mlModelVersion  = normalizeTrimNullable(this.mlModelVersion);
+        this.mlModelKey     = normalizeTrimNullable(this.mlModelKey);
+        this.mlSchemaHash   = normalizeTrimNullable(this.mlSchemaHash);
+        this.mlModelVersion = normalizeTrimNullable(this.mlModelVersion);
 
         if (this.cachedCandlesLimit != null && this.cachedCandlesLimit < 50) {
             this.cachedCandlesLimit = 50;
@@ -198,6 +269,14 @@ public class StrategySettings {
 
         if (this.mlConfidence == null) this.mlConfidence = BigDecimal.ZERO;
         if (this.totalProfitPct == null) this.totalProfitPct = BigDecimal.ZERO;
+
+        // нормализуем scale для чисел, чтобы не плодить разные представления в БД/логах
+        this.mlConfidence = safeScale6(this.mlConfidence);
+        this.totalProfitPct = safeScale6(this.totalProfitPct);
+
+        if (this.gateMinProb != null) {
+            this.gateMinProb = clampProb(this.gateMinProb);
+        }
     }
 
     private void validateRequiredForDb() {
@@ -229,6 +308,23 @@ public class StrategySettings {
         if (m == CapitalMode.PCT && this.capitalValue.compareTo(BigDecimal.valueOf(100)) > 0) {
             this.capitalValue = BigDecimal.valueOf(100);
         }
+    }
+
+    private AdvancedControlMode getControlModeSafe() {
+        return (advancedControlMode != null) ? advancedControlMode : AdvancedControlMode.MANUAL;
+    }
+
+    private static BigDecimal clampProb(BigDecimal v) {
+        if (v == null) return null;
+        BigDecimal x = v.setScale(6, RoundingMode.HALF_UP);
+        if (x.compareTo(PROB_MIN) < 0) return PROB_MIN;
+        if (x.compareTo(PROB_MAX) > 0) return PROB_MAX;
+        return x;
+    }
+
+    private static BigDecimal safeScale6(BigDecimal v) {
+        if (v == null) return null;
+        return v.setScale(6, RoundingMode.HALF_UP);
     }
 
     private static String normalizeTrimNullable(String s) {

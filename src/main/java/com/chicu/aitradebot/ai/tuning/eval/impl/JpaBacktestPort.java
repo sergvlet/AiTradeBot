@@ -49,10 +49,8 @@ public class JpaBacktestPort implements BacktestPort {
             if (startAt == null || endAt == null) return BacktestMetrics.fail("startAt/endAt is null");
             if (!endAt.isAfter(startAt)) return BacktestMetrics.fail("endAt must be after startAt");
 
-            // ✅ выбираем настройки: active first + freshest + match by override(sym/tf) if provided
             StrategySettings settings = pickBestSettings(chatId, type, symbolOverride, timeframeOverride, candidateParams);
 
-            // ✅ symbol/timeframe: override > settings
             String symbol = (symbolOverride != null && !symbolOverride.isBlank())
                     ? symbolOverride.trim()
                     : settings.getSymbol();
@@ -64,7 +62,6 @@ public class JpaBacktestPort implements BacktestPort {
             if (symbol == null || symbol.isBlank()) return BacktestMetrics.fail("symbol is null/blank");
             if (timeframe == null || timeframe.isBlank()) return BacktestMetrics.fail("timeframe is null/blank");
 
-            // ✅ env: строго из settings (для текущего контекста)
             String ex = normalizeExchangeOrNull(settings.getExchangeName());
             NetworkType net = settings.getNetworkType();
 
@@ -103,6 +100,86 @@ public class JpaBacktestPort implements BacktestPort {
         }
     }
 
+    /**
+     * ✅ Env-aware override: если тюнер/раннер передал exchange+network — используем их.
+     * Это критично, чтобы тестировать именно то окружение, где стратегия реально торгует.
+     */
+    @Override
+    public BacktestMetrics backtest(Long chatId,
+                                    StrategyType type,
+                                    String exchange,
+                                    NetworkType network,
+                                    String symbolOverride,
+                                    String timeframeOverride,
+                                    Map<String, Object> candidateParams,
+                                    Instant startAt,
+                                    Instant endAt) {
+
+        // если env не задан — используем базовый метод
+        if ((exchange == null || exchange.isBlank()) && network == null) {
+            return backtest(chatId, type, symbolOverride, timeframeOverride, candidateParams, startAt, endAt);
+        }
+
+        try {
+            if (chatId == null || chatId <= 0) return BacktestMetrics.fail("chatId is null/bad");
+            if (type == null) return BacktestMetrics.fail("strategyType is null");
+
+            if (startAt == null || endAt == null) return BacktestMetrics.fail("startAt/endAt is null");
+            if (!endAt.isAfter(startAt)) return BacktestMetrics.fail("endAt must be after startAt");
+
+            StrategySettings settings = pickBestSettings(chatId, type, symbolOverride, timeframeOverride, candidateParams);
+
+            String symbol = (symbolOverride != null && !symbolOverride.isBlank())
+                    ? symbolOverride.trim()
+                    : settings.getSymbol();
+
+            String timeframe = (timeframeOverride != null && !timeframeOverride.isBlank())
+                    ? timeframeOverride.trim()
+                    : settings.getTimeframe();
+
+            if (symbol == null || symbol.isBlank()) return BacktestMetrics.fail("symbol is null/blank");
+            if (timeframe == null || timeframe.isBlank()) return BacktestMetrics.fail("timeframe is null/blank");
+
+            String ex = normalizeExchangeOrNull(exchange);
+            if (ex == null) ex = normalizeExchangeOrNull(settings.getExchangeName());
+
+            NetworkType net = (network != null ? network : settings.getNetworkType());
+
+            if (ex == null) return BacktestMetrics.fail("exchange is null/blank");
+            if (net == null) return BacktestMetrics.fail("network is null");
+
+            int limit = resolveLimit(settings, candidateParams);
+
+            List<CandleBar> candles = candlePort.load(
+                    chatId,
+                    type,
+                    ex,
+                    net,
+                    symbol.trim(),
+                    timeframe.trim(),
+                    startAt,
+                    endAt,
+                    limit
+            );
+
+            if (candles == null || candles.size() < 50) {
+                return BacktestMetrics.fail("not enough candles: " + (candles == null ? 0 : candles.size()));
+            }
+
+            Map<String, Object> p = (candidateParams != null) ? candidateParams : Map.of();
+
+            return switch (type) {
+                case SCALPING -> runScalping(chatId, symbol, timeframe, p, startAt, endAt, candles);
+                case WINDOW_SCALPING -> runWindowScalping(chatId, symbol, timeframe, p, startAt, endAt, candles);
+                default -> BacktestMetrics.fail("Unsupported strategy for backtest: " + type);
+            };
+
+        } catch (Exception e) {
+            log.warn("Backtest(env) failed: {}", e.getMessage());
+            return BacktestMetrics.fail(e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+    }
+
     // =====================================================
     // StrategySettings pick: active first + freshest
     // + prefer match by symbol/timeframe overrides (и при желании по env из candidateParams)
@@ -126,11 +203,10 @@ public class JpaBacktestPort implements BacktestPort {
         String symHint = normSymbolOrNull(symbolOverride);
         String tfHint = normTfOrNull(timeframeOverride);
 
-        // (опционально) если кто-то положит в params exchange/network — тоже учтём при выборе
         String exHint = normalizeExchangeOrNull(firstString(candidateParams, "exchange", "exchangeName"));
         NetworkType netHint = firstNetwork(candidateParams, "network", "networkType");
 
-        Function<StrategySettings, Boolean> isInactive = s -> !Boolean.TRUE.equals(s.isActive());
+        Function<StrategySettings, Boolean> isInactive = s -> !s.isActive(); // ✅ boolean
 
         Comparator<StrategySettings> byFreshDesc =
                 Comparator.comparing(
@@ -144,7 +220,7 @@ public class JpaBacktestPort implements BacktestPort {
                         .reversed();
 
         Comparator<StrategySettings> pickBest =
-                Comparator.comparing(isInactive) // active(true) раньше inactive(false)
+                Comparator.comparing(isInactive) // active(false) раньше inactive(true)
                         .thenComparingInt(s -> matchPenalty(s, symHint, tfHint, exHint, netHint))
                         .thenComparing(byFreshDesc);
 
@@ -359,9 +435,10 @@ public class JpaBacktestPort implements BacktestPort {
 
         for (int i = window; i < candles.size(); i++) {
             CandleBar cur = candles.get(i);
-            BigDecimal close = nz(cur.close());
             Instant ts = cur.openTime();
             if (ts == null) continue;
+
+            BigDecimal close = nz(cur.close());
 
             if (!inPos) {
                 if (ts.getEpochSecond() < nextEntryAllowedSec) continue;
@@ -467,7 +544,7 @@ public class JpaBacktestPort implements BacktestPort {
     }
 
     // =====================================================
-    // WINDOW_SCALPING
+    // WINDOW_SCALPING (FIX NO_TRADES)
     // =====================================================
 
     private BacktestMetrics runWindowScalping(Long chatId,
@@ -481,8 +558,10 @@ public class JpaBacktestPort implements BacktestPort {
         int window = intParam(p, "windowSize", 30, 5, 2000);
 
         BigDecimal entryLowPct  = bdParam(p, "entryFromLowPct",  new BigDecimal("20"), "0", "100");
-        BigDecimal entryHighPct = bdParam(p, "entryFromHighPct", new BigDecimal("20"), "0", "100"); // ✅ теперь реально участвует
+        BigDecimal entryHighPct = bdParam(p, "entryFromHighPct", new BigDecimal("20"), "0", "100");
         BigDecimal minRangePct  = bdParam(p, "minRangePct",      new BigDecimal("0.25"), "0.01", "50");
+
+        // ✅ ВАЖНО: maxSpreadPct = спред СВЕЧИ (high-low), а не диапазон окна
         BigDecimal maxSpreadPct = bdParam(p, "maxSpreadPct",     new BigDecimal("0.08"), "0.0", "50");
 
         BigDecimal tpPct  = bdParam(p, "takeProfitPct", new BigDecimal("0.40"), "0.01", "50");
@@ -512,6 +591,9 @@ public class JpaBacktestPort implements BacktestPort {
                     .build();
         }
 
+        // ✅ диагностика причин NO_TRADES
+        Map<String, Integer> skips = new HashMap<>();
+
         BigDecimal equity = BigDecimal.ONE;
         BigDecimal peak = BigDecimal.ONE;
         BigDecimal maxDd = BigDecimal.ZERO;
@@ -530,10 +612,25 @@ public class JpaBacktestPort implements BacktestPort {
         for (int i = window; i < candles.size(); i++) {
             CandleBar cur = candles.get(i);
             Instant ts = cur.openTime();
-            if (ts == null) continue;
+            if (ts == null) {
+                skips.merge("ts_null", 1, Integer::sum);
+                continue;
+            }
 
             BigDecimal close = nz(cur.close());
+            if (close.signum() <= 0) {
+                skips.merge("close_invalid", 1, Integer::sum);
+                continue;
+            }
 
+            BigDecimal candleHigh = nz(cur.high());
+            BigDecimal candleLow  = nz(cur.low());
+            if (candleHigh.signum() <= 0 || candleLow.signum() <= 0) {
+                skips.merge("candle_hl_invalid", 1, Integer::sum);
+                continue;
+            }
+
+            // окно
             BigDecimal highW = BigDecimal.ZERO;
             BigDecimal lowW = null;
 
@@ -544,72 +641,117 @@ public class JpaBacktestPort implements BacktestPort {
                 if (h.compareTo(highW) > 0) highW = h;
                 if (lowW == null || (l.signum() > 0 && l.compareTo(lowW) < 0)) lowW = l;
             }
-            if (lowW == null || lowW.signum() <= 0) continue;
+            if (lowW == null || lowW.signum() <= 0) {
+                skips.merge("window_low_invalid", 1, Integer::sum);
+                continue;
+            }
 
             BigDecimal range = highW.subtract(lowW, mc);
-            if (range.signum() <= 0) continue;
+            if (range.signum() <= 0) {
+                skips.merge("window_range_zero", 1, Integer::sum);
+                continue;
+            }
 
             BigDecimal rangePct = range.divide(lowW, mc).multiply(new BigDecimal("100"), mc);
-            if (rangePct.compareTo(minRangePct) < 0) continue;
+            if (rangePct.compareTo(minRangePct) < 0) {
+                skips.merge("minRangePct", 1, Integer::sum);
+                continue;
+            }
 
-            BigDecimal spreadPct = range.divide(close.max(BigDecimal.ONE), mc).multiply(new BigDecimal("100"), mc);
-            if (spreadPct.compareTo(maxSpreadPct) > 0) continue;
+            // ✅ свечной спред
+            BigDecimal candleSpread = candleHigh.subtract(candleLow, mc).abs(mc);
+            BigDecimal candleSpreadPct = candleSpread
+                    .divide(close.max(BigDecimal.ONE), mc)
+                    .multiply(new BigDecimal("100"), mc);
+
+            if (candleSpreadPct.compareTo(maxSpreadPct) > 0) {
+                skips.merge("maxSpreadPct", 1, Integer::sum);
+                continue;
+            }
 
             if (!inPos) {
-                if (ts.getEpochSecond() < nextEntryAllowedSec) continue;
+                if (ts.getEpochSecond() < nextEntryAllowedSec) {
+                    skips.merge("cooldown", 1, Integer::sum);
+                    continue;
+                }
 
                 Integer mtd = rt.maxTradesPerDay;
                 if (mtd != null && mtd > 0) {
                     int d = dayIndex(startAt, ts);
-                    if (tradesPerDay.getOrDefault(d, 0) >= mtd) continue;
+                    if (tradesPerDay.getOrDefault(d, 0) >= mtd) {
+                        skips.merge("maxTradesPerDay", 1, Integer::sum);
+                        continue;
+                    }
                 }
 
                 if (rt.maxConsecutiveLosses != null && rt.maxConsecutiveLosses > 0) {
-                    if (consecLoss >= rt.maxConsecutiveLosses) continue;
+                    if (consecLoss >= rt.maxConsecutiveLosses) {
+                        skips.merge("maxConsecutiveLosses", 1, Integer::sum);
+                        continue;
+                    }
                 }
 
-                // ✅ зона входа: near low + (не near high) через entryFromHighPct
+                // ✅ зона входа: near low + (не near high)
                 BigDecimal lowZoneTop = lowW.add(range.multiply(entryLowPct.divide(new BigDecimal("100"), mc), mc), mc);
                 BigDecimal highGuard  = highW.subtract(range.multiply(entryHighPct.divide(new BigDecimal("100"), mc), mc), mc);
-
-                // итоговый потолок зоны входа — минимум из двух границ
                 BigDecimal entryTop = lowZoneTop.min(highGuard);
 
-                if (close.compareTo(entryTop) <= 0) {
+                // ✅ триггер: low свечи коснулся зоны
+                boolean touched = candleLow.compareTo(entryTop) <= 0;
+                boolean closedIn = close.compareTo(entryTop) <= 0;
+
+                if (touched || closedIn) {
+                    // консервативно: вход по верхней границе зоны
+                    BigDecimal entryPx = entryTop;
+                    if (entryPx.signum() <= 0) {
+                        skips.merge("entry_invalid", 1, Integer::sum);
+                        continue;
+                    }
+
                     inPos = true;
-                    entry = close;
+                    entry = entryPx;
                     posUnits = 1;
                     averaged = false;
+                } else {
+                    skips.merge("noEntrySignal", 1, Integer::sum);
                 }
+
                 continue;
             }
 
-            // averaging (упрощённо)
+            // averaging: один раз, по касанию low свечи
             if (!averaged && rt.allowAveraging && (rt.maxOpenOrders == null || rt.maxOpenOrders >= 2)) {
                 BigDecimal slLine = entry.multiply(BigDecimal.ONE.subtract(slPct.divide(new BigDecimal("100"), mc)), mc);
                 BigDecimal trigger = entry.subtract(entry.subtract(slLine, mc).divide(new BigDecimal("2"), mc), mc);
-                if (close.compareTo(trigger) <= 0) {
-                    BigDecimal newEntry = entry.multiply(new BigDecimal(posUnits), mc)
-                            .add(close, mc)
-                            .divide(new BigDecimal(posUnits + 1), mc);
 
-                    entry = newEntry;
-                    posUnits++;
-                    averaged = true;
+                if (candleLow.compareTo(trigger) <= 0) {
+                    BigDecimal addPx = trigger.max(BigDecimal.ZERO);
+                    if (addPx.signum() > 0) {
+                        BigDecimal newEntry = entry.multiply(new BigDecimal(posUnits), mc)
+                                .add(addPx, mc)
+                                .divide(new BigDecimal(posUnits + 1), mc);
+
+                        entry = newEntry;
+                        posUnits++;
+                        averaged = true;
+                    }
                 }
             }
 
             BigDecimal tp = entry.multiply(BigDecimal.ONE.add(tpPct.divide(new BigDecimal("100"), mc)), mc);
             BigDecimal sl = entry.multiply(BigDecimal.ONE.subtract(slPct.divide(new BigDecimal("100"), mc)), mc);
 
-            boolean hitTp = close.compareTo(tp) >= 0;
-            boolean hitSl = close.compareTo(sl) <= 0;
+            boolean hitTp = candleHigh.compareTo(tp) >= 0;
+            boolean hitSl = candleLow.compareTo(sl) <= 0;
 
             if (hitTp || hitSl) {
                 trades++;
 
-                BigDecimal gross = close.subtract(entry, mc).divide(entry, mc);
-                BigDecimal fee = feePct.divide(new BigDecimal("100"), mc);
+                // если оба в одной свече — берём консервативно SL
+                BigDecimal exitPx = hitSl ? sl : tp;
+
+                BigDecimal gross = exitPx.subtract(entry, mc).divide(entry, mc); // доля
+                BigDecimal fee = feePct.divide(new BigDecimal("100"), mc);       // доля
                 BigDecimal net = gross.subtract(fee.multiply(new BigDecimal("2"), mc), mc);
 
                 BigDecimal pos = rt.riskPerTradePct.divide(new BigDecimal("100"), mc);
@@ -666,6 +808,15 @@ public class JpaBacktestPort implements BacktestPort {
                 : BigDecimal.valueOf((wins * 100.0) / trades).setScale(6, RoundingMode.HALF_UP);
 
         String reason = "OK";
+
+        if (trades == 0) {
+            String top = skips.entrySet().stream()
+                    .max(Map.Entry.comparingByValue())
+                    .map(Map.Entry::getKey)
+                    .orElse("unknown");
+            reason = "NO_TRADES:" + top;
+        }
+
         if (rt.maxDrawdownPct != null && ddPct.compareTo(rt.maxDrawdownPct) > 0) {
             reason = "DD_LIMIT_REACHED";
         }

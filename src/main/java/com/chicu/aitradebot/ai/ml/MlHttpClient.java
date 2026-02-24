@@ -14,6 +14,7 @@ import okhttp3.RequestBody;
 import okhttp3.Response;
 
 import java.io.IOException;
+import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 
 @Slf4j
@@ -27,7 +28,6 @@ public class MlHttpClient implements MlClient {
 
     /**
      * Опционально. Если задан — клиент сам ставит X-API-KEY.
-     * Если ты ставишь ключ через interceptor в MlConfig — можно оставить null.
      */
     private final String apiKey;
 
@@ -36,11 +36,11 @@ public class MlHttpClient implements MlClient {
         this(http, om, baseUrl, null);
     }
 
-    // ✅ Новый конструктор (4 аргумента) — под твой MlConfig
+    // ✅ Новый конструктор (4 аргумента)
     public MlHttpClient(OkHttpClient http, ObjectMapper om, String baseUrl, String apiKey) {
-        this.http = http;
-        this.om = om;
-        this.baseUrl = (baseUrl == null) ? "" : baseUrl.trim();
+        this.http = Objects.requireNonNull(http, "http");
+        this.om = Objects.requireNonNull(om, "om");
+        this.baseUrl = trimSlash(baseUrl);
         this.apiKey = (apiKey == null || apiKey.isBlank()) ? null : apiKey.trim();
     }
 
@@ -67,6 +67,7 @@ public class MlHttpClient implements MlClient {
         if (apiKey != null) {
             b.header("X-API-KEY", apiKey);
         }
+        b.header("Accept", "application/json");
         return b;
     }
 
@@ -80,7 +81,7 @@ public class MlHttpClient implements MlClient {
 
         } catch (Exception e) {
             log.warn("🧠 ML {}: failed to serialize request: {}", op, e.toString());
-            return errorResponse(responseType, "serialize_error: " + e.getMessage());
+            return errorResponse(responseType, "serialize_error: " + safeMsg(e));
         }
     }
 
@@ -106,11 +107,11 @@ public class MlHttpClient implements MlClient {
         } catch (IOException e) {
             long tookMs = System.currentTimeMillis() - ts;
             log.warn("🧠 ML {}: io error tookMs={} err={}", op, tookMs, e.toString());
-            return errorResponse(responseType, "io_error: " + e.getMessage());
+            return errorResponse(responseType, "io_error: " + safeMsg(e));
         } catch (Exception e) {
             long tookMs = System.currentTimeMillis() - ts;
             log.warn("🧠 ML {}: parse error tookMs={} err={}", op, tookMs, e.toString());
-            return errorResponse(responseType, "parse_error: " + e.getMessage());
+            return errorResponse(responseType, "parse_error: " + safeMsg(e));
         }
     }
 
@@ -118,6 +119,13 @@ public class MlHttpClient implements MlClient {
         if (s == null) return null;
         String t = s.replace("\n", " ").replace("\r", " ");
         return t.length() > 400 ? t.substring(0, 400) + "..." : t;
+    }
+
+    private static String safeMsg(Throwable e) {
+        if (e == null) return "null";
+        String m = e.getMessage();
+        if (m == null || m.isBlank()) return e.getClass().getSimpleName();
+        return m;
     }
 
     @SuppressWarnings("unchecked")
@@ -134,6 +142,7 @@ public class MlHttpClient implements MlClient {
         }
 
         if (responseType == MlPredictResponse.class) {
+            // ✅ не возвращаем null — gating должен получить ok=false + error
             return (T) MlPredictResponse.fail(error);
         }
 
@@ -141,23 +150,68 @@ public class MlHttpClient implements MlClient {
             try {
                 return (T) MlTrainResponse.fail(error);
             } catch (Throwable ignore) {
-                return (T) new MlTrainResponse();
+                try {
+                    T t = responseType.getDeclaredConstructor().newInstance();
+                    // если там есть setOk/setError — заполним мягко
+                    tryInvokeSetters(t, now, error);
+                    return t;
+                } catch (Exception e) {
+                    return (T) new MlTrainResponse();
+                }
             }
         }
 
         try {
-            return responseType.getDeclaredConstructor().newInstance();
+            T t = responseType.getDeclaredConstructor().newInstance();
+            tryInvokeSetters(t, now, error);
+            return t;
         } catch (Exception e) {
             throw new IllegalStateException("Cannot create error response for " + responseType.getName());
         }
     }
 
+    private void tryInvokeSetters(Object t, long now, String error) {
+        if (t == null) return;
+        try {
+            var m = t.getClass().getMethod("setOk", boolean.class);
+            m.invoke(t, false);
+        } catch (Exception ignored) {}
+        try {
+            var m = t.getClass().getMethod("setError", String.class);
+            m.invoke(t, error);
+        } catch (Exception ignored) {}
+        try {
+            var m = t.getClass().getMethod("setTsMs", Long.class);
+            m.invoke(t, now);
+        } catch (Exception ignored) {}
+        try {
+            var m = t.getClass().getMethod("setTs", Long.class);
+            m.invoke(t, now);
+        } catch (Exception ignored) {}
+    }
+
+    /** ✅ совместимость: если кто-то зовёт defaultHttp(connect, read) */
+    public static OkHttpClient defaultHttp(long connectMs, long readMs) {
+        return defaultHttp(connectMs, readMs, readMs);
+    }
+
     public static OkHttpClient defaultHttp(long connectMs, long readMs, long writeMs) {
+        long c = Math.max(1, connectMs);
+        long r = Math.max(1, readMs);
+        long w = Math.max(1, writeMs);
+
         return new OkHttpClient.Builder()
-                .connectTimeout(connectMs, TimeUnit.MILLISECONDS)
-                .readTimeout(readMs, TimeUnit.MILLISECONDS)
-                .writeTimeout(writeMs, TimeUnit.MILLISECONDS)
+                .connectTimeout(c, TimeUnit.MILLISECONDS)
+                .readTimeout(r, TimeUnit.MILLISECONDS)
+                .writeTimeout(w, TimeUnit.MILLISECONDS)
                 .retryOnConnectionFailure(true)
                 .build();
+    }
+
+    private static String trimSlash(String s) {
+        if (s == null) return "";
+        String t = s.trim();
+        while (t.endsWith("/")) t = t.substring(0, t.length() - 1);
+        return t;
     }
 }

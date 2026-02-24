@@ -5,6 +5,7 @@ import jakarta.persistence.*;
 import lombok.*;
 
 import java.time.Instant;
+import java.util.Locale;
 
 @Entity
 @Table(
@@ -52,4 +53,51 @@ public class MlModelArtifactEntity {
 
     @Column(name = "created_at", nullable = false)
     private Instant createdAt;
+
+    @PrePersist
+    protected void prePersist() {
+        if (createdAt == null) createdAt = Instant.now();
+        normalize();
+        validate();
+    }
+
+    @PreUpdate
+    protected void preUpdate() {
+        normalize();
+        validate();
+    }
+
+    private void normalize() {
+        this.symbol = normUpper(this.symbol);
+        this.timeframe = normLower(this.timeframe);
+        this.schemaHash = normTrim(this.schemaHash);
+        this.modelKey = normTrim(this.modelKey);
+        this.modelVersion = normTrim(this.modelVersion);
+        this.metricsJson = normTrim(this.metricsJson);
+    }
+
+    private void validate() {
+        if (chatId == null) throw new IllegalStateException("MlModelArtifactEntity.chatId is null");
+        if (strategyType == null) throw new IllegalStateException("MlModelArtifactEntity.strategyType is null");
+        if (symbol == null) throw new IllegalStateException("MlModelArtifactEntity.symbol is null");
+        if (timeframe == null) throw new IllegalStateException("MlModelArtifactEntity.timeframe is null");
+        if (modelKey == null) throw new IllegalStateException("MlModelArtifactEntity.modelKey is null");
+        if (modelVersion == null) throw new IllegalStateException("MlModelArtifactEntity.modelVersion is null");
+    }
+
+    private static String normTrim(String s) {
+        if (s == null) return null;
+        String v = s.trim();
+        return v.isEmpty() ? null : v;
+    }
+
+    private static String normUpper(String s) {
+        String v = normTrim(s);
+        return v == null ? null : v.toUpperCase(Locale.ROOT);
+    }
+
+    private static String normLower(String s) {
+        String v = normTrim(s);
+        return v == null ? null : v.toLowerCase(Locale.ROOT);
+    }
 }

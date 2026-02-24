@@ -1,34 +1,59 @@
 package com.chicu.aitradebot.ai.ml.dto;
 
+import com.fasterxml.jackson.annotation.JsonAlias;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import lombok.Data;
 
 @Data
+@JsonInclude(JsonInclude.Include.NON_NULL)
+@JsonIgnoreProperties(ignoreUnknown = true)
 public class MlPredictResponse {
 
     private boolean ok;
 
     /** вероятность "BUY" (или “win”), 0..1 */
+    @JsonAlias({"pWin", "p", "prob", "probability", "confidence", "score"})
     private Double proba;
 
-    /** версия модели/артефакта, чтобы логировать/кешировать */
+    /** ключ модели (стабильный id), чтобы логировать/кешировать */
+    @JsonAlias({"model_key", "model", "key", "modelId"})
+    private String modelKey;
+
+    /** версия модели/артефакта */
+    @JsonAlias({"model_version", "version"})
     private String modelVersion;
 
+    /** схема фичей */
+    @JsonAlias({"schema_hash", "schema", "featuresSchema", "featureSchema"})
+    private String schemaHash;
+
     /** сообщение об ошибке (если ok=false) */
+    @JsonAlias({"message", "reason"})
     private String error;
 
     /** опционально — таймстемп */
+    @JsonAlias({"ts", "timestamp"})
     private Long tsMs;
 
     // =====================================================
-    // ✅ Фабрики (чтобы компилился MlApiController и клиент)
+    // ✅ Фабрики
     // =====================================================
 
+    /** Backward-compat: старый код мог звать ok(proba, modelVersion) */
     public static MlPredictResponse ok(Double proba, String modelVersion) {
+        return ok(proba, null, modelVersion, null);
+    }
+
+    public static MlPredictResponse ok(Double proba, String modelKey, String modelVersion, String schemaHash) {
         MlPredictResponse r = new MlPredictResponse();
         r.ok = true;
         r.tsMs = System.currentTimeMillis();
         r.proba = sanitizeProba(proba);
+        r.modelKey = blankToNull(modelKey);
         r.modelVersion = blankToNull(modelVersion);
+        r.schemaHash = blankToNull(schemaHash);
+        r.error = null;
         return r;
     }
 
@@ -38,7 +63,9 @@ public class MlPredictResponse {
         r.tsMs = System.currentTimeMillis();
         r.error = blankToNull(error);
         r.proba = null;
+        r.modelKey = null;
         r.modelVersion = null;
+        r.schemaHash = null;
         return r;
     }
 

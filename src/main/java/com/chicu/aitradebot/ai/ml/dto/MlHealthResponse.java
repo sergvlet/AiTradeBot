@@ -9,10 +9,6 @@ import lombok.NoArgsConstructor;
 
 /**
  * ✅ Контракт /health (FastAPI)
- * Чтобы не ловить вечные ошибки "getOk/isOk":
- * - Lombok для Boolean ok генерит getOk()
- * - мы добавляем isOk() вручную (многие места зовут именно его)
- * + добавляем fail(...) для MlApiController
  */
 @Data
 @Builder
@@ -46,24 +42,17 @@ public class MlHealthResponse {
     /** python: error */
     private String error;
 
-    /**
-     * ✅ Универсальный boolean-геттер.
-     * Старый код часто вызывает isOk().
-     */
+    /** ✅ Универсальный boolean-геттер. Старый код часто вызывает isOk(). */
     public boolean isOk() {
         return Boolean.TRUE.equals(ok);
     }
 
-    /**
-     * ✅ Удобный хелпер: есть ли модель на диске.
-     */
+    /** ✅ Удобный хелпер: есть ли модель на диске. */
     public boolean hasModel() {
         return Boolean.TRUE.equals(modelExists);
     }
 
-    /**
-     * ✅ Фабрика для контроллера/ошибок.
-     */
+    /** ✅ Фабрика для контроллера/ошибок. */
     public static MlHealthResponse fail(String error) {
         return MlHealthResponse.builder()
                 .ok(false)

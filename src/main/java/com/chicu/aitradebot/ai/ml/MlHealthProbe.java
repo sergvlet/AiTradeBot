@@ -3,6 +3,7 @@ package com.chicu.aitradebot.ai.ml;
 import com.chicu.aitradebot.ai.ml.dto.MlHealthResponse;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
@@ -18,7 +19,19 @@ import java.util.Locale;
 public class MlHealthProbe implements ApplicationRunner {
 
     private final MlProperties props;
-    private final MlClient client;
+
+    /**
+     * ✅ MlClient создаётся только при ml.enabled=true.
+     * Поэтому берём через ObjectProvider, иначе контекст падает при ml.enabled=false.
+     */
+    private final ObjectProvider<MlClient> clientProvider;
+
+    /**
+     * Лог-уровень именно для стартового health-check.
+     * Пример: ml.health.startupLogLevel=INFO|WARN|DEBUG|ERROR
+     */
+    @Value("${ml.health.startupLogLevel:INFO}")
+    private String startupLogLevel;
 
     /**
      * Прод-режим: если ML включён и недоступен — валим старт приложения.
@@ -36,8 +49,17 @@ public class MlHealthProbe implements ApplicationRunner {
 
     @Override
     public void run(ApplicationArguments args) {
+
         if (props == null || !props.isEnabled()) {
-            log.info("🧠 ML выключен (ml.enabled=false). Health-check пропущен.");
+            startup("INFO", "🧠 ML выключен (ml.enabled=false). Health-check пропущен.");
+            return;
+        }
+
+        MlClient client = clientProvider != null ? clientProvider.getIfAvailable() : null;
+        if (client == null) {
+            String msg = "🧠 ML включён (ml.enabled=true), но MlClient bean отсутствует (проверь MlConfig/ConditionalOnProperty)";
+            if (failFast) throw new IllegalStateException(msg);
+            startup("WARN", msg);
             return;
         }
 
@@ -45,26 +67,23 @@ public class MlHealthProbe implements ApplicationRunner {
         if (baseUrl.isEmpty()) {
             String msg = "🧠 ML включён (ml.enabled=true), но ml.baseUrl пустой";
             if (failFast) throw new IllegalStateException(msg);
-            log.warn(msg);
+            startup("WARN", msg);
             return;
         }
 
         String healthUrl = trimSlash(baseUrl) + "/health";
-        log.info("🧠 ML включён (ml.enabled=true). Проверяю /health: {}", healthUrl);
+        startup("INFO", "🧠 ML включён (ml.enabled=true). Проверяю /health: {}", healthUrl);
 
         try {
             MlHealthResponse h = client.health();
 
-            // ✅ НИКАКИХ прямых getOk()/getModelExists() — всё через reflection, чтобы DTO не ломал компиляцию
+            // ✅ НИКАКИХ прямых getOk()/getModelExists() — всё через reflection
             Boolean ok = asBool(readAny(h, "getOk", "isOk", "ok"));
             if (ok == null || !ok) {
-                String err = asStr(readAny(h,
-                        "getError", "error",
-                        "getMessage", "message"
-                ));
+                String err = asStr(readAny(h, "getError", "error", "getMessage", "message"));
                 String msg = "❌ ML service NOT OK: ok=" + ok + " error=" + (err == null ? "null" : err);
                 if (failFast) throw new IllegalStateException(msg);
-                log.warn("🧠 {}", msg);
+                startup("WARN", "🧠 {}", msg);
                 return;
             }
 
@@ -82,24 +101,38 @@ public class MlHealthProbe implements ApplicationRunner {
             String version = asStr(readAny(h, "getVersion", "version"));
             String modelsDir = asStr(readAny(h, "getModelsDir", "modelsDir"));
 
-            log.info("✅ ML service OK: ok=true version={} xgboost={} model_exists={} modelVersion={} modelsDir={}",
+            startup("INFO", "✅ ML service OK: ok=true version={} xgboost={} model_exists={} modelVersion={} modelsDir={}",
                     nn(version), nn(xgboost), nn(modelExists), nn(modelVersion), nn(modelsDir));
 
             if (requireModel) {
                 if (modelExists == null) {
-                    // DTO/ответ не отдал model_exists — не можем строго проверить, но предупреждаем
-                    log.warn("⚠️ ml.requireModel=true, но в health-ответе нет model_exists. Добавь поле/геттер в MlHealthResponse, если хочешь строгую проверку.");
+                    startup("WARN", "⚠️ ml.requireModel=true, но в health-ответе нет model_exists (нужен геттер/поле в MlHealthResponse).");
                 } else if (!modelExists) {
                     String msg = "❌ ml.requireModel=true, но model_exists=false — сначала обучи модель (/train), потом запускай AI/HYBRID";
                     if (failFast) throw new IllegalStateException(msg);
-                    log.warn(msg);
+                    startup("WARN", msg);
                 }
             }
 
         } catch (Exception e) {
             String msg = "❌ ML health-check failed: " + e.getMessage();
             if (failFast) throw new IllegalStateException(msg, e);
-            log.warn("🧠 {}", msg);
+            startup("WARN", "🧠 {}", msg);
+        }
+    }
+
+    private void startup(String defaultLevel, String fmt, Object... args) {
+        String eff = (startupLogLevel == null || startupLogLevel.isBlank()) ? defaultLevel : startupLogLevel;
+        String lvl = eff.trim().toUpperCase(Locale.ROOT);
+
+        if ("DEBUG".equals(lvl)) {
+            log.debug(fmt, args);
+        } else if ("WARN".equals(lvl) || "WARNING".equals(lvl)) {
+            log.warn(fmt, args);
+        } else if ("ERROR".equals(lvl)) {
+            log.error(fmt, args);
+        } else {
+            log.info(fmt, args);
         }
     }
 

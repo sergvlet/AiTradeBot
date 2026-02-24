@@ -296,29 +296,44 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
 
         boolean changed = false;
 
+        // =====================================================
+        // ✅ 1) minRangePct: уменьшаем, чтобы чаще были входы
+        // =====================================================
         double oldMinRange = toDouble(readGetter(cfg, "getMinRangePct"));
-        double newMinRange;
+        if (Double.isNaN(oldMinRange) || Double.isInfinite(oldMinRange)) oldMinRange = 0.35;
 
+        double newMinRange;
         if (reason != null && reason.toLowerCase(Locale.ROOT).contains("range")) {
             newMinRange = Math.max(0.0, oldMinRange * 0.35);
         } else {
-            newMinRange = Math.max(0.0, oldMinRange * 0.60);
+            newMinRange = Math.max(0.0, oldMinRange * 0.50);
         }
-
         newMinRange = clampD(newMinRange, 0.0, 10.0);
 
         if (Math.abs(newMinRange - oldMinRange) > 1e-9) {
             if (setNumeric(cfg, "setMinRangePct", newMinRange)) changed = true;
         }
 
+        // =====================================================
+        // ✅ 2) entry zones: расширяем, а не сужаем (иначе NO_TRADES)
+        // entryFromLowPct ↑ => больше входов у low
+        // entryFromHighPct ↑ => больше “ограничитель сверху” (если используется)
+        // =====================================================
         double oldLow = toDouble(readGetter(cfg, "getEntryFromLowPct"));
         double oldHigh = toDouble(readGetter(cfg, "getEntryFromHighPct"));
 
-        double newLow = clampD(oldLow * 0.70, 0.1, 30.0);
-        double newHigh = clampD(oldHigh * 0.70, 0.1, 30.0);
+        if (Double.isNaN(oldLow) || Double.isInfinite(oldLow)) oldLow = 20.0;
+        if (Double.isNaN(oldHigh) || Double.isInfinite(oldHigh)) oldHigh = 20.0;
 
-        if (newLow + newHigh > 60.0) {
-            double k = 60.0 / (newLow + newHigh);
+        double newLow = Math.max(oldLow * 1.35, oldLow + 5.0);
+        double newHigh = Math.max(oldHigh * 1.35, oldHigh + 5.0);
+
+        newLow = clampD(newLow, 0.5, 60.0);
+        newHigh = clampD(newHigh, 0.5, 60.0);
+
+        // не даём зонам “съесть” всё окно
+        if (newLow + newHigh > 90.0) {
+            double k = 90.0 / (newLow + newHigh);
             newLow *= k;
             newHigh *= k;
         }
@@ -330,15 +345,25 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
             if (setNumeric(cfg, "setEntryFromHighPct", newHigh)) changed = true;
         }
 
+        // =====================================================
+        // ✅ 3) maxSpreadPct: при NO_TRADES поднимаем существенно
+        // =====================================================
         double oldSpread = toDouble(readGetter(cfg, "getMaxSpreadPct"));
-        double newSpread = clampD(oldSpread + 0.05, 0.0, 5.0);
+        if (Double.isNaN(oldSpread) || Double.isInfinite(oldSpread) || oldSpread < 0) oldSpread = 0.08;
+
+        double newSpread = Math.max(oldSpread + 0.30, oldSpread * 2.0);
+        newSpread = clampD(newSpread, 0.0, 5.0);
+
         if (Math.abs(newSpread - oldSpread) > 1e-9) {
             if (setNumeric(cfg, "setMaxSpreadPct", newSpread)) changed = true;
         }
 
+        // =====================================================
+        // ✅ 4) windowSize: чуть уменьшаем, чтобы быстрее ловить low/high
+        // =====================================================
         Integer w = cfg.getWindowSize();
         Integer newWObj = w;
-        if (w != null && w > 20) {
+        if (w != null && w > 25) {
             int newW = clampInt((int) Math.round(w * 0.85), 5, 250);
             if (newW != w) {
                 cfg.setWindowSize(newW);
@@ -363,6 +388,7 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
 
     // =====================================================
     // candidate / compare
+
     // =====================================================
 
     private record Candidate(Map<String, Object> params, double score, Integer trades, String tag) {}

@@ -10,14 +10,11 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 
-import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.List;
-import java.util.Locale;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
 
 @Slf4j
 @Service
@@ -26,93 +23,80 @@ public class MarketStreamBacktestCandlePort implements BacktestCandlePort {
 
     private final ObjectProvider<MarketDataStreamService> marketStream;
 
-    // =====================================================
-    // OLD SIGNATURE
-    // =====================================================
-
     public List<CandleBar> load(long chatId,
-                                StrategyType type,
-                                String symbol,
-                                String timeframe,
-                                Instant startAt,
-                                Instant endAt,
-                                int limit) {
+                               StrategyType type,
+                               String symbol,
+                               String timeframe,
+                               Instant startAt,
+                               Instant endAt,
+                               int limit) {
+
         return load(chatId, type, null, null, symbol, timeframe, startAt, endAt, limit);
     }
 
-    // =====================================================
-    // NEW SIGNATURE
-    // =====================================================
-
+    @Override
     public List<CandleBar> load(long chatId,
-                                StrategyType type,
-                                String exchange,
-                                NetworkType network,
-                                String symbol,
-                                String timeframe,
-                                Instant startAt,
-                                Instant endAt,
-                                int limit) {
+                               StrategyType type,
+                               String exchange,
+                               NetworkType network,
+                               String symbol,
+                               String timeframe,
+                               Instant startAt,
+                               Instant endAt,
+                               int limit) {
 
         if (chatId <= 0 || type == null) return List.of();
-        symbol = normSymbol(symbol);
-        timeframe = normTf(timeframe);
-        if (symbol == null || timeframe == null) return List.of();
+
+        String sym = normSymbol(symbol);
+        String tf = normTf(timeframe);
+
+        if (sym == null || tf == null) return List.of();
         if (startAt == null || endAt == null || !endAt.isAfter(startAt)) return List.of();
         if (limit <= 0) return List.of();
 
         MarketDataStreamService svc = marketStream != null ? marketStream.getIfAvailable() : null;
         if (svc == null) return List.of();
 
-        List<?> raw = tryGetCachedCandles(svc, chatId, type, exchange, network, symbol, timeframe, limit);
+        List<?> raw = tryGetCachedCandles(svc, chatId, type, exchange, network, sym, tf, limit);
         if (raw == null || raw.isEmpty()) return List.of();
 
         long startMs = startAt.toEpochMilli();
         long endMs = endAt.toEpochMilli();
+        long tfMs = timeframeToMillis(tf);
 
-        List<CandleBar> out = new ArrayList<>(Math.min(raw.size(), limit));
+        TreeMap<Long, CandleBar> map = new TreeMap<>();
 
         for (Object c : raw) {
             if (c == null) continue;
 
-            Long tMs = asLong(readAny(c,
-                    "getOpenTime", "openTime",
-                    "getStartTime", "startTime",
-                    "getTime", "time",
-                    "getCloseTime", "closeTime",
-                    "getTimestamp", "timestamp"
-            ));
-            if (tMs == null || tMs <= 0) continue;
-            if (tMs < startMs || tMs > endMs) continue;
+            Long openMs = extractOpenTimeMs(c);
+            if (openMs == null || openMs <= 0) {
+                Long closeMs = extractCloseTimeMs(c);
+                if (closeMs == null || closeMs <= 0) continue;
+                openMs = closeMs - tfMs;
+                if (openMs <= 0) continue;
+            }
 
-            BigDecimal open = asBigDecimal(readAny(c, "getOpen", "open"));
-            BigDecimal high = asBigDecimal(readAny(c, "getHigh", "high"));
-            BigDecimal low  = asBigDecimal(readAny(c, "getLow",  "low"));
-            BigDecimal close= asBigDecimal(readAny(c, "getClose","close"));
-            BigDecimal vol  = asBigDecimal(readAny(c, "getVolume","volume", "getVol", "vol"));
+            if (openMs < startMs || openMs > endMs) continue;
 
-            if (open == null || high == null || low == null || close == null) continue;
+            BigDecimal open  = asBigDecimal(readAny(c, "getOpen", "open", "getO", "o"));
+            BigDecimal high  = asBigDecimal(readAny(c, "getHigh", "high", "getH", "h"));
+            BigDecimal low   = asBigDecimal(readAny(c, "getLow",  "low",  "getL", "l"));
+            BigDecimal close = asBigDecimal(readAny(c, "getClose","close","getC", "c"));
+            BigDecimal vol   = asBigDecimal(readAny(c, "getVolume","volume", "getVol", "vol", "getV", "v"));
 
-            CandleBar bar = buildCandleBar(tMs, timeframe, open, high, low, close, vol);
-            if (bar != null) out.add(bar);
+            if (!isValidOhlc(open, high, low, close)) continue;
+
+            CandleBar bar = new CandleBar(Instant.ofEpochMilli(openMs), open, high, low, close, vol);
+            map.putIfAbsent(openMs, bar);
         }
 
-        if (out.isEmpty()) return List.of();
+        if (map.isEmpty()) return List.of();
 
-        // сортировка по времени (важно для бэктеста)
-        out.sort(Comparator.comparingLong(this::extractTimeMsSafe));
-
-        // ограничение
-        if (out.size() > limit) {
-            out = out.subList(out.size() - limit, out.size());
-        }
-
+        List<CandleBar> out = new ArrayList<>(map.values());
+        if (out.size() > limit) out = out.subList(out.size() - limit, out.size());
         return out;
     }
-
-    // =====================================================
-    // CACHE GET (safe reflection)
-    // =====================================================
 
     private List<?> tryGetCachedCandles(MarketDataStreamService svc,
                                         long chatId,
@@ -123,7 +107,6 @@ public class MarketStreamBacktestCandlePort implements BacktestCandlePort {
                                         String timeframe,
                                         int limit) {
 
-        // 1) пробуем “ожидаемые” методы по именам + сигнатурам
         List<?> v;
 
         v = tryInvokeList(svc, "getCachedCandles",
@@ -146,7 +129,6 @@ public class MarketStreamBacktestCandlePort implements BacktestCandlePort {
                 new Class<?>[]{long.class, StrategyType.class, String.class, String.class, int.class});
         if (notEmpty(v)) return v;
 
-        // 2) fallback: ищем ЛЮБОЙ публичный метод, который возвращает List/Collection и содержит candle/kline/cache
         String[] hints = {"candle", "kline", "cache"};
         for (Method m : svc.getClass().getMethods()) {
             try {
@@ -169,11 +151,9 @@ public class MarketStreamBacktestCandlePort implements BacktestCandlePort {
 
                 Object res = m.invoke(svc, args);
                 if (res instanceof List<?> list && !list.isEmpty()) return list;
-
                 if (res instanceof java.util.Collection<?> col && !col.isEmpty()) return new ArrayList<>(col);
 
             } catch (Exception ignore) {
-                // intentionally ignore
             }
         }
 
@@ -191,7 +171,6 @@ public class MarketStreamBacktestCandlePort implements BacktestCandlePort {
 
         if (pts == null) return null;
 
-        // строки кладём в разных порядках (но типы не ломаем!)
         String netName = network != null ? network.name() : null;
         String[] s1 = new String[]{symbol, timeframe, exchange, netName};
         String[] s2 = new String[]{exchange, netName, symbol, timeframe};
@@ -207,29 +186,17 @@ public class MarketStreamBacktestCandlePort implements BacktestCandlePort {
             for (int i = 0; i < pts.length; i++) {
                 Class<?> p = pts[i];
 
-                if (p == long.class || p == Long.class) {
-                    args[i] = chatId;
-                    continue;
-                }
-                if (p == int.class || p == Integer.class) {
-                    args[i] = limit;
-                    continue;
-                }
-                if (p == StrategyType.class) {
-                    args[i] = type;
-                    continue;
-                }
-                if (p == NetworkType.class) {
-                    args[i] = network;
-                    continue;
-                }
+                if (p == long.class || p == Long.class) { args[i] = chatId; continue; }
+                if (p == int.class || p == Integer.class) { args[i] = limit; continue; }
+                if (p == StrategyType.class) { args[i] = type; continue; }
+                if (p == NetworkType.class) { args[i] = network; continue; }
+
                 if (p == String.class) {
                     if (si >= order.length) { ok = false; break; }
                     args[i] = order[si++];
                     continue;
                 }
 
-                // неизвестный параметр — не трогаем этот метод
                 ok = false;
                 break;
             }
@@ -256,195 +223,80 @@ public class MarketStreamBacktestCandlePort implements BacktestCandlePort {
         return v != null && !v.isEmpty();
     }
 
-    // =====================================================
-    // CandleBar build (reflection-safe)
-    // =====================================================
+    private static Long extractOpenTimeMs(Object c) {
+        return asLong(readAny(c,
+                "getOpenTimeMs", "openTimeMs",
+                "getOpenTime", "openTime",
+                "getStartTimeMs", "startTimeMs",
+                "getStartTime", "startTime",
+                "getTimeMs", "timeMs",
+                "getTime", "time"
+        ));
+    }
 
-    private CandleBar buildCandleBar(long timeMs,
-                                     String timeframe,
-                                     BigDecimal open,
-                                     BigDecimal high,
-                                     BigDecimal low,
-                                     BigDecimal close,
-                                     BigDecimal volume) {
+    private static Long extractCloseTimeMs(Object c) {
+        return asLong(readAny(c,
+                "getCloseTimeMs", "closeTimeMs",
+                "getCloseTime", "closeTime",
+                "getEndTimeMs", "endTimeMs",
+                "getEndTime", "endTime",
+                "getT", "t"
+        ));
+    }
 
+    private static long timeframeToMillis(String tf) {
+        if (tf == null || tf.isBlank()) return TimeUnit.MINUTES.toMillis(1);
+
+        String s = tf.trim().toLowerCase(Locale.ROOT);
         try {
-            // 1) builder()
-            Method builder = CandleBar.class.getMethod("builder");
-            Object b = builder.invoke(null);
+            int n = Integer.parseInt(s.substring(0, s.length() - 1));
+            char u = s.charAt(s.length() - 1);
 
-            call1(b, "time", timeMs);
-            call1(b, "timeMs", timeMs);
-            call1(b, "ts", timeMs);
-            call1(b, "timestamp", timeMs);
-            call1(b, "openTime", timeMs);
-            call1(b, "openTimeMs", timeMs);
+            return switch (u) {
+                case 'm' -> TimeUnit.MINUTES.toMillis(n);
+                case 'h' -> TimeUnit.HOURS.toMillis(n);
+                case 'd' -> TimeUnit.DAYS.toMillis(n);
+                case 'w' -> TimeUnit.DAYS.toMillis(7L * n);
+                default -> TimeUnit.MINUTES.toMillis(1);
+            };
+        } catch (Exception ignored) {
+            return TimeUnit.MINUTES.toMillis(1);
+        }
+    }
 
-            call1(b, "timeframe", timeframe);
-            call1(b, "tf", timeframe);
+    private static boolean isValidOhlc(BigDecimal open, BigDecimal high, BigDecimal low, BigDecimal close) {
+        if (open == null || high == null || low == null || close == null) return false;
+        if (open.signum() <= 0 || high.signum() <= 0 || low.signum() <= 0 || close.signum() <= 0) return false;
 
-            call1(b, "open", open);
-            call1(b, "high", high);
-            call1(b, "low", low);
-            call1(b, "close", close);
-            call1(b, "volume", volume);
+        if (low.compareTo(high) > 0) return false;
+        if (open.compareTo(low) < 0 || open.compareTo(high) > 0) return false;
+        if (close.compareTo(low) < 0 || close.compareTo(high) > 0) return false;
 
-            Method build = b.getClass().getMethod("build");
-            Object res = build.invoke(b);
-            return (res instanceof CandleBar cb) ? cb : null;
+        return true;
+    }
 
-        } catch (Exception ignoreBuilder) {
-            // 2) constructors
+    private static Object readAny(Object obj, String... gettersOrFields) {
+        if (obj == null || gettersOrFields == null) return null;
+
+        Class<?> c = obj.getClass();
+
+        for (String n : gettersOrFields) {
+            if (n == null || n.isBlank()) continue;
+
             try {
-                for (Constructor<?> c : CandleBar.class.getDeclaredConstructors()) {
-                    Class<?>[] pts = c.getParameterTypes();
-                    Object[] a = new Object[pts.length];
-
-                    int bdIdx = 0;
-                    BigDecimal[] bds = new BigDecimal[]{open, high, low, close, volume};
-
-                    boolean ok = true;
-
-                    for (int i = 0; i < pts.length; i++) {
-                        Class<?> p = pts[i];
-
-                        if (p == long.class || p == Long.class) { a[i] = timeMs; continue; }
-                        if (p == Instant.class) { a[i] = Instant.ofEpochMilli(timeMs); continue; }
-                        if (p == String.class) { a[i] = timeframe; continue; }
-
-                        if (p == BigDecimal.class) {
-                            a[i] = (bdIdx < bds.length) ? bds[bdIdx++] : null;
-                            continue;
-                        }
-
-                        if (p == double.class || p == Double.class) {
-                            double dv = (bdIdx < bds.length && bds[bdIdx] != null) ? bds[bdIdx].doubleValue() : 0.0;
-                            bdIdx++;
-                            a[i] = dv;
-                            continue;
-                        }
-
-                        ok = false;
-                        break;
-                    }
-
-                    if (!ok) continue;
-
-                    c.setAccessible(true);
-                    Object res = c.newInstance(a);
-                    return (res instanceof CandleBar cb) ? cb : null;
+                Method m = c.getMethod(n);
+                if (m.getParameterCount() == 0) {
+                    Object v = m.invoke(obj);
+                    if (v != null) return v;
                 }
-            } catch (Exception ignored) {
-                // ignore
-            }
-        }
+            } catch (Exception ignored) {}
 
-        return null;
-    }
-
-    private void call1(Object target, String name, Object arg) {
-        if (target == null || name == null) return;
-        try {
-            for (Method m : target.getClass().getMethods()) {
-                if (!m.getName().equals(name)) continue;
-                if (m.getParameterCount() != 1) continue;
-                Class<?> pt = m.getParameterTypes()[0];
-
-                Object coerced = coerce(arg, pt);
-                if (coerced == null && pt.isPrimitive()) continue;
-
-                m.invoke(target, coerced);
-                return;
-            }
-        } catch (Exception ignore) {
-            // ignore
-        }
-    }
-
-    private Object coerce(Object v, Class<?> pt) {
-        if (pt == null) return null;
-        if (v == null) return null;
-        if (pt.isInstance(v)) return v;
-
-        if (pt == long.class || pt == Long.class) return (v instanceof Number n) ? n.longValue() : null;
-        if (pt == int.class || pt == Integer.class) return (v instanceof Number n) ? n.intValue() : null;
-
-        if (pt == String.class) return String.valueOf(v);
-
-        if (pt == BigDecimal.class) {
-            if (v instanceof BigDecimal bd) return bd;
-            if (v instanceof Number n) return BigDecimal.valueOf(n.doubleValue());
-            try { return new BigDecimal(String.valueOf(v).trim()); } catch (Exception ignore) { return null; }
-        }
-
-        if (pt == double.class || pt == Double.class) {
-            if (v instanceof Number n) return n.doubleValue();
-            try { return Double.parseDouble(String.valueOf(v)); } catch (Exception ignore) { return null; }
-        }
-
-        return null;
-    }
-
-    private long extractTimeMsSafe(CandleBar cb) {
-        try {
-            // пробуем типичные getter’ы
-            Object v = tryCall0(cb, "getTime");
-            if (v == null) v = tryCall0(cb, "getTimeMs");
-            if (v == null) v = tryCall0(cb, "getTimestamp");
-            if (v == null) v = tryCall0(cb, "getOpenTime");
-            if (v instanceof Number n) return n.longValue();
-        } catch (Exception ignore) {
-            // ignore
-        }
-        return 0L;
-    }
-
-    private Object tryCall0(Object target, String m) {
-        try {
-            Method mm = target.getClass().getMethod(m);
-            return mm.invoke(target);
-        } catch (Exception ignore) {
-            return null;
-        }
-    }
-
-    // =====================================================
-    // small utils
-    // =====================================================
-
-    private static String normSymbol(String s) {
-        if (s == null) return null;
-        String x = s.trim().toUpperCase(Locale.ROOT);
-        return x.isEmpty() ? null : x;
-    }
-
-    private static String normTf(String s) {
-        if (s == null) return null;
-        String x = s.trim().toLowerCase(Locale.ROOT);
-        return x.isEmpty() ? null : x;
-    }
-
-    private static Object readAny(Object target, String... names) {
-        if (target == null || names == null) return null;
-        Class<?> c = target.getClass();
-
-        for (String name : names) {
-            if (name == null || name.isBlank()) continue;
             try {
-                Method m = c.getMethod(name);
-                return m.invoke(target);
-            } catch (NoSuchMethodException ignore) {
-                // field-like name -> try getX()
-                try {
-                    String cap = Character.toUpperCase(name.charAt(0)) + name.substring(1);
-                    Method m2 = c.getMethod("get" + cap);
-                    return m2.invoke(target);
-                } catch (Exception ignore2) {
-                    // ignore
-                }
-            } catch (Exception ignore) {
-                // ignore
-            }
+                var f = c.getDeclaredField(n);
+                f.setAccessible(true);
+                Object v = f.get(obj);
+                if (v != null) return v;
+            } catch (Exception ignored) {}
         }
 
         return null;
@@ -454,16 +306,35 @@ public class MarketStreamBacktestCandlePort implements BacktestCandlePort {
         if (v == null) return null;
         if (v instanceof Long l) return l;
         if (v instanceof Integer i) return i.longValue();
-        if (v instanceof Instant it) return it.toEpochMilli();
-        if (v instanceof java.util.Date d) return d.getTime();
         if (v instanceof Number n) return n.longValue();
-        try { return Long.parseLong(String.valueOf(v).trim()); } catch (Exception e) { return null; }
+        if (v instanceof String s) {
+            try { return Long.parseLong(s.trim()); } catch (Exception ignored) {}
+        }
+        if (v instanceof Instant inst) return inst.toEpochMilli();
+        return null;
     }
 
     private static BigDecimal asBigDecimal(Object v) {
         if (v == null) return null;
         if (v instanceof BigDecimal bd) return bd;
         if (v instanceof Number n) return BigDecimal.valueOf(n.doubleValue());
-        try { return new BigDecimal(String.valueOf(v).trim()); } catch (Exception e) { return null; }
+        if (v instanceof String s) {
+            String x = s.trim();
+            if (x.isEmpty()) return null;
+            try { return new BigDecimal(x.replace(",", ".")); } catch (Exception ignored) {}
+        }
+        return null;
+    }
+
+    private static String normSymbol(String symbol) {
+        if (symbol == null) return null;
+        String s = symbol.trim().toUpperCase(Locale.ROOT);
+        return s.isEmpty() ? null : s;
+    }
+
+    private static String normTf(String tf) {
+        if (tf == null) return null;
+        String s = tf.trim().toLowerCase(Locale.ROOT);
+        return s.isEmpty() ? null : s;
     }
 }

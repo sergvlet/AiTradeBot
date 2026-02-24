@@ -2,14 +2,13 @@ package com.chicu.aitradebot.ai.runtime;
 
 import com.chicu.aitradebot.ai.tuning.AutoTunerOrchestrator;
 import com.chicu.aitradebot.ai.tuning.TuningRequest;
+import com.chicu.aitradebot.ai.tuning.TuningResult;
 import com.chicu.aitradebot.ai.tuning.eval.StrategyEnvResolver;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
 import com.chicu.aitradebot.domain.enums.AdvancedControlMode;
 import com.chicu.aitradebot.service.StrategySettingsService;
-import com.chicu.aitradebot.strategy.windowscalping.WindowScalpingStrategySettings;
-import com.chicu.aitradebot.strategy.windowscalping.WindowScalpingStrategySettingsService;
 import com.chicu.aitradebot.trade.PositionStore;
 import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
@@ -17,11 +16,17 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
-import java.lang.reflect.Method;
-import java.math.BigDecimal;
 import java.time.Duration;
-import java.util.*;
-import java.util.concurrent.*;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
 @Slf4j
 @Service
@@ -30,16 +35,11 @@ public class MlAutoTuneRuntime {
 
     private static final String PHASE_COLLECT  = "COLLECT";
     private static final String PHASE_BACKTEST = "BACKTEST";
-    private static final String PHASE_PAPER    = "PAPER";
-    private static final String PHASE_LIVE     = "LIVE";
 
     private final AutoTunerOrchestrator autoTuner;
     private final StrategySettingsService strategySettingsService;
     private final StrategyEnvResolver envResolver;
     private final PositionStore positionStore;
-
-    /** ✅ Writer для WINDOW_SCALPING: чтобы тюнер реально менял БД. */
-    private final WindowScalpingStrategySettingsService windowSettingsService;
 
     // =====================================================
     // CONFIG
@@ -51,6 +51,10 @@ public class MlAutoTuneRuntime {
     @Value("${ai.autotune.periodicEveryHours:6}")
     private long periodicEveryHours;
 
+    /**
+     * Фазы, в которых тюнинг выключаем:
+     * например: BACKTEST,COLLECT
+     */
     @Value("${ai.autotune.skipPhases:BACKTEST}")
     private String skipPhases;
 
@@ -70,7 +74,7 @@ public class MlAutoTuneRuntime {
     /** key(chatId,type,exchange,network) -> periodic job */
     private final Map<String, ScheduledFuture<?>> jobs = new ConcurrentHashMap<>();
 
-    /** ключи, которые сейчас в тюне (чтобы не запускать параллельно) */
+    /** key(chatId,type,exchange,network) сейчас выполняется */
     private final Set<String> running = ConcurrentHashMap.newKeySet();
 
     /** debounce для ручных/авто триггеров */
@@ -79,7 +83,6 @@ public class MlAutoTuneRuntime {
     /** cache для skipPhases */
     private volatile String skipPhasesRawCache = null;
 
-    /** дефолтный фоллбек, если конфиг битый */
     private static final Set<String> DEFAULT_SKIP_PHASES = Set.of(PHASE_BACKTEST);
 
     private volatile Set<String> skipPhasesCache = DEFAULT_SKIP_PHASES;
@@ -99,7 +102,7 @@ public class MlAutoTuneRuntime {
     }
 
     // =====================================================
-    // PUBLIC API
+    // PUBLIC API (hooks from orchestrator)
     // =====================================================
 
     public void onStrategyStarted(Long chatId, StrategyType type, String exchange, NetworkType network) {
@@ -107,8 +110,6 @@ public class MlAutoTuneRuntime {
         if (!env.ok) return;
 
         StrategySettings ss = loadSettingsSoft(chatId, type);
-
-        // ✅ если тюнинг НЕ разрешён — гарантированно выключаем всё по этому ключу
         if (!tuningGate(ss).allowed) {
             cancelAllForKey(key(chatId, type, env.exchange, env.network));
             return;
@@ -128,8 +129,8 @@ public class MlAutoTuneRuntime {
                 )
         );
 
-        // ✅ warmup — отдельной задачей, но тоже через gate внутри safeTune
-        scheduler.submit(() -> safeTune(chatId, type, env.exchange, env.network, "warmup"));
+        // ✅ быстрый стартовый прогон (если можно)
+        scheduler.submit(() -> safeTune(chatId, type, env.exchange, env.network, "startup"));
     }
 
     public void onStrategyStopped(Long chatId, StrategyType type, String exchange, NetworkType network) {
@@ -150,7 +151,7 @@ public class MlAutoTuneRuntime {
     }
 
     // =====================================================
-    // HOLD hooks
+    // HOLD hooks (optional)
     // =====================================================
 
     public void onHold(Long chatId,
@@ -188,10 +189,7 @@ public class MlAutoTuneRuntime {
         StrategySettings ss = loadSettingsSoft(chatId, type);
         if (!tuningGate(ss).allowed) return;
 
-        Duration debounce = Duration.ofSeconds(90);
-        String r = "hold:" + safe(reason);
-
-        triggerTuneDebounced(chatId, type, env.exchange, env.network, r, debounce);
+        triggerTuneDebounced(chatId, type, env.exchange, env.network, "hold:" + safe(reason), Duration.ofSeconds(90));
     }
 
     public void triggerTuneDebounced(Long chatId,
@@ -254,11 +252,7 @@ public class MlAutoTuneRuntime {
 
         String phase = normalizeUpperNullable(ss.getRunPhase());
 
-        // ✅ ВАЖНО: читаем флаг авто-тюнинга безопасно (is/get/поле)
-        boolean autoTuneEnabled = readBool(ss,
-                "autoTuneEnabled", "isAutoTuneEnabled", "getAutoTuneEnabled",
-                "mlAutoTuneEnabled", "isMlAutoTuneEnabled", "getMlAutoTuneEnabled"
-        );
+        boolean autoTuneEnabled = ss.isAutoTuneEnabled();
 
         if (mode == AdvancedControlMode.MANUAL) {
             return new Gate(false, mode, autoTuneEnabled, phase, "manual_mode");
@@ -288,29 +282,31 @@ public class MlAutoTuneRuntime {
             StrategySettings ss = loadSettingsSoft(chatId, type);
             Gate gate = tuningGate(ss);
             if (!gate.allowed) {
-                log.debug("🧠 ML skip tune chatId={} type={} ex={} net={} gate={}",
-                        chatId, type, env.exchange, env.network, gate.reason);
+                if (log.isDebugEnabled()) {
+                    log.debug("🧠 AUTO-TUNE skip chatId={} type={} ex={} net={} gate={}",
+                            chatId, type, env.exchange, env.network, gate.reason);
+                }
                 return;
             }
 
-            // ✅ НЕ тюним, если стратегия в позиции
-            if (positionStore.isInPosition(chatId, type, env.exchange, env.network)) {
-                log.debug("🧠 ML skip tune (in position) chatId={} type={} ex={} net={}",
-                        chatId, type, env.exchange, env.network);
-                return;
-            }
-
-            String symbol = (ss != null) ? safeUpperNullable(ss.getSymbol()) : null;
-            String timeframe = (ss != null) ? safeLowerNullable(ss.getTimeframe()) : null;
-            Integer candlesLimit = (ss != null) ? ss.getCachedCandlesLimit() : null;
+            String symbol = safeUpperNullable(ss.getSymbol());
+            String timeframe = safeLowerNullable(ss.getTimeframe());
+            Integer candlesLimit = ss.getCachedCandlesLimit();
 
             if (symbol == null || timeframe == null || candlesLimit == null || candlesLimit <= 0) {
-                log.warn("🧠 ML skip tune (bad settings) chatId={} type={} ex={} net={} symbol={} tf={} limit={}",
+                log.warn("🧠 AUTO-TUNE skip (bad settings) chatId={} type={} ex={} net={} symbol={} tf={} limit={}",
                         chatId, type, env.exchange, env.network, symbol, timeframe, candlesLimit);
                 return;
             }
 
-            String beforeFp = fingerprintBefore(type, chatId);
+            // ✅ НЕ тюним, если стратегия в позиции
+            if (positionStore != null && positionStore.isInPosition(chatId, type, env.exchange, env.network, symbol)) {
+                if (log.isDebugEnabled()) {
+                    log.debug("🧠 AUTO-TUNE skip (in position) chatId={} type={} ex={} net={} sym={}",
+                            chatId, type, env.exchange, env.network, symbol);
+                }
+                return;
+            }
 
             TuningRequest req = TuningRequest.builder()
                     .chatId(chatId)
@@ -323,35 +319,29 @@ public class MlAutoTuneRuntime {
                     .reason((reason != null && !reason.isBlank()) ? reason : "trigger")
                     .build();
 
-            Object result = autoTuner.tune(req);
+            TuningResult res = autoTuner.tune(req);
 
-            boolean appliedFlag = readBool(result, "applied", "isApplied", "getApplied");
-            String resultReason = readString(result, "reason", "getReason", "message", "getMessage");
-
-            boolean appliedByRuntime = false;
-            if (!appliedFlag) {
-                appliedByRuntime = tryApplyResultToDb(type, chatId, result);
-                if (appliedByRuntime) appliedFlag = true;
+            if (res == null) {
+                log.warn("🧠 AUTO-TUNE result is null chatId={} type={} ex={} net={}", chatId, type, env.exchange, env.network);
+                return;
             }
 
-            String afterFp = fingerprintAfter(type, chatId);
-
-            if (appliedFlag) {
-                log.info("🧠 ML tune done chatId={} type={} ex={} net={} applied=true appliedByRuntime={} reason={} changed={}",
+            if (res.applied()) {
+                log.info("🧠 AUTO-TUNE APPLIED chatId={} type={} ex={} net={} score {} -> {} model={} reason={}",
                         chatId, type, env.exchange, env.network,
-                        appliedByRuntime,
-                        (resultReason != null ? resultReason : "ok"),
-                        (!Objects.equals(beforeFp, afterFp))
-                );
+                        nz(res.scoreBefore()), nz(res.scoreAfter()),
+                        safe(res.modelVersion()),
+                        safe(res.reason()));
             } else {
-                log.info("🧠 ML tune done chatId={} type={} ex={} net={} applied=false reason={} (no db changes)",
+                log.info("🧠 AUTO-TUNE SKIP chatId={} type={} ex={} net={} score {} -> {} model={} reason={}",
                         chatId, type, env.exchange, env.network,
-                        (resultReason != null ? resultReason : "not_applied")
-                );
+                        nz(res.scoreBefore()), nz(res.scoreAfter()),
+                        safe(res.modelVersion()),
+                        safe(res.reason()));
             }
 
         } catch (Exception e) {
-            log.error("🧠 ML tune FAILED chatId={} type={} ex={} net={}: {}",
+            log.error("🧠 AUTO-TUNE FAILED chatId={} type={} ex={} net={}: {}",
                     chatId, type, env.exchange, env.network, safeMsg(e), e);
         } finally {
             running.remove(k);
@@ -359,133 +349,7 @@ public class MlAutoTuneRuntime {
     }
 
     // =====================================================
-    // APPLY RESULT → DB (WINDOW_SCALPING)
-    // =====================================================
-
-    private boolean tryApplyResultToDb(StrategyType type, long chatId, Object result) {
-        if (result == null || type == null) return false;
-
-        try {
-            if (type == StrategyType.WINDOW_SCALPING) {
-
-                Object maybeCfg = readAnyNonNull(result,
-                        "windowSettings", "getWindowSettings",
-                        "bestWindowSettings", "getBestWindowSettings",
-                        "bestSettings", "getBestSettings",
-                        "settings", "getSettings",
-                        "cfg", "getCfg"
-                );
-
-                if (maybeCfg instanceof WindowScalpingStrategySettings ws) {
-                    WindowScalpingStrategySettings patch = sanitizeWindowPatch(chatId, ws);
-                    windowSettingsService.update(chatId, patch);
-                    return true;
-                }
-
-                Object maybeMap = readAnyNonNull(result,
-                        "params", "getParams",
-                        "bestParams", "getBestParams",
-                        "patch", "getPatch",
-                        "settingsPatch", "getSettingsPatch",
-                        "appliedPatch", "getAppliedPatch",
-                        "newParams", "getNewParams"
-                );
-
-                if (maybeMap instanceof Map<?, ?> raw) {
-                    @SuppressWarnings("unchecked")
-                    Map<String, Object> map = (Map<String, Object>) (Map<?, ?>) raw;
-
-                    WindowScalpingStrategySettings patch = mapToWindowPatch(chatId, map);
-                    if (patch != null) {
-                        windowSettingsService.update(chatId, patch);
-                        return true;
-                    }
-                }
-            }
-
-        } catch (Exception e) {
-            log.warn("🧠 ML apply patch failed type={} chatId={} err={}",
-                    type, chatId, safeMsg(e));
-        }
-
-        return false;
-    }
-
-    private WindowScalpingStrategySettings sanitizeWindowPatch(long chatId, WindowScalpingStrategySettings ws) {
-        WindowScalpingStrategySettings.WindowScalpingStrategySettingsBuilder b =
-                WindowScalpingStrategySettings.builder().chatId(chatId);
-
-        if (ws.getWindowSize() != null && ws.getWindowSize() > 0) b.windowSize(ws.getWindowSize());
-        if (ws.getEntryFromLowPct() != null) b.entryFromLowPct(ws.getEntryFromLowPct());
-        if (ws.getEntryFromHighPct() != null) b.entryFromHighPct(ws.getEntryFromHighPct());
-        if (ws.getMinRangePct() != null) b.minRangePct(ws.getMinRangePct());
-
-        if (ws.getTakeProfitPct() != null && ws.getTakeProfitPct().signum() > 0) b.takeProfitPct(ws.getTakeProfitPct());
-        if (ws.getStopLossPct() != null && ws.getStopLossPct().signum() > 0) b.stopLossPct(ws.getStopLossPct());
-
-        return b.build();
-    }
-
-    private WindowScalpingStrategySettings mapToWindowPatch(long chatId, Map<String, Object> map) {
-        if (map == null || map.isEmpty()) return null;
-
-        Integer windowSize = toInt(map.get("windowSize"));
-        Double entryLow = toDouble(map.get("entryFromLowPct"));
-        Double entryHigh = toDouble(map.get("entryFromHighPct"));
-        Double minRange = toDouble(map.get("minRangePct"));
-
-        BigDecimal tp = toBigDecimal(map.get("takeProfitPct"));
-        BigDecimal sl = toBigDecimal(map.get("stopLossPct"));
-
-        boolean any = windowSize != null || entryLow != null || entryHigh != null || minRange != null || tp != null || sl != null;
-        if (!any) return null;
-
-        WindowScalpingStrategySettings.WindowScalpingStrategySettingsBuilder b =
-                WindowScalpingStrategySettings.builder().chatId(chatId);
-
-        if (windowSize != null && windowSize > 0) b.windowSize(windowSize);
-        if (entryLow != null) b.entryFromLowPct(entryLow);
-        if (entryHigh != null) b.entryFromHighPct(entryHigh);
-        if (minRange != null) b.minRangePct(minRange);
-
-        if (tp != null && tp.signum() > 0) b.takeProfitPct(tp);
-        if (sl != null && sl.signum() > 0) b.stopLossPct(sl);
-
-        return b.build();
-    }
-
-    private String fingerprintBefore(StrategyType type, long chatId) {
-        try {
-            if (type == StrategyType.WINDOW_SCALPING) {
-                WindowScalpingStrategySettings cfg = windowSettingsService.getOrCreate(chatId);
-                return "WS:" + fp(cfg);
-            }
-        } catch (Exception ignore) {}
-        return null;
-    }
-
-    private String fingerprintAfter(StrategyType type, long chatId) {
-        try {
-            if (type == StrategyType.WINDOW_SCALPING) {
-                WindowScalpingStrategySettings cfg = windowSettingsService.getOrCreate(chatId);
-                return "WS:" + fp(cfg);
-            }
-        } catch (Exception ignore) {}
-        return null;
-    }
-
-    private String fp(WindowScalpingStrategySettings cfg) {
-        if (cfg == null) return "null";
-        return String.valueOf(cfg.getWindowSize()) + "|" +
-                String.valueOf(cfg.getEntryFromLowPct()) + "|" +
-                String.valueOf(cfg.getEntryFromHighPct()) + "|" +
-                String.valueOf(cfg.getMinRangePct()) + "|" +
-                (cfg.getTakeProfitPct() != null ? cfg.getTakeProfitPct().stripTrailingZeros().toPlainString() : "null") + "|" +
-                (cfg.getStopLossPct() != null ? cfg.getStopLossPct().stripTrailingZeros().toPlainString() : "null");
-    }
-
-    // =====================================================
-    // ENV RESOLVE (NO DEFAULT MAINNET!)
+    // ENV RESOLVE (NO DEFAULTS)
     // =====================================================
 
     private record ResolvedEnv(boolean ok, String exchange, NetworkType network) {}
@@ -502,14 +366,14 @@ public class MlAutoTuneRuntime {
                 if (ex == null) ex = normalizeExchangeOrNull(env.exchangeName());
                 if (net == null) net = env.networkType();
             } catch (Exception e) {
-                log.warn("🧠 ML env resolve FAIL chatId={} type={} ex={} net={} err={}",
+                log.warn("🧠 AUTO-TUNE env resolve FAIL chatId={} type={} ex={} net={} err={}",
                         chatId, type, exchange, network, safeMsg(e));
                 return new ResolvedEnv(false, null, null);
             }
         }
 
         if (ex == null || net == null) {
-            log.warn("🧠 ML env unresolved chatId={} type={} ex={} net={}", chatId, type, exchange, network);
+            log.warn("🧠 AUTO-TUNE env unresolved chatId={} type={} ex={} net={}", chatId, type, exchange, network);
             return new ResolvedEnv(false, null, null);
         }
 
@@ -587,8 +451,14 @@ public class MlAutoTuneRuntime {
         return m;
     }
 
+    private static String nz(Object v) {
+        if (v == null) return "null";
+        String s = String.valueOf(v).trim();
+        return s.isEmpty() ? "null" : s;
+    }
+
     // =====================================================
-    // SETTINGS LOAD (soft, without forcing writes)
+    // SETTINGS LOAD (soft)
     // =====================================================
 
     private StrategySettings loadSettingsSoft(Long chatId, StrategyType type) {
@@ -608,83 +478,5 @@ public class MlAutoTuneRuntime {
         }
 
         return s;
-    }
-
-    // =====================================================
-    // REFLECTION HELPERS (result + settings)
-    // =====================================================
-
-    /** ✅ Ищем ПЕРВОЕ НЕ-null значение среди методов/полей. */
-    private static Object readAnyNonNull(Object obj, String... gettersOrFields) {
-        if (obj == null) return null;
-
-        Class<?> c = obj.getClass();
-
-        for (String n : gettersOrFields) {
-            if (n == null || n.isBlank()) continue;
-
-            try {
-                Method m = findNoArgMethod(c, n);
-                if (m != null) {
-                    Object v = m.invoke(obj);
-                    if (v != null) return v;
-                }
-            } catch (Exception ignore) {}
-
-            try {
-                var f = c.getDeclaredField(n);
-                f.setAccessible(true);
-                Object v = f.get(obj);
-                if (v != null) return v;
-            } catch (Exception ignore) {}
-        }
-
-        return null;
-    }
-
-    private static boolean readBool(Object obj, String... names) {
-        Object v = readAnyNonNull(obj, names);
-        if (v == null) return false;
-        if (v instanceof Boolean b) return b;
-        if (v instanceof Number n) return n.intValue() != 0;
-        String s = String.valueOf(v).trim().toLowerCase(Locale.ROOT);
-        return "true".equals(s) || "1".equals(s) || "yes".equals(s);
-    }
-
-    private static String readString(Object obj, String... names) {
-        Object v = readAnyNonNull(obj, names);
-        if (v == null) return null;
-        String s = String.valueOf(v);
-        return s.isBlank() ? null : s.trim();
-    }
-
-    private static Integer toInt(Object v) {
-        if (v == null) return null;
-        if (v instanceof Number n) return n.intValue();
-        try { return Integer.parseInt(String.valueOf(v).trim()); } catch (Exception ignored) {}
-        return null;
-    }
-
-    private static Double toDouble(Object v) {
-        if (v == null) return null;
-        if (v instanceof Number n) return n.doubleValue();
-        try { return Double.parseDouble(String.valueOf(v).trim()); } catch (Exception ignored) {}
-        return null;
-    }
-
-    private static BigDecimal toBigDecimal(Object v) {
-        if (v == null) return null;
-        if (v instanceof BigDecimal bd) return bd;
-        if (v instanceof Number n) return BigDecimal.valueOf(n.doubleValue());
-        try { return new BigDecimal(String.valueOf(v).trim().replace(",", ".")); } catch (Exception ignored) {}
-        return null;
-    }
-
-    private static Method findNoArgMethod(Class<?> c, String name) {
-        try { return c.getMethod(name); } catch (Exception ignored) {}
-        String cap = name.length() > 0 ? Character.toUpperCase(name.charAt(0)) + name.substring(1) : name;
-        try { return c.getMethod("get" + cap); } catch (Exception ignored) {}
-        try { return c.getMethod("is" + cap); } catch (Exception ignored) {}
-        return null;
     }
 }

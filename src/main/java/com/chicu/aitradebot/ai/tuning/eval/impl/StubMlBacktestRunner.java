@@ -6,6 +6,7 @@ import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
@@ -15,6 +16,7 @@ import java.util.Map;
 
 @Slf4j
 @Service
+@ConditionalOnProperty(prefix = "ai.ml.backtest", name = "use-stub", havingValue = "true")
 @ConditionalOnMissingBean(MlBacktestRunner.class)
 public class StubMlBacktestRunner implements MlBacktestRunner {
 
@@ -29,10 +31,9 @@ public class StubMlBacktestRunner implements MlBacktestRunner {
                                Instant startAt,
                                Instant endAt) {
 
-        log.warn("🧪 ML BacktestRunner = STUB (type={}, ex={}, net={}, symbol={}, tf={}) — подключи RealMlBacktestRunner",
+        log.warn("🧪 ML BacktestRunner = STUB (type={}, ex={}, net={}, symbol={}, tf={})",
                 type, exchange, network, symbolOverride, timeframeOverride);
 
-        // ✅ ok=true, чтобы тюнер не падал, но score/trades будут нулевыми
         return BacktestMetrics.builder()
                 .ok(true)
                 .reason("STUB")

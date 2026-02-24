@@ -26,12 +26,12 @@ public class CompositeBacktestCandlePort implements BacktestCandlePort {
     // =====================================================
 
     public List<CandleBar> load(long chatId,
-                                StrategyType type,
-                                String symbol,
-                                String timeframe,
-                                Instant startAt,
-                                Instant endAt,
-                                int limit) {
+                               StrategyType type,
+                               String symbol,
+                               String timeframe,
+                               Instant startAt,
+                               Instant endAt,
+                               int limit) {
 
         return load(chatId, type, null, null, symbol, timeframe, startAt, endAt, limit);
     }
@@ -40,15 +40,16 @@ public class CompositeBacktestCandlePort implements BacktestCandlePort {
     // ✅ NEW SIGNATURE (exchange/network)
     // =====================================================
 
+    @Override
     public List<CandleBar> load(long chatId,
-                                StrategyType type,
-                                String exchange,
-                                NetworkType network,
-                                String symbol,
-                                String timeframe,
-                                Instant startAt,
-                                Instant endAt,
-                                int limit) {
+                               StrategyType type,
+                               String exchange,
+                               NetworkType network,
+                               String symbol,
+                               String timeframe,
+                               Instant startAt,
+                               Instant endAt,
+                               int limit) {
 
         if (chatId <= 0 || type == null) return List.of();
         if (symbol == null || symbol.isBlank()) return List.of();
@@ -64,20 +65,20 @@ public class CompositeBacktestCandlePort implements BacktestCandlePort {
         for (BacktestCandlePort p : list) {
             if (p == null) continue;
 
-            // защита от рекурсии
+            // ✅ защита от рекурсии
             if (p == this) continue;
-            if (p.getClass() == CompositeBacktestCandlePort.class) continue;
+
+            String sn = p.getClass().getSimpleName();
+            if (CompositeBacktestCandlePort.class.getSimpleName().equals(sn)) continue;
+            if ("HybridBacktestCandlePort".equals(sn)) continue; // ✅ цикл Hybrid <-> Composite
 
             try {
                 List<CandleBar> out = invokePort(p, chatId, type, exchange, network, symbol, timeframe, startAt, endAt, limit);
-                if (out != null && !out.isEmpty()) {
-                    return out;
-                }
+                if (out != null && !out.isEmpty()) return out;
             } catch (Exception e) {
-                errors.add(p.getClass().getSimpleName() + ":" + e.getClass().getSimpleName());
+                errors.add(sn + ":" + e.getClass().getSimpleName());
                 if (log.isDebugEnabled()) {
-                    log.debug("CompositeBacktestCandlePort: delegate {} failed: {}",
-                            p.getClass().getSimpleName(), e.getMessage());
+                    log.debug("CompositeBacktestCandlePort: delegate {} failed: {}", sn, e.getMessage());
                 }
             }
         }
@@ -95,17 +96,16 @@ public class CompositeBacktestCandlePort implements BacktestCandlePort {
 
     @SuppressWarnings("unchecked")
     private List<CandleBar> invokePort(BacktestCandlePort port,
-                                       long chatId,
-                                       StrategyType type,
-                                       String exchange,
-                                       NetworkType network,
-                                       String symbol,
-                                       String timeframe,
-                                       Instant startAt,
-                                       Instant endAt,
-                                       int limit) throws Exception {
+                                      long chatId,
+                                      StrategyType type,
+                                      String exchange,
+                                      NetworkType network,
+                                      String symbol,
+                                      String timeframe,
+                                      Instant startAt,
+                                      Instant endAt,
+                                      int limit) throws Exception {
 
-        // 1) try NEW
         Method mNew = findMethod(port.getClass(),
                 "load",
                 long.class, StrategyType.class, String.class, NetworkType.class,
@@ -116,7 +116,6 @@ public class CompositeBacktestCandlePort implements BacktestCandlePort {
             return (res instanceof List<?> l) ? (List<CandleBar>) l : List.of();
         }
 
-        // 2) fallback OLD
         Method mOld = findMethod(port.getClass(),
                 "load",
                 long.class, StrategyType.class,
@@ -132,10 +131,6 @@ public class CompositeBacktestCandlePort implements BacktestCandlePort {
     }
 
     private Method findMethod(Class<?> c, String name, Class<?>... sig) {
-        try {
-            return c.getMethod(name, sig);
-        } catch (Exception ignored) {
-            return null;
-        }
+        try { return c.getMethod(name, sig); } catch (Exception ignored) { return null; }
     }
 }
