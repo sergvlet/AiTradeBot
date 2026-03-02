@@ -99,3 +99,4 @@ public class WindowScalpingStrategySettings {
         updatedAt = Instant.now();
     }
 }
+

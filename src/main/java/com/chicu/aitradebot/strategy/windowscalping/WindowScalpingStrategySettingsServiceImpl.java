@@ -11,6 +11,7 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.math.BigDecimal;
+import java.util.Objects;
 
 @Slf4j
 @Service
@@ -42,9 +43,7 @@ public class WindowScalpingStrategySettingsServiceImpl implements WindowScalping
 
         } catch (DataIntegrityViolationException dup) {
             // гонка: кто-то создал параллельно
-            WindowScalpingStrategySettings again = repo.findByChatId(chatId)
-                    .orElseThrow(() -> dup);
-            return again;
+            return repo.findByChatId(chatId).orElseThrow(() -> dup);
         }
     }
 
@@ -56,44 +55,128 @@ public class WindowScalpingStrategySettingsServiceImpl implements WindowScalping
 
         WindowScalpingStrategySettings cur = getOrCreate(chatId);
 
+        // ✅ ВАЖНО:
+        // patchMode=true => incoming обычно собран через builder() и несёт @Builder.Default.
+        // Чтобы НЕ перетирать существующие значения дефолтами — применяем только то,
+        // что реально отличается от дефолтов.
+        boolean patchMode = (incoming.getId() == null);
+
+        WindowScalpingStrategySettings defaults = WindowScalpingStrategySettings.builder()
+                .chatId(chatId)
+                .build();
+
+        boolean changed = false;
+
         // ✅ TP/SL
         BigDecimal tp = incoming.getTakeProfitPct();
-        if (tp != null && tp.signum() > 0) cur.setTakeProfitPct(tp);
+        if (tp != null && tp.signum() > 0) {
+            if (!patchMode || !bdEquals(tp, defaults.getTakeProfitPct())) {
+                if (!bdEquals(tp, cur.getTakeProfitPct())) {
+                    cur.setTakeProfitPct(tp);
+                    changed = true;
+                }
+            }
+        }
 
         BigDecimal sl = incoming.getStopLossPct();
-        if (sl != null && sl.signum() > 0) cur.setStopLossPct(sl);
+        if (sl != null && sl.signum() > 0) {
+            if (!patchMode || !bdEquals(sl, defaults.getStopLossPct())) {
+                if (!bdEquals(sl, cur.getStopLossPct())) {
+                    cur.setStopLossPct(sl);
+                    changed = true;
+                }
+            }
+        }
 
         // ✅ WINDOW поля
         Integer ws = incoming.getWindowSize();
-        if (ws != null && ws >= 5) cur.setWindowSize(ws);
+        if (ws != null && ws >= 5) {
+            if (!patchMode || !Objects.equals(ws, defaults.getWindowSize())) {
+                if (!Objects.equals(ws, cur.getWindowSize())) {
+                    cur.setWindowSize(ws);
+                    changed = true;
+                }
+            }
+        }
 
         Double low = incoming.getEntryFromLowPct();
-        if (low != null) cur.setEntryFromLowPct(clamp(low, 0.0, 100.0));
+        if (low != null) {
+            double v = clamp(low, 0.0, 100.0);
+            if (!patchMode || !dblEquals(v, safeD(defaults.getEntryFromLowPct()))) {
+                if (!dblEquals(v, safeD(cur.getEntryFromLowPct()))) {
+                    cur.setEntryFromLowPct(v);
+                    changed = true;
+                }
+            }
+        }
 
         Double high = incoming.getEntryFromHighPct();
-        if (high != null) cur.setEntryFromHighPct(clamp(high, 0.0, 100.0));
+        if (high != null) {
+            double v = clamp(high, 0.0, 100.0);
+            if (!patchMode || !dblEquals(v, safeD(defaults.getEntryFromHighPct()))) {
+                if (!dblEquals(v, safeD(cur.getEntryFromHighPct()))) {
+                    cur.setEntryFromHighPct(v);
+                    changed = true;
+                }
+            }
+        }
 
+        // ✅ minRangePct:
+        //  - допускаем 0.0 (это будем трактовать как AUTO в стратегии)
+        //  - в patchMode НЕ перетираем cur дефолтом из builder()
         Double minRange = incoming.getMinRangePct();
-        if (minRange != null) cur.setMinRangePct(clamp(minRange, 0.0, 100.0));
+        if (minRange != null) {
+            double v = clamp(minRange, 0.0, 100.0);
+            if (!patchMode || !dblEquals(v, safeD(defaults.getMinRangePct()))) {
+                if (!dblEquals(v, safeD(cur.getMinRangePct()))) {
+                    cur.setMinRangePct(v);
+                    changed = true;
+                }
+            }
+        }
 
         Double maxSpread = incoming.getMaxSpreadPct();
-        if (maxSpread != null) cur.setMaxSpreadPct(clamp(maxSpread, 0.0, 100.0));
+        if (maxSpread != null) {
+            double v = clamp(maxSpread, 0.0, 100.0);
+            if (!patchMode || !dblEquals(v, safeD(defaults.getMaxSpreadPct()))) {
+                if (!dblEquals(v, safeD(cur.getMaxSpreadPct()))) {
+                    cur.setMaxSpreadPct(v);
+                    changed = true;
+                }
+            }
+        }
+
+        if (!changed) {
+            // ничего не поменяли — не трогаем БД и не шлём event
+            return cur;
+        }
 
         WindowScalpingStrategySettings saved = repo.saveAndFlush(cur);
 
         // ✅ событие строго после коммита, иначе стратегия может прочитать “старое”
         publishAfterCommit(new WindowScalpingSettingsUpdatedEvent(chatId, "update"));
 
-        log.info("✅ WINDOW_SCALPING settings updated (chatId={}, id={}, tpPct={}, slPct={}, windowSize={}, minRangePct={})",
+        log.info("✅ WINDOW_SCALPING settings updated (chatId={}, id={}, tpPct={}, slPct={}, windowSize={}, minRangePct={}, entryLowPct={}, entryHighPct={}, maxSpreadPct={})",
                 chatId,
                 saved.getId(),
                 saved.getTakeProfitPct(),
                 saved.getStopLossPct(),
                 saved.getWindowSize(),
-                saved.getMinRangePct()
+                saved.getMinRangePct(),
+                saved.getEntryFromLowPct(),
+                saved.getEntryFromHighPct(),
+                saved.getMaxSpreadPct()
         );
 
         return saved;
+    }
+
+    /**
+     * ✅ Для внутренних нужд (например, reflection-fallback в тюнере).
+     * Возвращаем репозиторий напрямую — безопасно, read-only API.
+     */
+    public WindowScalpingStrategySettingsRepository getRepository() {
+        return repo;
     }
 
     @Override
@@ -101,7 +184,6 @@ public class WindowScalpingStrategySettingsServiceImpl implements WindowScalping
         Integer v = repo.findVersionByChatId(chatId);
         return v != null ? v.longValue() : null;
     }
-
 
     // =====================================================
     // helpers
@@ -129,5 +211,19 @@ public class WindowScalpingStrategySettingsServiceImpl implements WindowScalping
         if (v < min) return min;
         if (v > max) return max;
         return v;
+    }
+
+    private static boolean dblEquals(double a, double b) {
+        return Math.abs(a - b) < 1e-12;
+    }
+
+    private static double safeD(Double v) {
+        return v == null ? 0.0 : v;
+    }
+
+    private static boolean bdEquals(BigDecimal a, BigDecimal b) {
+        if (a == null && b == null) return true;
+        if (a == null || b == null) return false;
+        return a.compareTo(b) == 0;
     }
 }

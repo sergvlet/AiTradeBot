@@ -43,6 +43,9 @@ document.addEventListener("DOMContentLoaded", () => {
         return;
     }
 
+    const symbolUpper = symbol;
+    const symbolLower = symbol.toLowerCase();
+
     // =====================================================
     // CHART
     // =====================================================
@@ -87,6 +90,119 @@ document.addEventListener("DOMContentLoaded", () => {
     console.log("🧠 Strategy initialized:", type, strategy?.constructor?.name);
 
     // =====================================================
+    // ✅ UI LAYERS CACHE (persist across refresh)
+    // =====================================================
+
+    const layerCacheKey = `uiLayers:${chatId}:${type}:${symbolUpper}`;
+
+    let _layerState = null;      // {levels, zone, tpSl, windowZone}
+    let _persistTimer = null;
+
+    function normalizeLayerState(raw) {
+        if (!raw || typeof raw !== "object") return null;
+
+        const L = (raw.layers && typeof raw.layers === "object") ? raw.layers : raw;
+        const out = {};
+
+        if (Array.isArray(L.levels)) out.levels = L.levels;
+        if ("zone" in L) out.zone = L.zone ?? null;
+
+        // tp_sl может быть tpSl или tp_sl
+        if ("tpSl" in L) out.tpSl = L.tpSl ?? null;
+        else if ("tp_sl" in L) out.tpSl = L.tp_sl ?? null;
+
+        // window_zone может быть windowZone или window_zone
+        if ("windowZone" in L) out.windowZone = L.windowZone ?? null;
+        else if ("window_zone" in L) out.windowZone = L.window_zone ?? null;
+
+        return out;
+    }
+
+    function applyLayerState(raw) {
+        const state = normalizeLayerState(raw);
+        if (!state) return;
+
+        // ВАЖНО: фичи ждут события, а не "layers" объект
+        if ("levels" in state) {
+            strategy.onEvent?.({ type: "levels", levels: state.levels || [] });
+        }
+        if ("zone" in state) {
+            strategy.onEvent?.({ type: "zone", zone: state.zone });
+        }
+        if ("tpSl" in state) {
+            strategy.onEvent?.({ type: "tp_sl", tpSl: state.tpSl });
+        }
+        if ("windowZone" in state) {
+            strategy.onEvent?.({ type: "window_zone", windowZone: state.windowZone });
+        }
+    }
+
+    function loadLayerStateFromLocalStorage() {
+        try {
+            const s = localStorage.getItem(layerCacheKey);
+            if (!s) return null;
+            const obj = JSON.parse(s);
+            return normalizeLayerState(obj);
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function schedulePersistLayerState() {
+        if (_persistTimer) return;
+        _persistTimer = setTimeout(() => {
+            _persistTimer = null;
+            try {
+                if (!_layerState) return;
+                localStorage.setItem(layerCacheKey, JSON.stringify({ v: 1, ts: Date.now(), ..._layerState }));
+            } catch (_) {
+                // ignore
+            }
+        }, 250);
+    }
+
+    function updateLayerStateFromEvent(ev) {
+        if (!ev || typeof ev.type !== "string") return;
+
+        const t = String(ev.type || "").trim();
+        if (!t) return;
+
+        if (!_layerState) _layerState = {};
+
+        switch (t) {
+            case "levels":
+                _layerState.levels = Array.isArray(ev.levels) ? ev.levels : [];
+                schedulePersistLayerState();
+                break;
+
+            case "zone":
+                _layerState.zone = ev.zone ?? null;
+                schedulePersistLayerState();
+                break;
+
+            case "tp_sl":
+                _layerState.tpSl = ev.tpSl ?? null;
+                schedulePersistLayerState();
+                break;
+
+            case "window_zone":
+                _layerState.windowZone = ev.windowZone ?? null;
+                schedulePersistLayerState();
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    // 1) мгновенно восстанавливаем слои из localStorage (чтобы после refresh не было "пусто")
+    const bootLayers = loadLayerStateFromLocalStorage();
+    if (bootLayers) {
+        _layerState = bootLayers;
+        applyLayerState(bootLayers);
+    }
+
+    // =====================================================
     // REST SNAPSHOT (ВАЖНО: timeframe ДО setHistory)
     // =====================================================
     const snapshotUrl =
@@ -110,12 +226,17 @@ document.addEventListener("DOMContentLoaded", () => {
                 strategy.onCandleHistory?.(chartCtrl.candlesData);
             }
 
-            // ✅ 3) слои
+            // ✅ 3) слои (НЕ ТОЛЬКО "layers" — раскладываем в события)
             if (data?.layers) {
+                // оставляем как есть (на будущее/диагностику)
                 strategy.onEvent?.({ type: "layers", layers: data.layers });
 
-                if ((type === "SCALPING" || type === "WINDOW_SCALPING") && data.layers.windowZone) {
-                    strategy.onEvent?.({ type: "window_zone", windowZone: data.layers.windowZone });
+                // ✅ главное: применяем в формате событий
+                const st = normalizeLayerState(data.layers);
+                if (st) {
+                    _layerState = st;
+                    applyLayerState(st);
+                    schedulePersistLayerState();
                 }
             }
         })
@@ -178,9 +299,6 @@ document.addEventListener("DOMContentLoaded", () => {
     let socket = null;
     let reconnectAttempt = 0;
     let reconnectTimer = null;
-
-    const symbolUpper = symbol;
-    const symbolLower = symbol.toLowerCase();
 
     const destinations = [
         `/topic/strategy/${chatId}/${type}/${symbolUpper}`,
@@ -266,6 +384,9 @@ document.addEventListener("DOMContentLoaded", () => {
 
                         // ✅ стратегия получает всё
                         strategy.onEvent?.(ev);
+
+                        // ✅ сохраняем слои, чтобы после refresh они появлялись сразу
+                        updateLayerStateFromEvent(ev);
 
                         // ✅ оверлеи пересчитываем только когда реально свеча
                         if ((type === "SCALPING" || type === "WINDOW_SCALPING") && isCandleEvent(ev)) {

@@ -61,12 +61,6 @@ public class AccountBalanceSnapshot {
         BigDecimal free;
         BigDecimal locked;
 
-        /**
-         * Важно: total не должен храниться отдельным полем,
-         * иначе легко поймать рассинхрон при билдере/десериализации.
-         * Делаем вычисляемым + даём safe-геттеры.
-         */
-
         public static AssetBalance of(BigDecimal free, BigDecimal locked) {
             return AssetBalance.builder()
                     .free(nz(free))

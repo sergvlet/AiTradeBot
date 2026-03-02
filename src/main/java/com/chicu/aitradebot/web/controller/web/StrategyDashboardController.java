@@ -2,7 +2,6 @@ package com.chicu.aitradebot.web.controller.web;
 
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
-import com.chicu.aitradebot.market.stream.MarketDataStreamService;
 import com.chicu.aitradebot.orchestrator.dto.StrategyRunInfo;
 import com.chicu.aitradebot.service.StrategySettingsService;
 import com.chicu.aitradebot.web.facade.WebStrategyFacade;
@@ -27,7 +26,6 @@ public class StrategyDashboardController {
 
     private final WebStrategyFacade webStrategyFacade;
     private final StrategySettingsService strategySettingsService;
-    private final MarketDataStreamService marketDataStreamService;
 
     @GetMapping("/{type}/dashboard")
     public String strategyDashboardPage(
@@ -139,33 +137,12 @@ public class StrategyDashboardController {
         );
 
         // =====================================================
-        // 3) START MARKET STREAM (IDEMPOTENT)
-        // =====================================================
-        if (configuredMarket) {
-            try {
-                marketDataStreamService.subscribe(
-                        exchangeNorm,
-                        settings.getNetworkType(),
-                        chatId,
-                        type,
-                        symbol,
-                        timeframe
-                );
-                log.info("📡 MARKET STREAM OK chatId={} type={} ex={} net={} {} {}",
-                        chatId, type, exchangeNorm, settings.getNetworkType(), symbol, timeframe);
-
-            } catch (Exception e) {
-                log.error("❌ MARKET STREAM FAILED chatId={} type={} ex={} net={} {} {}",
-                        chatId, type, exchangeNorm, settings.getNetworkType(), symbol, timeframe, e);
-
-                model.addAttribute("notice",
-                        "Не удалось подключить поток рынка (WS). Страница открыта, но данные могут не обновляться.");
-            }
-        }
-
-        // =====================================================
-        // 4) STRATEGY LIVE STATE (RUN INFO)
+        // 3) STRATEGY LIVE STATE (RUN INFO)
         // ✅ Тут тоже передаём нормализованный exchange
+        //
+        // ВАЖНО:
+        // - WS-подписка теперь НЕ зависит от открытия дашборда.
+        // - Поток рынка подключается/отключается оркестратором при START/STOP стратегии.
         // =====================================================
         StrategyRunInfo info =
                 webStrategyFacade.getRunInfo(

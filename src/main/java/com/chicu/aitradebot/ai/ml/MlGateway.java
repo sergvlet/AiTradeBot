@@ -9,6 +9,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.Locale;
@@ -122,6 +123,9 @@ public class MlGateway {
         f.putIfAbsent("ts", tsMs);
         f.putIfAbsent("tsMs", tsMs);
 
+        // ✅ нормализуем значения (Enum/Instant/BigDecimal и т.п.)
+        f = normalizeFeatures(f);
+
         // ✅ top-level request тоже заполняем (это правильный контракт)
         MlPredictRequest req = new MlPredictRequest();
         req.setChatId(chatId);
@@ -144,6 +148,12 @@ public class MlGateway {
                 return MlPredictResponse.fail("predict_no_proba");
             }
 
+            // ✅ если sidecar явно сказал, что модель/формат сломан — подсвечиваем это в логах
+            if (!r.isOk() && isModelFormatError(r.getError())) {
+                log.warn("🧠 ML model format error (sidecar): type={} chatId={} symbol={} err={}",
+                        type, chatId, symbol, safeStr(r.getError()));
+            }
+
             return r;
 
         } catch (Exception e) {
@@ -153,11 +163,65 @@ public class MlGateway {
         }
     }
 
+    private static Map<String, Object> normalizeFeatures(Map<String, Object> in) {
+        Map<String, Object> out = new HashMap<>();
+        if (in == null || in.isEmpty()) return out;
+
+        for (Map.Entry<String, Object> e : in.entrySet()) {
+            String k = e.getKey();
+            Object v = e.getValue();
+            if (k == null || k.isBlank()) continue;
+
+            Object nv = normalizeValue(v);
+            out.put(k, nv);
+        }
+        return out;
+    }
+
+    private static Object normalizeValue(Object v) {
+        if (v == null) return null;
+
+        if (v instanceof Enum<?> en) return en.name();
+        if (v instanceof Instant inst) return inst.toEpochMilli();
+
+        // BigDecimal оставляем BigDecimal (Jackson нормально сериализует), но если кто-то сунул NaN/Inf — защитимся
+        if (v instanceof Double d) {
+            if (!Double.isFinite(d)) return null;
+            return d;
+        }
+        if (v instanceof Float f) {
+            if (!Float.isFinite(f)) return null;
+            return f.doubleValue();
+        }
+
+        // числа/строки/булевы/мапы/листы — пусть идут как есть
+        return v;
+    }
+
+    private static boolean isModelFormatError(String err) {
+        if (err == null) return false;
+        String s = err.toLowerCase(Locale.ROOT);
+
+        // типичные симптомы твоего лога:
+        // "'dict' object has no attribute 'predict_proba'"
+        if (s.contains("predict_proba") && s.contains("dict")) return true;
+
+        // предупреждение xgboost про старую сериализацию
+        if (s.contains("xgboost") && (s.contains("save_model") || s.contains("serialized model"))) return true;
+
+        // общие признаки сломанной загрузки модели
+        return s.contains("model") && (s.contains("load") || s.contains("deserialize") || s.contains("pickle"));
+    }
+
     private static String safeMsg(Throwable e) {
         if (e == null) return "null";
         String m = e.getMessage();
         if (m == null || m.isBlank()) return e.getClass().getSimpleName();
         return m;
+    }
+
+    private static String safeStr(String s) {
+        return s == null ? "null" : s;
     }
 
     private static String blankToNull(String s) {

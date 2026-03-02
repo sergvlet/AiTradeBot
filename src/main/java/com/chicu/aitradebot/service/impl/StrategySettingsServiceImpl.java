@@ -17,6 +17,7 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Locale;
@@ -285,30 +286,51 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
      * Эти фазы может выставлять рантайм (MlAutoTuneRuntime/AutoTuner) для внутренних процессов.
      */
     private void applyControlModeFlags(StrategySettings s) {
-        AdvancedControlMode mode = (s.getAdvancedControlMode() != null)
-                ? s.getAdvancedControlMode()
-                : AdvancedControlMode.MANUAL;
+        if (s == null) return;
 
-        String phase = normalizeUpperNullable(s.getRunPhase());
+        AdvancedControlMode mode = s.getAdvancedControlMode();
+        if (mode == null) mode = AdvancedControlMode.MANUAL;
+
+        // runPhase: BACKTEST не трогаем. COLLECT больше не выставляем автоматически для AI/HYBRID,
+        // иначе ордера не исполняются. Если в БД осталась старая COLLECT — приводим к торговой фазе.
+        String rp = (s.getRunPhase() == null) ? "" : s.getRunPhase().trim().toUpperCase(Locale.ROOT);
+        boolean phaseIsBacktest = "BACKTEST".equals(rp);
+
+        NetworkType net = (s.getNetworkType() != null) ? s.getNetworkType() : NetworkType.TESTNET;
+        String defaultTradingPhase = (net == NetworkType.TESTNET) ? "PAPER" : "LIVE";
 
         switch (mode) {
             case MANUAL -> {
                 s.setAutoTuneEnabled(false);
                 s.setMlGateEnabled(false);
-                s.setRunPhase(PHASE_LIVE);
+                s.setGateMinProb(null);
+
+                if (!phaseIsBacktest && (rp.isEmpty())) {
+                    s.setRunPhase("LIVE");
+                }
             }
-            case HYBRID, AI -> {
+            case HYBRID -> {
+                // HYBRID = ML-gate обязателен, автотюн выключен
+                s.setAutoTuneEnabled(false);
+                s.setMlGateEnabled(true);
+                if (s.getGateMinProb() == null) s.setGateMinProb(new BigDecimal("0.55"));
+
+                if (!phaseIsBacktest && (rp.isEmpty() || "COLLECT".equals(rp))) {
+                    s.setRunPhase(defaultTradingPhase);
+                }
+            }
+            case AI -> {
+                // AI = автотюн обязателен, ML-gate по умолчанию включён
                 s.setAutoTuneEnabled(true);
                 s.setMlGateEnabled(true);
+                if (s.getGateMinProb() == null) s.setGateMinProb(new BigDecimal("0.55"));
 
-                if (phase == null) {
-                    // безопасный дефолт, если никто не выставил фазу
-                    NetworkType net = (s.getNetworkType() != null ? s.getNetworkType() : defaultNetwork());
-                    s.setRunPhase(net == NetworkType.TESTNET ? PHASE_PAPER : PHASE_LIVE);
-                } else {
-                    // оставляем как есть: LIVE/PAPER/COLLECT/BACKTEST/…
-                    s.setRunPhase(phase);
+                if (!phaseIsBacktest && (rp.isEmpty() || "COLLECT".equals(rp))) {
+                    s.setRunPhase(defaultTradingPhase);
                 }
+            }
+            default -> {
+                // no-op
             }
         }
     }

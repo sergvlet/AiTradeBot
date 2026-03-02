@@ -6,6 +6,7 @@ import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
 import com.chicu.aitradebot.domain.enums.AdvancedControlMode;
 import com.chicu.aitradebot.exchange.model.Order;
+import com.chicu.aitradebot.market.MarketStreamService;
 import com.chicu.aitradebot.market.model.UnifiedKline;
 import com.chicu.aitradebot.orchestrator.dto.StrategyRunInfo;
 import com.chicu.aitradebot.service.OrderService;
@@ -18,7 +19,6 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 
-import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Duration;
@@ -45,6 +45,7 @@ public class AiStrategyOrchestrator {
     private final OrderService orderService;
     private final StrategySettingsService settingsService;
     private final StrategyRegistry strategyRegistry;
+    private final MarketStreamService marketStreamService;
 
     /**
      * ✅ ML autotune runtime (оркестратор — главный lifecycle хаб)
@@ -200,6 +201,19 @@ public class AiStrategyOrchestrator {
         AdvancedControlMode mode = safeMode(s);
         String phase = sanitizePhase(s.getRunPhase());
 
+        // 🚑 AUTO-FIX: если по старой логике AI/HYBRID загнал фазу в COLLECT — ордера не будут выставляться.
+        // В AI/HYBRID по умолчанию торгуем: TESTNET -> PAPER, MAINNET -> LIVE.
+        boolean phaseAutoFixed = false;
+        if (mode != AdvancedControlMode.MANUAL && "COLLECT".equalsIgnoreCase(phase)) {
+            NetworkType net = (network != null) ? network : s.getNetworkType();
+            String newPhase = (net == NetworkType.TESTNET) ? "PAPER" : "LIVE";
+            if (!newPhase.equalsIgnoreCase(phase)) {
+                phase = newPhase;
+                s.setRunPhase(newPhase);
+                phaseAutoFixed = true;
+            }
+        }
+
         // ===== desired state по правилам
         boolean desiredAutoTune;
         boolean desiredGateEnabled;
@@ -224,6 +238,7 @@ public class AiStrategyOrchestrator {
 
         // ===== привести entity к desired (чтобы стратегия увидела правильные значения из БД)
         boolean changed = false;
+        if (phaseAutoFixed) changed = true;
 
         if (s.isAutoTuneEnabled() != desiredAutoTune) {
             s.setAutoTuneEnabled(desiredAutoTune);
@@ -413,10 +428,33 @@ public class AiStrategyOrchestrator {
             // 3) START нового binding
             try {
                 strategy.start(chatId, desired.symbol(), desired.exchange(), desired.network());
+
+                // ✅ WS-подписка на рынок теперь поднимается/переключается тут
+                marketStreamService.ensureSubscribed(
+                        chatId,
+                        type,
+                        desired.symbol(),
+                        desired.timeframe(),
+                        desired.exchange(),
+                        desired.network()
+                );
             } catch (Exception e) {
                 // откат binding если старт не удался
                 running.put(key, current);
                 runtimePolicyCache.put(key, policyOf(s));
+
+                // возвращаем подписку на старый контекст (на всякий)
+                try {
+                    marketStreamService.ensureSubscribed(
+                            chatId,
+                            type,
+                            current.symbol(),
+                            current.timeframe(),
+                            current.exchange(),
+                            current.network()
+                    );
+                } catch (Exception ignored) {}
+
                 log.error("❌ [ORCH] start(new) failed chatId={} type={} ex={} net={} sym={} tf={}",
                         chatId, type, desired.exchange(), desired.network(), desired.symbol(), desired.timeframe(), e);
                 return buildRunInfoFromBinding(s, current, true, "Ошибка рестарта: не удалось запустить новый контекст");
@@ -514,6 +552,10 @@ public class AiStrategyOrchestrator {
                 }
 
                 applyRuntimePolicy(chatId, type, ex, net, s);
+
+                // ✅ поток рынка должен быть активен независимо от UI
+                // (если UI закрыт/обновлён — стратегия всё равно должна получать тики/свечи)
+                marketStreamService.ensureSubscribed(chatId, type, sym, tf, ex, net);
                 return buildRunInfo(s, true, "Стратегия уже запущена");
             }
 
@@ -540,9 +582,15 @@ public class AiStrategyOrchestrator {
 
             try {
                 strategy.start(chatId, sym, ex, net);
+
+                // ✅ WS-подписка на рынок теперь поднимается тут (а не из StrategyDashboardController)
+                marketStreamService.ensureSubscribed(chatId, type, sym, tf, ex, net);
             } catch (Exception e) {
                 running.remove(key, newBinding);
                 runtimePolicyCache.remove(key);
+
+                // если старт упал — не оставляем WS-стрим висеть
+                try { marketStreamService.unsubscribe(chatId, type); } catch (Exception ignored) {}
                 log.error("❌ [ORCH] startStrategy failed type={} chatId={} ex={} net={} sym={} tf={}",
                         type, chatId, ex, net, sym, tf, e);
                 return buildRunInfo(s, false, "Ошибка запуска стратегии");
@@ -601,6 +649,10 @@ public class AiStrategyOrchestrator {
             }
 
             String sym = sanitizeSymbol(s.getSymbol());
+
+            // ✅ отписка от WS-рынка не зависит от UI
+            // (страница может быть закрыта/обновлена — стратегия должна останавливаться корректно)
+            try { marketStreamService.unsubscribe(chatId, type); } catch (Exception ignored) {}
 
             RunBinding removed = running.remove(key);
             ignoreCounters.remove(key);
@@ -687,8 +739,7 @@ public class AiStrategyOrchestrator {
         RunKey key = new RunKey(chatId, type);
         RunBinding b = running.get(key);
 
-        if (b == null) {
-            StrategyRunInfo info = buildRunInfo(s, false, "Стратегия остановлена");
+                if (b == null) {
 
             String ex = sanitizeExchange(exchange);
             if (ex == null) ex = sanitizeExchange(s.getExchangeName());
@@ -697,9 +748,26 @@ public class AiStrategyOrchestrator {
             NetworkType net = (network != null ? network : s.getNetworkType());
             if (net == null) net = NetworkType.TESTNET;
 
-            patchRunInfoContext(info, ex, net, null, null);
-            return info;
+            return StrategyRunInfo.builder()
+                    .chatId(s.getChatId())
+                    .type(s.getType())
+                    .symbol(sanitizeSymbol(s.getSymbol()))
+                    .active(false)
+
+                    .timeframe(sanitizeTf(s.getTimeframe()))
+                    .exchangeName(ex)
+                    .networkType(net)
+
+                    .version(s.getVersion())
+
+                    .startedAt(toInstant(s.getStartedAt()))
+                    .stoppedAt(toInstant(s.getStoppedAt()))
+                    .updatedAt(Instant.now())
+
+                    .message("Стратегия остановлена")
+                    .build();
         }
+
 
         String reqEx = sanitizeExchange(exchange);
         NetworkType reqNet = network;
@@ -1077,35 +1145,27 @@ public class AiStrategyOrchestrator {
     }
 
     private StrategyRunInfo buildRunInfoFromBinding(StrategySettings s, RunBinding b, boolean active, String msg) {
-        StrategyRunInfo info = buildRunInfo(s, active, msg);
-        if (b != null) {
-            patchRunInfoContext(info, b.exchange(), b.network(), b.symbol(), b.timeframe());
-        }
-        return info;
-    }
+        if (s == null) return buildRunInfo(null, active, msg);
 
-    /** ✅ Аккуратная подстановка контекста в DTO (если DTO immutable — просто пропускаем). */
-    private void patchRunInfoContext(StrategyRunInfo info,
-                                     String exchange,
-                                     NetworkType network,
-                                     String symbol,
-                                     String timeframe) {
-        if (info == null) return;
+        String ex = (b != null && b.exchange() != null) ? b.exchange() : sanitizeExchange(s.getExchangeName());
+        NetworkType net = (b != null && b.network() != null) ? b.network() : s.getNetworkType();
+        String sym = (b != null && b.symbol() != null) ? b.symbol() : sanitizeSymbol(s.getSymbol());
+        String tf = (b != null && b.timeframe() != null) ? b.timeframe() : sanitizeTf(s.getTimeframe());
 
-        trySet(info, "setExchangeName", String.class, exchange);
-        trySet(info, "setNetworkType", NetworkType.class, network);
-        trySet(info, "setSymbol", String.class, symbol);
-        trySet(info, "setTimeframe", String.class, timeframe);
-    }
-
-    private void trySet(Object target, String method, Class<?> argType, Object value) {
-        if (target == null) return;
-        try {
-            Method m = target.getClass().getMethod(method, argType);
-            m.invoke(target, value);
-        } catch (Exception ignored) {
-            // DTO может быть immutable — тогда просто пропускаем
-        }
+        return StrategyRunInfo.builder()
+                .chatId(s.getChatId())
+                .type(s.getType())
+                .symbol(sym)
+                .active(active)
+                .timeframe(tf)
+                .exchangeName(ex)
+                .networkType(net)
+                .version(s.getVersion())
+                .startedAt(toInstant(s.getStartedAt()))
+                .stoppedAt(toInstant(s.getStoppedAt()))
+                .updatedAt(Instant.now())
+                .message(msg)
+                .build();
     }
 
     private Instant toInstant(LocalDateTime time) {
@@ -1187,62 +1247,9 @@ public class AiStrategyOrchestrator {
     private Long extractOrderTimestamp(Order o) {
         if (o == null) return null;
 
-        Long ms = tryLong(o, "getTimestampMs")
-                .or(() -> tryLong(o, "getTimeMs"))
-                .or(() -> tryLong(o, "getTs"))
-                .or(() -> tryLong(o, "getTime"))
-                .orElse(null);
-        if (ms != null && ms > 0) return ms;
-
-        Instant inst = tryInstant(o, "getCreatedAt")
-                .or(() -> tryInstant(o, "getUpdatedAt"))
-                .or(() -> tryInstant(o, "getExecutedAt"))
-                .orElse(null);
-        if (inst != null) return inst.toEpochMilli();
-
-        LocalDateTime ldt = tryLocalDateTime(o, "getCreatedAt")
-                .or(() -> tryLocalDateTime(o, "getUpdatedAt"))
-                .orElse(null);
-        if (ldt != null) return ldt.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
-
-        return null;
-    }
-
-    private Optional<Long> tryLong(Object target, String method) {
-        try {
-            Method m = target.getClass().getMethod(method);
-            Object v = m.invoke(target);
-            if (v == null) return Optional.empty();
-            if (v instanceof Long l) return Optional.of(l);
-            if (v instanceof Integer i) return Optional.of(i.longValue());
-            if (v instanceof BigDecimal bd) return Optional.of(bd.longValue());
-            if (v instanceof String s) return Optional.of(Long.parseLong(s.trim()));
-            return Optional.empty();
-        } catch (Exception ignored) {
-            return Optional.empty();
-        }
-    }
-
-    private Optional<Instant> tryInstant(Object target, String method) {
-        try {
-            Method m = target.getClass().getMethod(method);
-            Object v = m.invoke(target);
-            if (v instanceof Instant inst) return Optional.of(inst);
-            return Optional.empty();
-        } catch (Exception ignored) {
-            return Optional.empty();
-        }
-    }
-
-    private Optional<LocalDateTime> tryLocalDateTime(Object target, String method) {
-        try {
-            Method m = target.getClass().getMethod(method);
-            Object v = m.invoke(target);
-            if (v instanceof LocalDateTime ldt) return Optional.of(ldt);
-            return Optional.empty();
-        } catch (Exception ignored) {
-            return Optional.empty();
-        }
+        // ✅ в проекте Order хранит timestamp в поле time (Long)
+        Long t = o.getTime();
+        return (t != null && t > 0) ? t : null;
     }
 
     // =====================================================================
@@ -1296,51 +1303,6 @@ public class AiStrategyOrchestrator {
         return s.isEmpty() ? null : s;
     }
 
-    // =====================================================================
-    // ✅ SAFE READ BOOL (осталось на всякий случай, но сейчас не используется)
-    // =====================================================================
-
-    private static Object readAnyNonNull(Object obj, String... gettersOrFields) {
-        if (obj == null) return null;
-
-        Class<?> c = obj.getClass();
-
-        for (String n : gettersOrFields) {
-            if (n == null || n.isBlank()) continue;
-
-            try {
-                Method m = findNoArgMethod(c, n);
-                if (m != null) {
-                    Object v = m.invoke(obj);
-                    if (v != null) return v;
-                }
-            } catch (Exception ignore) {}
-
-            try {
-                var f = c.getDeclaredField(n);
-                f.setAccessible(true);
-                Object v = f.get(obj);
-                if (v != null) return v;
-            } catch (Exception ignore) {}
-        }
-
-        return null;
-    }
-
-    private static boolean readBool(Object obj, String... names) {
-        Object v = readAnyNonNull(obj, names);
-        if (v == null) return false;
-        if (v instanceof Boolean b) return b;
-        if (v instanceof Number n) return n.intValue() != 0;
-        String s = String.valueOf(v).trim().toLowerCase(Locale.ROOT);
-        return "true".equals(s) || "1".equals(s) || "yes".equals(s);
-    }
-
-    private static Method findNoArgMethod(Class<?> c, String name) {
-        try { return c.getMethod(name); } catch (Exception ignored) {}
-        String cap = name.length() > 0 ? Character.toUpperCase(name.charAt(0)) + name.substring(1) : name;
-        try { return c.getMethod("get" + cap); } catch (Exception ignored) {}
-        try { return c.getMethod("is" + cap); } catch (Exception ignored) {}
-        return null;
-    }
+    // reflection helpers удалены: в проекте работаем строго по методам/полям.
 }
+

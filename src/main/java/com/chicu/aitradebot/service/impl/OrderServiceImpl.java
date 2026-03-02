@@ -149,7 +149,6 @@ public class OrderServiceImpl implements OrderService {
 
         try {
             Map<String, String> extra = new LinkedHashMap<>();
-            // ключ универсальный; в реализации биржи маппишь на newClientOrderId/orderLinkId и т.д.
             extra.put("clientOrderId", clientOrderId);
 
             log.info("📤 [OCO->EXCHANGE] chatId={} ex={} net={} sym={} qty={} tp={} stop={} stopLimit={} st={} cid={} role={}",
@@ -178,11 +177,9 @@ public class OrderServiceImpl implements OrderService {
                     correlationId);
 
         } catch (UnsupportedOperationException uoe) {
-            // Нормально: не все биржи имеют OCO (Bybit spot часто нет, OKX зависит)
             log.warn("⚠️ OCO NOT SUPPORTED -> fallback-local chatId={} ex={} net={} sym={} msg={} cid={}",
                     chatId, exchangeName, networkType, symbol, uoe.getMessage(), correlationId);
         } catch (Exception e) {
-            // Если биржа “умеет”, но упала — это уже ошибка (чтобы не думать что риск закрыт)
             log.error("❌ [OCO EXCHANGE FAILED] chatId={} ex={} net={} sym={} err={} cid={}",
                     chatId, exchangeName, networkType, symbol, e.toString(), correlationId, e);
             throw (e instanceof RuntimeException) ? (RuntimeException) e : new RuntimeException(e);
@@ -209,7 +206,6 @@ public class OrderServiceImpl implements OrderService {
         entity.setPrice(ref);
         if (ref != null) entity.setTotal(ref.multiply(quantity));
 
-        // статус: если реально поставили на биржу — NEW/OPEN, если fallback — NEW (виртуальный)
         String status = "NEW";
         if (ocoPlacedOnExchange && ocoResult != null && ocoResult.status() != null && !ocoResult.status().isBlank()) {
             status = ocoResult.status().trim().toUpperCase(Locale.ROOT);
@@ -510,17 +506,20 @@ public class OrderServiceImpl implements OrderService {
         if (finalQty == null || finalQty.signum() <= 0) throw new IllegalArgumentException("finalQty invalid after guard");
         if (finalPrice == null || finalPrice.signum() <= 0) finalPrice = priceHint;
 
-        // BUY budget pre-check
-        if ("BUY".equals(sideNorm)) {
-            BigDecimal notional = safeMul(finalQty, finalPrice);
-            if (notional == null || notional.signum() <= 0) throw new IllegalArgumentException("notional invalid after guard");
+        // ✅ Нотионал (после guard) — единая точка истины
+        BigDecimal finalNotional = safeMul(finalQty, finalPrice);
+        if (finalNotional == null || finalNotional.signum() <= 0) {
+            throw new IllegalArgumentException("notional invalid after guard");
+        }
 
+        // BUY budget pre-check (с учетом микродопуска)
+        if ("BUY".equals(sideNorm)) {
             BigDecimal maxAllowed = quoteAmount.multiply(BUY_BUDGET_EPS);
-            if (notional.compareTo(maxAllowed) > 0) {
+            if (finalNotional.compareTo(maxAllowed) > 0) {
                 log.warn("💥 BUY BLOCKED: budget exceeded chatId={} ex={} net={} sym={} quote={} notional={} qty={} price={} cid={}",
                         chatId, exchangeName, networkType, symbol,
-                        strip(quoteAmount), strip(notional), strip(finalQty), strip(finalPrice), correlationId);
-                throw new IllegalArgumentException("BUDGET_EXCEEDED: notional=" + strip(notional) + " > quote=" + strip(quoteAmount));
+                        strip(quoteAmount), strip(finalNotional), strip(finalQty), strip(finalPrice), correlationId);
+                throw new IllegalArgumentException("BUDGET_EXCEEDED: notional=" + strip(finalNotional) + " > quote=" + strip(quoteAmount));
             }
         }
 
@@ -542,7 +541,16 @@ public class OrderServiceImpl implements OrderService {
             ExchangeClient.OrderAmountType amountType;
 
             if (os == OrderSide.BUY) {
-                amountToSend = quoteAmount;
+                // ✅ BUY отправляем “на quoteAmount”, но согласованный после guard
+                BigDecimal quoteToSend = finalNotional.setScale(QTY_SCALE, RoundingMode.DOWN);
+                if (quoteToSend.signum() <= 0) throw new IllegalArgumentException("quoteToSend <= 0");
+
+                // если вдруг из-за округления/данных вышли за бюджет — блок
+                if (quoteToSend.compareTo(quoteAmount.multiply(BUY_BUDGET_EPS)) > 0) {
+                    throw new IllegalArgumentException("BUDGET_EXCEEDED(after_round): quoteToSend=" + strip(quoteToSend) + " > quote=" + strip(quoteAmount));
+                }
+
+                amountToSend = quoteToSend;
                 amountType = ExchangeClient.OrderAmountType.QUOTE_QTY;
             } else {
                 amountToSend = finalQty;

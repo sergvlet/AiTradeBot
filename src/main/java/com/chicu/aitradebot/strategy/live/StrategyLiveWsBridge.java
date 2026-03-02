@@ -146,6 +146,23 @@ public class StrategyLiveWsBridge {
                 uiLayers.saveTpSl(ev.getChatId(), ev.getStrategyType(), ev.getSymbol(), time, tp, sl);
             }
 
+            // ✅ ВАЖНО: это твоя “зона окна” — без этого после refresh всё пропадает
+            case "window_zone" -> {
+                if (ev.getWindowZone() == null || ev.getWindowZone().getHigh() == null || ev.getWindowZone().getLow() == null) {
+                    uiLayers.clearWindowZone(ev.getChatId(), ev.getStrategyType(), ev.getSymbol());
+                    return;
+                }
+
+                uiLayers.saveWindowZone(
+                        ev.getChatId(),
+                        ev.getStrategyType(),
+                        ev.getSymbol(),
+                        time,
+                        ev.getWindowZone().getHigh().doubleValue(),
+                        ev.getWindowZone().getLow().doubleValue()
+                );
+            }
+
             default -> { }
         }
     }

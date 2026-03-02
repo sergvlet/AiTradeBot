@@ -1,14 +1,8 @@
 "use strict";
 
 /**
- * BaseStrategy (ШАГ 11)
- * -------------------
- * Адаптер между:
- *   - источником событий (WS / REST / replay)
- *   - набором feature
- *
- * ДОПОЛНИТЕЛЬНО:
- * ✔ хранит read-only runtime-состояния (cooldown и т.п.)
+ * BaseStrategy
+ * Адаптер между источником событий (WS/REST/replay) и набором feature.
  */
 export class BaseStrategy {
 
@@ -75,6 +69,24 @@ export class BaseStrategy {
         }
     }
 
+    /**
+     * ✅ ВАЖНО: прокидываем историю свечей в features (например FeatureWindowZone).
+     */
+    onCandleHistory(candles) {
+        if (!Array.isArray(candles) || candles.length === 0) return;
+
+        for (const f of this.features) {
+            const fn = f?.onCandleHistory;
+            if (typeof fn !== "function") continue;
+
+            try {
+                fn.call(f, candles);
+            } catch (e) {
+                console.warn(`⚠ ${this.name}: feature onCandleHistory error`, e);
+            }
+        }
+    }
+
     // =====================================================
     // SIGNAL HANDLERS
     // =====================================================
@@ -98,9 +110,6 @@ export class BaseStrategy {
     // READ-ONLY API (для UI)
     // =====================================================
 
-    /**
-     * @returns {number|null}
-     */
     getCooldownSeconds() {
         return this.cooldownSeconds;
     }
@@ -118,7 +127,6 @@ export class BaseStrategy {
             }
         }
 
-        // сбрасываем runtime-индикаторы
         this.cooldownSeconds = null;
         this.cooldownUpdatedAt = null;
 
@@ -127,7 +135,6 @@ export class BaseStrategy {
         }
     }
 
-    // OPTIONAL HOOKS
     onStart() {}
     onStop() {}
 }

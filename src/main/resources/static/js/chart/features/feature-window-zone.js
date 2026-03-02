@@ -60,30 +60,27 @@ export class FeatureWindowZone extends FeatureBase {
 
         const zone = ev.windowZone;
 
-        if (
-            !zone ||
-            !Number.isFinite(zone.high) ||
-            !Number.isFinite(zone.low) ||
-            zone.low >= zone.high
-        ) {
+        // ✅ допускаем BigDecimal как string
+        const hi = zone ? Number(zone.high) : NaN;
+        const lo = zone ? Number(zone.low) : NaN;
+
+        if (!zone || !Number.isFinite(hi) || !Number.isFinite(lo) || lo >= hi) {
             this.lastZone = null;
             this.clear();
             return;
         }
 
-        this.lastZone = { high: zone.high, low: zone.low };
+        this.lastZone = { high: hi, low: lo };
 
-        // ✅ ВАЖНО: больше НЕ блокируем рендер из-за candlesData.
-        // Если history уже есть — передадим candlesData для фоновой зоны.
-        // Если history ещё нет — всё равно нарисуем хотя бы линии.
         this.callLayer("renderWindowZone", {
-            high: zone.high,
-            low: zone.low,
+            ...zone,
+            high: hi,
+            low: lo,
             candlesData: (Array.isArray(this.candlesData) && this.candlesData.length) ? this.candlesData : null
         });
 
         this.active = true;
-        this.log("render window zone (event)", zone);
+        this.log("render window zone (event)", { high: hi, low: lo });
     }
 
     // =====================================================

@@ -9,18 +9,20 @@ import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.Locale; // ✅ FIX: нужен для Locale.ROOT
 
 /**
  * Простая in-memory реализация для V4:
  * - хранит факт "в позиции"
  * - хранит snapshot (entryPrice/qty/tp/sl) для правильного выхода
- *
+
  * ⚠️ Если нужно переживать рестарт приложения — позже заменим на DB-реализацию.
  */
 @Slf4j
 @Service
 public class InMemoryPositionStoreImpl implements PositionStore {
+
+    /** Спец-символ: если старый код не передал symbol, всё равно ставим "факт" позиции. */
+    private static final String ANY_SYMBOL = "__ANY__";
 
     /**
      * Храним по точному ключу (включая symbol).
@@ -63,14 +65,10 @@ public class InMemoryPositionStoreImpl implements PositionStore {
 
         String ex = normUpper(exchange);
         String net = normUpper(network != null ? network.name() : null);
-        String sym = normUpper(symbol);
 
-        // Если symbol не задан — мы не знаем куда класть (но и не хотим ломать старый код).
-        // Поэтому просто логируем и игнорируем, чтобы не создать "мутный" ключ.
-        if (sym == null) {
-            log.debug("[POS] markOpened skipped (symbol is null) chatId={} type={} ex={} net={}", chatId, type, ex, net);
-            return;
-        }
+        // ✅ если symbol не задан — ставим "факт" через ANY_SYMBOL (backward-compat)
+        String sym = normUpper(symbol);
+        if (sym == null) sym = ANY_SYMBOL;
 
         positions.putIfAbsent(
                 key(chatId, type, ex, net, sym),
@@ -78,6 +76,10 @@ public class InMemoryPositionStoreImpl implements PositionStore {
                         null, null, null, null,
                         null, null, Instant.now())
         );
+
+        if (log.isDebugEnabled()) {
+            log.debug("[POS] OPEN(fact) chatId={} type={} ex={} net={} sym={}", chatId, type, ex, net, sym);
+        }
     }
 
     @Override
@@ -98,12 +100,9 @@ public class InMemoryPositionStoreImpl implements PositionStore {
 
         String ex = normUpper(exchange);
         String net = normUpper(network != null ? network.name() : null);
-        String sym = normUpper(symbol);
 
-        if (sym == null) {
-            log.debug("[POS] markOpened(snapshot) skipped (symbol is null) chatId={} type={} ex={} net={}", chatId, type, ex, net);
-            return;
-        }
+        String sym = normUpper(symbol);
+        if (sym == null) sym = ANY_SYMBOL;
 
         Instant ts = (openedAt != null ? openedAt : Instant.now());
 
@@ -155,7 +154,10 @@ public class InMemoryPositionStoreImpl implements PositionStore {
             return;
         }
 
+        // ✅ закрываем конкретный symbol + чистим плейсхолдер ANY_SYMBOL (если был)
         positions.remove(key(chatId, type, ex, net, sym));
+        positions.remove(key(chatId, type, ex, net, ANY_SYMBOL));
+
         log.debug("[POS] CLOSE chatId={} type={} ex={} net={} sym={}", chatId, type, ex, net, sym);
     }
 
@@ -175,13 +177,25 @@ public class InMemoryPositionStoreImpl implements PositionStore {
         if (sym == null) {
             // вернуть любую позицию по контексту (например для "быстрого статуса")
             String prefix = prefixKey(chatId, type, ex, net);
+
+            // 1) сначала попробуем реальную (не ANY)
             for (Map.Entry<String, PositionSnapshot> e : positions.entrySet()) {
-                if (e.getKey() != null && e.getKey().startsWith(prefix)) return Optional.ofNullable(e.getValue());
+                String k = e.getKey();
+                if (k != null && k.startsWith(prefix) && !k.endsWith(":" + ANY_SYMBOL)) {
+                    return Optional.ofNullable(e.getValue());
+                }
             }
-            return Optional.empty();
+
+            // 2) потом ANY_SYMBOL, если только он и есть
+            PositionSnapshot any = positions.get(key(chatId, type, ex, net, ANY_SYMBOL));
+            return Optional.ofNullable(any);
         }
 
-        return Optional.ofNullable(positions.get(key(chatId, type, ex, net, sym)));
+        PositionSnapshot snap = positions.get(key(chatId, type, ex, net, sym));
+        if (snap != null) return Optional.of(snap);
+
+        // fallback: если почему-то есть только ANY_SYMBOL
+        return Optional.ofNullable(positions.get(key(chatId, type, ex, net, ANY_SYMBOL)));
     }
 
     @Override

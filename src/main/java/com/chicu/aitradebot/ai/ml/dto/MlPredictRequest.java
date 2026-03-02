@@ -4,6 +4,7 @@ import com.fasterxml.jackson.annotation.JsonInclude;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
+import java.util.List;
 import java.util.Map;
 
 @Data
@@ -18,6 +19,12 @@ public class MlPredictRequest {
 
     private String modelKey;
     private String schemaHash;
+
+    /**
+     * ✅ Явный порядок фич (если нужен).
+     * Sidecar принимает: featureOrder / schema / schemaFields.
+     */
+    private List<String> featureOrder;
 
     private Map<String, Object> features;
 

@@ -1,12 +1,12 @@
 package com.chicu.aitradebot.strategy.live;
 
 import com.chicu.aitradebot.common.enums.StrategyType;
+import com.chicu.aitradebot.market.model.UnifiedKline;
 import com.chicu.aitradebot.strategy.core.signal.Signal;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
-import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.List;
@@ -26,6 +26,10 @@ public class StrategyLivePublisher {
 
     private static long nowMs(Instant ts) {
         return ts != null ? ts.toEpochMilli() : System.currentTimeMillis();
+    }
+
+    private static Instant instantFromMs(long ms) {
+        return ms > 0 ? Instant.ofEpochMilli(ms) : null;
     }
 
     private static String sanitizeSymbol(String symbol) {
@@ -69,19 +73,12 @@ public class StrategyLivePublisher {
         bridge.publish(ev);
     }
 
+    /**
+     * ✅ БЕЗ рефлексии.
+     * Если в твоём Signal появится поле confidence на уровне интерфейса/класса — добавим поддержку.
+     */
     private static double safeSignalConfidence(Signal signal) {
-        if (signal == null) return 0.0;
-        try {
-            Method m = signal.getClass().getMethod("getConfidence");
-            Object v = m.invoke(signal);
-            if (v == null) return 0.0;
-            if (v instanceof Number n) return n.doubleValue();
-            String s = String.valueOf(v).trim();
-            if (s.isEmpty() || "null".equalsIgnoreCase(s)) return 0.0;
-            return Double.parseDouble(s);
-        } catch (Exception ignore) {
-            return 0.0;
-        }
+        return 0.0;
     }
 
     // =====================================================
@@ -689,27 +686,21 @@ public class StrategyLivePublisher {
 
     public void publishCandle(long chatId,
                               StrategyType strategyType,
-                              com.chicu.aitradebot.market.model.UnifiedKline kline) {
+                              UnifiedKline kline) {
 
         if (kline == null) return;
 
-        String symbol = asString(readAny(kline, "symbol", "getSymbol"));
-        String tf     = asString(readAny(kline, "timeframe", "getTimeframe", "interval", "getInterval"));
+        String symbol = kline.getSymbol();
+        String tf     = kline.getTimeframe();
 
-        BigDecimal open   = asBigDecimal(readAny(kline, "open", "getOpen"));
-        BigDecimal high   = asBigDecimal(readAny(kline, "high", "getHigh"));
-        BigDecimal low    = asBigDecimal(readAny(kline, "low", "getLow"));
-        BigDecimal close  = asBigDecimal(readAny(kline, "close", "getClose"));
-        BigDecimal volume = asBigDecimal(readAny(kline, "volume", "getVolume"));
+        BigDecimal open   = kline.getOpen();
+        BigDecimal high   = kline.getHigh();
+        BigDecimal low    = kline.getLow();
+        BigDecimal close  = kline.getClose();
+        BigDecimal volume = kline.getVolume();
 
-        Long timeMs = asLong(readAny(kline,
-                "openTime", "getOpenTime",
-                "startTime", "getStartTime",
-                "time", "getTime",
-                "closeTime", "getCloseTime"
-        ));
-
-        if (open == null || high == null || low == null || close == null) return;
+        long openTimeMs = kline.getOpenTime();
+        Instant ts = instantFromMs(openTimeMs);
 
         pushCandleOhlc(
                 chatId,
@@ -721,73 +712,7 @@ public class StrategyLivePublisher {
                 low,
                 close,
                 volume,
-                timeMs != null && timeMs > 0 ? Instant.ofEpochMilli(timeMs) : null
+                ts
         );
-    }
-
-    // =====================================================
-    // 🧩 Reflection helpers
-    // =====================================================
-
-    private static Object readAny(Object target, String... methodNames) {
-        if (target == null || methodNames == null) return null;
-
-        Class<?> c = target.getClass();
-        for (String name : methodNames) {
-            if (name == null || name.isBlank()) continue;
-            try {
-                var m = c.getMethod(name);
-                return m.invoke(target);
-            } catch (NoSuchMethodException ignore) {
-                if (!name.startsWith("get") && !name.startsWith("is")) {
-                    String cap = Character.toUpperCase(name.charAt(0)) + name.substring(1);
-                    try {
-                        var m2 = c.getMethod("get" + cap);
-                        return m2.invoke(target);
-                    } catch (Exception ignore2) {
-                        try {
-                            var m3 = c.getMethod("is" + cap);
-                            return m3.invoke(target);
-                        } catch (Exception ignore3) {
-                            // continue
-                        }
-                    }
-                }
-            } catch (Exception ignored) {
-                // ignore
-            }
-        }
-        return null;
-    }
-
-    private static String asString(Object v) {
-        if (v == null) return null;
-        String s = String.valueOf(v).trim();
-        return s.isEmpty() ? null : s;
-    }
-
-    private static Long asLong(Object v) {
-        if (v == null) return null;
-        if (v instanceof Long l) return l;
-        if (v instanceof Integer i) return i.longValue();
-        if (v instanceof Instant it) return it.toEpochMilli();
-        if (v instanceof java.util.Date d) return d.getTime();
-        if (v instanceof Number n) return n.longValue();
-        try {
-            return Long.parseLong(String.valueOf(v));
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    private static BigDecimal asBigDecimal(Object v) {
-        if (v == null) return null;
-        if (v instanceof BigDecimal bd) return bd;
-        if (v instanceof Number n) return BigDecimal.valueOf(n.doubleValue());
-        try {
-            return new BigDecimal(String.valueOf(v));
-        } catch (Exception e) {
-            return null;
-        }
     }
 }

@@ -14,6 +14,7 @@ import org.json.JSONObject;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -37,10 +38,10 @@ public class BinanceSpotWebSocketClient {
      * key = BINANCE:NET:chatId:TYPE:symbol[:tf]:CHANNEL
      * - AGG_TRADE без tf
      * - KLINE с tf
+     * - BOOK_TICKER без tf
      */
     private final Map<String, WebSocket> sockets = new ConcurrentHashMap<>();
 
-    // ✅ чтобы понять, приходят ли KLINE вообще (не спамим)
     private final Map<String, Integer> klineRxCount = new ConcurrentHashMap<>();
 
     // =====================================================
@@ -144,6 +145,54 @@ public class BinanceSpotWebSocketClient {
     }
 
     // =====================================================
+    // ✅ BOOK TICKER (частые обновления цены)
+    // =====================================================
+
+    public void subscribeBookTicker(NetworkType networkType,
+                                    String symbol,
+                                    long chatId,
+                                    StrategyType strategyType) {
+
+        NetworkType net = (networkType != null) ? networkType : NetworkType.MAINNET;
+
+        String sym = normSymbolLowerSafe(symbol);
+        if (sym == null || strategyType == null) return;
+
+        String key = buildKeyBook(chatId, strategyType, sym, net);
+        if (sockets.containsKey(key)) return;
+
+        String streams = sym + "@bookTicker";
+        String wsUrl = buildWsUrl(net, streams);
+
+        Request request = new Request.Builder().url(wsUrl).build();
+
+        log.info("🔌 WS CONNECT BINANCE chatId={} type={} sym={} net={} channel=BOOK_TICKER url={}",
+                chatId, strategyType, sym.toUpperCase(Locale.ROOT), net, wsUrl);
+
+        WebSocket ws = client.newWebSocket(request,
+                new BookTickerListener(key, chatId, strategyType, sym, net));
+
+        WebSocket prev = sockets.putIfAbsent(key, ws);
+        if (prev != null) {
+            try { ws.close(1000, "duplicate"); } catch (Exception ignored) {}
+        }
+    }
+
+    public void unsubscribeBookTicker(NetworkType networkType,
+                                      String symbol,
+                                      long chatId,
+                                      StrategyType strategyType) {
+
+        NetworkType net = (networkType != null) ? networkType : NetworkType.MAINNET;
+
+        String sym = normSymbolLowerSafe(symbol);
+        if (sym == null || strategyType == null) return;
+
+        String key = buildKeyBook(chatId, strategyType, sym, net);
+        closeAndRemove(key, "unsubscribe");
+    }
+
+    // =====================================================
     // LISTENERS
     // =====================================================
 
@@ -232,6 +281,109 @@ public class BinanceSpotWebSocketClient {
         }
     }
 
+    private final class BookTickerListener extends WebSocketListener {
+        private final String key;
+        private final long chatId;
+        private final StrategyType type;
+        private final String symLower;
+        private final NetworkType net;
+
+        private BookTickerListener(String key,
+                                   long chatId,
+                                   StrategyType type,
+                                   String symLower,
+                                   NetworkType net) {
+            this.key = key;
+            this.chatId = chatId;
+            this.type = type;
+            this.symLower = symLower;
+            this.net = net;
+        }
+
+        @Override
+        public void onOpen(@NotNull WebSocket webSocket, @NotNull Response response) {
+            log.info("✅ WS OPEN BINANCE key={}", key);
+        }
+
+        @Override
+        public void onMessage(@NotNull WebSocket webSocket, @NotNull String text) {
+            handleBook(text);
+        }
+
+        @Override
+        public void onMessage(@NotNull WebSocket webSocket, @NotNull ByteString bytes) {
+            handleBook(bytes.utf8());
+        }
+
+        @Override
+        public void onClosing(@NotNull WebSocket webSocket, int code, @NotNull String reason) {
+            log.warn("⚠️ WS CLOSING BINANCE key={} code={} reason={}", key, code, reason);
+        }
+
+        @Override
+        public void onClosed(@NotNull WebSocket webSocket, int code, @NotNull String reason) {
+            log.warn("❌ WS CLOSED BINANCE key={} code={} reason={}", key, code, reason);
+            removeIfSame(key, webSocket);
+        }
+
+        @Override
+        public void onFailure(@NotNull WebSocket webSocket, @NotNull Throwable t, Response response) {
+            String resp = (response != null) ? (response.code() + " " + response.message()) : "no-response";
+            log.error("💥 WS FAIL BINANCE key={} resp={} err={}", key, resp, t.toString());
+            removeIfSame(key, webSocket);
+        }
+
+        private void handleBook(String raw) {
+            try {
+                JSONObject root = new JSONObject(raw);
+                JSONObject data = root.has("data") ? root.getJSONObject("data") : root;
+
+                // stream: @bookTicker
+                // поля обычно: s,b,B,a,A,u
+                String s = data.optString("s", "");
+                if (s.isBlank()) {
+                    // иногда symbol может не прийти (редко) — тогда используем наш
+                    s = symLower.toUpperCase(Locale.ROOT);
+                }
+
+                String bidStr = data.optString("b", "");
+                String askStr = data.optString("a", "");
+                if (bidStr.isBlank() && askStr.isBlank()) return;
+
+                BigDecimal bid = bidStr.isBlank() ? null : new BigDecimal(bidStr);
+                BigDecimal ask = askStr.isBlank() ? null : new BigDecimal(askStr);
+
+                BigDecimal price;
+                if (bid != null && ask != null && bid.signum() > 0 && ask.signum() > 0) {
+                    price = bid.add(ask).divide(new BigDecimal("2"), 10, RoundingMode.HALF_UP);
+                } else if (bid != null && bid.signum() > 0) {
+                    price = bid;
+                } else if (ask != null && ask.signum() > 0) {
+                    price = ask;
+                } else {
+                    return;
+                }
+
+                long ts = data.has("E") ? data.getLong("E") : System.currentTimeMillis();
+
+                // ✅ прокидываем как “тик” (qty=0)
+                marketStream.onAggTrade(
+                        chatId,
+                        type,
+                        "BINANCE",
+                        net,
+                        s.trim().toUpperCase(Locale.ROOT),
+                        price,
+                        BigDecimal.ZERO,
+                        ts
+                );
+
+            } catch (Exception e) {
+                if (log.isDebugEnabled()) log.debug("WS bookTicker parse error: {}", e.toString());
+            }
+        }
+    }
+
     private final class KlineListener extends WebSocketListener {
         private final String key;
         private final long chatId;
@@ -295,33 +447,15 @@ public class BinanceSpotWebSocketClient {
                 String eventType = event.optString("e", "");
                 if (!"kline".equalsIgnoreCase(eventType)) return;
 
-                // ✅ очень редкий лог: чтобы доказать, что kline реально приходит
                 int cnt = klineRxCount.merge(key, 1, Integer::sum);
                 if (cnt == 1 || (cnt % 30 == 0)) {
                     String stream = root.optString("stream", "");
                     log.info("🕯️ WS KLINE RX key={} cnt={} stream={}", key, cnt, stream);
                 }
 
-                // ✅ КРИТИЧЕСКИЙ ФИКС:
-                // пробуем сначала распарсить объект k (саму свечу), если он есть.
-                JSONObject kObj = event.optJSONObject("k");
-                UnifiedKline kline = null;
-
-                if (kObj != null) {
-                    kline = klineParser.parse(kObj);
-                }
-                // fallback: если парсер ждал весь event
-                if (kline == null) {
-                    kline = klineParser.parse(event);
-                }
-                if (kline == null) {
-                    // не спамим: только debug
-                    if (log.isDebugEnabled()) {
-                        log.debug("WS kline parsed=null key={} sym={} tf={} keys={}",
-                                key, symLower, tfLower, event.keySet());
-                    }
-                    return;
-                }
+                // ✅ парсим единым способом (поддерживает combined/direct)
+                UnifiedKline kline = klineParser.parse(root);
+                if (kline == null) return;
 
                 String symUpper = symLower.toUpperCase(Locale.ROOT);
 
@@ -364,6 +498,13 @@ public class BinanceSpotWebSocketClient {
                                       String symLower,
                                       NetworkType net) {
         return "BINANCE:" + net + ":" + chatId + ":" + strategyType.name() + ":" + symLower + ":AGG_TRADE";
+    }
+
+    private static String buildKeyBook(long chatId,
+                                       StrategyType strategyType,
+                                       String symLower,
+                                       NetworkType net) {
+        return "BINANCE:" + net + ":" + chatId + ":" + strategyType.name() + ":" + symLower + ":BOOK_TICKER";
     }
 
     private static String buildKeyKline(long chatId,

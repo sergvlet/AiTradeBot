@@ -1,4 +1,4 @@
-package com.chicu.aitradebot.ai.ml.trading;
+package com.chicu.aitradebot.ai.ml.training;
 
 import com.chicu.aitradebot.ai.ml.MlClient;
 import com.chicu.aitradebot.ai.ml.MlTrainProperties;
@@ -8,8 +8,6 @@ import com.chicu.aitradebot.ai.ml.dataset.MlSampleEntity;
 import com.chicu.aitradebot.ai.ml.dataset.MlSampleRepository;
 import com.chicu.aitradebot.ai.ml.dto.MlTrainRequest;
 import com.chicu.aitradebot.ai.ml.dto.MlTrainResponse;
-import com.chicu.aitradebot.ai.ml.training.MlTrainingResult;
-import com.chicu.aitradebot.ai.ml.training.MlTrainingService;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
 import com.chicu.aitradebot.domain.enums.AdvancedControlMode;
@@ -36,9 +34,6 @@ import java.util.concurrent.ConcurrentHashMap;
 @Service
 @RequiredArgsConstructor
 public class MlTrainingServiceImpl implements MlTrainingService {
-
-    private static final BigDecimal PROB_MIN = BigDecimal.ZERO.setScale(6, RoundingMode.HALF_UP);
-    private static final BigDecimal PROB_MAX = BigDecimal.ONE.setScale(6, RoundingMode.HALF_UP);
 
     private final MlTrainProperties props;
     private final MlSampleRepository sampleRepo;
@@ -72,31 +67,43 @@ public class MlTrainingServiceImpl implements MlTrainingService {
             return new MlTrainingResult(false, false, null, null, null, "strategy_settings_missing");
         }
 
+        String reasonNorm = (reason == null || reason.isBlank()) ? "manual" : reason.trim();
+
+        Instant now = Instant.now();
+        Instant from = now.minus(Math.max(1, props.getLookbackDays()), ChronoUnit.DAYS);
+
+        // symbol/tf: сначала из StrategySettings, если пусто — попробуем восстановить из датасета
         String symbol = normUpper(ss.getSymbol());
         String tf = normLower(ss.getTimeframe());
+
+        if (symbol == null || tf == null) {
+            Pair symTf = inferSymbolTfFromSamples(chatId, type, from);
+            if (symbol == null) symbol = symTf.symbol;
+            if (tf == null) tf = symTf.timeframe;
+        }
+
         if (symbol == null) return new MlTrainingResult(false, false, null, null, null, "symbol_missing");
         if (tf == null) return new MlTrainingResult(false, false, null, null, null, "timeframe_missing");
 
-        String reasonNorm = (reason == null || reason.isBlank()) ? "manual" : reason.trim();
-
+        // cooldown
         String cdKey = cooldownKey(chatId, type, symbol, tf);
-        Instant now = Instant.now();
-
         Instant last = lastTrainAt.get(cdKey);
         long cooldownMin = Math.max(0, props.getCooldownMinutes());
         if (last != null && ChronoUnit.MINUTES.between(last, now) < cooldownMin) {
             return new MlTrainingResult(false, false, null, null, null, "cooldown");
         }
 
-        Instant from = now.minus(Math.max(1, props.getLookbackDays()), ChronoUnit.DAYS);
-
+        // грузим последние сэмплы
         List<MlSampleEntity> recent = safeFindRecent(chatId, type, from);
 
         List<MlSampleEntity> samples = new ArrayList<>();
         for (MlSampleEntity s : recent) {
             if (s == null) continue;
             if (s.getFeaturesJson() == null) continue;
-            if (s.getLabel() == null || s.getLabel().isBlank()) continue;
+
+            String lbl = s.getLabel();
+            Integer y = labelToIntOrNull(lbl);
+            if (y == null) continue; // ✅ не тащим мусор в train
 
             String sSym = normUpper(s.getSymbol());
             String sTf = normLower(s.getTimeframe());
@@ -111,29 +118,42 @@ public class MlTrainingServiceImpl implements MlTrainingService {
             return new MlTrainingResult(false, false, null, null, null, "not_enough_samples=" + samples.size());
         }
 
+        // ✅ правильный rowsLimit: берём САМЫЕ НОВЫЕ rowsLimit, потом сортируем ASC (для time-split)
         int rowsLimit = Math.max(100, props.getRowsLimit());
+        samples.sort(Comparator.comparing(MlTrainingServiceImpl::sampleTimeMs, Comparator.nullsLast(Comparator.reverseOrder())));
         if (samples.size() > rowsLimit) {
-            samples = samples.subList(0, rowsLimit);
+            samples = new ArrayList<>(samples.subList(0, rowsLimit));
+        }
+        samples.sort(Comparator.comparing(MlTrainingServiceImpl::sampleTimeMs, Comparator.nullsLast(Comparator.naturalOrder())));
+
+        // feature schema
+        List<String> featureSchema = resolveFeatureSchema(samples);
+        if (featureSchema == null || featureSchema.isEmpty()) {
+            return new MlTrainingResult(false, false, null, null, null, "feature_schema_missing");
         }
 
-        // ASC для тайм-сплита без утечек (если sidecar так обучает)
-        samples.sort(Comparator.comparing(MlSampleEntity::getCreatedAt, Comparator.nullsLast(Comparator.naturalOrder())));
-
-        List<String> featureSchema = resolveFeatureSchema(samples);
         String schemaHash = computeSchemaHash(featureSchema);
         if (schemaHash == null) schemaHash = normTrim(ss.getMlSchemaHash());
         if (schemaHash == null) schemaHash = "schema_v1";
 
-        if (isBlank(ss.getMlSchemaHash())) {
+        if (!Objects.equals(normTrim(ss.getMlSchemaHash()), schemaHash)) {
             ss.setMlSchemaHash(schemaHash);
             try { ss = strategySettingsService.save(ss); } catch (Exception ignored) {}
         }
 
+        // ✅ modelKey: держим совместимость с auto-resolve в sidecar (strategy:symbol:timeframe)
+        String modelKey = normTrim(ss.getMlModelKey());
+        if (modelKey == null) {
+            modelKey = type.name() + ":" + symbol + ":" + tf;
+        }
+
+        // request
         MlTrainRequest req = new MlTrainRequest();
         req.setChatId(chatId);
         req.setStrategyType(type.name());
         req.setSymbol(symbol);
         req.setTimeframe(tf);
+        req.setModelKey(modelKey);
         req.setSchemaHash(schemaHash);
         req.setFeatureSchema(featureSchema);
         req.setRows(toRows(samples, featureSchema));
@@ -143,23 +163,27 @@ public class MlTrainingServiceImpl implements MlTrainingService {
         params.put("rows", req.getRows() != null ? req.getRows().size() : 0);
         params.put("from", from.toEpochMilli());
         params.put("to", now.toEpochMilli());
+        params.put("modelKey", modelKey);
         req.setParams(params);
 
-        log.info("🧠 TRAIN START chatId={} type={} sym={} tf={} rows={} schemaHash={} reason={}",
-                chatId, type, symbol, tf, params.get("rows"), schemaHash, reasonNorm);
+        log.info("🧠 TRAIN START chatId={} type={} sym={} tf={} rows={} schemaHash={} modelKey={} reason={}",
+                chatId, type, symbol, tf, params.get("rows"), schemaHash, modelKey, reasonNorm);
 
         MlTrainResponse resp;
         try {
             resp = mlClient.train(req);
         } catch (Exception e) {
             log.warn("🧠 TRAIN exception chatId={} type={} err={}", chatId, type, e.toString());
-            return new MlTrainingResult(false, false, null, null, schemaHash, "train_exception");
+            return new MlTrainingResult(false, false, modelKey, null, schemaHash, "train_exception");
         }
 
         if (resp == null || !resp.isOk()) {
-            return new MlTrainingResult(false, false, null, null, schemaHash,
+            return new MlTrainingResult(false, false, modelKey, null, schemaHash,
                     resp != null ? resp.getError() : "train_null");
         }
+
+        String respSchema = normTrim(resp.getSchemaHash());
+        String finalSchemaHash = (respSchema != null ? respSchema : schemaHash);
 
         // 1) артефакт
         try {
@@ -168,8 +192,8 @@ public class MlTrainingServiceImpl implements MlTrainingService {
                     .strategyType(type)
                     .symbol(symbol)
                     .timeframe(tf)
-                    .schemaHash(normTrim(resp.getSchemaHash()) != null ? normTrim(resp.getSchemaHash()) : schemaHash)
-                    .modelKey(resp.getModelKey())
+                    .schemaHash(finalSchemaHash)
+                    .modelKey(resp.getModelKey() != null ? resp.getModelKey() : modelKey)
                     .modelVersion(resp.getModelVersion())
                     .metricsJson(resp.getMetricsJson())
                     .createdAt(now)
@@ -185,9 +209,18 @@ public class MlTrainingServiceImpl implements MlTrainingService {
         if (props.isAutoApply()) {
             AdvancedControlMode mode = ss.getAdvancedControlMode() != null ? ss.getAdvancedControlMode() : AdvancedControlMode.MANUAL;
 
-            ss.setMlModelKey(resp.getModelKey());
+            ss.setMlModelKey(resp.getModelKey() != null ? resp.getModelKey() : modelKey);
             ss.setMlModelVersion(resp.getModelVersion());
-            ss.setMlSchemaHash(normTrim(resp.getSchemaHash()) != null ? normTrim(resp.getSchemaHash()) : schemaHash);
+            ss.setMlSchemaHash(finalSchemaHash);
+
+            // если gateMinProb пустой — выставим дефолт из props.thresholdAutoEnable (только если > 0)
+            try {
+                BigDecimal minProb = ss.getGateMinProb();
+                if ((minProb == null || minProb.signum() <= 0) && props.getThresholdAutoEnable() > 0) {
+                    ss.setGateMinProb(BigDecimal.valueOf(props.getThresholdAutoEnable())
+                            .setScale(6, RoundingMode.HALF_UP));
+                }
+            } catch (Exception ignored) {}
 
             if (mode != AdvancedControlMode.MANUAL) {
                 ss.setMlGateEnabled(true);
@@ -197,19 +230,24 @@ public class MlTrainingServiceImpl implements MlTrainingService {
                 } catch (Exception e) {
                     log.warn("🧠 TRAIN apply settings failed chatId={} type={} err={}", chatId, type, e.toString());
                 }
-                publishSettingsUpdated(chatId, type, "ml_train:" + reasonNorm);
             } else {
                 try { strategySettingsService.save(ss); } catch (Exception ignored) {}
             }
+
+            // ✅ событие — чтобы стратегия/UI подхватили изменения
+            publishSettingsUpdated(chatId, type, "ml_train:" + reasonNorm);
         }
 
         lastTrainAt.put(cdKey, now);
 
         log.info("🧠 TRAIN DONE chatId={} type={} applied={} modelKey={} ver={} schemaHash={}",
-                chatId, type, applied, resp.getModelKey(), resp.getModelVersion(), schemaHash);
+                chatId, type, applied, (resp.getModelKey() != null ? resp.getModelKey() : modelKey), resp.getModelVersion(), finalSchemaHash);
 
-        return new MlTrainingResult(true, applied, resp.getModelKey(), resp.getModelVersion(),
-                (resp.getSchemaHash() != null ? resp.getSchemaHash() : schemaHash), null);
+        return new MlTrainingResult(true, applied,
+                (resp.getModelKey() != null ? resp.getModelKey() : modelKey),
+                resp.getModelVersion(),
+                finalSchemaHash,
+                null);
     }
 
     private List<MlSampleEntity> safeFindRecent(Long chatId, StrategyType type, Instant from) {
@@ -229,6 +267,9 @@ public class MlTrainingServiceImpl implements MlTrainingService {
             JsonNode fj = s.getFeaturesJson();
             if (fj == null) continue;
 
+            Integer y = labelToIntOrNull(s.getLabel());
+            if (y == null) continue;
+
             @SuppressWarnings("unchecked")
             Map<String, Object> features = objectMapper.convertValue(fj, Map.class);
 
@@ -244,9 +285,10 @@ public class MlTrainingServiceImpl implements MlTrainingService {
                 row.putAll(sorted);
             }
 
-            String lbl = s.getLabel();
-            row.put("y", lbl);
-            row.put("label", lbl);
+            // ✅ label должен быть int/bool, не строка
+            row.put("y", y);
+            row.put("label", y);
+            row.put("win", y);
 
             if (s.getTs() != null) row.put("tsMs", s.getTs().toEpochMilli());
 
@@ -273,6 +315,7 @@ public class MlTrainingServiceImpl implements MlTrainingService {
     private static List<String> resolveFeatureSchema(List<MlSampleEntity> samples) {
         if (samples == null || samples.isEmpty()) return null;
 
+        // 1) meta.featureSpec (то, что пишет DatasetCollector)
         JsonNode meta = samples.get(0).getMetaJson();
         if (meta != null) {
             JsonNode spec = meta.get("featureSpec");
@@ -287,6 +330,7 @@ public class MlTrainingServiceImpl implements MlTrainingService {
             }
         }
 
+        // 2) fallback: ключи featuresJson (первого сэмпла)
         JsonNode fj = samples.get(0).getFeaturesJson();
         if (fj != null && fj.isObject()) {
             Iterator<String> it = fj.fieldNames();
@@ -295,6 +339,18 @@ public class MlTrainingServiceImpl implements MlTrainingService {
             keys.sort(String.CASE_INSENSITIVE_ORDER);
             return keys.isEmpty() ? null : keys;
         }
+
+        // 3) fallback: union по всем сэмплам
+        try {
+            Set<String> all = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+            for (MlSampleEntity s : samples) {
+                JsonNode x = s != null ? s.getFeaturesJson() : null;
+                if (x == null || !x.isObject()) continue;
+                Iterator<String> it = x.fieldNames();
+                while (it.hasNext()) all.add(it.next());
+            }
+            if (!all.isEmpty()) return new ArrayList<>(all);
+        } catch (Exception ignored) {}
 
         return null;
     }
@@ -316,8 +372,55 @@ public class MlTrainingServiceImpl implements MlTrainingService {
         }
     }
 
-    private static boolean isBlank(String s) {
-        return s == null || s.trim().isEmpty();
+    private static Long sampleTimeMs(MlSampleEntity s) {
+        if (s == null) return null;
+        if (s.getTs() != null) return s.getTs().toEpochMilli();
+        if (s.getCreatedAt() != null) return s.getCreatedAt().toEpochMilli();
+        return null;
+    }
+
+    private record Pair(String symbol, String timeframe) {}
+
+    private Pair inferSymbolTfFromSamples(Long chatId, StrategyType type, Instant from) {
+        try {
+            List<MlSampleEntity> r = safeFindRecent(chatId, type, from);
+            if (r == null || r.isEmpty()) return new Pair(null, null);
+
+            // возьмём самый новый сэмпл с валидными symbol/tf
+            r.sort(Comparator.comparing(MlTrainingServiceImpl::sampleTimeMs, Comparator.nullsLast(Comparator.reverseOrder())));
+            for (MlSampleEntity s : r) {
+                String sym = normUpper(s.getSymbol());
+                String tf = normLower(s.getTimeframe());
+                if (sym != null && tf != null) return new Pair(sym, tf);
+            }
+            return new Pair(null, null);
+        } catch (Exception ignored) {
+            return new Pair(null, null);
+        }
+    }
+
+    private static Integer labelToIntOrNull(String lbl) {
+        if (lbl == null) return null;
+        String s = lbl.trim();
+        if (s.isEmpty()) return null;
+
+        String u = s.toUpperCase(Locale.ROOT);
+
+        // частые текстовые варианты
+        if (u.equals("WIN") || u.equals("TP") || u.equals("TAKE_PROFIT") || u.equals("PROFIT") || u.equals("TRUE")) return 1;
+        if (u.equals("LOSS") || u.equals("SL") || u.equals("STOP_LOSS") || u.equals("STOP") || u.equals("FALSE")) return 0;
+
+        // числовые
+        try {
+            int v = Integer.parseInt(s);
+            return v > 0 ? 1 : 0;
+        } catch (Exception ignored) {}
+
+        // bool-like
+        if (u.equals("YES") || u.equals("Y")) return 1;
+        if (u.equals("NO") || u.equals("N")) return 0;
+
+        return null;
     }
 
     private static String normTrim(String s) {

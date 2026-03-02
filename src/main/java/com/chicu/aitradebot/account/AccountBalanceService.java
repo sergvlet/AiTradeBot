@@ -4,8 +4,8 @@ import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
 import com.chicu.aitradebot.exchange.client.ExchangeClient;
-import com.chicu.aitradebot.exchange.client.ExchangeClientFactory;
 import com.chicu.aitradebot.exchange.client.ExchangeClient.Balance;
+import com.chicu.aitradebot.exchange.client.ExchangeClientFactory;
 import com.chicu.aitradebot.exchange.model.AccountFees;
 import com.chicu.aitradebot.service.StrategySettingsService;
 import lombok.RequiredArgsConstructor;
@@ -20,6 +20,8 @@ import java.util.stream.Collectors;
 @Service
 @RequiredArgsConstructor
 public class AccountBalanceService {
+
+    private static final String PREFERRED_ASSET = "USDT";
 
     private final StrategySettingsService strategySettingsService;
     private final ExchangeClientFactory exchangeClientFactory;
@@ -42,6 +44,26 @@ public class AccountBalanceService {
                     chatId, type, ex, net, e.toString());
         }
 
+        // если контекст не передан — не идём в биржу
+        if (ex == null) {
+            return AccountBalanceSnapshot.builder()
+                    .availableAssets(List.of())
+                    .selectedAsset(settings != null ? normalize(settings.getAccountAsset()) : null)
+                    .selectedBalance(null)
+                    .connectionOk(false)
+                    .error("exchangeName не задан")
+                    .build();
+        }
+        if (net == null) {
+            return AccountBalanceSnapshot.builder()
+                    .availableAssets(List.of())
+                    .selectedAsset(settings != null ? normalize(settings.getAccountAsset()) : null)
+                    .selectedBalance(null)
+                    .connectionOk(false)
+                    .error("networkType не задан")
+                    .build();
+        }
+
         try {
             ExchangeClient client = exchangeClientFactory.get(ex, net);
 
@@ -58,9 +80,13 @@ public class AccountBalanceService {
                             LinkedHashMap::new
                     ));
 
-            List<String> availableAssets = positiveTotal.keySet().stream()
-                    .sorted(String.CASE_INSENSITIVE_ORDER)
-                    .toList();
+            List<String> availableAssets = new ArrayList<>(positiveTotal.keySet());
+            availableAssets.sort(String.CASE_INSENSITIVE_ORDER);
+
+            // USDT — первый в списке (если есть)
+            if (availableAssets.remove(PREFERRED_ASSET)) {
+                availableAssets.add(0, PREFERRED_ASSET);
+            }
 
             String selected = (settings != null) ? normalize(settings.getAccountAsset()) : null;
 
@@ -80,7 +106,7 @@ public class AccountBalanceService {
 
             boolean changed = false;
             if (selected == null || !positiveTotal.containsKey(selected)) {
-                selected = availableAssets.getFirst();
+                selected = pickDefaultAsset(positiveTotal, availableAssets);
                 changed = true;
             }
 
@@ -109,12 +135,15 @@ public class AccountBalanceService {
             log.warn("⚠️ Не удалось получить баланс (chatId={}, type={}, ex={}, net={}): {}",
                     chatId, type, ex, net, exx.toString());
 
+            String msg = exx.getMessage();
+            if (msg == null || msg.isBlank()) msg = exx.toString();
+
             return AccountBalanceSnapshot.builder()
                     .availableAssets(List.of())
                     .selectedAsset(selectedFallback)
                     .selectedBalance(null)
                     .connectionOk(false)
-                    .error(exx.getMessage())
+                    .error(msg)
                     .build();
         }
     }
@@ -122,8 +151,44 @@ public class AccountBalanceService {
     public AccountFees getAccountFees(long chatId, String exchangeName, NetworkType networkType) {
         String ex = normalize(exchangeName);
         NetworkType net = networkType;
-        ExchangeClient client = exchangeClientFactory.get(ex, net);
-        return client.getAccountFees(chatId, net);
+
+        if (ex == null || net == null) {
+            return null;
+        }
+
+        try {
+            ExchangeClient client = exchangeClientFactory.get(ex, net);
+            return client.getAccountFees(chatId, net);
+        } catch (Exception e) {
+            log.warn("⚠️ Не удалось получить AccountFees (chatId={}, ex={}, net={}): {}",
+                    chatId, ex, net, e.toString());
+            return null;
+        }
+    }
+
+    private String pickDefaultAsset(Map<String, Balance> positiveTotal, List<String> availableAssets) {
+        if (positiveTotal.containsKey(PREFERRED_ASSET)) {
+            return PREFERRED_ASSET;
+        }
+
+        String best = null;
+        double bestTotal = -1.0d;
+
+        for (Map.Entry<String, Balance> e : positiveTotal.entrySet()) {
+            Balance b = e.getValue();
+            if (b == null) continue;
+
+            double total = b.free() + b.locked();
+            if (total > bestTotal) {
+                bestTotal = total;
+                best = e.getKey();
+            }
+        }
+
+        if (best != null) return best;
+
+        // крайний fallback
+        return availableAssets.get(0);
     }
 
     private String normalize(String s) {

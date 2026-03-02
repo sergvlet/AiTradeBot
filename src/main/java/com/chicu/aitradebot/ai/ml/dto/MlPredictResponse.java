@@ -28,6 +28,14 @@ public class MlPredictResponse {
     @JsonAlias({"schema_hash", "schema", "featuresSchema", "featureSchema"})
     private String schemaHash;
 
+    /** sidecar backend (например: xgboost/joblib/no_model) */
+    @JsonAlias({"backend"})
+    private String backend;
+
+    /** sidecar model_loaded */
+    @JsonAlias({"model_loaded", "modelLoaded"})
+    private Boolean modelLoaded;
+
     /** сообщение об ошибке (если ok=false) */
     @JsonAlias({"message", "reason"})
     private String error;
@@ -53,6 +61,8 @@ public class MlPredictResponse {
         r.modelKey = blankToNull(modelKey);
         r.modelVersion = blankToNull(modelVersion);
         r.schemaHash = blankToNull(schemaHash);
+        r.backend = null;
+        r.modelLoaded = null;
         r.error = null;
         return r;
     }
@@ -66,6 +76,8 @@ public class MlPredictResponse {
         r.modelKey = null;
         r.modelVersion = null;
         r.schemaHash = null;
+        r.backend = null;
+        r.modelLoaded = null;
         return r;
     }
 

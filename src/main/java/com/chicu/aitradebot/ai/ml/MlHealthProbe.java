@@ -27,13 +27,6 @@ public class MlHealthProbe implements ApplicationRunner {
     private final ObjectProvider<MlClient> clientProvider;
 
     /**
-     * Лог-уровень именно для стартового health-check.
-     * Пример: ml.health.startupLogLevel=INFO|WARN|DEBUG|ERROR
-     */
-    @Value("${ml.health.startupLogLevel:INFO}")
-    private String startupLogLevel;
-
-    /**
      * Прод-режим: если ML включён и недоступен — валим старт приложения.
      * По умолчанию false (удобно для dev).
      */
@@ -122,8 +115,7 @@ public class MlHealthProbe implements ApplicationRunner {
     }
 
     private void startup(String defaultLevel, String fmt, Object... args) {
-        String eff = (startupLogLevel == null || startupLogLevel.isBlank()) ? defaultLevel : startupLogLevel;
-        String lvl = eff.trim().toUpperCase(Locale.ROOT);
+        String lvl = resolveStartupLogLevel(defaultLevel);
 
         if ("DEBUG".equals(lvl)) {
             log.debug(fmt, args);
@@ -134,6 +126,30 @@ public class MlHealthProbe implements ApplicationRunner {
         } else {
             log.info(fmt, args);
         }
+    }
+
+    private String resolveStartupLogLevel(String defaultLevel) {
+        String lvl = null;
+
+        // ✅ новое место: ml.health.startupLogLevel
+        try {
+            if (props != null && props.getHealth() != null) {
+                String v = props.getHealth().getStartupLogLevel();
+                if (v != null && !v.isBlank()) lvl = v;
+            }
+        } catch (Exception ignored) {}
+
+        // ✅ backward-compat: ml.healthStartupLogLevel
+        if (lvl == null) {
+            try {
+                String v = props != null ? props.getHealthStartupLogLevel() : null;
+                if (v != null && !v.isBlank()) lvl = v;
+            } catch (Exception ignored) {}
+        }
+
+        if (lvl == null || lvl.isBlank()) lvl = defaultLevel;
+
+        return lvl.trim().toUpperCase(Locale.ROOT);
     }
 
     private static String trimSlash(String s) {

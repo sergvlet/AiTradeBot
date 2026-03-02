@@ -1,6 +1,8 @@
 package com.chicu.aitradebot.ai.ml.dto;
 
+import com.fasterxml.jackson.annotation.JsonAlias;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
@@ -14,6 +16,7 @@ import lombok.NoArgsConstructor;
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
+@JsonInclude(JsonInclude.Include.NON_NULL)
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class MlHealthResponse {
 
@@ -27,6 +30,7 @@ public class MlHealthResponse {
     private String version;
 
     /** python: modelsDir */
+    @JsonAlias({"models_dir"})
     private String modelsDir;
 
     /** python: xgboost */
@@ -34,9 +38,11 @@ public class MlHealthResponse {
 
     /** python: model_exists */
     @JsonProperty("model_exists")
+    @JsonAlias({"modelExists"})
     private Boolean modelExists;
 
     /** python: modelVersion */
+    @JsonAlias({"model_version"})
     private String modelVersion;
 
     /** python: error */

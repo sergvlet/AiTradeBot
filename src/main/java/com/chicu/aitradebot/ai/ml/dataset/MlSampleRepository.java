@@ -3,6 +3,7 @@ package com.chicu.aitradebot.ai.ml.dataset;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 
 import java.time.Instant;
 import java.util.List;
@@ -16,7 +17,9 @@ public interface MlSampleRepository extends JpaRepository<MlSampleEntity, Long> 
           and s.createdAt >= :from
         order by s.createdAt desc
     """)
-    List<MlSampleEntity> findRecent(Long chatId, StrategyType type, Instant from);
+    List<MlSampleEntity> findRecent(@Param("chatId") Long chatId,
+                                    @Param("type") StrategyType type,
+                                    @Param("from") Instant from);
 
     long countByChatIdAndStrategyType(Long chatId, StrategyType type);
 
@@ -33,10 +36,10 @@ public interface MlSampleRepository extends JpaRepository<MlSampleEntity, Long> 
           and (s.label is not null and s.label <> '')
         order by s.createdAt asc
     """)
-    List<MlSampleEntity> findForTraining(Long chatId,
-                                         StrategyType type,
-                                         String symbol,
-                                         String timeframe,
-                                         Instant from,
-                                         Instant to);
+    List<MlSampleEntity> findForTraining(@Param("chatId") Long chatId,
+                                         @Param("type") StrategyType type,
+                                         @Param("symbol") String symbol,
+                                         @Param("timeframe") String timeframe,
+                                         @Param("from") Instant from,
+                                         @Param("to") Instant to);
 }

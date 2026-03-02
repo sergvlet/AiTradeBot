@@ -176,6 +176,15 @@ public class StrategySettings {
         return clampProb(v);
     }
 
+    /**
+     * ML уверенность (0..1) в нормализованном виде.
+     * Если null — 0.
+     */
+    public BigDecimal getMlConfidenceSafe() {
+        BigDecimal v = (mlConfidence != null) ? mlConfidence : BigDecimal.ZERO;
+        return clampProb(v);
+    }
+
     public BigDecimal getEffectiveCapitalValueOrNull() {
         CapitalMode m = (capitalMode != null ? capitalMode : CapitalMode.ALL);
         return (m == CapitalMode.ALL) ? null : capitalValue;
@@ -270,9 +279,11 @@ public class StrategySettings {
         if (this.mlConfidence == null) this.mlConfidence = BigDecimal.ZERO;
         if (this.totalProfitPct == null) this.totalProfitPct = BigDecimal.ZERO;
 
-        // нормализуем scale для чисел, чтобы не плодить разные представления в БД/логах
-        this.mlConfidence = safeScale6(this.mlConfidence);
+        // нормализуем scale
         this.totalProfitPct = safeScale6(this.totalProfitPct);
+
+        // ✅ mlConfidence как вероятность: scale=6 и clamp 0..1
+        this.mlConfidence = clampProb(this.mlConfidence);
 
         if (this.gateMinProb != null) {
             this.gateMinProb = clampProb(this.gateMinProb);

@@ -21,6 +21,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 @Slf4j
 @Service
@@ -31,13 +32,27 @@ public class MlDatasetCollector {
     private final MlFeatureBuilder featureBuilder;
     private final ObjectMapper objectMapper;
 
+    private final AtomicLong savedCount = new AtomicLong(0);
+    private final AtomicLong lastInfoLogMs = new AtomicLong(0);
+
     @EventListener
     public void onTradeClosed(TradeClosedEvent e) {
         if (e == null) return;
 
+        Long chatId = null;
+        StrategyType type = null;
+        String symbol = null;
+        String tf = null;
+
         try {
-            StrategyType type = e.strategyType();
+            chatId = e.chatId();
+            type = e.strategyType();
+            symbol = safeSym(e.symbol());
+            tf = safeTf(e.timeframe());
+
+            if (chatId == null || chatId <= 0) return;
             if (type == null) return;
+            if (symbol == null || symbol.isBlank()) return;
 
             // ✅ label пока простой (потом заменим на TP/SL labeler по H свечам)
             String label = (e.pnlPct() != null && e.pnlPct().signum() >= 0) ? "1" : "0";
@@ -49,35 +64,65 @@ public class MlDatasetCollector {
             );
             if (ts == null) ts = Instant.now();
 
+            // ✅ exchange/network должны приходить из TradeClosedEvent
             String exchange = extractString(e,
-                    "exchange", "exchangeName", "ex",
-                    "getExchange", "getExchangeName", "getEx"
+                    "exchange", "exchangeName", "ex", "exchangeId",
+                    "getExchange", "getExchangeName", "getEx", "getExchangeId"
             );
+            exchange = normUpper(exchange);
 
             NetworkType network = extractEnum(e, NetworkType.class,
-                    "network", "networkType",
-                    "getNetwork", "getNetworkType"
+                    "network", "networkType", "net", "netType",
+                    "getNetwork", "getNetworkType", "getNet", "getNetType"
             );
 
-            // ✅ extra: Map.of нельзя (там могут быть null)
+            // =====================================================
+            // extra/meta: собираем полезные поля по сделке
+            // =====================================================
+
             Map<String, Object> extra = new HashMap<>();
             if (e.pnlPct() != null) extra.put("pnlPct", e.pnlPct());
             if (e.exitReason() != null) extra.put("exitReason", e.exitReason());
 
-            // если в event есть поля entry/exit — положим тоже
+            // попробуем вытащить доп. поля, если есть
             Object entryPrice = readAny(e, "entryPrice", "getEntryPrice");
             Object exitPrice = readAny(e, "exitPrice", "getExitPrice", "closePrice", "getClosePrice");
             Object qty = readAny(e, "qty", "quantity", "getQty", "getQuantity");
+
+            Object pnlUsd = readAny(e, "pnlUsd", "pnl", "profitUsd", "getPnlUsd", "getPnl", "getProfitUsd");
+
             if (entryPrice != null) extra.put("entryPrice", entryPrice);
             if (exitPrice != null) extra.put("exitPrice", exitPrice);
             if (qty != null) extra.put("qty", qty);
+            if (pnlUsd != null) extra.put("pnlUsd", pnlUsd);
 
-            // ✅ Контекст для featureBuilder
+            // tp/sl hit (если есть флаги — берём их; иначе пытаемся вывести из exitReason)
+            Boolean tpHit = extractBool(e,
+                    "tpHit", "takeProfitHit", "isTakeProfitHit", "getTakeProfitHit", "isTpHit", "getTpHit"
+            );
+            Boolean slHit = extractBool(e,
+                    "slHit", "stopLossHit", "isStopLossHit", "getStopLossHit", "isSlHit", "getSlHit"
+            );
+
+            String exitReasonStr = (e.exitReason() != null) ? String.valueOf(e.exitReason()) : null;
+            if (tpHit == null || slHit == null) {
+                InferHit inf = inferTpSlFromReason(exitReasonStr);
+                if (tpHit == null) tpHit = inf.tpHit;
+                if (slHit == null) slHit = inf.slHit;
+            }
+
+            if (tpHit != null) extra.put("tpHit", tpHit);
+            if (slHit != null) extra.put("slHit", slHit);
+
+            // =====================================================
+            // Контекст для featureBuilder
+            // =====================================================
+
             MlFeatureContext ctx = MlFeatureContext.builder()
-                    .chatId(e.chatId())
+                    .chatId(chatId)
                     .strategyType(type)
-                    .symbol(e.symbol())
-                    .timeframe(e.timeframe())
+                    .symbol(symbol)
+                    .timeframe(tf)
                     .action(SignalType.BUY.name()) // обучаем "вход" -> win/lose
                     .extra(extra)
                     .build();
@@ -86,7 +131,7 @@ public class MlDatasetCollector {
             if (rawFeatures == null || rawFeatures.isEmpty()) {
                 if (log.isDebugEnabled()) {
                     log.debug("🧠 ML dataset: пустые фичи, пропуск. chatId={} type={} sym={}",
-                            e.chatId(), type, e.symbol());
+                            chatId, type, symbol);
                 }
                 return;
             }
@@ -111,17 +156,37 @@ public class MlDatasetCollector {
 
             JsonNode featuresJson = featuresNode;
 
+            // =====================================================
+            // metaJson (обязательные поля)
+            // =====================================================
+
             ObjectNode meta = objectMapper.createObjectNode();
-            meta.put("action", "CLOSE");
+
+            meta.put("event", "TRADE_CLOSED");
+            meta.put("trainAction", SignalType.BUY.name());
             meta.put("label", label);
+
             meta.put("strategy", type.name());
+            meta.put("chatId", chatId);
+            meta.put("symbol", symbol);
+            meta.put("timeframe", tf);
             meta.put("ts", ts.toEpochMilli());
 
             if (exchange != null) meta.put("exchange", exchange);
             if (network != null) meta.put("network", network.name());
 
             if (e.pnlPct() != null) meta.put("pnlPct", e.pnlPct().doubleValue());
-            if (e.exitReason() != null) meta.put("exitReason", String.valueOf(e.exitReason()));
+            if (pnlUsd != null) putMetaAny(meta, "pnlUsd", pnlUsd);
+
+            if (exitReasonStr != null && !exitReasonStr.isBlank()) meta.put("exitReason", exitReasonStr);
+
+            // ✅ новые поля по чек-листу
+            if (entryPrice != null) putMetaAny(meta, "entryPrice", entryPrice);
+            if (exitPrice != null) putMetaAny(meta, "exitPrice", exitPrice);
+            if (qty != null) putMetaAny(meta, "qty", qty);
+
+            if (tpHit != null) meta.put("tpHit", tpHit);
+            if (slHit != null) meta.put("slHit", slHit);
 
             if (spec != null && !spec.isEmpty()) {
                 ArrayNode a = meta.putArray("featureSpec");
@@ -132,12 +197,12 @@ public class MlDatasetCollector {
             meta.put("schemaHash", sha256Hex(featuresNode.toString()));
 
             MlSampleEntity sample = MlSampleEntity.builder()
-                    .chatId(e.chatId())
+                    .chatId(chatId)
                     .strategyType(type)
                     .exchange(exchange)
                     .network(network != null ? network.name() : null)
-                    .symbol(e.symbol())
-                    .timeframe(e.timeframe())
+                    .symbol(symbol)
+                    .timeframe(tf)
                     .ts(ts)
                     .label(label)
                     .target("win")
@@ -149,8 +214,37 @@ public class MlDatasetCollector {
 
             repo.save(sample);
 
+            long c = savedCount.incrementAndGet();
+            maybeInfoLog(chatId, type, exchange, network, symbol, tf, c);
+
         } catch (Exception ex) {
-            log.warn("🧠 ML sample save failed: {}", ex.toString());
+            log.warn("🧠 ML sample save failed: chatId={} type={} sym={} tf={} err={}",
+                    chatId, type, symbol, tf, ex.toString());
+        }
+    }
+
+    private void maybeInfoLog(Long chatId,
+                              StrategyType type,
+                              String exchange,
+                              NetworkType network,
+                              String symbol,
+                              String tf,
+                              long saved) {
+
+        long now = System.currentTimeMillis();
+        long last = lastInfoLogMs.get();
+
+        boolean timeOk = (now - last) >= 60_000L; // раз в минуту
+        boolean countOk = (saved % 50L) == 0L;    // или каждые 50 записей
+
+        if (timeOk || countOk) {
+            if (lastInfoLogMs.compareAndSet(last, now)) {
+                log.info("🧠 ML sample saved: count={} chatId={} type={} ex={} net={} sym={} tf={}",
+                        saved, chatId, type,
+                        exchange, (network != null ? network.name() : null),
+                        symbol, tf
+                );
+            }
         }
     }
 
@@ -161,14 +255,6 @@ public class MlDatasetCollector {
     @SuppressWarnings("unchecked")
     private List<String> resolveFeatureSpec(MlFeatureBuilder builder, MlFeatureContext ctx, StrategyType type) {
         if (builder == null) return null;
-
-        // варианты сигнатур, которые часто встречаются:
-        // - featureSpec(MlFeatureContext)
-        // - getFeatureSpec(MlFeatureContext)
-        // - featureSpec(StrategyType)
-        // - getFeatureSpec(StrategyType)
-        // - featureSpec()
-        // - getFeatureSpec()
 
         Object v;
 
@@ -210,7 +296,6 @@ public class MlDatasetCollector {
                 String s = String.valueOf(o).trim();
                 if (!s.isEmpty()) out.add(s);
             }
-            // Set не гарантирует порядок — сортируем
             out.sort(String.CASE_INSENSITIVE_ORDER);
             return out.isEmpty() ? null : out;
         }
@@ -240,41 +325,36 @@ public class MlDatasetCollector {
         }
 
         try {
-            if (v instanceof Boolean b) {
-                node.put(key, b);
-                return;
-            }
-            if (v instanceof Integer i) {
-                node.put(key, i);
-                return;
-            }
-            if (v instanceof Long l) {
-                node.put(key, l);
-                return;
-            }
-            if (v instanceof Double d) {
-                node.put(key, d);
-                return;
-            }
-            if (v instanceof Float f) {
-                node.put(key, f.doubleValue());
-                return;
-            }
-            if (v instanceof Number n) {
-                node.put(key, n.doubleValue());
-                return;
-            }
+            if (v instanceof Boolean b) { node.put(key, b); return; }
+            if (v instanceof Integer i) { node.put(key, i); return; }
+            if (v instanceof Long l) { node.put(key, l); return; }
+            if (v instanceof Double d) { node.put(key, d); return; }
+            if (v instanceof Float f) { node.put(key, f.doubleValue()); return; }
+            if (v instanceof Number n) { node.put(key, n.doubleValue()); return; }
+            if (v instanceof String s) { node.put(key, s); return; }
 
-            if (v instanceof String s) {
-                node.put(key, s);
-                return;
-            }
-
-            // fallback: сериализуем объект как JsonNode
             node.set(key, objectMapper.valueToTree(v));
 
         } catch (Exception ex) {
             node.put(key, String.valueOf(v));
+        }
+    }
+
+    private void putMetaAny(ObjectNode meta, String key, Object v) {
+        if (meta == null || key == null || v == null) return;
+
+        try {
+            if (v instanceof Boolean b) { meta.put(key, b); return; }
+            if (v instanceof Integer i) { meta.put(key, i); return; }
+            if (v instanceof Long l) { meta.put(key, l); return; }
+            if (v instanceof Double d) { meta.put(key, d); return; }
+            if (v instanceof Float f) { meta.put(key, f.doubleValue()); return; }
+            if (v instanceof Number n) { meta.put(key, n.doubleValue()); return; }
+            if (v instanceof String s) { meta.put(key, s); return; }
+
+            meta.set(key, objectMapper.valueToTree(v));
+        } catch (Exception ex) {
+            meta.put(key, String.valueOf(v));
         }
     }
 
@@ -364,5 +444,60 @@ public class MlDatasetCollector {
         }
 
         return null;
+    }
+
+    private static Boolean extractBool(Object target, String... names) {
+        Object v = readAny(target, names);
+        if (v == null) return null;
+        if (v instanceof Boolean b) return b;
+        if (v instanceof Number n) return n.intValue() != 0;
+        String s = String.valueOf(v).trim().toLowerCase(Locale.ROOT);
+        if (s.isEmpty()) return null;
+        if (s.equals("true") || s.equals("1") || s.equals("yes") || s.equals("y")) return true;
+        if (s.equals("false") || s.equals("0") || s.equals("no") || s.equals("n")) return false;
+        return null;
+    }
+
+    // =====================================================
+    // Small utils
+    // =====================================================
+
+    private static String safeSym(String s) {
+        if (s == null) return null;
+        String x = s.trim().toUpperCase(Locale.ROOT);
+        return x.isEmpty() ? null : x;
+    }
+
+    private static String safeTf(String s) {
+        if (s == null) return "1m";
+        String x = s.trim();
+        return x.isEmpty() ? "1m" : x;
+    }
+
+    private static String normUpper(String s) {
+        if (s == null) return null;
+        String x = s.trim().toUpperCase(Locale.ROOT);
+        return x.isEmpty() ? null : x;
+    }
+
+    private record InferHit(Boolean tpHit, Boolean slHit) {}
+
+    private static InferHit inferTpSlFromReason(String reason) {
+        if (reason == null) return new InferHit(null, null);
+
+        String r = reason.trim().toUpperCase(Locale.ROOT);
+        if (r.isEmpty()) return new InferHit(null, null);
+
+        Boolean tp = null;
+        Boolean sl = null;
+
+        if (r.contains("TAKE_PROFIT") || r.equals("TP") || r.contains(" TP") || r.contains("TP_") || r.contains("PROFIT")) {
+            tp = true;
+        }
+        if (r.contains("STOP_LOSS") || r.equals("SL") || r.contains(" SL") || r.contains("SL_") || r.contains("LOSS")) {
+            sl = true;
+        }
+
+        return new InferHit(tp, sl);
     }
 }

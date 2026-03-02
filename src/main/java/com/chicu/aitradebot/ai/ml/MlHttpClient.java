@@ -76,7 +76,12 @@ public class MlHttpClient implements MlClient {
             String json = om.writeValueAsString(body);
             RequestBody rb = RequestBody.create(json, JSON);
 
-            Request req = withAuth(new Request.Builder().url(url).post(rb)).build();
+            Request req = withAuth(new Request.Builder()
+                    .url(url)
+                    .post(rb)
+                    .header("Content-Type", "application/json"))
+                    .build();
+
             return execute(req, responseType, op);
 
         } catch (Exception e) {
@@ -93,8 +98,10 @@ public class MlHttpClient implements MlClient {
             String body = resp.body() != null ? resp.body().string() : null;
 
             if (!resp.isSuccessful()) {
+                // ✅ важно: вернуть тело ошибки, чтобы было видно причину (например, stacktrace / error)
+                String err = "http_" + resp.code() + (body != null && !body.isBlank() ? (": " + safe(body)) : "");
                 log.warn("🧠 ML {}: http={} tookMs={} body={}", op, resp.code(), tookMs, safe(body));
-                return errorResponse(responseType, "http_" + resp.code());
+                return errorResponse(responseType, err);
             }
 
             if (body == null || body.isBlank()) {
@@ -118,7 +125,7 @@ public class MlHttpClient implements MlClient {
     private String safe(String s) {
         if (s == null) return null;
         String t = s.replace("\n", " ").replace("\r", " ");
-        return t.length() > 400 ? t.substring(0, 400) + "..." : t;
+        return t.length() > 800 ? t.substring(0, 800) + "..." : t;
     }
 
     private static String safeMsg(Throwable e) {
@@ -152,7 +159,6 @@ public class MlHttpClient implements MlClient {
             } catch (Throwable ignore) {
                 try {
                     T t = responseType.getDeclaredConstructor().newInstance();
-                    // если там есть setOk/setError — заполним мягко
                     tryInvokeSetters(t, now, error);
                     return t;
                 } catch (Exception e) {
@@ -172,21 +178,38 @@ public class MlHttpClient implements MlClient {
 
     private void tryInvokeSetters(Object t, long now, String error) {
         if (t == null) return;
+
+        invokeSetterBool(t, "setOk", false);
+        invokeSetterStr(t, "setError", error);
+
+        // ✅ tsMs / ts могут быть long или Long
+        invokeSetterLong(t, "setTsMs", now);
+        invokeSetterLong(t, "setTs", now);
+    }
+
+    private void invokeSetterBool(Object t, String method, boolean v) {
         try {
-            var m = t.getClass().getMethod("setOk", boolean.class);
-            m.invoke(t, false);
+            var m = t.getClass().getMethod(method, boolean.class);
+            m.invoke(t, v);
+        } catch (Exception ignored) {}
+    }
+
+    private void invokeSetterStr(Object t, String method, String v) {
+        try {
+            var m = t.getClass().getMethod(method, String.class);
+            m.invoke(t, v);
+        } catch (Exception ignored) {}
+    }
+
+    private void invokeSetterLong(Object t, String method, long v) {
+        try {
+            var m = t.getClass().getMethod(method, long.class);
+            m.invoke(t, v);
+            return;
         } catch (Exception ignored) {}
         try {
-            var m = t.getClass().getMethod("setError", String.class);
-            m.invoke(t, error);
-        } catch (Exception ignored) {}
-        try {
-            var m = t.getClass().getMethod("setTsMs", Long.class);
-            m.invoke(t, now);
-        } catch (Exception ignored) {}
-        try {
-            var m = t.getClass().getMethod("setTs", Long.class);
-            m.invoke(t, now);
+            var m = t.getClass().getMethod(method, Long.class);
+            m.invoke(t, v);
         } catch (Exception ignored) {}
     }
 

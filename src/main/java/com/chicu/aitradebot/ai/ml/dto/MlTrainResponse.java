@@ -1,12 +1,15 @@
 package com.chicu.aitradebot.ai.ml.dto;
 
+import com.fasterxml.jackson.annotation.JsonAlias;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.Data;
 
 import java.util.List;
 
 @Data
+@JsonInclude(JsonInclude.Include.NON_NULL)
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class MlTrainResponse {
 
@@ -17,6 +20,7 @@ public class MlTrainResponse {
     private String error;
 
     /** FastAPI: tsMs */
+    @JsonAlias({"ts", "timestamp"})
     private Long tsMs;
 
     // =========================
@@ -24,15 +28,19 @@ public class MlTrainResponse {
     // =========================
 
     /** FastAPI: modelKey */
+    @JsonAlias({"model_key", "key"})
     private String modelKey;
 
     /** FastAPI: modelVersion */
+    @JsonAlias({"model_version", "version"})
     private String modelVersion;
 
     /** FastAPI: schemaHash */
+    @JsonAlias({"schema_hash"})
     private String schemaHash;
 
     /** FastAPI: metricsJson */
+    @JsonAlias({"metrics_json"})
     private String metricsJson;
 
     // =========================
@@ -56,13 +64,20 @@ public class MlTrainResponse {
 
     /**
      * optional: featureSchema
-     * (и алиас "schema" для старых ответов)
+     * (и алиас "schema" / "schemaFields" для старых ответов)
      */
     @JsonProperty("featureSchema")
     private List<String> featureSchema;
 
     @JsonProperty("schema")
     private void setSchemaAlias(List<String> schema) {
+        if (this.featureSchema == null || this.featureSchema.isEmpty()) {
+            this.featureSchema = schema;
+        }
+    }
+
+    @JsonProperty("schemaFields")
+    private void setSchemaFieldsAlias(List<String> schema) {
         if (this.featureSchema == null || this.featureSchema.isEmpty()) {
             this.featureSchema = schema;
         }

@@ -100,4 +100,5 @@ public class UiStrategyLayerEntity {
             this.layerType = t.isEmpty() ? null : t;
         }
     }
+
 }

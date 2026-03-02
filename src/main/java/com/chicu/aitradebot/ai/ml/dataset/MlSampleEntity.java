@@ -16,7 +16,9 @@ import java.util.Locale;
         indexes = {
                 @Index(name = "ix_ml_samples_chat_strategy_time", columnList = "chat_id,strategy_type,created_at"),
                 @Index(name = "ix_ml_samples_symbol_time", columnList = "symbol,created_at"),
-                @Index(name = "ix_ml_samples_ts", columnList = "ts")
+                @Index(name = "ix_ml_samples_ts", columnList = "ts"),
+                // ✅ ускоряет findForTraining (chatId + type + symbol + tf + time)
+                @Index(name = "ix_ml_samples_train", columnList = "chat_id,strategy_type,symbol,timeframe,created_at")
         }
 )
 @Getter

@@ -1,195 +1,83 @@
+// src/main/java/com/chicu/aitradebot/web/ui/UiStrategyLayerService.java
 package com.chicu.aitradebot.web.ui;
 
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.web.ui.entity.UiStrategyLayerEntity;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
-import java.util.function.Supplier;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.locks.ReentrantLock;
 
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class UiStrategyLayerService {
 
-    private final UiStrategyLayerRepository repository;
+    // Типы слоёв (под StrategyLiveWsBridge типы приходят как: levels/zone/tp_sl/window_zone)
+    public static final String TYPE_LEVELS      = "LEVELS";
+    public static final String TYPE_ZONE        = "ZONE";
+    public static final String TYPE_TP_SL       = "TP_SL";
+    public static final String TYPE_WINDOW_ZONE = "WINDOW_ZONE";
+
+    // чтобы не раздувать таблицу бесконечно (можно менять)
+    private static final Duration DEFAULT_TTL = Duration.ofDays(14);
+
+    private final UiStrategyLayerRepository repo;
     private final ObjectMapper objectMapper;
 
-    // TTL
-    private static final Duration TTL = Duration.ofHours(24);
-
-    /**
-     * ✅ Striped locks вместо map-локов:
-     * - нет утечки памяти по ключам
-     * - атомарность delete+insert сохраняем (для одного и того же lockKey гарантированно один stripe)
-     */
-    private static final int LOCK_STRIPES = 1024;
-    private final Object[] lockStripes = new Object[LOCK_STRIPES];
-
-    @PostConstruct
-    void initLockStripes() {
-        for (int i = 0; i < lockStripes.length; i++) {
-            lockStripes[i] = new Object();
-        }
-    }
+    private final ConcurrentMap<String, ReentrantLock> locks = new ConcurrentHashMap<>();
 
     // =====================================================
-    // 📊 READ — ВСЕ СЛОИ (история)
-    // =====================================================
-    @Transactional(readOnly = true)
-    public List<UiStrategyLayerEntity> loadForChart(Long chatId,
-                                                    StrategyType strategyType,
-                                                    String symbol) {
-
-        Long cid = normChatId(chatId);
-        String sym = normSymbol(symbol);
-
-        if (cid == null || strategyType == null || sym == null) return List.of();
-
-        try {
-            return repository.findAllForChart(cid, strategyType, sym);
-        } catch (Exception e) {
-            log.warn("⚠ UI loadForChart failed chatId={} strategy={} symbol={} err={}",
-                    cid, strategyType, sym, e.getMessage());
-            return List.of();
-        }
-    }
-
-    // =====================================================
-    // ✅ READ — ПОСЛЕДНИЕ СНАПШОТЫ
+    // API под StrategyLiveWsBridge
     // =====================================================
 
-    @Transactional(readOnly = true)
-    public List<Double> loadLatestLevels(Long chatId,
-                                         StrategyType strategyType,
-                                         String symbol) {
-
-        return loadLatest(chatId, strategyType, symbol, "LEVELS")
-                .flatMap(this::parseLevels)
-                .orElseGet(List::of);
-    }
-
-    @Transactional(readOnly = true)
-    public Map<String, Object> loadLatestZone(Long chatId,
-                                              StrategyType strategyType,
-                                              String symbol) {
-
-        return loadLatest(chatId, strategyType, symbol, "ZONE")
-                .flatMap(this::parseMap)
-                .orElse(null);
-    }
-
-    @Transactional(readOnly = true)
-    public List<Map<String, Object>> loadLatestOrders(Long chatId,
-                                                      StrategyType strategyType,
-                                                      String symbol) {
-
-        return loadLatest(chatId, strategyType, symbol, "ORDERS")
-                .flatMap(this::parseOrders)
-                .orElseGet(List::of);
-    }
-
-    @Transactional(readOnly = true)
-    public Map<String, Object> loadLatestTpSl(Long chatId,
-                                              StrategyType strategyType,
-                                              String symbol) {
-
-        return loadLatest(chatId, strategyType, symbol, "TPSL")
-                .flatMap(this::parseMap)
-                .orElse(null);
-    }
-
-    @Transactional(readOnly = true)
-    public Map<String, Object> loadLatestBuySellZones(Long chatId,
-                                                      StrategyType strategyType,
-                                                      String symbol) {
-
-        return loadLatest(chatId, strategyType, symbol, "BUYSELL_ZONES")
-                .flatMap(this::parseMap)
-                .orElse(null);
-    }
-
-    // =====================================================
-    // ✅ CLEAR (нужно для clearLevels/clearTpSl/clearZone)
-    // =====================================================
-
-    @Transactional
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void clearLevels(Long chatId, StrategyType strategyType, String symbol) {
-        clearByType(chatId, strategyType, symbol, "LEVELS");
+        clearByType(chatId, strategyType, symbol, TYPE_LEVELS);
     }
 
-    @Transactional
-    public void clearZone(Long chatId, StrategyType strategyType, String symbol) {
-        clearByType(chatId, strategyType, symbol, "ZONE");
-    }
-
-    @Transactional
-    public void clearOrders(Long chatId, StrategyType strategyType, String symbol) {
-        clearByType(chatId, strategyType, symbol, "ORDERS");
-    }
-
-    @Transactional
-    public void clearTpSl(Long chatId, StrategyType strategyType, String symbol) {
-        clearByType(chatId, strategyType, symbol, "TPSL");
-    }
-
-    @Transactional
-    public void clearBuySellZones(Long chatId, StrategyType strategyType, String symbol) {
-        clearByType(chatId, strategyType, symbol, "BUYSELL_ZONES");
-    }
-
-    private void clearByType(Long chatId, StrategyType strategyType, String symbol, String layerType) {
-        Long cid = normChatId(chatId);
-        String sym = normSymbol(symbol);
-        String lt = normLayerType(layerType);
-
-        if (cid == null || strategyType == null || sym == null || lt == null) return;
-
-        withLock(lockKey(cid, strategyType, sym, lt), () -> {
-            repository.deleteByType(cid, strategyType, sym, lt);
-            return null;
-        });
-    }
-
-    // =====================================================
-    // 🧠 SAVE — LEVELS
-    // =====================================================
-    @Transactional
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void saveLevels(Long chatId,
                            StrategyType strategyType,
                            String symbol,
                            Instant candleTime,
-                           List<? extends Number> levels) {
+                           List<Double> levels) {
+        if (levels == null || levels.isEmpty()) {
+            clearLevels(chatId, strategyType, symbol);
+            return;
+        }
 
-        Long cid = normChatId(chatId);
-        String sym = normSymbol(symbol);
-        if (cid == null || strategyType == null || sym == null) return;
+        // как в WS: levels=[{price:...}, ...]
+        List<Map<String, Object>> payloadLevels = new ArrayList<>(levels.size());
+        for (Double p : levels) {
+            if (p == null) continue;
+            payloadLevels.add(Map.of("price", p));
+        }
+        if (payloadLevels.isEmpty()) {
+            clearLevels(chatId, strategyType, symbol);
+            return;
+        }
 
-        final String lt = "LEVELS";
-
-        withLock(lockKey(cid, strategyType, sym, lt), () -> {
-            repository.deleteByType(cid, strategyType, sym, lt);
-
-            // ✅ пустой список = очистка слоя
-            if (levels == null || levels.isEmpty()) return null;
-
-            saveLayer(cid, strategyType, sym, lt, candleTime, Map.of("levels", levels));
-            return null;
-        });
+        saveLayer(chatId, strategyType, symbol, TYPE_LEVELS, candleTime, toJson(payloadLevels));
     }
 
-    // =====================================================
-    // 🟠 SAVE — ZONE
-    // =====================================================
-    @Transactional
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void clearZone(Long chatId, StrategyType strategyType, String symbol) {
+        clearByType(chatId, strategyType, symbol, TYPE_ZONE);
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void saveZone(Long chatId,
                          StrategyType strategyType,
                          String symbol,
@@ -198,57 +86,20 @@ public class UiStrategyLayerService {
                          double bottom,
                          String color) {
 
-        Long cid = normChatId(chatId);
-        String sym = normSymbol(symbol);
-        if (cid == null || strategyType == null || sym == null) return;
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("top", top);
+        payload.put("bottom", bottom);
+        if (color != null && !color.isBlank()) payload.put("color", color);
 
-        final String lt = "ZONE";
-
-        withLock(lockKey(cid, strategyType, sym, lt), () -> {
-            repository.deleteByType(cid, strategyType, sym, lt);
-
-            // ⚠️ Map.of не принимает null значения
-            Map<String, Object> payload = new LinkedHashMap<>();
-            payload.put("top", top);
-            payload.put("bottom", bottom);
-            if (color != null && !color.isBlank()) payload.put("color", color);
-
-            saveLayer(cid, strategyType, sym, lt, candleTime, payload);
-            return null;
-        });
+        saveLayer(chatId, strategyType, symbol, TYPE_ZONE, candleTime, toJson(payload));
     }
 
-    // =====================================================
-    // 🟢 SAVE — ORDERS
-    // =====================================================
-    @Transactional
-    public void saveOrders(Long chatId,
-                           StrategyType strategyType,
-                           String symbol,
-                           Instant candleTime,
-                           List<Map<String, Object>> orders) {
-
-        Long cid = normChatId(chatId);
-        String sym = normSymbol(symbol);
-        if (cid == null || strategyType == null || sym == null) return;
-
-        final String lt = "ORDERS";
-
-        withLock(lockKey(cid, strategyType, sym, lt), () -> {
-            repository.deleteByType(cid, strategyType, sym, lt);
-
-            // ✅ null/empty = очистка слоя
-            if (orders == null || orders.isEmpty()) return null;
-
-            saveLayer(cid, strategyType, sym, lt, candleTime, Map.of("orders", orders));
-            return null;
-        });
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void clearTpSl(Long chatId, StrategyType strategyType, String symbol) {
+        clearByType(chatId, strategyType, symbol, TYPE_TP_SL);
     }
 
-    // =====================================================
-    // 🎯 SAVE — TP / SL
-    // =====================================================
-    @Transactional
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void saveTpSl(Long chatId,
                          StrategyType strategyType,
                          String symbol,
@@ -256,243 +107,240 @@ public class UiStrategyLayerService {
                          Double tp,
                          Double sl) {
 
-        Long cid = normChatId(chatId);
+        if (tp == null && sl == null) {
+            clearTpSl(chatId, strategyType, symbol);
+            return;
+        }
+
+        Map<String, Object> payload = new LinkedHashMap<>();
+        if (tp != null) payload.put("tp", tp);
+        if (sl != null) payload.put("sl", sl);
+
+        saveLayer(chatId, strategyType, symbol, TYPE_TP_SL, candleTime, toJson(payload));
+    }
+
+    // ✅ WINDOW_ZONE (для WINDOW_SCALPING / SCALPING)
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void clearWindowZone(Long chatId, StrategyType strategyType, String symbol) {
+        clearByType(chatId, strategyType, symbol, TYPE_WINDOW_ZONE);
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void saveWindowZone(Long chatId,
+                               StrategyType strategyType,
+                               String symbol,
+                               Instant candleTime,
+                               double high,
+                               double low) {
+
+        if (!Double.isFinite(high) || !Double.isFinite(low)) {
+            clearWindowZone(chatId, strategyType, symbol);
+            return;
+        }
+
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("high", Math.max(high, low));
+        payload.put("low", Math.min(high, low));
+
+        saveLayer(chatId, strategyType, symbol, TYPE_WINDOW_ZONE, candleTime, toJson(payload));
+    }
+
+    // =====================================================
+    // Универсальные методы (для replay/snapshot)
+    // =====================================================
+
+    public List<UiStrategyLayerEntity> findAll(Long chatId, StrategyType strategyType, String symbol) {
         String sym = normSymbol(symbol);
-        if (cid == null || strategyType == null || sym == null) return;
+        if (chatId == null || strategyType == null || sym == null) return List.of();
+        return repo.findByChatIdAndStrategyTypeAndSymbolOrderByCandleTimeAsc(chatId, strategyType, sym);
+    }
 
-        final String lt = "TPSL";
+    public Optional<UiStrategyLayerEntity> findLatestByType(Long chatId, StrategyType strategyType, String symbol, String layerType) {
+        String sym = normSymbol(symbol);
+        String lt = normType(layerType);
+        if (chatId == null || strategyType == null || sym == null || lt == null) return Optional.empty();
+        return repo.findTop1ByChatIdAndStrategyTypeAndSymbolAndLayerTypeOrderByCreatedAtDesc(chatId, strategyType, sym, lt);
+    }
 
-        withLock(lockKey(cid, strategyType, sym, lt), () -> {
-            repository.deleteByType(cid, strategyType, sym, lt);
+    /**
+     * ✅ Готовый layers-map для REST snapshot:
+     * keys: levels, zone, tpSl, windowZone
+     */
+    public Map<String, Object> buildLatestLayersForSnapshot(Long chatId, StrategyType strategyType, String symbol) {
+        String sym = normSymbol(symbol);
+        if (chatId == null || strategyType == null || sym == null) return Map.of();
 
-            // ✅ оба null = очистка слоя
-            if (tp == null && sl == null) return null;
+        LinkedHashMap<String, Object> out = new LinkedHashMap<>();
 
-            Map<String, Object> payload = new LinkedHashMap<>();
-            if (tp != null) payload.put("tp", tp);
-            if (sl != null) payload.put("sl", sl);
-            payload.put("colorTp", "rgba(34,197,94,0.9)");
-            payload.put("colorSl", "rgba(239,68,68,0.9)");
+        // levels -> "levels"
+        findLatestByType(chatId, strategyType, sym, TYPE_LEVELS)
+                .flatMap(this::parsePayloadAny)
+                .ifPresent(v -> out.put("levels", v));
 
-            saveLayer(cid, strategyType, sym, lt, candleTime, payload);
+        // zone -> "zone"
+        findLatestByType(chatId, strategyType, sym, TYPE_ZONE)
+                .flatMap(this::parsePayloadAny)
+                .ifPresent(v -> out.put("zone", v));
+
+        // tp_sl -> "tpSl" (как ожидает JS-стратегия)
+        findLatestByType(chatId, strategyType, sym, TYPE_TP_SL)
+                .flatMap(this::parsePayloadAny)
+                .ifPresent(v -> out.put("tpSl", v));
+
+        // window_zone -> "windowZone"
+        findLatestByType(chatId, strategyType, sym, TYPE_WINDOW_ZONE)
+                .flatMap(this::parsePayloadAny)
+                .ifPresent(v -> out.put("windowZone", v));
+
+        return out;
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void clearAll(Long chatId, StrategyType strategyType, String symbol) {
+        String sym = normSymbol(symbol);
+        if (chatId == null || strategyType == null || sym == null) return;
+
+        withLock(lockKey(chatId, strategyType, sym), () -> {
+            int n = repo.deleteAllByContext(chatId, strategyType, sym);
+            if (n > 0) log.info("🧽 [UI-LAYERS] Очищены все слои: chatId={} type={} sym={} удалено={}", chatId, strategyType, sym, n);
             return null;
         });
     }
 
-    // =====================================================
-    // 🔴 SAVE — BUY / SELL ZONES
-    // =====================================================
-    @Transactional
-    public void saveBuySellZones(Long chatId,
-                                 StrategyType strategyType,
-                                 String symbol,
-                                 Instant candleTime,
-                                 Map<String, Object> buyZone,
-                                 Map<String, Object> sellZone) {
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public int cleanupOld(Duration ttl) {
+        Duration eff = (ttl != null ? ttl : DEFAULT_TTL);
+        Instant olderThan = Instant.now().minus(eff);
 
-        Long cid = normChatId(chatId);
+        int deleted = repo.deleteOlderThan(olderThan);
+        if (deleted > 0) {
+            log.info("🧹 [UI-LAYERS] Очистка старых слоёв: olderThan={} удалено={}", olderThan, deleted);
+        }
+        return deleted;
+    }
+
+    // =====================================================
+    // internals
+    // =====================================================
+
+    private void clearByType(Long chatId, StrategyType strategyType, String symbol, String layerType) {
         String sym = normSymbol(symbol);
-        if (cid == null || strategyType == null || sym == null) return;
+        String lt = normType(layerType);
+        if (chatId == null || strategyType == null || sym == null || lt == null) return;
 
-        final String lt = "BUYSELL_ZONES";
-
-        withLock(lockKey(cid, strategyType, sym, lt), () -> {
-            repository.deleteByType(cid, strategyType, sym, lt);
-
-            // ✅ оба null = очистка слоя
-            if (buyZone == null && sellZone == null) return null;
-
-            Map<String, Object> payload = new LinkedHashMap<>();
-            if (buyZone != null) payload.put("buy", buyZone);
-            if (sellZone != null) payload.put("sell", sellZone);
-
-            saveLayer(cid, strategyType, sym, lt, candleTime, payload);
+        withLock(lockKey(chatId, strategyType, sym), () -> {
+            int n = repo.deleteByType(chatId, strategyType, sym, lt);
+            if (n > 0 && log.isDebugEnabled()) {
+                log.debug("🧽 [UI-LAYERS] Слой очищен: chatId={} type={} sym={} layerType={} удалено={}",
+                        chatId, strategyType, sym, lt, n);
+            }
             return null;
         });
     }
 
-    // =====================================================
-    // 🔵 INTERNAL SAVE (только INSERT)
-    // =====================================================
     private void saveLayer(Long chatId,
                            StrategyType strategyType,
                            String symbol,
                            String layerType,
                            Instant candleTime,
-                           Object payloadObj) {
+                           String payloadJson) {
 
-        if (chatId == null || strategyType == null || symbol == null || layerType == null) return;
-        if (payloadObj == null) return;
+        String sym = normSymbol(symbol);
+        String lt = normType(layerType);
+        if (chatId == null || strategyType == null || sym == null || lt == null) return;
+        if (payloadJson == null || payloadJson.isBlank()) return;
 
-        try {
-            String json = objectMapper.writeValueAsString(payloadObj);
+        Instant ct = (candleTime != null ? candleTime : Instant.now());
+        Instant now = Instant.now();
 
-            UiStrategyLayerEntity entity = UiStrategyLayerEntity.builder()
+        withLock(lockKey(chatId, strategyType, sym), () -> {
+            // держим “последний” слой одного типа: чистим старый и пишем новый
+            repo.deleteByType(chatId, strategyType, sym, lt);
+
+            UiStrategyLayerEntity e = UiStrategyLayerEntity.builder()
                     .chatId(chatId)
                     .strategyType(strategyType)
-                    .symbol(symbol)
-                    .layerType(layerType)
-                    .payload(json)
-                    .candleTime(candleTime != null ? candleTime : Instant.now())
-                    .createdAt(Instant.now())
+                    .symbol(sym)
+                    .layerType(lt)
+                    .payload(payloadJson)
+                    .candleTime(ct)
+                    .createdAt(now)
                     .build();
 
-            repository.save(entity);
+            repo.save(e);
 
             if (log.isDebugEnabled()) {
-                log.debug("💾 UI layer saved type={} chatId={} strategy={} symbol={}",
-                        layerType, chatId, strategyType, symbol);
+                log.debug("💾 [UI-LAYERS] Слой сохранён: chatId={} type={} sym={} layerType={} candleTime={}",
+                        chatId, strategyType, sym, lt, ct);
             }
 
-        } catch (JsonProcessingException e) {
-            log.error("❌ Failed to serialize UI layer payload type={} chatId={} strategy={} symbol={} payloadClass={}",
-                    layerType, chatId, strategyType, symbol,
-                    payloadObj.getClass().getSimpleName(), e);
-        } catch (Exception e) {
-            log.error("❌ Failed to save UI layer type={} chatId={} strategy={} symbol={}",
-                    layerType, chatId, strategyType, symbol, e);
-        }
+            return null;
+        });
     }
 
-    // =====================================================
-    // 🔍 INTERNAL LOAD
-    // =====================================================
-    private Optional<UiStrategyLayerEntity> loadLatest(Long chatId,
-                                                       StrategyType strategyType,
-                                                       String symbol,
-                                                       String layerType) {
-
-        Long cid = normChatId(chatId);
-        String sym = normSymbol(symbol);
-        String lt = normLayerType(layerType);
-
-        if (cid == null || strategyType == null || sym == null || lt == null) return Optional.empty();
-
-        try {
-            return repository.findLatestByType(cid, strategyType, sym, lt)
-                    .stream()
-                    .findFirst();
-        } catch (Exception e) {
-            log.warn("⚠ UI layer loadLatest failed chatId={} strategy={} symbol={} type={} err={}",
-                    cid, strategyType, sym, lt, e.getMessage());
-            return Optional.empty();
-        }
-    }
-
-    // =====================================================
-    // 🧩 JSON PARSERS
-    // =====================================================
-    private Optional<Map<String, Object>> parseMap(UiStrategyLayerEntity e) {
+    private Optional<Object> parsePayloadAny(UiStrategyLayerEntity e) {
         if (e == null) return Optional.empty();
-        String payload = e.getPayload();
-        if (payload == null || payload.isBlank()) return Optional.empty();
+        String json = e.getPayload();
+        if (json == null || json.isBlank()) return Optional.empty();
 
         try {
-            @SuppressWarnings("unchecked")
-            Map<String, Object> map = objectMapper.readValue(payload, Map.class);
-            return Optional.ofNullable(map);
+            String lt = normType(e.getLayerType());
+
+            if (TYPE_LEVELS.equals(lt)) {
+                // ожидаем List<Map<String,Object>>
+                Object v = objectMapper.readValue(json, new TypeReference<List<Map<String, Object>>>() {});
+                return Optional.ofNullable(v);
+            }
+
+            // zone/tp_sl/window_zone -> Map<String,Object>
+            Object v = objectMapper.readValue(json, new TypeReference<Map<String, Object>>() {});
+            return Optional.ofNullable(v);
+
         } catch (Exception ex) {
+            log.warn("⚠ [UI-LAYERS] payload parse failed layerType={} id={} err={}",
+                    e.getLayerType(), safeId(e), ex.toString());
             return Optional.empty();
         }
     }
 
-    private Optional<List<Double>> parseLevels(UiStrategyLayerEntity e) {
-        return parseMap(e).map(m -> {
-            Object raw = m.get("levels");
-            if (!(raw instanceof List<?> list)) return List.<Double>of();
-
-            List<Double> out = new ArrayList<>();
-            for (Object v : list) {
-                if (v instanceof Number n) out.add(n.doubleValue());
-            }
-            return out;
-        });
-    }
-
-    private Optional<List<Map<String, Object>>> parseOrders(UiStrategyLayerEntity e) {
-        return parseMap(e).map(m -> {
-            Object raw = m.get("orders");
-            if (!(raw instanceof List<?> list)) return List.<Map<String, Object>>of();
-
-            List<Map<String, Object>> out = new ArrayList<>();
-            for (Object o : list) {
-                if (o instanceof Map<?, ?> mm) {
-                    Map<String, Object> one = new LinkedHashMap<>();
-                    mm.forEach((k, v) -> one.put(String.valueOf(k), v));
-                    out.add(one);
-                }
-            }
-            return out;
-        });
-    }
-
-    // =====================================================
-    // 🧹 CLEANUP
-    // =====================================================
-    @Transactional
-    public int cleanupOld() {
-        Instant before = Instant.now().minus(TTL);
+    private String toJson(Object obj) {
         try {
-            return repository.deleteOlderThan(before);
-        } catch (Exception e) {
-            log.warn("⚠ UI cleanupOld failed: {}", e.getMessage());
-            return 0;
+            return objectMapper.writeValueAsString(obj);
+        } catch (JsonProcessingException e) {
+            log.warn("❌ [UI-LAYERS] Не удалось сериализовать JSON payload: {}", e.toString());
+            return null;
         }
     }
 
-    @Transactional
-    public void clearStrategy(Long chatId,
-                              StrategyType strategyType,
-                              String symbol) {
-
-        Long cid = normChatId(chatId);
-        String sym = normSymbol(symbol);
-
-        if (cid == null || strategyType == null || sym == null) return;
-
-        try {
-            repository.deleteForStrategy(cid, strategyType, sym);
-        } catch (Exception e) {
-            log.warn("⚠ UI clearStrategy failed chatId={} strategy={} symbol={} err={}",
-                    cid, strategyType, sym, e.getMessage());
-        }
-    }
-
-    // =====================================================
-    // ✅ NORMALIZATION
-    // =====================================================
-
-    private static Long normChatId(Long chatId) {
-        if (chatId == null || chatId <= 0) return null;
-        return chatId;
-    }
-
-    private static String normSymbol(String symbol) {
+    private String normSymbol(String symbol) {
         if (symbol == null) return null;
         String s = symbol.trim().toUpperCase(Locale.ROOT);
         return s.isEmpty() ? null : s;
     }
 
-    private static String normLayerType(String layerType) {
+    private String normType(String layerType) {
         if (layerType == null) return null;
         String t = layerType.trim().toUpperCase(Locale.ROOT);
         return t.isEmpty() ? null : t;
     }
 
-    private static String lockKey(Long chatId, StrategyType type, String symbol, String layerType) {
-        return chatId + "|" + type.name() + "|" + symbol + "|" + layerType;
+    private String lockKey(Long chatId, StrategyType strategyType, String symbol) {
+        return chatId + ":" + strategyType + ":" + symbol;
     }
 
-    private Object stripeLock(String key) {
-        int h = (key != null ? key.hashCode() : 0);
-        int idx = (h & 0x7fffffff) % lockStripes.length;
-        return lockStripes[idx];
-    }
-
-    private <T> T withLock(String key, Supplier<T> fn) {
-        Object lock = stripeLock(key);
-        synchronized (lock) {
-            return fn.get();
+    private <T> T withLock(String key, java.util.concurrent.Callable<T> action) {
+        ReentrantLock lock = locks.computeIfAbsent(key, k -> new ReentrantLock(true));
+        lock.lock();
+        try {
+            return action.call();
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        } finally {
+            lock.unlock();
         }
+    }
+
+    private static Object safeId(UiStrategyLayerEntity e) {
+        try { return e.getId(); } catch (Exception ex) { return "n/a"; }
     }
 }

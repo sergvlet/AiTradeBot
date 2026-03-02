@@ -10,8 +10,6 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -28,7 +26,7 @@ public class MarketDataStreamService {
     /** ✅ цикл разорван — берём лениво */
     private final ObjectProvider<BinanceSpotWebSocketClient> binanceWsProvider;
 
-    /** ✅ общий кэш свечей для бэктеста/дашборда (env-aware если умеет) */
+    /** ✅ общий кэш свечей для бэктеста/дашборда */
     private final MarketStreamManager streamManager;
 
     /** seq для логов/троттлинга */
@@ -90,6 +88,7 @@ public class MarketDataStreamService {
             if (ws != null) {
                 try { ws.unsubscribeKline(networkType, sym, tf, chatId, strategyType); } catch (Exception ignored) {}
                 try { ws.unsubscribeAggTrade(networkType, sym, tf, chatId, strategyType); } catch (Exception ignored) {}
+                try { ws.unsubscribeBookTicker(networkType, sym, chatId, strategyType); } catch (Exception ignored) {}
             }
         }
 
@@ -101,6 +100,12 @@ public class MarketDataStreamService {
                 chatId, strategyType, ex, networkType, sym, tf);
     }
 
+    /**
+     * ✅ Реальный tick:
+     * - строим synthetic candle по timeframe (из тиков)
+     * - обновляем candleStorage + streamManager
+     * - при смене бакета возвращаем candleClosed (UnifiedKline)
+     */
     public MarketPushResult pushAggTrade(String exchange,
                                          NetworkType networkType,
                                          long chatId,
@@ -112,7 +117,102 @@ public class MarketDataStreamService {
                                          long tradeTsMs) {
 
         long n = seq.incrementAndGet();
-        return new MarketPushResult(n, true, false, false, null);
+
+        String ex  = normExchange(exchange);
+        String sym = normSymbol(symbol);
+        String tf  = normTf(timeframe);
+
+        if (ex == null || networkType == null || chatId <= 0 || strategyType == null || sym == null) {
+            return new MarketPushResult(n, false, false, false, null);
+        }
+
+        if (price == null || price.signum() <= 0 || tradeTsMs <= 0) {
+            return new MarketPushResult(n, false, false, false, null);
+        }
+
+        boolean pushedCandle = false;
+        boolean createdCandle = false;
+        UnifiedKline candleClosed = null;
+
+        long tfMs = parseTimeframeMs(tf);
+        if (tfMs > 0) {
+            long openTime = (tradeTsMs / tfMs) * tfMs;
+
+            double p = safeDouble(price);
+            double v = (qty != null ? Math.max(0.0, safeDouble(qty)) : 0.0);
+
+            CandleStoreKey key = new CandleStoreKey(chatId, strategyType, ex, networkType, sym, tf);
+            Deque<Candle> deque = candleStorage.computeIfAbsent(key, __ -> new ConcurrentLinkedDeque<>());
+
+            Candle lastNow;
+
+            synchronized (deque) {
+                Candle last = deque.peekLast();
+
+                if (last == null) {
+                    Candle c = new Candle(openTime, p, p, p, p, v, false);
+                    deque.addLast(c);
+                    createdCandle = true;
+                    pushedCandle = true;
+
+                } else if (last.getTime() == openTime) {
+                    // update forming candle
+                    double open = last.getOpen();
+                    double high = Math.max(last.getHigh(), p);
+                    double low  = Math.min(last.getLow(), p);
+                    double vol  = last.getVolume() + v;
+
+                    Candle c = new Candle(openTime, open, high, low, p, vol, false);
+                    deque.pollLast();
+                    deque.addLast(c);
+                    pushedCandle = true;
+
+                } else if (last.getTime() < openTime) {
+                    // закрываем предыдущий бакет
+                    Candle prevClosed = new Candle(
+                            last.getTime(),
+                            last.getOpen(),
+                            last.getHigh(),
+                            last.getLow(),
+                            last.getClose(),
+                            last.getVolume(),
+                            true
+                    );
+                    deque.pollLast();
+                    deque.addLast(prevClosed);
+
+                    candleClosed = UnifiedKline.builder()
+                            .openTime(prevClosed.getTime())
+                            .closeTime(prevClosed.getTime() + tfMs - 1)
+                            .open(BigDecimal.valueOf(prevClosed.getOpen()))
+                            .high(BigDecimal.valueOf(prevClosed.getHigh()))
+                            .low(BigDecimal.valueOf(prevClosed.getLow()))
+                            .close(BigDecimal.valueOf(prevClosed.getClose()))
+                            .volume(BigDecimal.valueOf(prevClosed.getVolume()))
+                            .timeframe(tf)
+                            .symbol(sym)
+                            .closed(true)
+                            .build();
+
+                    // новый forming бакет
+                    Candle c = new Candle(openTime, p, p, p, p, v, false);
+                    deque.addLast(c);
+                    createdCandle = true;
+                    pushedCandle = true;
+
+                    while (deque.size() > MAX_CANDLES) deque.pollFirst();
+                }
+
+                while (deque.size() > MAX_CANDLES) deque.pollFirst();
+                lastNow = deque.peekLast();
+            }
+
+            if (lastNow != null) {
+                pushToStreamManager(ex, networkType, sym, tf, lastNow);
+            }
+        }
+
+        return new MarketPushResult(n, true, pushedCandle, createdCandle, candleClosed);
     }
 
     public void pushKline(String exchange,
@@ -131,10 +231,8 @@ public class MarketDataStreamService {
 
         if (ex == null || networkType == null || sym == null || tf == null) return;
 
-        try {
-            if (kline.getSymbol() == null || kline.getSymbol().isBlank()) kline.setSymbol(sym);
-            if (kline.getTimeframe() == null || kline.getTimeframe().isBlank()) kline.setTimeframe(tf);
-        } catch (Exception ignored) {}
+        if (kline.getSymbol() == null || kline.getSymbol().isBlank()) kline.setSymbol(sym);
+        if (kline.getTimeframe() == null || kline.getTimeframe().isBlank()) kline.setTimeframe(tf);
 
         Candle candle = toCandleSafe(kline);
         if (candle == null) return;
@@ -153,23 +251,12 @@ public class MarketDataStreamService {
         String ex = normExchange(exchange);
         if (ex == null || networkType == null) return;
 
-        String symRaw = readStringAny(kline, "getSymbol", "symbol", "getS", "s").orElse(null);
-        String tfRaw  = readStringAny(kline, "getTimeframe", "timeframe", "getInterval", "interval").orElse(null);
-
-        String sym = normSymbol(symRaw);
-        String tf  = normTf(tfRaw);
+        String sym = normSymbol(kline.getSymbol());
+        String tf  = normTf(kline.getTimeframe());
 
         if (sym == null || tf == null) return;
 
-        try {
-            if (kline.getSymbol() == null || kline.getSymbol().isBlank()) kline.setSymbol(sym);
-            if (kline.getTimeframe() == null || kline.getTimeframe().isBlank()) kline.setTimeframe(tf);
-        } catch (Exception ignored) {}
-
-        Candle candle = toCandleSafe(kline);
-        if (candle == null) return;
-
-        onCandle(chatId, strategyType, ex, networkType, sym, tf, candle);
+        pushKline(ex, networkType, chatId, strategyType, sym, tf, kline);
     }
 
     public record MarketPushResult(
@@ -237,8 +324,9 @@ public class MarketDataStreamService {
         try {
             ws.subscribeKline(networkType, sym, tf, chatId, strategyType);
             ws.subscribeAggTrade(networkType, sym, tf, chatId, strategyType);
+            ws.subscribeBookTicker(networkType, sym, chatId, strategyType);
 
-            log.info("📡 [STREAM] SUBSCRIBE WS: chatId={} type={} ex={} net={} {} {} (KLINE+AGGTRADE)",
+            log.info("📡 [STREAM] SUBSCRIBE WS: chatId={} type={} ex={} net={} {} {} (KLINE+AGGTRADE+BOOK_TICKER)",
                     chatId, strategyType, ex, networkType, sym, tf);
         } catch (Exception e) {
             subs.remove(key);
@@ -319,9 +407,6 @@ public class MarketDataStreamService {
     // ✅ ПУБЛИЧНЫЙ API ДЛЯ БЭКТЕСТА/ТЮНЕРА (КЭШ С LIMIT)
     // =====================================================================
 
-    /**
-     * ✅ Сигнатура, которую ищет MarketStreamBacktestCandlePort в первую очередь.
-     */
     public List<Candle> getCachedCandles(long chatId,
                                          StrategyType strategyType,
                                          String exchange,
@@ -343,7 +428,6 @@ public class MarketDataStreamService {
             return copyTail(deque, limit);
         }
 
-        // ✅ fallback: общий streamManager (там warmup пишет свечи тоже)
         if (streamManager != null) {
             return streamManager.getCandles(ex, networkType, sym, tf, limit);
         }
@@ -351,10 +435,6 @@ public class MarketDataStreamService {
         return List.of();
     }
 
-    /**
-     * ✅ Backward: без env — пробуем найти “лучший” deque по chatId/type/sym/tf,
-     * иначе падаем в streamManager legacy.
-     */
     public List<Candle> getCachedCandles(long chatId,
                                          StrategyType strategyType,
                                          String symbol,
@@ -398,9 +478,6 @@ public class MarketDataStreamService {
         return List.of();
     }
 
-    /**
-     * ✅ Удобный алиас (некоторые места ищут getCandles(..., limit)).
-     */
     public List<Candle> getCandles(long chatId,
                                    StrategyType strategyType,
                                    String exchange,
@@ -410,10 +487,6 @@ public class MarketDataStreamService {
                                    int limit) {
         return getCachedCandles(chatId, strategyType, exchange, networkType, symbol, timeframe, limit);
     }
-
-    // =====================================================================
-    // (старый) getCandles без limit — оставляем
-    // =====================================================================
 
     public List<Candle> getCandles(long chatId,
                                    StrategyType strategyType,
@@ -464,7 +537,6 @@ public class MarketDataStreamService {
             }
         }
 
-        // ✅ важно: если мы прогрели историю — положим также в streamManager
         if (candles != null && !candles.isEmpty()) {
             for (Candle c : candles) {
                 if (c == null) continue;
@@ -518,34 +590,15 @@ public class MarketDataStreamService {
     }
 
     // =====================================================================
-    // MarketStreamManager compat (reflection, чтобы не ломать сборку)
+    // MarketStreamManager (без reflection)
     // =====================================================================
 
     private void pushToStreamManager(String exchange, NetworkType network, String symbol, String timeframe, Candle candle) {
-        if (streamManager == null) return;
-
+        if (streamManager == null || candle == null) return;
         try {
-            Method m5 = findMethod(streamManager.getClass(), "addCandle", 5);
-            if (m5 != null) {
-                m5.invoke(streamManager, exchange, network, symbol, timeframe, candle);
-                return;
-            }
-
-            Method m3 = findMethod(streamManager.getClass(), "addCandle", 3);
-            if (m3 != null) {
-                m3.invoke(streamManager, symbol, timeframe, candle);
-            }
+            streamManager.addCandle(exchange, network, symbol, timeframe, candle);
         } catch (Exception ignored) {
         }
-    }
-
-    private Method findMethod(Class<?> cls, String name, int paramCount) {
-        for (Method m : cls.getMethods()) {
-            if (!m.getName().equals(name)) continue;
-            if (m.getParameterCount() != paramCount) continue;
-            return m;
-        }
-        return null;
     }
 
     // =====================================================================
@@ -584,131 +637,66 @@ public class MarketDataStreamService {
     }
 
     // =====================================================================
-    // ✅ UnifiedKline -> Candle (safe, без падений)
+    // ✅ timeframe parser
+    // =====================================================================
+
+    private static long parseTimeframeMs(String tf) {
+        if (tf == null) return -1;
+        String s = tf.trim().toLowerCase(Locale.ROOT);
+        if (s.isEmpty() || "na".equals(s)) return -1;
+
+        long mult;
+        char unit = s.charAt(s.length() - 1);
+
+        String numStr = s.substring(0, s.length() - 1).trim();
+        if (numStr.isEmpty()) return -1;
+
+        long n;
+        try { n = Long.parseLong(numStr); }
+        catch (Exception e) { return -1; }
+
+        if (n <= 0) return -1;
+
+        if (unit == 's') mult = 1000L;
+        else if (unit == 'm') mult = 60_000L;
+        else if (unit == 'h') mult = 3_600_000L;
+        else if (unit == 'd') mult = 86_400_000L;
+        else return -1;
+
+        long ms = n * mult;
+        return ms > 0 ? ms : -1;
+    }
+
+    private static double safeDouble(BigDecimal v) {
+        try { return v.doubleValue(); } catch (Exception e) { return 0.0; }
+    }
+
+    // =====================================================================
+    // ✅ UnifiedKline -> Candle (safe)
     // =====================================================================
 
     private Candle toCandleSafe(UnifiedKline kline) {
-        long openTime = readLongAny(kline, "getOpenTime", "openTime", "getT", "t").orElse(0L);
+        if (kline == null) return null;
 
-        Double open  = readDoubleAny(kline, "getOpen", "open").orElse(null);
-        Double high  = readDoubleAny(kline, "getHigh", "high").orElse(null);
-        Double low   = readDoubleAny(kline, "getLow", "low").orElse(null);
-        Double close = readDoubleAny(kline, "getClose", "close").orElse(null);
-        Double vol   = readDoubleAny(kline, "getVolume", "volume").orElse(0.0);
+        long openTime = kline.getOpenTime();
+        BigDecimal o = kline.getOpen();
+        BigDecimal h = kline.getHigh();
+        BigDecimal l = kline.getLow();
+        BigDecimal c = kline.getClose();
+        BigDecimal v = kline.getVolume();
 
-        boolean closed = readBoolAny(kline, "isClosed", "getClosed", "closed", "isFinal", "getFinal", "final")
-                .orElse(false);
-
-        if (openTime <= 0 || open == null || high == null || low == null || close == null) {
+        if (openTime <= 0 || o == null || h == null || l == null || c == null) {
             return null;
         }
 
-        return new Candle(openTime, open, high, low, close, vol, closed);
-    }
+        boolean closed = kline.isClosed();
 
-    // =====================================================================
-    // reflection helpers (метод ИЛИ поле)
-    // =====================================================================
+        double od = safeDouble(o);
+        double hd = safeDouble(h);
+        double ld = safeDouble(l);
+        double cd = safeDouble(c);
+        double vd = (v != null ? safeDouble(v) : 0.0);
 
-    private static Optional<Object> readAny(Object target, String... names) {
-        if (target == null || names == null) return Optional.empty();
-
-        Class<?> c = target.getClass();
-
-        for (String n : names) {
-            if (n == null || n.isBlank()) continue;
-
-            Method m = findNoArgMethod(c, n);
-            if (m != null) {
-                try {
-                    return Optional.ofNullable(m.invoke(target));
-                } catch (Exception ignored) {}
-            }
-
-            Field f = findField(c, n);
-            if (f != null) {
-                try {
-                    f.setAccessible(true);
-                    return Optional.ofNullable(f.get(target));
-                } catch (Exception ignored) {}
-            }
-        }
-
-        return Optional.empty();
-    }
-
-    private static Optional<String> readStringAny(Object target, String... names) {
-        Object v = readAny(target, names).orElse(null);
-        if (v == null) return Optional.empty();
-        String s = String.valueOf(v).trim();
-        return s.isEmpty() ? Optional.empty() : Optional.of(s);
-    }
-
-    private static Optional<Long> readLongAny(Object target, String... names) {
-        Object v = readAny(target, names).orElse(null);
-        if (v == null) return Optional.empty();
-
-        if (v instanceof Number n) return Optional.of(n.longValue());
-
-        String s = String.valueOf(v).trim();
-        if (s.isEmpty()) return Optional.empty();
-
-        try { return Optional.of(Long.parseLong(s)); }
-        catch (Exception ignored) { return Optional.empty(); }
-    }
-
-    private static Optional<Boolean> readBoolAny(Object target, String... names) {
-        Object v = readAny(target, names).orElse(null);
-        if (v == null) return Optional.empty();
-
-        if (v instanceof Boolean b) return Optional.of(b);
-
-        String s = String.valueOf(v).trim();
-        if (s.isEmpty()) return Optional.empty();
-
-        return Optional.of(Boolean.parseBoolean(s));
-    }
-
-    private static Optional<Double> readDoubleAny(Object target, String... names) {
-        Object v = readAny(target, names).orElse(null);
-        if (v == null) return Optional.empty();
-
-        if (v instanceof Double d) return Optional.of(d);
-        if (v instanceof Float f) return Optional.of((double) f);
-        if (v instanceof Integer i) return Optional.of((double) i);
-        if (v instanceof Long l) return Optional.of((double) l);
-        if (v instanceof BigDecimal bd) return Optional.of(bd.doubleValue());
-        if (v instanceof Number n) return Optional.of(n.doubleValue());
-
-        String s = String.valueOf(v).trim();
-        if (s.isEmpty()) return Optional.empty();
-
-        try { return Optional.of(Double.parseDouble(s)); }
-        catch (Exception ignored) { return Optional.empty(); }
-    }
-
-    private static Method findNoArgMethod(Class<?> c, String name) {
-        try { return c.getMethod(name); } catch (Exception ignored) {}
-
-        String cap = (name.length() > 0)
-                ? Character.toUpperCase(name.charAt(0)) + name.substring(1)
-                : name;
-
-        try { return c.getMethod("get" + cap); } catch (Exception ignored) {}
-        try { return c.getMethod("is" + cap); } catch (Exception ignored) {}
-
-        return null;
-    }
-
-    private static Field findField(Class<?> c, String name) {
-        Class<?> cur = c;
-        while (cur != null && cur != Object.class) {
-            try {
-                return cur.getDeclaredField(name);
-            } catch (Exception ignored) {
-                cur = cur.getSuperclass();
-            }
-        }
-        return null;
+        return new Candle(openTime, od, hd, ld, cd, vd, closed);
     }
 }

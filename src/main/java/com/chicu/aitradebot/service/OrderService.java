@@ -31,7 +31,7 @@ public interface OrderService {
 
     /**
      * MARKET ордер.
-
+     *
      * Семантика amount:
      * - BUY (SPOT): amount = quoteAmount (например, USDT budget), который готов потратить
      * - SELL (SPOT): amount = baseQty (количество базовой монеты), которое продаёшь

@@ -213,7 +213,7 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         boolean okCfg = persistSafe(windowSettingsService, chatId, cfgToSave);
         boolean okSs = persistSafe(strategySettingsService, chatId, ssToSave);
 
-        // retry на stale (очень часто вылезает на ss при старте/тоггле)
+        // retry на stale (очень часто вылезает при старте/тоггле)
         if (!okCfg) {
             WindowScalpingStrategySettings fresh = windowSettingsService.getOrCreate(chatId);
             if (fresh != null) {
@@ -299,7 +299,8 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         // =====================================================
         // ✅ 1) minRangePct: уменьшаем, чтобы чаще были входы
         // =====================================================
-        double oldMinRange = toDouble(readGetter(cfg, "getMinRangePct"));
+        Object minRangeVal = readGetter(cfg, "getMinRangePct");
+        double oldMinRange = (minRangeVal == null) ? 0.35 : toDouble(minRangeVal);
         if (Double.isNaN(oldMinRange) || Double.isInfinite(oldMinRange)) oldMinRange = 0.35;
 
         double newMinRange;
@@ -316,11 +317,12 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
 
         // =====================================================
         // ✅ 2) entry zones: расширяем, а не сужаем (иначе NO_TRADES)
-        // entryFromLowPct ↑ => больше входов у low
-        // entryFromHighPct ↑ => больше “ограничитель сверху” (если используется)
         // =====================================================
-        double oldLow = toDouble(readGetter(cfg, "getEntryFromLowPct"));
-        double oldHigh = toDouble(readGetter(cfg, "getEntryFromHighPct"));
+        Object lowVal = readGetter(cfg, "getEntryFromLowPct");
+        Object highVal = readGetter(cfg, "getEntryFromHighPct");
+
+        double oldLow = (lowVal == null) ? 20.0 : toDouble(lowVal);
+        double oldHigh = (highVal == null) ? 20.0 : toDouble(highVal);
 
         if (Double.isNaN(oldLow) || Double.isInfinite(oldLow)) oldLow = 20.0;
         if (Double.isNaN(oldHigh) || Double.isInfinite(oldHigh)) oldHigh = 20.0;
@@ -331,7 +333,6 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         newLow = clampD(newLow, 0.5, 60.0);
         newHigh = clampD(newHigh, 0.5, 60.0);
 
-        // не даём зонам “съесть” всё окно
         if (newLow + newHigh > 90.0) {
             double k = 90.0 / (newLow + newHigh);
             newLow *= k;
@@ -348,7 +349,8 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         // =====================================================
         // ✅ 3) maxSpreadPct: при NO_TRADES поднимаем существенно
         // =====================================================
-        double oldSpread = toDouble(readGetter(cfg, "getMaxSpreadPct"));
+        Object spreadVal = readGetter(cfg, "getMaxSpreadPct");
+        double oldSpread = (spreadVal == null) ? 0.08 : toDouble(spreadVal);
         if (Double.isNaN(oldSpread) || Double.isInfinite(oldSpread) || oldSpread < 0) oldSpread = 0.08;
 
         double newSpread = Math.max(oldSpread + 0.30, oldSpread * 2.0);
@@ -388,7 +390,6 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
 
     // =====================================================
     // candidate / compare
-
     // =====================================================
 
     private record Candidate(Map<String, Object> params, double score, Integer trades, String tag) {}
@@ -425,29 +426,44 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         return rel.compareTo(minRel) >= 0;
     }
 
+    /**
+     * ✅ Генерация кандидата. Раньше TP/SL вообще не менялись => "вечно одни и те же".
+     * Теперь тюним и TP/SL, и базовые фильтры.
+     */
     private void mutateCandidate(Map<String, Object> p, Random rnd) {
 
         int windowJitter = 10;
+
         double entryJitter = 2.0;
         double minRangeJitter = 0.25;
         double spreadJitter = 0.25;
+
         double riskJitter = 0.15;
         double rrJitter = 0.20;
+
         int leverageJitter = 1;
         int cooldownJitter = 60;
 
+        // ✅ TP/SL jitter (проценты)
+        double tpJitter = 0.25; // +/- 0.25%
+        double slJitter = 0.20; // +/- 0.20%
+
+        // -----------------------------
+        // WINDOW
+        // -----------------------------
         int w = intOf(p.get("windowSize"), 40);
         w = clampInt(w + rndInt(rnd, -windowJitter, windowJitter), 5, 250);
         p.put("windowSize", w);
 
-        double low = dblOf(p.get("entryFromLowPct"), 1.2);
-        double high = dblOf(p.get("entryFromHighPct"), 1.2);
+        double low = dblOf(p.get("entryFromLowPct"), 20.0);
+        double high = dblOf(p.get("entryFromHighPct"), 20.0);
 
-        low = clampD(low + rndD(rnd, -entryJitter, entryJitter), 0.1, 30.0);
-        high = clampD(high + rndD(rnd, -entryJitter, entryJitter), 0.1, 30.0);
+        low = clampD(low + rndD(rnd, -entryJitter, entryJitter), 0.0, 60.0);
+        high = clampD(high + rndD(rnd, -entryJitter, entryJitter), 0.0, 60.0);
 
-        if (low + high > 60.0) {
-            double k = 60.0 / (low + high);
+        double sum = low + high;
+        if (sum > 90.0) {
+            double k = 90.0 / sum;
             low *= k;
             high *= k;
         }
@@ -456,23 +472,47 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         p.put("entryFromHighPct", high);
 
         double minR = dblOf(p.get("minRangePct"), 0.35);
-        minR = clampD(minR + rndD(rnd, -minRangeJitter, minRangeJitter), 0.0, 10.0);
+        minR = clampD(minR + rndD(rnd, -minRangeJitter, minRangeJitter), 0.01, 10.0);
         p.put("minRangePct", minR);
 
         double maxSp = dblOf(p.get("maxSpreadPct"), 0.30);
         maxSp = clampD(maxSp + rndD(rnd, -spreadJitter, spreadJitter), 0.0, 5.0);
         p.put("maxSpreadPct", maxSp);
 
-        // ss поля
+        // -----------------------------
+        // TP / SL (в %)
+        // -----------------------------
+        BigDecimal tp = bd(p.get("takeProfitPct"));
+        if (tp == null) tp = new BigDecimal("0.60");
+
+        BigDecimal sl = bd(p.get("stopLossPct"));
+        if (sl == null) sl = new BigDecimal("0.35");
+
+        tp = clampBD(tp.add(BigDecimal.valueOf(rndD(rnd, -tpJitter, tpJitter))),
+                new BigDecimal("0.05"), new BigDecimal("10.00"));
+
+        sl = clampBD(sl.add(BigDecimal.valueOf(rndD(rnd, -slJitter, slJitter))),
+                new BigDecimal("0.05"), new BigDecimal("10.00"));
+
+        // TP чуть выше SL (чтобы не уходить в странные комбинации)
+        BigDecimal minTp = sl.multiply(new BigDecimal("1.05")).setScale(8, RoundingMode.HALF_UP);
+        if (tp.compareTo(minTp) < 0) tp = minTp;
+
+        p.put("takeProfitPct", tp.setScale(8, RoundingMode.HALF_UP));
+        p.put("stopLossPct", sl.setScale(8, RoundingMode.HALF_UP));
+
+        // -----------------------------
+        // ss поля (могут отсутствовать в StrategySettings — тогда setNumeric просто ничего не сделает)
+        // -----------------------------
         BigDecimal risk = bd(p.get("riskPerTradePct"));
         if (risk == null) risk = new BigDecimal("1.0");
-        risk = clampBD(risk.add(bd(rndD(rnd, -riskJitter, riskJitter))),
+        risk = clampBD(risk.add(BigDecimal.valueOf(rndD(rnd, -riskJitter, riskJitter))),
                 new BigDecimal("0.1"), new BigDecimal("10.0"));
         p.put("riskPerTradePct", risk);
 
         BigDecimal rr = bd(p.get("minRiskReward"));
         if (rr == null) rr = new BigDecimal("1.5");
-        rr = clampBD(rr.add(bd(rndD(rnd, -rrJitter, rrJitter))),
+        rr = clampBD(rr.add(BigDecimal.valueOf(rndD(rnd, -rrJitter, rrJitter))),
                 new BigDecimal("0.5"), new BigDecimal("6.0"));
         p.put("minRiskReward", rr);
 
@@ -514,7 +554,7 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         p.put("takeProfitPct", cfg.getTakeProfitPct());
         p.put("stopLossPct", cfg.getStopLossPct());
 
-        // ss
+        // ss (через reflection — не ломаем сборку если полей нет)
         p.put("riskPerTradePct", readGetter(ss, "getRiskPerTradePct"));
         p.put("minRiskReward", readGetter(ss, "getMinRiskReward"));
         p.put("leverage", readGetter(ss, "getLeverage"));
@@ -601,30 +641,36 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
 
         InvokeRes r;
 
+        // ✅ важный приоритет: часто именно update(chatId, entity) шлёт “updated event”
         r = tryInvoke2(service, "update", chatId, entity);
-        if (r.ok) return true; else lastErr = pick(lastErr, r.err);
+        if (r.ok) return true; else lastErr = pickFirst(lastErr, r.err);
+
+        r = tryInvoke2(service, "save", chatId, entity);
+        if (r.ok) return true; else lastErr = pickFirst(lastErr, r.err);
 
         r = tryInvoke2(service, "saveOrUpdate", chatId, entity);
-        if (r.ok) return true; else lastErr = pick(lastErr, r.err);
+        if (r.ok) return true; else lastErr = pickFirst(lastErr, r.err);
 
         r = tryInvoke1(service, "save", entity);
-        if (r.ok) return true; else lastErr = pick(lastErr, r.err);
+        if (r.ok) return true; else lastErr = pickFirst(lastErr, r.err);
 
         r = tryInvoke1(service, "saveOrUpdate", entity);
-        if (r.ok) return true; else lastErr = pick(lastErr, r.err);
+        if (r.ok) return true; else lastErr = pickFirst(lastErr, r.err);
 
         r = tryInvoke1(service, "persist", entity);
-        if (r.ok) return true; else lastErr = pick(lastErr, r.err);
+        if (r.ok) return true; else lastErr = pickFirst(lastErr, r.err);
 
+        // fallback: getRepository().save(entity)
         try {
             Method getRepo = service.getClass().getMethod("getRepository");
             Object repo = getRepo.invoke(service);
             if (repo != null) {
                 r = tryInvoke1(repo, "save", entity);
-                if (r.ok) return true; else lastErr = pick(lastErr, r.err);
+                if (r.ok) return true; else lastErr = pickFirst(lastErr, r.err);
             }
         } catch (Exception e) {
-            lastErr = pick(lastErr, e);
+            // не затираем первопричину (getRepository может отсутствовать)
+            lastErr = pickFirst(lastErr, e);
         }
 
         if (lastErr != null) {
@@ -685,8 +731,9 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         return new InvokeRes(false, null);
     }
 
-    private static Throwable pick(Throwable prev, Throwable next) {
-        return (next != null) ? next : prev;
+    private static Throwable pickFirst(Throwable prev, Throwable next) {
+        // ✅ не затираем первопричину (поздние ошибки типа NoSuchMethodException — шум)
+        return (prev != null) ? prev : next;
     }
 
     private static Throwable rootCause(Throwable t) {

@@ -11,6 +11,20 @@ public interface StrategySettingsService {
     StrategySettings save(StrategySettings s);
 
     /**
+     * ✅ Нужен тюнеру/ML: универсальный метод сохранения сущности по chatId.
+     * Важно: должен быть В ИНТЕРФЕЙСЕ, иначе при JDK-proxy @Transactional
+     * reflection-слой может не увидеть update(chatId, entity).
+     */
+    StrategySettings update(Long chatId, StrategySettings incoming);
+
+    /**
+     * Алиас под разные callers (иногда ищут save(chatId, entity)).
+     */
+    default StrategySettings save(Long chatId, StrategySettings incoming) {
+        return update(chatId, incoming);
+    }
+
+    /**
      * Источник истины: одна строка на (chatId, type).
      * Может вернуть null, если настроек ещё нет.
      */
@@ -34,7 +48,6 @@ public interface StrategySettingsService {
     );
 
     Long getVersion(Long chatId, StrategyType type);
-
 
     /**
      * Патч контекста в уже существующей сущности.

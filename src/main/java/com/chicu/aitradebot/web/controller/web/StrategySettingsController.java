@@ -41,6 +41,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 
 @Slf4j
 @Controller
@@ -91,7 +92,7 @@ public class StrategySettingsController {
 
         // ✅ сохраняем только если реально поменялось (а не “на каждый GET”)
         boolean ctxChanged = patchContextIfChanged(strategy, exchange, network);
-        boolean phaseChanged = syncRunPhaseWithContextChanged(strategy);
+        boolean phaseChanged = syncRunPhaseWithContextChanged(strategy, exchange, network);
         if (ctxChanged || phaseChanged) {
             try {
                 strategySettingsService.save(strategy);
@@ -633,6 +634,12 @@ public class StrategySettingsController {
     // =====================================================
     // MODE DEFAULTS ✅ “ЖЕЛЕЗНО”
     // =====================================================
+    private void applyModeDefaultsHard(StrategySettings s) {
+        if (s == null) return;
+        AdvancedControlMode m = (s.getAdvancedControlMode() != null) ? s.getAdvancedControlMode() : AdvancedControlMode.MANUAL;
+        applyModeDefaultsHard(s, m, s.getNetworkType());
+    }
+
     private void applyModeDefaultsHard(StrategySettings s, AdvancedControlMode mode, NetworkType net) {
         if (s == null || mode == null) return;
 
@@ -651,14 +658,29 @@ public class StrategySettingsController {
                 s.setMlModelVersion(null);
             }
             case HYBRID -> {
-                s.setAutoTuneEnabled(true);
+                // HYBRID: ML‑gate обязателен, автотюн запрещён
+                s.setAutoTuneEnabled(false);
                 s.setMlGateEnabled(true);
+
+                if (s.getGateMinProb() == null) {
+                    // дефолт, если пользователь ещё не задавал
+                    s.setGateMinProb(new BigDecimal("0.550000"));
+                }
+
                 s.setRunPhase(n == NetworkType.TESTNET ? PHASE_PAPER : PHASE_LIVE);
             }
             case AI -> {
+                // AI: автотюн обязателен. ML‑gate по умолчанию включаем (можно выключить вручную в UI).
                 s.setAutoTuneEnabled(true);
-                s.setMlGateEnabled(true);
-                s.setRunPhase(PHASE_COLLECT);
+                if (!s.isMlGateEnabled()) {
+                    s.setMlGateEnabled(true);
+                }
+                if (s.getGateMinProb() == null && s.isMlGateEnabled()) {
+                    s.setGateMinProb(new BigDecimal("0.550000"));
+                }
+
+                // ✅ важно: AI должен ТОРГОВАТЬ, иначе ты никогда не увидишь сделок
+                s.setRunPhase(n == NetworkType.TESTNET ? PHASE_PAPER : PHASE_LIVE);
             }
         }
 
@@ -715,13 +737,33 @@ public class StrategySettingsController {
 
     private boolean syncRunPhaseWithContextChanged(StrategySettings s) {
         if (s == null) return false;
-        String before = (s.getRunPhase() == null) ? null : s.getRunPhase();
-        syncRunPhaseWithContext(s);
-        String after = (s.getRunPhase() == null) ? null : s.getRunPhase();
-        if (before == null && after == null) return false;
-        if (before == null || after == null) return true;
-        return !before.equalsIgnoreCase(after);
+        return syncRunPhaseWithContextChanged(s, s.getExchangeName(), s.getNetworkType());
     }
+
+    /**
+     * Синхронизирует runPhase с контекстом (mode + network) и возвращает true если было изменение.
+     * Важное правило: если runPhase уже BACKTEST или COLLECT — не трогаем (это ручные спец‑режимы).
+     */
+    private boolean syncRunPhaseWithContextChanged(StrategySettings s, String exchange, NetworkType network) {
+        if (s == null) return false;
+
+        // не навязываем контекст тут, но если передали — используем как "источник истины" для расчёта фазы
+        NetworkType net = (network != null) ? network : s.getNetworkType();
+
+        String before = normalizeUpperNullable(s.getRunPhase());
+
+        // спец-фазы не перезаписываем автоматически
+        if (PHASE_BACKTEST.equals(before) || PHASE_COLLECT.equals(before)) {
+            return false;
+        }
+
+        // пересчитываем “нормальную” фазу (PAPER на тестнете, LIVE на мейннете)
+        syncRunPhaseWithContext(s, exchange, net);
+
+        String after = normalizeUpperNullable(s.getRunPhase());
+        return !Objects.equals(before, after);
+    }
+
 
     /**
      * ✅ ВАЖНО:
@@ -731,31 +773,61 @@ public class StrategySettingsController {
      */
     private void syncRunPhaseWithContext(StrategySettings s) {
         if (s == null) return;
+        syncRunPhaseWithContext(s, s.getExchangeName(), s.getNetworkType());
+    }
 
-        String rp = (s.getRunPhase() == null) ? "" : s.getRunPhase().trim().toUpperCase(Locale.ROOT);
+    /**
+     * Нормальная “торговая” фаза:
+     * - TESTNET  -> PAPER (можно торговать, но только на testnet)
+     * - MAINNET  -> LIVE  (реальная торговля)
+     *
+     * COLLECT/BACKTEST — спецрежимы и выставляются вручную.
+     */
+    private void syncRunPhaseWithContext(StrategySettings s, String exchange, NetworkType network) {
+        if (s == null) return;
 
-        if (PHASE_BACKTEST.equals(rp) || PHASE_COLLECT.equals(rp)) {
+        AdvancedControlMode mode = (s.getAdvancedControlMode() != null) ? s.getAdvancedControlMode() : AdvancedControlMode.MANUAL;
+        NetworkType net = (network != null) ? network : s.getNetworkType();
+
+        // Если network неизвестен — считаем “безопасно”: TESTNET -> PAPER
+        boolean isTestnet = (net == null || net == NetworkType.TESTNET);
+
+        String desired;
+        if (mode == AdvancedControlMode.MANUAL) {
+            desired = PHASE_LIVE;
+        } else {
+            desired = isTestnet ? PHASE_PAPER : PHASE_LIVE;
+        }
+
+        // PAPER на MAINNET не допускаем
+        if (!isTestnet && PHASE_PAPER.equalsIgnoreCase(s.getRunPhase())) {
+            s.setRunPhase(PHASE_LIVE);
             return;
         }
 
-        AdvancedControlMode mode = s.getAdvancedControlMode();
-        if (mode == null) mode = AdvancedControlMode.MANUAL;
-
-        if (mode == AdvancedControlMode.AI) {
-            s.setRunPhase(PHASE_COLLECT);
+        if (s.getRunPhase() == null || s.getRunPhase().isBlank()) {
+            s.setRunPhase(desired);
             return;
         }
 
-        NetworkType net = (s.getNetworkType() != null) ? s.getNetworkType() : NetworkType.TESTNET;
+        String cur = normalizeUpperNullable(s.getRunPhase());
 
-        String desired = (mode == AdvancedControlMode.MANUAL)
-                ? PHASE_LIVE
-                : (net == NetworkType.TESTNET ? PHASE_PAPER : PHASE_LIVE);
+        // BACKTEST/COLLECT:
+        //  - MANUAL: не трогаем
+        //  - HYBRID/AI: авто-исправляем, иначе пользователь жмёт START и торговля не идёт
+        if (PHASE_BACKTEST.equals(cur) || PHASE_COLLECT.equals(cur)) {
+            if (mode == AdvancedControlMode.MANUAL) return;
+            if (!desired.equals(cur)) {
+                s.setRunPhase(desired);
+            }
+            return;
+        }
 
-        if (s.getRunPhase() == null || !desired.equalsIgnoreCase(s.getRunPhase())) {
+        if (!desired.equals(cur)) {
             s.setRunPhase(desired);
         }
     }
+
 
     // =====================================================
     // UI STATE builder
@@ -1229,6 +1301,13 @@ public class StrategySettingsController {
         if (s == null) return "";
         String x = s.trim();
         return x.length() > 200 ? x.substring(0, 200) : x;
+    }
+
+    private static String normalizeUpperNullable(String s) {
+        if (s == null) return null;
+        String v = s.trim();
+        if (v.isEmpty()) return null;
+        return v.toUpperCase(Locale.ROOT);
     }
 
     @SuppressWarnings("unchecked")

@@ -3,6 +3,8 @@ package com.chicu.aitradebot.ai.ml.artifacts;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import jakarta.persistence.*;
 import lombok.*;
+import org.hibernate.annotations.JdbcTypeCode;
+import org.hibernate.type.SqlTypes;
 
 import java.time.Instant;
 import java.util.Locale;
@@ -48,7 +50,12 @@ public class MlModelArtifactEntity {
     @Column(name = "model_version", nullable = false, length = 80)
     private String modelVersion;
 
-    @Column(name = "metrics_json")
+    /**
+     * В БД это TEXT, НЕ OID/CLOB.
+     * Явно закрепляем тип, чтобы Hibernate не ожидал CLOB (oid) при schema-validation.
+     */
+    @JdbcTypeCode(SqlTypes.LONGVARCHAR)
+    @Column(name = "metrics_json", columnDefinition = "text")
     private String metricsJson;
 
     @Column(name = "created_at", nullable = false)

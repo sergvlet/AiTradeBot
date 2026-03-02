@@ -2,17 +2,19 @@ package com.chicu.aitradebot.market;
 
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
+import com.chicu.aitradebot.market.model.Candle;
 import com.chicu.aitradebot.market.model.UnifiedKline;
 import com.chicu.aitradebot.market.stream.MarketDataStreamService;
 import com.chicu.aitradebot.orchestrator.AiStrategyOrchestrator;
 import com.chicu.aitradebot.strategy.live.StrategyLivePublisher;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.ObjectProvider;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
-import java.lang.reflect.Method;
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
@@ -26,10 +28,27 @@ public class MarketStreamServiceImpl implements MarketStreamService {
 
     private final MarketDataStreamService marketDataStreamService;
     private final StrategyLivePublisher livePublisher;
-    private final AiStrategyOrchestrator orchestrator;
+    /** ✅ ленивый доступ, чтобы разорвать цикл MarketStreamServiceImpl <-> AiStrategyOrchestrator */
+    private final ObjectProvider<AiStrategyOrchestrator> orchestratorProvider;
+
+    private AiStrategyOrchestrator orch() {
+        return orchestratorProvider != null ? orchestratorProvider.getIfAvailable() : null;
+    }
+
+    private Optional<AiStrategyOrchestrator.RunBinding> bindingOf(long chatId, StrategyType type) {
+        AiStrategyOrchestrator o = orch();
+        return o != null ? o.getBinding(chatId, type) : Optional.empty();
+    }
 
     @Value("${market.dispatch.min-interval-ms:0}")
     private long minDispatchIntervalMs;
+
+    /**
+     * UI: как часто отправлять forming-candle по WS (ms).
+     * Чтобы график "жил" как на бирже, но не убивал браузер.
+     */
+    @Value("${market.ui.candle-interval-ms:300}")
+    private long uiCandleIntervalMs;
 
     @Value("${market.dispatch.logFirstSeq:5}")
     private long logFirstSeq;
@@ -42,6 +61,18 @@ public class MarketStreamServiceImpl implements MarketStreamService {
 
     @Value("${market.dispatch.skip-log-cooldown-ms:30000}")
     private long skipLogCooldownMs;
+
+    // ============================================================
+    // ✅ NEW: KLINE -> PRICE DISPATCH (чтобы не зависеть от редких aggTrade)
+    // ============================================================
+
+    /** Включить диспатч onPriceUpdate из kline-апдейтов (forming candle). */
+    @Value("${market.dispatch.kline-price.enabled:true}")
+    private boolean klinePriceDispatchEnabled;
+
+    /** Минимальный интервал диспатча цены из kline (ms). */
+    @Value("${market.dispatch.kline-price.min-interval-ms:250}")
+    private long klinePriceMinIntervalMs;
 
     // ============================================================
     // ✅ AGG_TRADE maps (БЕЗ timeframe!)
@@ -61,6 +92,12 @@ public class MarketStreamServiceImpl implements MarketStreamService {
     // ============================================================
 
     private final ConcurrentMap<KlineKey, Long> lastKlineSeenAtMs = new ConcurrentHashMap<>();
+
+    /** last успешный DISPATCH цены из KLINE (по wall-clock, ms) */
+    private final ConcurrentMap<KlineKey, Long> lastKlinePriceDispatchAtMs = new ConcurrentHashMap<>();
+
+    /** последняя отправка forming-candle по WS (чтобы график был живой, но без спама) */
+    private final ConcurrentMap<KlineKey, Long> lastUiCandleAtMs = new ConcurrentHashMap<>();
 
     /** Диагностический счётчик, если push.seq() == 0 */
     private final AtomicLong diagCounter = new AtomicLong(0);
@@ -102,7 +139,6 @@ public class MarketStreamServiceImpl implements MarketStreamService {
                     ex, networkType, sym, tf
             );
 
-            // ✅ у тебя метод unsubscribe есть — вызываем напрямую (без reflection)
             try {
                 marketDataStreamService.unsubscribe(prev.exchange, prev.networkType, chatId, type, prev.symbol, prev.timeframe);
             } catch (Exception e) {
@@ -118,6 +154,24 @@ public class MarketStreamServiceImpl implements MarketStreamService {
         } catch (Exception e) {
             log.error("❌ [MARKET] Ошибка подписки chatId={} type={} ex={} net={} sym={} tf={} err={}",
                     chatId, type, ex, networkType, sym, tf, e.getMessage(), e);
+        }
+    }
+
+    @Override
+    public void unsubscribe(long chatId, StrategyType type) {
+        if (chatId <= 0 || type == null) return;
+
+        SubKey k = new SubKey(chatId, type);
+        SubBinding prev = lastSub.remove(k);
+        if (prev == null) return;
+
+        try {
+            marketDataStreamService.unsubscribe(prev.exchange, prev.networkType, chatId, type, prev.symbol, prev.timeframe);
+            log.info("📴 [MARKET] Unsubscribe OK chatId={} type={} ex={} net={} {} {}",
+                    chatId, type, prev.exchange, prev.networkType, prev.symbol, prev.timeframe);
+        } catch (Exception e) {
+            log.warn("⚠️ [MARKET] Unsubscribe failed chatId={} type={} ex={} net={} {} {} err={}",
+                    chatId, type, prev.exchange, prev.networkType, prev.symbol, prev.timeframe, e.toString());
         }
     }
 
@@ -155,7 +209,7 @@ public class MarketStreamServiceImpl implements MarketStreamService {
         // 0) определяем timeframe для UI/оркестратора (из binding, иначе из lastSub)
         final String tf = resolveTimeframe(chatId, type, ex, networkType, sym);
 
-        // 1) push в stream cache (оставляем сигнатуру сервиса как у тебя)
+        // 1) push в stream cache
         final MarketDataStreamService.MarketPushResult push;
         try {
             push = marketDataStreamService.pushAggTrade(
@@ -170,6 +224,12 @@ public class MarketStreamServiceImpl implements MarketStreamService {
             return;
         }
 
+
+        // ✅ если из тиков построили/обновили свечу — публикуем forming-candle (throttled)
+        if (push != null && push.pushedCandle()) {
+            tryPublishUiCandleFromCache(chatId, type, ex, networkType, sym, tf, tradeTsMs);
+        }
+
         // 2) ✅ UI живёт ВСЕГДА
         try {
             livePublisher.publishAggTick(chatId, type, sym, (tf != null ? tf : "na"), price, qty, tradeTsMs);
@@ -180,7 +240,7 @@ public class MarketStreamServiceImpl implements MarketStreamService {
         }
 
         // 3) ✅ торговая логика: диспатчим только если есть binding и он совпал
-        Optional<AiStrategyOrchestrator.RunBinding> bindingOpt = orchestrator.getBinding(chatId, type);
+        Optional<AiStrategyOrchestrator.RunBinding> bindingOpt = bindingOf(chatId, type);
         if (bindingOpt.isEmpty()) {
             cleanupTickKeyIfOld(key, nowMs);
             maybeLogTickSkip(key, nowMs, safeSeq(push),
@@ -205,7 +265,7 @@ public class MarketStreamServiceImpl implements MarketStreamService {
                     chatId, type, ex, networkType, sym, tf, price, qty, tradeTsMs,
                     sinceLastDispatchMs,
                     "Пропуск: контекст не совпал с binding (ожидаю ex=" + b.exchange() + " net=" + b.network()
-                            + " " + b.symbol() + " " + b.timeframe() + ")",
+                    + " " + b.symbol() + " " + b.timeframe() + ")",
                     push);
             return;
         }
@@ -219,7 +279,7 @@ public class MarketStreamServiceImpl implements MarketStreamService {
 
         if (allowedByThrottle) {
             try {
-                orchestrator.onPriceUpdate(chatId, type, ex, networkType, sym, tf, price, tradeTsMs);
+                orch().onPriceUpdate(chatId, type, ex, networkType, sym, tf, price, tradeTsMs);
 
                 // ✅ фиксируем диспатч ТОЛЬКО после успеха
                 lastTickDispatchAtMs.put(key, nowMs);
@@ -263,7 +323,7 @@ public class MarketStreamServiceImpl implements MarketStreamService {
 
     private String resolveTimeframe(long chatId, StrategyType type, String ex, NetworkType net, String sym) {
         try {
-            Optional<AiStrategyOrchestrator.RunBinding> b = orchestrator.getBinding(chatId, type);
+            Optional<AiStrategyOrchestrator.RunBinding> b = bindingOf(chatId, type);
             if (b.isPresent()) {
                 AiStrategyOrchestrator.RunBinding rb = b.get();
                 if (eq(ex, rb.exchange()) && net == rb.network() && eq(sym, rb.symbol())) {
@@ -280,6 +340,60 @@ public class MarketStreamServiceImpl implements MarketStreamService {
         }
 
         return null;
+    }
+
+    /**
+     * ✅ Публикуем текущую (forming) свечу по WS из кэша, чтобы график обновлялся чаще, чем 1 раз в минуту.
+     * Делается с троттлингом.
+     */
+    private void tryPublishUiCandleFromCache(long chatId,
+                                             StrategyType type,
+                                             String exchange,
+                                             NetworkType networkType,
+                                             String symbol,
+                                             String timeframe,
+                                             long tradeTsMs) {
+
+        String ex = sanitizeExchange(exchange);
+        String sym = sanitizeSymbol(symbol);
+        String tf = sanitizeTf(timeframe);
+
+        if (chatId <= 0 || type == null || ex == null || networkType == null || sym == null || tf == null) return;
+
+        long nowMs = System.currentTimeMillis();
+        long interval = Math.max(50L, uiCandleIntervalMs);
+
+        KlineKey key = new KlineKey(chatId, type, ex, networkType, sym, tf);
+
+        Long last = lastUiCandleAtMs.get(key);
+        if (last != null && (nowMs - last) < interval) return;
+        lastUiCandleAtMs.put(key, nowMs);
+
+        try {
+            var tail = marketDataStreamService.getCachedCandles(chatId, type, ex, networkType, sym, tf, 1);
+            if (tail == null || tail.isEmpty()) return;
+
+            Candle c = tail.get(tail.size() - 1);
+            if (c == null) return;
+
+            // ВАЖНО: time = openTime свечи (бакет), а не tradeTsMs
+            Instant ts = Instant.ofEpochMilli(c.getTime());
+
+            livePublisher.pushCandleOhlc(
+                    chatId,
+                    type,
+                    sym,
+                    tf,
+                    BigDecimal.valueOf(c.getOpen()),
+                    BigDecimal.valueOf(c.getHigh()),
+                    BigDecimal.valueOf(c.getLow()),
+                    BigDecimal.valueOf(c.getClose()),
+                    BigDecimal.valueOf(c.getVolume()),
+                    ts
+            );
+        } catch (Exception ignored) {
+            // нельзя ломать поток тиков из-за UI
+        }
     }
 
     private void maybeLogTickSkip(TickKey key,
@@ -324,6 +438,51 @@ public class MarketStreamServiceImpl implements MarketStreamService {
     // KLINE (CANDLE)
     // ============================================================
 
+    /**
+     * ⚠ Legacy overload: старый контракт MarketStreamService без timeframe.
+     * Пытаемся взять TF из kline, иначе — из подписки (run binding).
+     */
+    @Override
+    public void onKline(long chatId,
+                        StrategyType type,
+                        String exchange,
+                        NetworkType networkType,
+                        String symbol,
+                        UnifiedKline kline) {
+
+        String ex = sanitizeExchange(exchange);
+        String sym = sanitizeSymbol(symbol);
+
+        // если kline несёт свой sym/tf — используем
+        if (kline != null) {
+            if (sym == null) sym = sanitizeSymbol(kline.getSymbol());
+        }
+
+        if (ex == null || networkType == null || type == null || sym == null || kline == null) {
+            return;
+        }
+
+        String tf = null;
+        try { tf = sanitizeTf(kline.getTimeframe()); } catch (Exception ignored) {}
+
+        if (tf == null) {
+            tf = resolveTimeframe(chatId, type, ex, networkType, sym);
+        }
+
+        if (tf == null) {
+            // timeframe неизвестен — kline без tf мы не кладём в строгий кэш
+            if (log.isDebugEnabled()) {
+                log.debug("⏭️ [MARKET] SKIP kline without timeframe chatId={} type={} ex={} net={} sym={}",
+                        chatId, type, ex, networkType, sym);
+            }
+            return;
+        }
+
+        onKline(chatId, type, ex, networkType, sym, tf, kline);
+    }
+
+
+
     @Override
     public void onKline(long chatId,
                         StrategyType type,
@@ -363,10 +522,45 @@ public class MarketStreamServiceImpl implements MarketStreamService {
         // 2) UI свеча всегда
         try { livePublisher.publishCandle(chatId, type, kline); } catch (Exception ignored) {}
 
-        // 3) закрытие свечи -> оркестратор (только если binding совпал)
+        // 3) ✅ NEW: kline -> price update (forming candle тоже)
+        if (klinePriceDispatchEnabled) {
+            Optional<AiStrategyOrchestrator.RunBinding> bindingOpt = bindingOf(chatId, type);
+            if (bindingOpt.isPresent()) {
+                AiStrategyOrchestrator.RunBinding b = bindingOpt.get();
+
+                boolean match =
+                        eq(ex, b.exchange()) &&
+                        networkType == b.network() &&
+                        eq(sym, b.symbol()) &&
+                        eq(tf, b.timeframe());
+
+                if (match) {
+                    BigDecimal px = extractClosePriceSafe(kline);
+                    if (px != null && px.signum() > 0) {
+                        long minInt = Math.max(0L, klinePriceMinIntervalMs);
+                        Long prev = lastKlinePriceDispatchAtMs.get(key);
+                        long since = (prev == null) ? Long.MAX_VALUE : (nowMs - prev);
+
+                        if (since >= minInt) {
+                            long tsMs = extractEventTimeMsSafe(kline, nowMs);
+
+                            try {
+                                orch().onPriceUpdate(chatId, type, ex, networkType, sym, tf, px, tsMs);
+                                lastKlinePriceDispatchAtMs.put(key, nowMs);
+                            } catch (Exception e) {
+                                log.error("❌ [MARKET] KLINE->PRICE DISPATCH ошибка chatId={} type={} ex={} net={} sym={} tf={} err={}",
+                                        chatId, type, ex, networkType, sym, tf, e.getMessage(), e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4) закрытие свечи -> оркестратор (только если binding совпал)
         if (!isKlineClosed(kline)) return;
 
-        Optional<AiStrategyOrchestrator.RunBinding> bindingOpt = orchestrator.getBinding(chatId, type);
+        Optional<AiStrategyOrchestrator.RunBinding> bindingOpt = bindingOf(chatId, type);
         if (bindingOpt.isEmpty()) {
             cleanupKlineKeyIfOld(key, nowMs);
             return;
@@ -386,7 +580,7 @@ public class MarketStreamServiceImpl implements MarketStreamService {
         }
 
         try {
-            orchestrator.onCandleClosed(chatId, type, ex, networkType, sym, tf, kline);
+            orch().onCandleClosed(chatId, type, ex, networkType, sym, tf, kline);
         } catch (Exception e) {
             log.error("❌ [MARKET] onCandleClosed упал chatId={} type={} ex={} net={} sym={} tf={} err={}",
                     chatId, type, ex, networkType, sym, tf, e.getMessage(), e);
@@ -399,8 +593,7 @@ public class MarketStreamServiceImpl implements MarketStreamService {
                         String symbol,
                         String timeframe,
                         UnifiedKline kline) {
-        // попробуем восстановить env из binding
-        Optional<AiStrategyOrchestrator.RunBinding> b = orchestrator.getBinding(chatId, type);
+        Optional<AiStrategyOrchestrator.RunBinding> b = bindingOf(chatId, type);
         if (b.isEmpty()) return;
         AiStrategyOrchestrator.RunBinding rb = b.get();
         onKline(chatId, type, rb.exchange(), rb.network(), symbol, timeframe, kline);
@@ -413,6 +606,7 @@ public class MarketStreamServiceImpl implements MarketStreamService {
         long ttl = Math.max(1L, inactiveTtlMs);
         if (nowMs - lastSeen >= ttl) {
             lastKlineSeenAtMs.remove(key);
+            lastKlinePriceDispatchAtMs.remove(key);
         }
     }
 
@@ -496,19 +690,7 @@ public class MarketStreamServiceImpl implements MarketStreamService {
     }
 
     private boolean isKlineClosed(UnifiedKline kline) {
-        try {
-            Optional<Boolean> a = tryBool(kline, "isClosed");
-            if (a.isPresent()) return a.get();
-            Optional<Boolean> b = tryBool(kline, "getClosed");
-            if (b.isPresent()) return b.get();
-        } catch (Exception ignored) {}
-
-        try {
-            Optional<Boolean> c = tryBool(kline, "closed");
-            return c.orElse(false);
-        } catch (Exception ignored) {}
-
-        return false;
+        return kline != null && kline.isClosed();
     }
 
     private static boolean safeBool(java.util.concurrent.Callable<Boolean> c) {
@@ -544,17 +726,20 @@ public class MarketStreamServiceImpl implements MarketStreamService {
         return s.isEmpty() ? null : s;
     }
 
-    private static Optional<Boolean> tryBool(Object target, String method) {
-        try {
-            Method m = target.getClass().getMethod(method);
-            Object v = m.invoke(target);
-            if (v == null) return Optional.empty();
-            if (v instanceof Boolean b) return Optional.of(b);
-            if (v instanceof String s) return Optional.of(Boolean.parseBoolean(s.trim()));
-            return Optional.empty();
-        } catch (Exception ignored) {
-            return Optional.empty();
-        }
+    // ============================================================
+    // ✅ KLINE extractors (БЕЗ reflection)
+    // ============================================================
+
+    private static BigDecimal extractClosePriceSafe(UnifiedKline kline) {
+        return kline != null ? kline.getClose() : null;
+    }
+
+    private static long extractEventTimeMsSafe(UnifiedKline kline, long fallbackNowMs) {
+        if (kline == null) return fallbackNowMs;
+
+        long t = kline.getCloseTime();
+        if (t <= 0) t = kline.getOpenTime();
+        return t > 0 ? t : fallbackNowMs;
     }
 
     // ============================================================
@@ -594,9 +779,9 @@ public class MarketStreamServiceImpl implements MarketStreamService {
             if (this == o) return true;
             if (!(o instanceof SubBinding b)) return false;
             return eq(exchange, b.exchange)
-                    && networkType == b.networkType
-                    && eq(symbol, b.symbol)
-                    && eq(timeframe, b.timeframe);
+                   && networkType == b.networkType
+                   && eq(symbol, b.symbol)
+                   && eq(timeframe, b.timeframe);
         }
 
         @Override
