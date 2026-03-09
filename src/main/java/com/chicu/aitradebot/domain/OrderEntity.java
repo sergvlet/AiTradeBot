@@ -5,6 +5,7 @@ import lombok.*;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
+import java.util.Locale;
 
 @Entity
 @Table(
@@ -12,7 +13,8 @@ import java.time.LocalDateTime;
         indexes = {
                 @Index(name = "idx_orders_chat_symbol", columnList = "chat_id,symbol"),
                 @Index(name = "idx_orders_chat_strategy", columnList = "chat_id,strategy_type"),
-                @Index(name = "idx_orders_status", columnList = "status")
+                @Index(name = "idx_orders_status", columnList = "status"),
+                @Index(name = "idx_orders_ctx_runtime", columnList = "chat_id,strategy_type,symbol,exchange_name,network_type,timestamp")
         }
 )
 @Getter
@@ -29,7 +31,6 @@ public class OrderEntity {
     /** chatId — идентификатор пользователя */
     @Column(name = "chat_id", nullable = false)
     private Long chatId;
-
 
     /** старое поле, оставлено для миграции */
     @Column(name = "user_id")
@@ -74,6 +75,13 @@ public class OrderEntity {
     @Column(name = "updated_at")
     private LocalDateTime updatedAt;
 
+    /** новый контекст для восстановления после рестарта */
+    @Column(name = "exchange_name", length = 32)
+    private String exchangeName;
+
+    /** MAINNET / TESTNET */
+    @Column(name = "network_type", length = 32)
+    private String networkType;
 
     // ============================================
     // ULTRA-поля (TP/SL, ML, причины, PnL)
@@ -112,37 +120,68 @@ public class OrderEntity {
     @Column(name = "ml_confidence", precision = 10, scale = 5)
     private BigDecimal mlConfidence;
 
-
     // ============================================
     // Lifecycle
     // ============================================
+
     @PrePersist
     public void prePersist() {
+        normalizeContext();
 
-        if (createdAt == null)
+        if (createdAt == null) {
             createdAt = LocalDateTime.now();
+        }
 
-        if (timestamp == null)
+        if (timestamp == null) {
             timestamp = System.currentTimeMillis();
+        }
 
-        if (price != null && quantity != null && total == null)
+        if (price != null && quantity != null && total == null) {
             total = price.multiply(quantity);
+        }
 
-        if (chatId == null && userId != null)
+        if (chatId == null && userId != null) {
             chatId = userId;
+        }
 
-        if (filled == null)
+        if (filled == null) {
             filled = true;
+        }
     }
 
     @PreUpdate
     public void preUpdate() {
+        normalizeContext();
+
         updatedAt = LocalDateTime.now();
 
-        if (price != null && quantity != null)
+        if (price != null && quantity != null) {
             total = price.multiply(quantity);
+        }
 
-        if (filled == null)
+        if (filled == null) {
             filled = true;
+        }
+    }
+
+    private void normalizeContext() {
+        if (symbol != null) {
+            symbol = symbol.trim().toUpperCase(Locale.ROOT);
+        }
+        if (side != null) {
+            side = side.trim().toUpperCase(Locale.ROOT);
+        }
+        if (status != null) {
+            status = status.trim().toUpperCase(Locale.ROOT);
+        }
+        if (strategyType != null) {
+            strategyType = strategyType.trim().toUpperCase(Locale.ROOT);
+        }
+        if (exchangeName != null) {
+            exchangeName = exchangeName.trim().toUpperCase(Locale.ROOT);
+        }
+        if (networkType != null) {
+            networkType = networkType.trim().toUpperCase(Locale.ROOT);
+        }
     }
 }

@@ -8,6 +8,7 @@ import com.chicu.aitradebot.domain.enums.AdvancedControlMode;
 import com.chicu.aitradebot.exchange.model.Order;
 import com.chicu.aitradebot.market.MarketStreamService;
 import com.chicu.aitradebot.market.model.UnifiedKline;
+import com.chicu.aitradebot.market.stream.MarketDataStreamService;
 import com.chicu.aitradebot.orchestrator.dto.StrategyRunInfo;
 import com.chicu.aitradebot.service.OrderService;
 import com.chicu.aitradebot.service.StrategySettingsService;
@@ -17,6 +18,7 @@ import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
@@ -166,6 +168,47 @@ public class AiStrategyOrchestrator {
     }
 
     // =====================================================================
+    // ✅ MARKET EVENTS: слушаем события из MarketDataStreamService
+    // =====================================================================
+
+    /**
+     * ✅ Главная связка “рынок -> стратегия”:
+     * MarketDataStreamService публикует MarketTickEvent, а оркестратор маршрутизирует в onPriceUpdate(...)
+     */
+    @EventListener
+    public void onMarketTickEvent(MarketDataStreamService.MarketTickEvent ev) {
+        if (ev == null) return;
+        onPriceUpdate(
+                ev.chatId(),
+                ev.strategyType(),
+                ev.exchange(),
+                ev.networkType(),
+                ev.symbol(),
+                ev.timeframe(),
+                ev.price(),
+                ev.tsMs()
+        );
+    }
+
+    /**
+     * ✅ Закрытая свеча (если стратегия поддерживает CandleCloseAware)
+     */
+    @EventListener
+    public void onCandleClosedEvent(MarketDataStreamService.CandleClosedEvent ev) {
+        if (ev == null) return;
+        UnifiedKline k = ev.kline();
+        onCandleClosed(
+                ev.chatId(),
+                ev.strategyType(),
+                ev.exchange(),
+                ev.networkType(),
+                ev.symbol(),
+                ev.timeframe(),
+                k
+        );
+    }
+
+    // =====================================================================
     // ✅ RUNTIME POLICY (единые правила режима/фазы)
     // =====================================================================
 
@@ -301,6 +344,25 @@ public class AiStrategyOrchestrator {
     }
 
     /**
+     * ✅ Подстраховка: если стратегия запущена, но runtimePolicyCache пуст (рестарт приложения/горячие вызовы),
+     * обновим policy 1 раз при первом тике/свече.
+     */
+    private void ensurePolicyLoadedIfMissing(long chatId, StrategyType type, RunBinding b) {
+        if (type == null || b == null) return;
+
+        RunKey key = new RunKey(chatId, type);
+        if (runtimePolicyCache.containsKey(key)) return;
+
+        try {
+            StrategySettings s = loadSettingsReadOnly(chatId, type);
+            if (s == null) return;
+            // контекст берём строго из binding
+            syncSettingsContextIfNeeded(s, b.exchange(), b.network());
+            applyRuntimePolicy(chatId, type, b.exchange(), b.network(), s);
+        } catch (Exception ignored) {}
+    }
+
+    /**
      * ✅ Обновить runtime фазу/режим без рестарта (важно при переключении MANUAL/HYBRID/AI).
      * Вызывается из UI после сохранения.
      */
@@ -429,7 +491,7 @@ public class AiStrategyOrchestrator {
             try {
                 strategy.start(chatId, desired.symbol(), desired.exchange(), desired.network());
 
-                // ✅ WS-подписка на рынок теперь поднимается/переключается тут
+                // ✅ WS/Market подписка поднимается/переключается тут
                 marketStreamService.ensureSubscribed(
                         chatId,
                         type,
@@ -554,7 +616,6 @@ public class AiStrategyOrchestrator {
                 applyRuntimePolicy(chatId, type, ex, net, s);
 
                 // ✅ поток рынка должен быть активен независимо от UI
-                // (если UI закрыт/обновлён — стратегия всё равно должна получать тики/свечи)
                 marketStreamService.ensureSubscribed(chatId, type, sym, tf, ex, net);
                 return buildRunInfo(s, true, "Стратегия уже запущена");
             }
@@ -583,7 +644,7 @@ public class AiStrategyOrchestrator {
             try {
                 strategy.start(chatId, sym, ex, net);
 
-                // ✅ WS-подписка на рынок теперь поднимается тут (а не из StrategyDashboardController)
+                // ✅ подписка на рынок поднимается тут
                 marketStreamService.ensureSubscribed(chatId, type, sym, tf, ex, net);
             } catch (Exception e) {
                 running.remove(key, newBinding);
@@ -651,7 +712,6 @@ public class AiStrategyOrchestrator {
             String sym = sanitizeSymbol(s.getSymbol());
 
             // ✅ отписка от WS-рынка не зависит от UI
-            // (страница может быть закрыта/обновлена — стратегия должна останавливаться корректно)
             try { marketStreamService.unsubscribe(chatId, type); } catch (Exception ignored) {}
 
             RunBinding removed = running.remove(key);
@@ -739,8 +799,7 @@ public class AiStrategyOrchestrator {
         RunKey key = new RunKey(chatId, type);
         RunBinding b = running.get(key);
 
-                if (b == null) {
-
+        if (b == null) {
             String ex = sanitizeExchange(exchange);
             if (ex == null) ex = sanitizeExchange(s.getExchangeName());
             if (ex == null) ex = "BINANCE";
@@ -753,21 +812,16 @@ public class AiStrategyOrchestrator {
                     .type(s.getType())
                     .symbol(sanitizeSymbol(s.getSymbol()))
                     .active(false)
-
                     .timeframe(sanitizeTf(s.getTimeframe()))
                     .exchangeName(ex)
                     .networkType(net)
-
                     .version(s.getVersion())
-
                     .startedAt(toInstant(s.getStartedAt()))
                     .stoppedAt(toInstant(s.getStoppedAt()))
                     .updatedAt(Instant.now())
-
                     .message("Стратегия остановлена")
                     .build();
         }
-
 
         String reqEx = sanitizeExchange(exchange);
         NetworkType reqNet = network;
@@ -868,13 +922,19 @@ public class AiStrategyOrchestrator {
         RunBinding b = running.get(key);
         if (b == null) return;
 
-        // ✅ если exchange/network не передали (старый/частичный вызов) — берём из binding
+        // ✅ подстрахуем policy-cache (после рестарта или если UI не вызывал applyRuntimePolicy)
+        ensurePolicyLoadedIfMissing(chatId, type, b);
+
+        // ✅ если exchange/network не передали — берём из binding
         String ex = sanitizeExchange(exchange);
         if (ex == null) ex = b.exchange();
         NetworkType net = (network != null ? network : b.network());
 
+        // ✅ если symbol/tf не передали — берём из binding
         String sym = sanitizeSymbol(symbol);
-        String tf  = sanitizeTf(timeframe);
+        if (sym == null) sym = b.symbol();
+        String tf = sanitizeTf(timeframe);
+        if (tf == null) tf = b.timeframe();
 
         if (!eq(ex, b.exchange()) || net != b.network() || !eq(sym, b.symbol()) || !eq(tf, b.timeframe())) {
             logIgnore(key, "TICK_IGNORED",
@@ -889,9 +949,11 @@ public class AiStrategyOrchestrator {
         TradingStrategy strategy = strategyRegistry.get(type);
         if (strategy == null) return;
 
+        long ts = (tradeTsMs > 0 ? tradeTsMs : System.currentTimeMillis());
+
         if (strategy instanceof PriceUpdateAware aware) {
             try {
-                aware.onPriceUpdate(chatId, type, sym, tf, price, tradeTsMs, b.exchange(), b.network());
+                aware.onPriceUpdate(chatId, type, sym, tf, price, ts, b.exchange(), b.network());
             } catch (Exception e) {
                 log.warn("⚠️ [ORCH] TICK_HANDLER_FAILED chatId={} type={} | {}", chatId, type, e.getMessage());
             }
@@ -899,7 +961,7 @@ public class AiStrategyOrchestrator {
         }
 
         try {
-            strategy.onPriceUpdate(chatId, sym, price, Instant.ofEpochMilli(tradeTsMs));
+            strategy.onPriceUpdate(chatId, sym, price, Instant.ofEpochMilli(ts));
         } catch (Exception e) {
             log.warn("⚠️ [ORCH] TICK_HANDLER_FAILED_LEGACY chatId={} type={} | {}", chatId, type, e.getMessage());
         }
@@ -919,11 +981,16 @@ public class AiStrategyOrchestrator {
         if (b == null) return;
 
         String sym = sanitizeSymbol(symbol);
-        String tf  = sanitizeTf(timeframe);
+        String tf = sanitizeTf(timeframe);
 
-        if (!eq(sym, b.symbol()) || !eq(tf, b.timeframe())) {
+        if (sym != null && !eq(sym, b.symbol())) {
             logIgnore(key, "TICK_IGNORED_NOCTX",
-                    "пришло " + sym + " " + tf + " | ожидаю " + b.symbol() + " " + b.timeframe());
+                    "пришло " + sym + " " + (tf != null ? tf : "null") + " | ожидаю " + b.symbol() + " " + b.timeframe());
+            return;
+        }
+        if (tf != null && !eq(tf, b.timeframe())) {
+            logIgnore(key, "TICK_IGNORED_NOCTX",
+                    "пришло " + (sym != null ? sym : "null") + " " + tf + " | ожидаю " + b.symbol() + " " + b.timeframe());
             return;
         }
 
@@ -944,13 +1011,18 @@ public class AiStrategyOrchestrator {
         RunBinding b = running.get(key);
         if (b == null) return;
 
+        ensurePolicyLoadedIfMissing(chatId, type, b);
+
         // ✅ если exchange/network не передали — берём из binding
         String ex = sanitizeExchange(exchange);
         if (ex == null) ex = b.exchange();
         NetworkType net = (network != null ? network : b.network());
 
+        // ✅ если symbol/tf не передали — берём из binding
         String sym = sanitizeSymbol(symbol);
-        String tf  = sanitizeTf(timeframe);
+        if (sym == null) sym = b.symbol();
+        String tf = sanitizeTf(timeframe);
+        if (tf == null) tf = b.timeframe();
 
         if (!eq(ex, b.exchange()) || net != b.network() || !eq(sym, b.symbol()) || !eq(tf, b.timeframe())) {
             logIgnore(key, "CANDLE_IGNORED",
@@ -991,11 +1063,16 @@ public class AiStrategyOrchestrator {
         if (b == null) return;
 
         String sym = sanitizeSymbol(symbol);
-        String tf  = sanitizeTf(timeframe);
+        String tf = sanitizeTf(timeframe);
 
-        if (!eq(sym, b.symbol()) || !eq(tf, b.timeframe())) {
+        if (sym != null && !eq(sym, b.symbol())) {
             logIgnore(key, "CANDLE_IGNORED_NOCTX",
-                    "пришло " + sym + " " + tf + " | ожидаю " + b.symbol() + " " + b.timeframe());
+                    "пришло " + sym + " " + (tf != null ? tf : "null") + " | ожидаю " + b.symbol() + " " + b.timeframe());
+            return;
+        }
+        if (tf != null && !eq(tf, b.timeframe())) {
+            logIgnore(key, "CANDLE_IGNORED_NOCTX",
+                    "пришло " + (sym != null ? sym : "null") + " " + tf + " | ожидаю " + b.symbol() + " " + b.timeframe());
             return;
         }
 
@@ -1246,8 +1323,6 @@ public class AiStrategyOrchestrator {
 
     private Long extractOrderTimestamp(Order o) {
         if (o == null) return null;
-
-        // ✅ в проекте Order хранит timestamp в поле time (Long)
         Long t = o.getTime();
         return (t != null && t > 0) ? t : null;
     }
@@ -1302,7 +1377,4 @@ public class AiStrategyOrchestrator {
         String s = exchange.trim().toUpperCase(Locale.ROOT);
         return s.isEmpty() ? null : s;
     }
-
-    // reflection helpers удалены: в проекте работаем строго по методам/полям.
 }
-

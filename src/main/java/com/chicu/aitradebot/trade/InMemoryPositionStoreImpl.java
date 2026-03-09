@@ -2,32 +2,55 @@ package com.chicu.aitradebot.trade;
 
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
+import com.chicu.aitradebot.domain.OrderEntity;
+import com.chicu.aitradebot.repository.OrderRepository;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.time.ZoneId;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
-/**
- * Простая in-memory реализация для V4:
- * - хранит факт "в позиции"
- * - хранит snapshot (entryPrice/qty/tp/sl) для правильного выхода
-
- * ⚠️ Если нужно переживать рестарт приложения — позже заменим на DB-реализацию.
- */
 @Slf4j
 @Service
+@RequiredArgsConstructor
 public class InMemoryPositionStoreImpl implements PositionStore {
 
-    /** Спец-символ: если старый код не передал symbol, всё равно ставим "факт" позиции. */
+    /** если старый код не передал symbol */
     private static final String ANY_SYMBOL = "__ANY__";
 
+    private final OrderRepository orderRepository;
+
     /**
-     * Храним по точному ключу (включая symbol).
+     * in-memory cache уже восстановленных позиций
      */
     private final Map<String, PositionSnapshot> positions = new ConcurrentHashMap<>();
+
+    private static final class OpenLot {
+        private BigDecimal qty;
+        private final BigDecimal price;
+        private final BigDecimal tp;
+        private final BigDecimal sl;
+        private final Long entryOrderId;
+        private final Instant openedAt;
+
+        private OpenLot(BigDecimal qty,
+                        BigDecimal price,
+                        BigDecimal tp,
+                        BigDecimal sl,
+                        Long entryOrderId,
+                        Instant openedAt) {
+            this.qty = qty;
+            this.price = price;
+            this.tp = tp;
+            this.sl = sl;
+            this.entryOrderId = entryOrderId;
+            this.openedAt = openedAt;
+        }
+    }
 
     @Override
     public boolean isInPosition(Long chatId,
@@ -39,19 +62,21 @@ public class InMemoryPositionStoreImpl implements PositionStore {
         if (chatId == null || type == null) return false;
 
         String ex = normUpper(exchange);
-        String net = normUpper(network != null ? network.name() : null);
+        String netKey = normUpper(network != null ? network.name() : null);
 
         String sym = normUpper(symbol);
         if (sym == null) {
-            // "любой символ" для данного контекста
-            String prefix = prefixKey(chatId, type, ex, net);
+            String prefix = prefixKey(chatId, type, ex, netKey);
             for (String k : positions.keySet()) {
                 if (k != null && k.startsWith(prefix)) return true;
             }
             return false;
         }
 
-        return positions.containsKey(key(chatId, type, ex, net, sym));
+        String k = key(chatId, type, ex, netKey, sym);
+        if (positions.containsKey(k)) return true;
+
+        return tryRestorePosition(chatId, type, ex, network, netKey, sym).isPresent();
     }
 
     @Override
@@ -64,21 +89,23 @@ public class InMemoryPositionStoreImpl implements PositionStore {
         if (chatId == null || type == null) return;
 
         String ex = normUpper(exchange);
-        String net = normUpper(network != null ? network.name() : null);
+        String netKey = normUpper(network != null ? network.name() : null);
 
-        // ✅ если symbol не задан — ставим "факт" через ANY_SYMBOL (backward-compat)
         String sym = normUpper(symbol);
         if (sym == null) sym = ANY_SYMBOL;
 
         positions.putIfAbsent(
-                key(chatId, type, ex, net, sym),
-                new PositionSnapshot(chatId, type, ex, network, sym,
+                key(chatId, type, ex, netKey, sym),
+                new PositionSnapshot(
+                        chatId, type, ex, network, sym,
                         null, null, null, null,
-                        null, null, Instant.now())
+                        null, null, Instant.now()
+                )
         );
 
         if (log.isDebugEnabled()) {
-            log.debug("[POS] OPEN(fact) chatId={} type={} ex={} net={} sym={}", chatId, type, ex, net, sym);
+            log.debug("[POS] OPEN(fact) chatId={} type={} ex={} net={} sym={}",
+                    chatId, type, ex, netKey, sym);
         }
     }
 
@@ -99,12 +126,10 @@ public class InMemoryPositionStoreImpl implements PositionStore {
         if (chatId == null || type == null) return;
 
         String ex = normUpper(exchange);
-        String net = normUpper(network != null ? network.name() : null);
+        String netKey = normUpper(network != null ? network.name() : null);
 
         String sym = normUpper(symbol);
         if (sym == null) sym = ANY_SYMBOL;
-
-        Instant ts = (openedAt != null ? openedAt : Instant.now());
 
         PositionSnapshot snap = new PositionSnapshot(
                 chatId,
@@ -118,14 +143,16 @@ public class InMemoryPositionStoreImpl implements PositionStore {
                 positiveOrNull(sl),
                 positiveOrNull(quoteSpent),
                 entryOrderId,
-                ts
+                openedAt != null ? openedAt : Instant.now()
         );
 
-        positions.put(key(chatId, type, ex, net, sym), snap);
+        positions.put(key(chatId, type, ex, netKey, sym), snap);
 
-        log.debug("[POS] OPEN chatId={} type={} ex={} net={} sym={} entryPrice={} qty={} tp={} sl={} orderId={}",
-                chatId, type, ex, net, sym,
-                toStr(entryPrice), toStr(qty), toStr(tp), toStr(sl), entryOrderId);
+        if (log.isDebugEnabled()) {
+            log.debug("[POS] OPEN chatId={} type={} ex={} net={} sym={} entryPrice={} qty={} tp={} sl={} orderId={}",
+                    chatId, type, ex, netKey, sym,
+                    toStr(entryPrice), toStr(qty), toStr(tp), toStr(sl), entryOrderId);
+        }
     }
 
     @Override
@@ -138,27 +165,35 @@ public class InMemoryPositionStoreImpl implements PositionStore {
         if (chatId == null || type == null) return;
 
         String ex = normUpper(exchange);
-        String net = normUpper(network != null ? network.name() : null);
+        String netKey = normUpper(network != null ? network.name() : null);
 
         String sym = normUpper(symbol);
         if (sym == null) {
-            // закрыть "всё" по контексту
-            String prefix = prefixKey(chatId, type, ex, net);
+            String prefix = prefixKey(chatId, type, ex, netKey);
             List<String> toRemove = new ArrayList<>();
+
             for (String k : positions.keySet()) {
-                if (k != null && k.startsWith(prefix)) toRemove.add(k);
+                if (k != null && k.startsWith(prefix)) {
+                    toRemove.add(k);
+                }
             }
+
             toRemove.forEach(positions::remove);
 
-            log.debug("[POS] CLOSE(all) chatId={} type={} ex={} net={} removed={}", chatId, type, ex, net, toRemove.size());
+            if (log.isDebugEnabled()) {
+                log.debug("[POS] CLOSE(all) chatId={} type={} ex={} net={} removed={}",
+                        chatId, type, ex, netKey, toRemove.size());
+            }
             return;
         }
 
-        // ✅ закрываем конкретный symbol + чистим плейсхолдер ANY_SYMBOL (если был)
-        positions.remove(key(chatId, type, ex, net, sym));
-        positions.remove(key(chatId, type, ex, net, ANY_SYMBOL));
+        positions.remove(key(chatId, type, ex, netKey, sym));
+        positions.remove(key(chatId, type, ex, netKey, ANY_SYMBOL));
 
-        log.debug("[POS] CLOSE chatId={} type={} ex={} net={} sym={}", chatId, type, ex, net, sym);
+        if (log.isDebugEnabled()) {
+            log.debug("[POS] CLOSE chatId={} type={} ex={} net={} sym={}",
+                    chatId, type, ex, netKey, sym);
+        }
     }
 
     @Override
@@ -171,14 +206,12 @@ public class InMemoryPositionStoreImpl implements PositionStore {
         if (chatId == null || type == null) return Optional.empty();
 
         String ex = normUpper(exchange);
-        String net = normUpper(network != null ? network.name() : null);
+        String netKey = normUpper(network != null ? network.name() : null);
 
         String sym = normUpper(symbol);
         if (sym == null) {
-            // вернуть любую позицию по контексту (например для "быстрого статуса")
-            String prefix = prefixKey(chatId, type, ex, net);
+            String prefix = prefixKey(chatId, type, ex, netKey);
 
-            // 1) сначала попробуем реальную (не ANY)
             for (Map.Entry<String, PositionSnapshot> e : positions.entrySet()) {
                 String k = e.getKey();
                 if (k != null && k.startsWith(prefix) && !k.endsWith(":" + ANY_SYMBOL)) {
@@ -186,16 +219,21 @@ public class InMemoryPositionStoreImpl implements PositionStore {
                 }
             }
 
-            // 2) потом ANY_SYMBOL, если только он и есть
-            PositionSnapshot any = positions.get(key(chatId, type, ex, net, ANY_SYMBOL));
+            PositionSnapshot any = positions.get(key(chatId, type, ex, netKey, ANY_SYMBOL));
             return Optional.ofNullable(any);
         }
 
-        PositionSnapshot snap = positions.get(key(chatId, type, ex, net, sym));
-        if (snap != null) return Optional.of(snap);
+        PositionSnapshot snap = positions.get(key(chatId, type, ex, netKey, sym));
+        if (snap != null) {
+            return Optional.of(snap);
+        }
 
-        // fallback: если почему-то есть только ANY_SYMBOL
-        return Optional.ofNullable(positions.get(key(chatId, type, ex, net, ANY_SYMBOL)));
+        Optional<PositionSnapshot> restored = tryRestorePosition(chatId, type, ex, network, netKey, sym);
+        if (restored.isPresent()) {
+            return restored;
+        }
+
+        return Optional.ofNullable(positions.get(key(chatId, type, ex, netKey, ANY_SYMBOL)));
     }
 
     @Override
@@ -205,6 +243,226 @@ public class InMemoryPositionStoreImpl implements PositionStore {
                               NetworkType network,
                               String symbol) {
         markClosed(chatId, type, exchange, network, symbol);
+    }
+
+    // =====================================================
+    // lazy restore from orders
+    // =====================================================
+
+    private Optional<PositionSnapshot> tryRestorePosition(Long chatId,
+                                                          StrategyType type,
+                                                          String exchange,
+                                                          NetworkType network,
+                                                          String networkKey,
+                                                          String symbol) {
+
+        if (chatId == null || type == null || symbol == null || orderRepository == null) {
+            return Optional.empty();
+        }
+
+        String k = key(chatId, type, exchange, networkKey, symbol);
+        PositionSnapshot cached = positions.get(k);
+        if (cached != null) {
+            return Optional.of(cached);
+        }
+
+        synchronized (positions) {
+            cached = positions.get(k);
+            if (cached != null) {
+                return Optional.of(cached);
+            }
+
+            List<OrderEntity> orders = loadContextOrders(chatId, type, symbol, exchange, networkKey);
+            if (orders == null || orders.isEmpty()) {
+                return Optional.empty();
+            }
+
+            List<OpenLot> openLots = new ArrayList<>();
+
+            for (OrderEntity order : orders) {
+                if (order == null) continue;
+                if (!isFilledOrder(order)) continue;
+
+                String side = normUpper(order.getSide());
+                BigDecimal qty = positiveOrNull(order.getQuantity());
+                BigDecimal price = positiveOrNull(order.getPrice());
+
+                if (qty == null || price == null) continue;
+
+                if ("BUY".equals(side)) {
+                    openLots.add(new OpenLot(
+                            qty,
+                            price,
+                            positiveOrNull(order.getTakeProfitPrice()),
+                            positiveOrNull(order.getStopLossPrice()),
+                            order.getId(),
+                            resolveOrderInstant(order)
+                    ));
+                    continue;
+                }
+
+                if ("SELL".equals(side)) {
+                    BigDecimal leftToClose = qty;
+
+                    while (leftToClose.signum() > 0 && !openLots.isEmpty()) {
+                        OpenLot first = openLots.get(0);
+
+                        if (first.qty.compareTo(leftToClose) <= 0) {
+                            leftToClose = leftToClose.subtract(first.qty);
+                            openLots.remove(0);
+                        } else {
+                            first.qty = first.qty.subtract(leftToClose);
+                            leftToClose = BigDecimal.ZERO;
+                        }
+                    }
+                }
+            }
+
+            if (openLots.isEmpty()) {
+                return Optional.empty();
+            }
+
+            BigDecimal totalQty = BigDecimal.ZERO;
+            BigDecimal totalCost = BigDecimal.ZERO;
+
+            BigDecimal tp = null;
+            BigDecimal sl = null;
+            Long entryOrderId = null;
+            Instant openedAt = null;
+
+            for (OpenLot lot : openLots) {
+                if (lot == null || lot.qty == null || lot.qty.signum() <= 0) continue;
+
+                totalQty = totalQty.add(lot.qty);
+                totalCost = totalCost.add(lot.qty.multiply(lot.price));
+
+                if (lot.tp != null) tp = lot.tp;
+                if (lot.sl != null) sl = lot.sl;
+
+                entryOrderId = lot.entryOrderId;
+
+                if (openedAt == null || (lot.openedAt != null && lot.openedAt.isBefore(openedAt))) {
+                    openedAt = lot.openedAt;
+                }
+            }
+
+            if (totalQty.signum() <= 0 || totalCost.signum() <= 0) {
+                return Optional.empty();
+            }
+
+            BigDecimal avgEntry = totalCost.divide(totalQty, 12, BigDecimal.ROUND_HALF_UP);
+
+            PositionSnapshot restored = new PositionSnapshot(
+                    chatId,
+                    type,
+                    exchange,
+                    network,
+                    symbol,
+                    avgEntry.stripTrailingZeros(),
+                    totalQty.stripTrailingZeros(),
+                    tp,
+                    sl,
+                    totalCost.stripTrailingZeros(),
+                    entryOrderId,
+                    openedAt != null ? openedAt : Instant.now()
+            );
+
+            positions.put(k, restored);
+
+            log.warn("[POS] ♻️ RESTORED chatId={} type={} ex={} net={} sym={} qty={} entry={} tp={} sl={} entryOrderId={}",
+                    chatId,
+                    type,
+                    exchange,
+                    networkKey,
+                    symbol,
+                    toStr(restored.qty()),
+                    toStr(restored.entryPrice()),
+                    toStr(restored.tp()),
+                    toStr(restored.sl()),
+                    restored.entryOrderId());
+
+            return Optional.of(restored);
+        }
+    }
+
+    private List<OrderEntity> loadContextOrders(Long chatId,
+                                                StrategyType type,
+                                                String symbol,
+                                                String exchange,
+                                                String networkKey) {
+
+        String strategy = type.name();
+        List<OrderEntity> exact = List.of();
+
+        if (exchange != null && networkKey != null) {
+            exact = orderRepository
+                    .findByChatIdAndStrategyTypeAndSymbolAndExchangeNameAndNetworkTypeOrderByTimestampAsc(
+                            chatId, strategy, symbol, exchange, networkKey
+                    );
+        }
+
+        if (exact != null && !exact.isEmpty()) {
+            return exact;
+        }
+
+        List<OrderEntity> legacy = orderRepository.findByChatIdAndStrategyTypeAndSymbolOrderByTimestampAsc(
+                chatId, strategy, symbol
+        );
+
+        if (legacy == null || legacy.isEmpty()) {
+            return List.of();
+        }
+
+        if (exchange == null && networkKey == null) {
+            return legacy;
+        }
+
+        List<OrderEntity> filtered = new ArrayList<>();
+        for (OrderEntity order : legacy) {
+            if (order == null) continue;
+
+            String ox = normUpper(order.getExchangeName());
+            String on = normUpper(order.getNetworkType());
+
+            if (ox == null && on == null) {
+                filtered.add(order);
+                continue;
+            }
+
+            if (Objects.equals(ox, exchange) && Objects.equals(on, networkKey)) {
+                filtered.add(order);
+            }
+        }
+
+        return filtered;
+    }
+
+    private boolean isFilledOrder(OrderEntity order) {
+        if (order == null) return false;
+        if (Boolean.TRUE.equals(order.getFilled())) return true;
+
+        String status = normUpper(order.getStatus());
+        return "FILLED".equals(status);
+    }
+
+    private Instant resolveOrderInstant(OrderEntity order) {
+        if (order == null) return Instant.now();
+
+        try {
+            if (order.getTimestamp() != null && order.getTimestamp() > 0) {
+                return Instant.ofEpochMilli(order.getTimestamp());
+            }
+        } catch (Exception ignored) {
+        }
+
+        try {
+            if (order.getCreatedAt() != null) {
+                return order.getCreatedAt().atZone(ZoneId.systemDefault()).toInstant();
+            }
+        } catch (Exception ignored) {
+        }
+
+        return Instant.now();
     }
 
     // =====================================================

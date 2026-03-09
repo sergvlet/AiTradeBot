@@ -40,7 +40,7 @@ public class OrderServiceImpl implements OrderService {
     private static final int QTY_SCALE = 8;
 
     /** микродопуск, чтобы BUY не блокировался из-за округления */
-    private static final BigDecimal BUY_BUDGET_EPS = new BigDecimal("1.0005"); // +0.05%
+    private static final BigDecimal BUY_BUDGET_EPS = new BigDecimal("1.0005");
 
     private final OrderRepository orderRepository;
     private final StrategyLivePublisher livePublisher;
@@ -52,10 +52,6 @@ public class OrderServiceImpl implements OrderService {
     private final MarketSymbolService marketSymbolService;
 
     private final TradeJournalGateway tradeJournalGateway;
-
-    // =====================================================
-    // ✅ НОВОЕ API (строгое, из интерфейса)
-    // =====================================================
 
     @Override
     @Transactional
@@ -80,11 +76,6 @@ public class OrderServiceImpl implements OrderService {
         return doPlaceLimit(ctx, side.name(), quantity, limitPrice, timeInForce);
     }
 
-    /**
-     * ✅ OCO:
-     * 1) Если биржа поддерживает OCO — реально ставим на биржу.
-     * 2) Если не поддерживает — сохраняем локально как "виртуальный OCO" (под твой fallback/монитор).
-     */
     @Override
     @Transactional
     public Order placeOco(OrderContext ctx,
@@ -117,7 +108,6 @@ public class OrderServiceImpl implements OrderService {
             throw new IllegalArgumentException("OCO requires at least one price (tp/stop/stopLimit)");
         }
 
-        // если stopLimit не задан, часто достаточно stopPrice
         BigDecimal slPrice = (stopLimitPrice != null ? stopLimitPrice : stopPrice);
 
         GuardResult guard = GuardResult.builder()
@@ -141,9 +131,6 @@ public class OrderServiceImpl implements OrderService {
             log.debug("TradeJournal link skipped: {}", e.toString());
         }
 
-        // =====================================================
-        // ✅ Пытаемся поставить OCO на бирже
-        // =====================================================
         ExchangeClient.OcoResult ocoResult = null;
         boolean ocoPlacedOnExchange = false;
 
@@ -185,10 +172,6 @@ public class OrderServiceImpl implements OrderService {
             throw (e instanceof RuntimeException) ? (RuntimeException) e : new RuntimeException(e);
         }
 
-        // =====================================================
-        // ✅ Сохраняем в БД (и для биржевого OCO, и для fallback)
-        // =====================================================
-
         OrderEntity entity = new OrderEntity();
         entity.setChatId(chatId);
         entity.setUserId(chatId);
@@ -198,6 +181,8 @@ public class OrderServiceImpl implements OrderService {
         entity.setStrategyType(st.name());
         entity.setTimestamp(System.currentTimeMillis());
         entity.setCreatedAt(LocalDateTime.now());
+        entity.setExchangeName(exchangeName);
+        entity.setNetworkType(networkType.name());
 
         entity.setTakeProfitPrice(takeProfitPrice);
         entity.setStopLossPrice(slPrice);
@@ -217,10 +202,6 @@ public class OrderServiceImpl implements OrderService {
 
         return mapToDto(entity);
     }
-
-    // =====================================================
-    // ⚠️ Старое API — делегируем в новое
-    // =====================================================
 
     @Override
     @Transactional
@@ -251,8 +232,6 @@ public class OrderServiceImpl implements OrderService {
                 net
         );
 
-        // Legacy: раньше BUY.quantity означал baseQty
-        // Новый API: BUY.amount = quoteAmount -> baseQty*price
         String sideNorm = normalizeSide(side);
 
         BigDecimal amount;
@@ -328,10 +307,6 @@ public class OrderServiceImpl implements OrderService {
 
         return placeOco(ctx, quantity, takeProfitPrice, stopPrice, stopLimitPrice);
     }
-
-    // =====================================================
-    // CANCEL / OPEN / HISTORY / CREATE
-    // =====================================================
 
     @Override
     @Transactional
@@ -431,10 +406,6 @@ public class OrderServiceImpl implements OrderService {
         return mapToDto(e);
     }
 
-    // =====================================================
-    // INTERNAL: MARKET / LIMIT (строгая логика)
-    // =====================================================
-
     private Order doPlaceMarket(OrderContext ctx,
                                 String side,
                                 BigDecimal amount,
@@ -467,8 +438,6 @@ public class OrderServiceImpl implements OrderService {
 
         SymbolDescriptor descriptor = resolveSymbolDescriptor(exchangeName, networkType, symbol);
 
-        // BUY: amount=quote, requestedQty=quote/price
-        // SELL: amount=baseQty
         final BigDecimal quoteAmount = "BUY".equals(sideNorm) ? amount : null;
 
         final BigDecimal requestedQty = "BUY".equals(sideNorm)
@@ -506,13 +475,11 @@ public class OrderServiceImpl implements OrderService {
         if (finalQty == null || finalQty.signum() <= 0) throw new IllegalArgumentException("finalQty invalid after guard");
         if (finalPrice == null || finalPrice.signum() <= 0) finalPrice = priceHint;
 
-        // ✅ Нотионал (после guard) — единая точка истины
         BigDecimal finalNotional = safeMul(finalQty, finalPrice);
         if (finalNotional == null || finalNotional.signum() <= 0) {
             throw new IllegalArgumentException("notional invalid after guard");
         }
 
-        // BUY budget pre-check (с учетом микродопуска)
         if ("BUY".equals(sideNorm)) {
             BigDecimal maxAllowed = quoteAmount.multiply(BUY_BUDGET_EPS);
             if (finalNotional.compareTo(maxAllowed) > 0) {
@@ -523,7 +490,6 @@ public class OrderServiceImpl implements OrderService {
             }
         }
 
-        // clientOrderId + journal link
         String clientOrderId = OrderCorrelation.clientOrderId(correlationId, chatId, st, symbol, role);
         try {
             tradeJournalGateway.attachClientOrderId(correlationId, clientOrderId);
@@ -532,7 +498,6 @@ public class OrderServiceImpl implements OrderService {
             log.debug("TradeJournal link skipped: {}", e.toString());
         }
 
-        // Реальный MARKET на биржу
         Order exec;
         try {
             OrderSide os = "BUY".equals(sideNorm) ? OrderSide.BUY : OrderSide.SELL;
@@ -541,11 +506,9 @@ public class OrderServiceImpl implements OrderService {
             ExchangeClient.OrderAmountType amountType;
 
             if (os == OrderSide.BUY) {
-                // ✅ BUY отправляем “на quoteAmount”, но согласованный после guard
                 BigDecimal quoteToSend = finalNotional.setScale(QTY_SCALE, RoundingMode.DOWN);
                 if (quoteToSend.signum() <= 0) throw new IllegalArgumentException("quoteToSend <= 0");
 
-                // если вдруг из-за округления/данных вышли за бюджет — блок
                 if (quoteToSend.compareTo(quoteAmount.multiply(BUY_BUDGET_EPS)) > 0) {
                     throw new IllegalArgumentException("BUDGET_EXCEEDED(after_round): quoteToSend=" + strip(quoteToSend) + " > quote=" + strip(quoteAmount));
                 }
@@ -603,6 +566,8 @@ public class OrderServiceImpl implements OrderService {
         entity.setFilled(filled);
         entity.setTimestamp(System.currentTimeMillis());
         entity.setCreatedAt(LocalDateTime.now());
+        entity.setExchangeName(exchangeName);
+        entity.setNetworkType(networkType.name());
 
         if (executedPrice != null && executedQty != null) {
             entity.setTotal(executedPrice.multiply(executedQty));
@@ -731,6 +696,8 @@ public class OrderServiceImpl implements OrderService {
         entity.setFilled(filled);
         entity.setTimestamp(System.currentTimeMillis());
         entity.setCreatedAt(LocalDateTime.now());
+        entity.setExchangeName(exchangeName);
+        entity.setNetworkType(networkType.name());
 
         entity.setTotal(finalPrice.multiply(finalQty));
 
@@ -742,10 +709,6 @@ public class OrderServiceImpl implements OrderService {
 
         return mapToDto(entity);
     }
-
-    // =====================================================
-    // HELPERS
-    // =====================================================
 
     private static void requireCtx(OrderContext ctx) {
         if (ctx == null) throw new IllegalArgumentException("OrderContext is null");
@@ -905,7 +868,8 @@ public class OrderServiceImpl implements OrderService {
         if (st != null && !st.isBlank()) {
             try {
                 o.setStrategyType(StrategyType.valueOf(st.trim().toUpperCase(Locale.ROOT)));
-            } catch (Exception ignored) { }
+            } catch (Exception ignored) {
+            }
         }
         return o;
     }
@@ -961,9 +925,6 @@ public class OrderServiceImpl implements OrderService {
         return QtyMath.mul(a, b);
     }
 
-    /**
-     * ✅ Защита от компиляции: если у GuardResult нет minNotional() — просто вернём null.
-     */
     private static BigDecimal minNotionalSafe(GuardResult guard) {
         if (guard == null) return null;
         try {

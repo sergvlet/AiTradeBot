@@ -44,7 +44,6 @@ public class MlTrainingServiceImpl implements MlTrainingService {
     private final ObjectProvider<MlClient> mlClientProvider;
     private final ApplicationEventPublisher eventPublisher;
 
-    /** простой in-memory cooldown (на прод можно в БД/Redis) */
     private final Map<String, Instant> lastTrainAt = new ConcurrentHashMap<>();
 
     @Override
@@ -72,7 +71,6 @@ public class MlTrainingServiceImpl implements MlTrainingService {
         Instant now = Instant.now();
         Instant from = now.minus(Math.max(1, props.getLookbackDays()), ChronoUnit.DAYS);
 
-        // symbol/tf: сначала из StrategySettings, если пусто — попробуем восстановить из датасета
         String symbol = normUpper(ss.getSymbol());
         String tf = normLower(ss.getTimeframe());
 
@@ -85,7 +83,6 @@ public class MlTrainingServiceImpl implements MlTrainingService {
         if (symbol == null) return new MlTrainingResult(false, false, null, null, null, "symbol_missing");
         if (tf == null) return new MlTrainingResult(false, false, null, null, null, "timeframe_missing");
 
-        // cooldown
         String cdKey = cooldownKey(chatId, type, symbol, tf);
         Instant last = lastTrainAt.get(cdKey);
         long cooldownMin = Math.max(0, props.getCooldownMinutes());
@@ -93,7 +90,6 @@ public class MlTrainingServiceImpl implements MlTrainingService {
             return new MlTrainingResult(false, false, null, null, null, "cooldown");
         }
 
-        // грузим последние сэмплы
         List<MlSampleEntity> recent = safeFindRecent(chatId, type, from);
 
         List<MlSampleEntity> samples = new ArrayList<>();
@@ -101,9 +97,8 @@ public class MlTrainingServiceImpl implements MlTrainingService {
             if (s == null) continue;
             if (s.getFeaturesJson() == null) continue;
 
-            String lbl = s.getLabel();
-            Integer y = labelToIntOrNull(lbl);
-            if (y == null) continue; // ✅ не тащим мусор в train
+            Integer y = labelToIntOrNull(s.getLabel());
+            if (y == null) continue;
 
             String sSym = normUpper(s.getSymbol());
             String sTf = normLower(s.getTimeframe());
@@ -118,7 +113,6 @@ public class MlTrainingServiceImpl implements MlTrainingService {
             return new MlTrainingResult(false, false, null, null, null, "not_enough_samples=" + samples.size());
         }
 
-        // ✅ правильный rowsLimit: берём САМЫЕ НОВЫЕ rowsLimit, потом сортируем ASC (для time-split)
         int rowsLimit = Math.max(100, props.getRowsLimit());
         samples.sort(Comparator.comparing(MlTrainingServiceImpl::sampleTimeMs, Comparator.nullsLast(Comparator.reverseOrder())));
         if (samples.size() > rowsLimit) {
@@ -126,7 +120,6 @@ public class MlTrainingServiceImpl implements MlTrainingService {
         }
         samples.sort(Comparator.comparing(MlTrainingServiceImpl::sampleTimeMs, Comparator.nullsLast(Comparator.naturalOrder())));
 
-        // feature schema
         List<String> featureSchema = resolveFeatureSchema(samples);
         if (featureSchema == null || featureSchema.isEmpty()) {
             return new MlTrainingResult(false, false, null, null, null, "feature_schema_missing");
@@ -138,16 +131,17 @@ public class MlTrainingServiceImpl implements MlTrainingService {
 
         if (!Objects.equals(normTrim(ss.getMlSchemaHash()), schemaHash)) {
             ss.setMlSchemaHash(schemaHash);
-            try { ss = strategySettingsService.save(ss); } catch (Exception ignored) {}
+            try {
+                ss = strategySettingsService.save(ss);
+            } catch (Exception ignored) {
+            }
         }
 
-        // ✅ modelKey: держим совместимость с auto-resolve в sidecar (strategy:symbol:timeframe)
         String modelKey = normTrim(ss.getMlModelKey());
         if (modelKey == null) {
             modelKey = type.name() + ":" + symbol + ":" + tf;
         }
 
-        // request
         MlTrainRequest req = new MlTrainRequest();
         req.setChatId(chatId);
         req.setStrategyType(type.name());
@@ -185,7 +179,6 @@ public class MlTrainingServiceImpl implements MlTrainingService {
         String respSchema = normTrim(resp.getSchemaHash());
         String finalSchemaHash = (respSchema != null ? respSchema : schemaHash);
 
-        // 1) артефакт
         try {
             MlModelArtifactEntity art = MlModelArtifactEntity.builder()
                     .chatId(chatId)
@@ -205,22 +198,23 @@ public class MlTrainingServiceImpl implements MlTrainingService {
 
         boolean applied = false;
 
-        // 2) autoApply
         if (props.isAutoApply()) {
-            AdvancedControlMode mode = ss.getAdvancedControlMode() != null ? ss.getAdvancedControlMode() : AdvancedControlMode.MANUAL;
+            AdvancedControlMode mode = ss.getAdvancedControlMode() != null
+                    ? ss.getAdvancedControlMode()
+                    : AdvancedControlMode.MANUAL;
 
             ss.setMlModelKey(resp.getModelKey() != null ? resp.getModelKey() : modelKey);
             ss.setMlModelVersion(resp.getModelVersion());
             ss.setMlSchemaHash(finalSchemaHash);
 
-            // если gateMinProb пустой — выставим дефолт из props.thresholdAutoEnable (только если > 0)
             try {
                 BigDecimal minProb = ss.getGateMinProb();
                 if ((minProb == null || minProb.signum() <= 0) && props.getThresholdAutoEnable() > 0) {
                     ss.setGateMinProb(BigDecimal.valueOf(props.getThresholdAutoEnable())
                             .setScale(6, RoundingMode.HALF_UP));
                 }
-            } catch (Exception ignored) {}
+            } catch (Exception ignored) {
+            }
 
             if (mode != AdvancedControlMode.MANUAL) {
                 ss.setMlGateEnabled(true);
@@ -231,10 +225,12 @@ public class MlTrainingServiceImpl implements MlTrainingService {
                     log.warn("🧠 TRAIN apply settings failed chatId={} type={} err={}", chatId, type, e.toString());
                 }
             } else {
-                try { strategySettingsService.save(ss); } catch (Exception ignored) {}
+                try {
+                    strategySettingsService.save(ss);
+                } catch (Exception ignored) {
+                }
             }
 
-            // ✅ событие — чтобы стратегия/UI подхватили изменения
             publishSettingsUpdated(chatId, type, "ml_train:" + reasonNorm);
         }
 
@@ -285,12 +281,12 @@ public class MlTrainingServiceImpl implements MlTrainingService {
                 row.putAll(sorted);
             }
 
-            // ✅ label должен быть int/bool, не строка
+            // ✅ Только один label-ключ.
             row.put("y", y);
-            row.put("label", y);
-            row.put("win", y);
 
-            if (s.getTs() != null) row.put("tsMs", s.getTs().toEpochMilli());
+            if (s.getTs() != null) {
+                row.put("tsMs", s.getTs().toEpochMilli());
+            }
 
             rows.add(row);
         }
@@ -315,7 +311,6 @@ public class MlTrainingServiceImpl implements MlTrainingService {
     private static List<String> resolveFeatureSchema(List<MlSampleEntity> samples) {
         if (samples == null || samples.isEmpty()) return null;
 
-        // 1) meta.featureSpec (то, что пишет DatasetCollector)
         JsonNode meta = samples.get(0).getMetaJson();
         if (meta != null) {
             JsonNode spec = meta.get("featureSpec");
@@ -330,7 +325,6 @@ public class MlTrainingServiceImpl implements MlTrainingService {
             }
         }
 
-        // 2) fallback: ключи featuresJson (первого сэмпла)
         JsonNode fj = samples.get(0).getFeaturesJson();
         if (fj != null && fj.isObject()) {
             Iterator<String> it = fj.fieldNames();
@@ -340,7 +334,6 @@ public class MlTrainingServiceImpl implements MlTrainingService {
             return keys.isEmpty() ? null : keys;
         }
 
-        // 3) fallback: union по всем сэмплам
         try {
             Set<String> all = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
             for (MlSampleEntity s : samples) {
@@ -350,7 +343,8 @@ public class MlTrainingServiceImpl implements MlTrainingService {
                 while (it.hasNext()) all.add(it.next());
             }
             if (!all.isEmpty()) return new ArrayList<>(all);
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {
+        }
 
         return null;
     }
@@ -386,7 +380,6 @@ public class MlTrainingServiceImpl implements MlTrainingService {
             List<MlSampleEntity> r = safeFindRecent(chatId, type, from);
             if (r == null || r.isEmpty()) return new Pair(null, null);
 
-            // возьмём самый новый сэмпл с валидными symbol/tf
             r.sort(Comparator.comparing(MlTrainingServiceImpl::sampleTimeMs, Comparator.nullsLast(Comparator.reverseOrder())));
             for (MlSampleEntity s : r) {
                 String sym = normUpper(s.getSymbol());
@@ -406,17 +399,15 @@ public class MlTrainingServiceImpl implements MlTrainingService {
 
         String u = s.toUpperCase(Locale.ROOT);
 
-        // частые текстовые варианты
         if (u.equals("WIN") || u.equals("TP") || u.equals("TAKE_PROFIT") || u.equals("PROFIT") || u.equals("TRUE")) return 1;
         if (u.equals("LOSS") || u.equals("SL") || u.equals("STOP_LOSS") || u.equals("STOP") || u.equals("FALSE")) return 0;
 
-        // числовые
         try {
             int v = Integer.parseInt(s);
             return v > 0 ? 1 : 0;
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {
+        }
 
-        // bool-like
         if (u.equals("YES") || u.equals("Y")) return 1;
         if (u.equals("NO") || u.equals("N")) return 0;
 

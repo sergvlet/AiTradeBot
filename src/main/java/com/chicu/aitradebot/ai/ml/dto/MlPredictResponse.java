@@ -5,18 +5,22 @@ import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import lombok.Data;
 
+import java.util.List;
+
 @Data
 @JsonInclude(JsonInclude.Include.NON_NULL)
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class MlPredictResponse {
 
+    /** общий флаг успеха */
+    @JsonAlias({"success"})
     private boolean ok;
 
-    /** вероятность "BUY" (или “win”), 0..1 */
+    /** вероятность BUY / win, 0..1 */
     @JsonAlias({"pWin", "p", "prob", "probability", "confidence", "score"})
     private Double proba;
 
-    /** ключ модели (стабильный id), чтобы логировать/кешировать */
+    /** ключ модели */
     @JsonAlias({"model_key", "model", "key", "modelId"})
     private String modelKey;
 
@@ -24,20 +28,24 @@ public class MlPredictResponse {
     @JsonAlias({"model_version", "version"})
     private String modelVersion;
 
-    /** схема фичей */
-    @JsonAlias({"schema_hash", "schema", "featuresSchema", "featureSchema"})
+    /** hash схемы фичей */
+    @JsonAlias({"schema_hash", "feature_hash", "features_hash", "hash"})
     private String schemaHash;
 
-    /** sidecar backend (например: xgboost/joblib/no_model) */
+    /** если sidecar вернул сам порядок/схему */
+    @JsonAlias({"featureOrder", "schema", "schemaFields", "featureSchema"})
+    private List<String> featureOrder;
+
+    /** backend sidecar */
     @JsonAlias({"backend"})
     private String backend;
 
-    /** sidecar model_loaded */
+    /** загружена ли модель */
     @JsonAlias({"model_loaded", "modelLoaded"})
     private Boolean modelLoaded;
 
-    /** сообщение об ошибке (если ok=false) */
-    @JsonAlias({"message", "reason"})
+    /** сообщение об ошибке */
+    @JsonAlias({"error", "message", "reason", "detail"})
     private String error;
 
     /** опционально — таймстемп */
@@ -45,7 +53,7 @@ public class MlPredictResponse {
     private Long tsMs;
 
     // =====================================================
-    // ✅ Фабрики
+    // Фабрики
     // =====================================================
 
     /** Backward-compat: старый код мог звать ok(proba, modelVersion) */
@@ -61,6 +69,7 @@ public class MlPredictResponse {
         r.modelKey = blankToNull(modelKey);
         r.modelVersion = blankToNull(modelVersion);
         r.schemaHash = blankToNull(schemaHash);
+        r.featureOrder = null;
         r.backend = null;
         r.modelLoaded = null;
         r.error = null;
@@ -76,6 +85,7 @@ public class MlPredictResponse {
         r.modelKey = null;
         r.modelVersion = null;
         r.schemaHash = null;
+        r.featureOrder = null;
         r.backend = null;
         r.modelLoaded = null;
         return r;

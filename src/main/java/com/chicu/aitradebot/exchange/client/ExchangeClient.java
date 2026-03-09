@@ -312,3 +312,4 @@ public interface ExchangeClient {
         QUOTE_QTY
     }
 }
+

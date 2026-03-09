@@ -8,6 +8,7 @@ import com.chicu.aitradebot.market.model.Candle;
 import com.chicu.aitradebot.market.model.UnifiedKline;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
@@ -29,6 +30,9 @@ public class MarketDataStreamService {
     /** ✅ общий кэш свечей для бэктеста/дашборда */
     private final MarketStreamManager streamManager;
 
+    /** ✅ публикуем события (если оркестратор слушает @EventListener) */
+    private final ApplicationEventPublisher eventPublisher;
+
     /** seq для логов/троттлинга */
     private final AtomicLong seq = new AtomicLong(0);
 
@@ -42,10 +46,38 @@ public class MarketDataStreamService {
     private final ConcurrentMap<Long, Set<SubscriptionKey>> activeSubscriptions = new ConcurrentHashMap<>();
 
     public MarketDataStreamService(ObjectProvider<BinanceSpotWebSocketClient> binanceWsProvider,
-                                   MarketStreamManager streamManager) {
+                                   MarketStreamManager streamManager,
+                                   ApplicationEventPublisher eventPublisher) {
         this.binanceWsProvider = binanceWsProvider;
         this.streamManager = streamManager;
+        this.eventPublisher = eventPublisher;
     }
+
+    // =====================================================================
+    // ✅ EVENTS (должны быть public, т.к. их читает другой пакет)
+    // =====================================================================
+
+    public static record MarketTickEvent(
+            String exchange,
+            NetworkType networkType,
+            long chatId,
+            StrategyType strategyType,
+            String symbol,
+            String timeframe,
+            BigDecimal price,
+            BigDecimal qty,
+            long tsMs
+    ) {}
+
+    public static record CandleClosedEvent(
+            String exchange,
+            NetworkType networkType,
+            long chatId,
+            StrategyType strategyType,
+            String symbol,
+            String timeframe,
+            UnifiedKline kline
+    ) {}
 
     // =====================================================================
     // ✅ API ДЛЯ MarketStreamServiceImpl
@@ -130,6 +162,9 @@ public class MarketDataStreamService {
             return new MarketPushResult(n, false, false, false, null);
         }
 
+        // ✅ публикуем тик-событие (если оркестратор слушает)
+        publishSafe(new MarketTickEvent(ex, networkType, chatId, strategyType, sym, tf, price, qty, tradeTsMs));
+
         boolean pushedCandle = false;
         boolean createdCandle = false;
         UnifiedKline candleClosed = null;
@@ -194,6 +229,9 @@ public class MarketDataStreamService {
                             .closed(true)
                             .build();
 
+                    // ✅ публикуем закрытие свечи
+                    publishSafe(new CandleClosedEvent(ex, networkType, chatId, strategyType, sym, tf, candleClosed));
+
                     // новый forming бакет
                     Candle c = new Candle(openTime, p, p, p, p, v, false);
                     deque.addLast(c);
@@ -233,6 +271,11 @@ public class MarketDataStreamService {
 
         if (kline.getSymbol() == null || kline.getSymbol().isBlank()) kline.setSymbol(sym);
         if (kline.getTimeframe() == null || kline.getTimeframe().isBlank()) kline.setTimeframe(tf);
+
+        // ✅ если это закрытая свеча — публикуем событие закрытия
+        if (kline.isClosed()) {
+            publishSafe(new CandleClosedEvent(ex, networkType, chatId, strategyType, sym, tf, kline));
+        }
 
         Candle candle = toCandleSafe(kline);
         if (candle == null) return;
@@ -597,8 +640,18 @@ public class MarketDataStreamService {
         if (streamManager == null || candle == null) return;
         try {
             streamManager.addCandle(exchange, network, symbol, timeframe, candle);
-        } catch (Exception ignored) {
-        }
+        } catch (Exception ignored) {}
+    }
+
+    // =====================================================================
+    // events: safe publish
+    // =====================================================================
+
+    private void publishSafe(Object event) {
+        if (eventPublisher == null || event == null) return;
+        try {
+            eventPublisher.publishEvent(event);
+        } catch (Exception ignored) {}
     }
 
     // =====================================================================

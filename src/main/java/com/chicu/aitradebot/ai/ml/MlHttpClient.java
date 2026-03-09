@@ -14,6 +14,7 @@ import okhttp3.RequestBody;
 import okhttp3.Response;
 
 import java.io.IOException;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 
@@ -27,16 +28,18 @@ public class MlHttpClient implements MlClient {
     private final String baseUrl;
 
     /**
-     * Опционально. Если задан — клиент сам ставит X-API-KEY.
+     * Если задан — клиент сам ставит X-API-KEY.
      */
     private final String apiKey;
 
-    // ✅ Variant A: старый конструктор (3 аргумента)
+    // =====================================================
+    // CTOR
+    // =====================================================
+
     public MlHttpClient(OkHttpClient http, ObjectMapper om, String baseUrl) {
         this(http, om, baseUrl, null);
     }
 
-    // ✅ Новый конструктор (4 аргумента)
     public MlHttpClient(OkHttpClient http, ObjectMapper om, String baseUrl, String apiKey) {
         this.http = Objects.requireNonNull(http, "http");
         this.om = Objects.requireNonNull(om, "om");
@@ -44,24 +47,53 @@ public class MlHttpClient implements MlClient {
         this.apiKey = (apiKey == null || apiKey.isBlank()) ? null : apiKey.trim();
     }
 
+    // =====================================================
+    // API
+    // =====================================================
+
     @Override
     public MlHealthResponse health() {
         String url = baseUrl + "/health";
         Request req = withAuth(new Request.Builder().url(url).get()).build();
-        return execute(req, MlHealthResponse.class, "health");
+        return execute(req, MlHealthResponse.class, "health", "health");
     }
 
     @Override
     public MlPredictResponse predict(MlPredictRequest request) {
+        MlPredictResponse invalid = validatePredictRequest(request);
+        if (invalid != null) {
+            return invalid;
+        }
+
         String url = baseUrl + "/predict";
-        return postJson(url, request, MlPredictResponse.class, "predict");
+        String ctx = buildPredictContext(request);
+        MlPredictResponse r = postJson(url, request, MlPredictResponse.class, "predict", ctx);
+
+        if (r == null) {
+            return MlPredictResponse.fail("predict_null");
+        }
+
+        if (r.isOk() && (r.getProba() == null || !Double.isFinite(r.getProba()))) {
+            log.warn("🧠 ML predict: sidecar вернул ok=true, но proba отсутствует | {}", ctx);
+            return MlPredictResponse.fail("predict_no_proba");
+        }
+
+        if (!r.isOk() && (r.getError() == null || r.getError().isBlank())) {
+            r.setError("predict_not_ok");
+        }
+
+        return r;
     }
 
     @Override
     public MlTrainResponse train(MlTrainRequest request) {
         String url = baseUrl + "/train";
-        return postJson(url, request, MlTrainResponse.class, "train");
+        return postJson(url, request, MlTrainResponse.class, "train", "train");
     }
+
+    // =====================================================
+    // Request builders
+    // =====================================================
 
     private Request.Builder withAuth(Request.Builder b) {
         if (apiKey != null) {
@@ -71,9 +103,9 @@ public class MlHttpClient implements MlClient {
         return b;
     }
 
-    private <T> T postJson(String url, Object body, Class<T> responseType, String op) {
+    private <T> T postJson(String url, Object body, Class<T> responseType, String op, String ctx) {
         try {
-            String json = om.writeValueAsString(body);
+            byte[] json = om.writeValueAsBytes(body);
             RequestBody rb = RequestBody.create(json, JSON);
 
             Request req = withAuth(new Request.Builder()
@@ -82,58 +114,109 @@ public class MlHttpClient implements MlClient {
                     .header("Content-Type", "application/json"))
                     .build();
 
-            return execute(req, responseType, op);
+            return execute(req, responseType, op, ctx);
 
         } catch (Exception e) {
-            log.warn("🧠 ML {}: failed to serialize request: {}", op, e.toString());
+            log.warn("🧠 ML {}: не удалось сериализовать request | {} | err={}", op, ctx, safeMsg(e));
             return errorResponse(responseType, "serialize_error: " + safeMsg(e));
         }
     }
 
-    private <T> T execute(Request req, Class<T> responseType, String op) {
+    private <T> T execute(Request req, Class<T> responseType, String op, String ctx) {
         long ts = System.currentTimeMillis();
-        try (Response resp = http.newCall(req).execute()) {
 
+        try (Response resp = http.newCall(req).execute()) {
             long tookMs = System.currentTimeMillis() - ts;
             String body = resp.body() != null ? resp.body().string() : null;
 
             if (!resp.isSuccessful()) {
-                // ✅ важно: вернуть тело ошибки, чтобы было видно причину (например, stacktrace / error)
-                String err = "http_" + resp.code() + (body != null && !body.isBlank() ? (": " + safe(body)) : "");
-                log.warn("🧠 ML {}: http={} tookMs={} body={}", op, resp.code(), tookMs, safe(body));
+                String bodySafe = safe(body);
+                String err = "http_" + resp.code() + (bodySafe != null && !bodySafe.isBlank() ? (": " + bodySafe) : "");
+
+                log.warn("🧠 ML {}: HTTP {} | tookMs={} | {} | body={}",
+                        op, resp.code(), tookMs, ctx, bodySafe);
+
                 return errorResponse(responseType, err);
             }
 
             if (body == null || body.isBlank()) {
-                log.warn("🧠 ML {}: empty body tookMs={}", op, tookMs);
+                log.warn("🧠 ML {}: пустой body | tookMs={} | {}", op, tookMs, ctx);
                 return errorResponse(responseType, "empty_body");
             }
 
-            return om.readValue(body, responseType);
+            T parsed = om.readValue(body, responseType);
+
+            if (log.isDebugEnabled()) {
+                log.debug("🧠 ML {}: OK | tookMs={} | {}", op, tookMs, ctx);
+            }
+
+            return parsed;
 
         } catch (IOException e) {
             long tookMs = System.currentTimeMillis() - ts;
-            log.warn("🧠 ML {}: io error tookMs={} err={}", op, tookMs, e.toString());
+            log.warn("🧠 ML {}: IO ошибка | tookMs={} | {} | err={}", op, tookMs, ctx, safeMsg(e));
             return errorResponse(responseType, "io_error: " + safeMsg(e));
+
         } catch (Exception e) {
             long tookMs = System.currentTimeMillis() - ts;
-            log.warn("🧠 ML {}: parse error tookMs={} err={}", op, tookMs, e.toString());
+            log.warn("🧠 ML {}: ошибка разбора ответа | tookMs={} | {} | err={}", op, tookMs, ctx, safeMsg(e));
             return errorResponse(responseType, "parse_error: " + safeMsg(e));
         }
     }
 
-    private String safe(String s) {
-        if (s == null) return null;
-        String t = s.replace("\n", " ").replace("\r", " ");
-        return t.length() > 800 ? t.substring(0, 800) + "..." : t;
+    // =====================================================
+    // Predict validation
+    // =====================================================
+
+    private MlPredictResponse validatePredictRequest(MlPredictRequest request) {
+        if (request == null) {
+            return MlPredictResponse.fail("predict_request_null");
+        }
+
+        Map<String, Object> features = request.getFeatures();
+        if (features == null || features.isEmpty()) {
+            return MlPredictResponse.fail("no_features");
+        }
+
+        if (request.getFeatureOrder() == null || request.getFeatureOrder().isEmpty()) {
+            return MlPredictResponse.fail("feature_order_missing");
+        }
+
+        for (String f : request.getFeatureOrder()) {
+            if (f == null || f.isBlank()) {
+                return MlPredictResponse.fail("feature_order_invalid");
+            }
+            if (!features.containsKey(f)) {
+                return MlPredictResponse.fail("feature_order_missing_feature:" + f);
+            }
+        }
+
+        if (request.getSchemaHash() == null || request.getSchemaHash().isBlank()) {
+            return MlPredictResponse.fail("schema_hash_missing");
+        }
+
+        return null;
     }
 
-    private static String safeMsg(Throwable e) {
-        if (e == null) return "null";
-        String m = e.getMessage();
-        if (m == null || m.isBlank()) return e.getClass().getSimpleName();
-        return m;
+    private String buildPredictContext(MlPredictRequest req) {
+        if (req == null) return "predict";
+
+        int featuresCount = (req.getFeatures() != null ? req.getFeatures().size() : 0);
+        int orderCount = (req.getFeatureOrder() != null ? req.getFeatureOrder().size() : 0);
+
+        return "type=" + safe(req.getStrategyType())
+               + " chatId=" + req.getChatId()
+               + " symbol=" + safe(req.getSymbol())
+               + " tf=" + safe(req.getTimeframe())
+               + " modelKey=" + safe(req.getModelKey())
+               + " schemaHash=" + safe(req.getSchemaHash())
+               + " features=" + featuresCount
+               + " order=" + orderCount;
     }
+
+    // =====================================================
+    // Error response
+    // =====================================================
 
     @SuppressWarnings("unchecked")
     private <T> T errorResponse(Class<T> responseType, String error) {
@@ -149,71 +232,41 @@ public class MlHttpClient implements MlClient {
         }
 
         if (responseType == MlPredictResponse.class) {
-            // ✅ не возвращаем null — gating должен получить ok=false + error
-            return (T) MlPredictResponse.fail(error);
+            MlPredictResponse r = MlPredictResponse.fail(error);
+            r.setTsMs(now);
+            return (T) r;
         }
 
         if (responseType == MlTrainResponse.class) {
             try {
-                return (T) MlTrainResponse.fail(error);
+                MlTrainResponse r = MlTrainResponse.fail(error);
+                return (T) r;
             } catch (Throwable ignore) {
-                try {
-                    T t = responseType.getDeclaredConstructor().newInstance();
-                    tryInvokeSetters(t, now, error);
-                    return t;
-                } catch (Exception e) {
-                    return (T) new MlTrainResponse();
-                }
+                return (T) new MlTrainResponse();
             }
         }
 
-        try {
-            T t = responseType.getDeclaredConstructor().newInstance();
-            tryInvokeSetters(t, now, error);
-            return t;
-        } catch (Exception e) {
-            throw new IllegalStateException("Cannot create error response for " + responseType.getName());
-        }
+        throw new IllegalStateException("Cannot create error response for " + responseType.getName());
     }
 
-    private void tryInvokeSetters(Object t, long now, String error) {
-        if (t == null) return;
+    // =====================================================
+    // Utils
+    // =====================================================
 
-        invokeSetterBool(t, "setOk", false);
-        invokeSetterStr(t, "setError", error);
-
-        // ✅ tsMs / ts могут быть long или Long
-        invokeSetterLong(t, "setTsMs", now);
-        invokeSetterLong(t, "setTs", now);
+    private String safe(String s) {
+        if (s == null) return "null";
+        String t = s.replace("\n", " ").replace("\r", " ").trim();
+        if (t.isEmpty()) return "null";
+        return t.length() > 400 ? t.substring(0, 400) + "..." : t;
     }
 
-    private void invokeSetterBool(Object t, String method, boolean v) {
-        try {
-            var m = t.getClass().getMethod(method, boolean.class);
-            m.invoke(t, v);
-        } catch (Exception ignored) {}
+    private static String safeMsg(Throwable e) {
+        if (e == null) return "null";
+        String m = e.getMessage();
+        if (m == null || m.isBlank()) return e.getClass().getSimpleName();
+        return m;
     }
 
-    private void invokeSetterStr(Object t, String method, String v) {
-        try {
-            var m = t.getClass().getMethod(method, String.class);
-            m.invoke(t, v);
-        } catch (Exception ignored) {}
-    }
-
-    private void invokeSetterLong(Object t, String method, long v) {
-        try {
-            var m = t.getClass().getMethod(method, long.class);
-            m.invoke(t, v);
-            return;
-        } catch (Exception ignored) {}
-        try {
-            var m = t.getClass().getMethod(method, Long.class);
-            m.invoke(t, v);
-        } catch (Exception ignored) {}
-    }
-
-    /** ✅ совместимость: если кто-то зовёт defaultHttp(connect, read) */
     public static OkHttpClient defaultHttp(long connectMs, long readMs) {
         return defaultHttp(connectMs, readMs, readMs);
     }
