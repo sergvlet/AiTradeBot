@@ -18,6 +18,7 @@ import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
 
@@ -48,19 +49,29 @@ public class AiStrategyOrchestrator {
     private final StrategySettingsService settingsService;
     private final StrategyRegistry strategyRegistry;
     private final MarketStreamService marketStreamService;
+    private final MarketDataStreamService marketDataStreamService;
 
     /**
-     * ✅ ML autotune runtime (оркестратор — главный lifecycle хаб)
-     * ✅ ObjectProvider — защита от циклов и от временного отсутствия ML-слоя
+     * ML autotune runtime (оркестратор — главный lifecycle хаб)
+     * ObjectProvider — защита от циклов и от временного отсутствия ML-слоя
      */
     private final ObjectProvider<MlAutoTuneRuntime> mlAutoTuneRuntime;
+
+    @Value("${orch.market-events.listener-enabled:false}")
+    private boolean eventBridgeEnabled;
+
+    @Value("${orch.market-events.block-when-degraded:true}")
+    private boolean blockWhenDegraded;
+
+    @Value("${orch.market-events.degraded-log-cooldown-ms:30000}")
+    private long degradedLogCooldownMs;
 
     private MlAutoTuneRuntime ml() {
         return mlAutoTuneRuntime != null ? mlAutoTuneRuntime.getIfAvailable() : null;
     }
 
     // =====================================================================
-    // ✅ RUN CONTEXT (источник истины)
+    // RUN CONTEXT (источник истины)
     // =====================================================================
 
     /** Жёстко фиксируем один запуск на (chatId,type). */
@@ -82,6 +93,9 @@ public class AiStrategyOrchestrator {
     /** Дебаунс ручных триггеров тюнинга. */
     private final ConcurrentMap<RunKey, Long> lastTuneTriggerAtMs = new ConcurrentHashMap<>();
 
+    /** Антиспам логов degraded. */
+    private final ConcurrentMap<RunKey, Long> lastDegradedLogAtMs = new ConcurrentHashMap<>();
+
     // 🔒 атомарность операций на (chatId,type)
     private final ConcurrentMap<RunKey, ReentrantLock> locks = new ConcurrentHashMap<>();
 
@@ -90,7 +104,7 @@ public class AiStrategyOrchestrator {
     }
 
     // =====================================================================
-    // ✅ RUNTIME POLICY CACHE (чтобы не лезть в БД на каждый тик)
+    // RUNTIME POLICY CACHE (чтобы не лезть в БД на каждый тик)
     // =====================================================================
 
     private record RuntimePolicy(
@@ -125,7 +139,7 @@ public class AiStrategyOrchestrator {
         return new RuntimePolicy(m, rp, autoTune, gate, thr, modelVer);
     }
 
-    /** ✅ блокируем торговые события для фаз COLLECT/BACKTEST */
+    /** блокируем торговые события для фаз COLLECT/BACKTEST */
     private boolean isMarketEventsBlocked(RunKey key) {
         RuntimePolicy rp = runtimePolicyCache.get(key);
         if (rp == null) return false;
@@ -135,7 +149,10 @@ public class AiStrategyOrchestrator {
 
     @PostConstruct
     public void init() {
-        log.info("🧠 AiStrategyOrchestrator v4 initialized | mlRuntime={}", (ml() != null ? "ON" : "OFF"));
+        log.info("🧠 AiStrategyOrchestrator v4 initialized | mlRuntime={} | eventBridge={} | blockWhenDegraded={}",
+                (ml() != null ? "ON" : "OFF"),
+                eventBridgeEnabled,
+                blockWhenDegraded);
     }
 
     public Optional<RunBinding> getBinding(long chatId, StrategyType type) {
@@ -149,7 +166,7 @@ public class AiStrategyOrchestrator {
     }
 
     /**
-     * ✅ Проверка “запущено ли в конкретном контексте” (exchange/network).
+     * Проверка “запущено ли в конкретном контексте” (exchange/network).
      * Если exchange == null → не проверяем exchange.
      * Если network == null → не проверяем network.
      */
@@ -168,15 +185,16 @@ public class AiStrategyOrchestrator {
     }
 
     // =====================================================================
-    // ✅ MARKET EVENTS: слушаем события из MarketDataStreamService
+    // MARKET EVENTS: слушаем события из MarketDataStreamService
     // =====================================================================
 
     /**
-     * ✅ Главная связка “рынок -> стратегия”:
-     * MarketDataStreamService публикует MarketTickEvent, а оркестратор маршрутизирует в onPriceUpdate(...)
+     * По умолчанию выключено, чтобы не было двойного диспатча:
+     * MarketStreamServiceImpl уже напрямую вызывает onPriceUpdate/onCandleClosed.
      */
     @EventListener
     public void onMarketTickEvent(MarketDataStreamService.MarketTickEvent ev) {
+        if (!eventBridgeEnabled) return;
         if (ev == null) return;
         onPriceUpdate(
                 ev.chatId(),
@@ -191,10 +209,11 @@ public class AiStrategyOrchestrator {
     }
 
     /**
-     * ✅ Закрытая свеча (если стратегия поддерживает CandleCloseAware)
+     * По умолчанию выключено, чтобы не было двойного диспатча.
      */
     @EventListener
     public void onCandleClosedEvent(MarketDataStreamService.CandleClosedEvent ev) {
+        if (!eventBridgeEnabled) return;
         if (ev == null) return;
         UnifiedKline k = ev.kline();
         onCandleClosed(
@@ -209,7 +228,7 @@ public class AiStrategyOrchestrator {
     }
 
     // =====================================================================
-    // ✅ RUNTIME POLICY (единые правила режима/фазы)
+    // RUNTIME POLICY (единые правила режима/фазы)
     // =====================================================================
 
     private static AdvancedControlMode safeMode(StrategySettings s) {
@@ -244,8 +263,7 @@ public class AiStrategyOrchestrator {
         AdvancedControlMode mode = safeMode(s);
         String phase = sanitizePhase(s.getRunPhase());
 
-        // 🚑 AUTO-FIX: если по старой логике AI/HYBRID загнал фазу в COLLECT — ордера не будут выставляться.
-        // В AI/HYBRID по умолчанию торгуем: TESTNET -> PAPER, MAINNET -> LIVE.
+        // AUTO-FIX: если по старой логике AI/HYBRID загнал фазу в COLLECT — ордера не будут выставляться.
         boolean phaseAutoFixed = false;
         if (mode != AdvancedControlMode.MANUAL && "COLLECT".equalsIgnoreCase(phase)) {
             NetworkType net = (network != null) ? network : s.getNetworkType();
@@ -257,7 +275,6 @@ public class AiStrategyOrchestrator {
             }
         }
 
-        // ===== desired state по правилам
         boolean desiredAutoTune;
         boolean desiredGateEnabled;
         BigDecimal desiredGateMinProb;
@@ -267,19 +284,17 @@ public class AiStrategyOrchestrator {
             desiredGateEnabled = false;
             desiredGateMinProb = null;
         } else if (mode == AdvancedControlMode.HYBRID) {
-            desiredAutoTune = false;               // HYBRID = без автотюна
-            desiredGateEnabled = true;             // HYBRID = gate обязателен
+            desiredAutoTune = false;
+            desiredGateEnabled = true;
             desiredGateMinProb = clampProb(s.getGateMinProb() != null ? s.getGateMinProb() : DEFAULT_GATE_MIN_PROB);
         } else {
-            // AI
-            desiredAutoTune = true;                // AI = автотюн обязателен
-            desiredGateEnabled = s.isMlGateEnabled(); // gate по желанию
+            desiredAutoTune = true;
+            desiredGateEnabled = s.isMlGateEnabled();
             desiredGateMinProb = desiredGateEnabled
                     ? clampProb(s.getGateMinProb() != null ? s.getGateMinProb() : DEFAULT_GATE_MIN_PROB)
                     : null;
         }
 
-        // ===== привести entity к desired (чтобы стратегия увидела правильные значения из БД)
         boolean changed = false;
         if (phaseAutoFixed) changed = true;
 
@@ -314,7 +329,6 @@ public class AiStrategyOrchestrator {
             }
         }
 
-        // ===== обновить кеш (после возможной коррекции)
         BigDecimal effThr = desiredGateEnabled ? desiredGateMinProb : null;
         RuntimePolicy rp = new RuntimePolicy(
                 mode,
@@ -326,7 +340,6 @@ public class AiStrategyOrchestrator {
         );
         runtimePolicyCache.put(key, rp);
 
-        // ===== AUTOTUNE lifecycle
         if (mode == AdvancedControlMode.MANUAL) {
             safeAutotuneStop(chatId, type, exchange, network);
         } else {
@@ -344,8 +357,7 @@ public class AiStrategyOrchestrator {
     }
 
     /**
-     * ✅ Подстраховка: если стратегия запущена, но runtimePolicyCache пуст (рестарт приложения/горячие вызовы),
-     * обновим policy 1 раз при первом тике/свече.
+     * Подстраховка: если стратегия запущена, но runtimePolicyCache пуст.
      */
     private void ensurePolicyLoadedIfMissing(long chatId, StrategyType type, RunBinding b) {
         if (type == null || b == null) return;
@@ -356,15 +368,14 @@ public class AiStrategyOrchestrator {
         try {
             StrategySettings s = loadSettingsReadOnly(chatId, type);
             if (s == null) return;
-            // контекст берём строго из binding
             syncSettingsContextIfNeeded(s, b.exchange(), b.network());
             applyRuntimePolicy(chatId, type, b.exchange(), b.network(), s);
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {
+        }
     }
 
     /**
-     * ✅ Обновить runtime фазу/режим без рестарта (важно при переключении MANUAL/HYBRID/AI).
-     * Вызывается из UI после сохранения.
+     * Обновить runtime фазу/режим без рестарта.
      */
     public void refreshRuntimePhase(long chatId, StrategyType type, String exchange, NetworkType network) {
         if (type == null) return;
@@ -390,7 +401,7 @@ public class AiStrategyOrchestrator {
     }
 
     // =====================================================================
-    // 🔄 ATOMIC RESTART (главный метод)
+    // ATOMIC RESTART (главный метод)
     // =====================================================================
 
     public StrategyRunInfo restartStrategyAtomic(Long chatId,
@@ -436,7 +447,7 @@ public class AiStrategyOrchestrator {
             }
 
             String newSym = sanitizeSymbol(s.getSymbol());
-            String newTf  = sanitizeTf(s.getTimeframe());
+            String newTf = sanitizeTf(s.getTimeframe());
 
             String newEx = sanitizeExchange(exchange);
             if (newEx == null) newEx = sanitizeExchange(s.getExchangeName());
@@ -458,7 +469,6 @@ public class AiStrategyOrchestrator {
                     || !eq(current.timeframe(), desired.timeframe());
 
             if (!changed) {
-                // контекст тот же — обновляем runtime-policy (режим/фаза/автотюн)
                 applyRuntimePolicy(chatId, type, current.exchange(), current.network(), s);
                 return buildRunInfoFromBinding(s, current, true, "Контекст не изменился (рестарт не нужен)");
             }
@@ -474,7 +484,6 @@ public class AiStrategyOrchestrator {
                 return buildRunInfoFromBinding(s, current, true, "Стратегия не найдена (рестарт пропущен)");
             }
 
-            // 1) STOP старого binding
             try {
                 strategy.stop(chatId, current.symbol(), current.exchange(), current.network());
             } catch (Exception e) {
@@ -482,16 +491,14 @@ public class AiStrategyOrchestrator {
             }
             safeAutotuneStop(chatId, type, current.exchange(), current.network());
 
-            // 2) UPDATE binding (до старта!)
             running.put(key, desired);
             ignoreCounters.remove(key);
             lastTuneTriggerAtMs.remove(key);
+            lastDegradedLogAtMs.remove(key);
 
-            // 3) START нового binding
             try {
                 strategy.start(chatId, desired.symbol(), desired.exchange(), desired.network());
 
-                // ✅ WS/Market подписка поднимается/переключается тут
                 marketStreamService.ensureSubscribed(
                         chatId,
                         type,
@@ -501,11 +508,9 @@ public class AiStrategyOrchestrator {
                         desired.network()
                 );
             } catch (Exception e) {
-                // откат binding если старт не удался
                 running.put(key, current);
                 runtimePolicyCache.put(key, policyOf(s));
 
-                // возвращаем подписку на старый контекст (на всякий)
                 try {
                     marketStreamService.ensureSubscribed(
                             chatId,
@@ -515,14 +520,14 @@ public class AiStrategyOrchestrator {
                             current.exchange(),
                             current.network()
                     );
-                } catch (Exception ignored) {}
+                } catch (Exception ignored) {
+                }
 
                 log.error("❌ [ORCH] start(new) failed chatId={} type={} ex={} net={} sym={} tf={}",
                         chatId, type, desired.exchange(), desired.network(), desired.symbol(), desired.timeframe(), e);
                 return buildRunInfoFromBinding(s, current, true, "Ошибка рестарта: не удалось запустить новый контекст");
             }
 
-            // ✅ фиксируем контекст и active=true в БД (консистентность)
             syncSettingsContextIfNeeded(s, desired.exchange(), desired.network());
             if (!s.isActive()) {
                 s.setActive(true);
@@ -531,7 +536,6 @@ public class AiStrategyOrchestrator {
                 settingsService.save(s);
             }
 
-            // ✅ применяем policy уже в новом контексте
             applyRuntimePolicy(chatId, type, desired.exchange(), desired.network(), s);
 
             log.info("▶️ [ORCH] RUN {} chatId={} ex={} net={} symbol={} tf={} mode={}",
@@ -545,7 +549,7 @@ public class AiStrategyOrchestrator {
     }
 
     // =====================================================================
-    // ▶️ START
+    // START
     // =====================================================================
     public StrategyRunInfo startStrategy(Long chatId, StrategyType type, String exchange, NetworkType network) {
 
@@ -579,7 +583,7 @@ public class AiStrategyOrchestrator {
             }
 
             String sym = sanitizeSymbol(s.getSymbol());
-            String tf  = sanitizeTf(s.getTimeframe());
+            String tf = sanitizeTf(s.getTimeframe());
 
             String ex = sanitizeExchange(exchange);
             if (ex == null) ex = sanitizeExchange(s.getExchangeName());
@@ -615,12 +619,10 @@ public class AiStrategyOrchestrator {
 
                 applyRuntimePolicy(chatId, type, ex, net, s);
 
-                // ✅ поток рынка должен быть активен независимо от UI
                 marketStreamService.ensureSubscribed(chatId, type, sym, tf, ex, net);
                 return buildRunInfo(s, true, "Стратегия уже запущена");
             }
 
-            // если был другой binding — аккуратно стопаем старый
             if (existing != null) {
                 log.warn("⚠️ [ORCH] Перезапуск binding: {} chatId={} было ex={} net={} {} {} -> стало ex={} net={} {} {}",
                         type, chatId,
@@ -636,22 +638,23 @@ public class AiStrategyOrchestrator {
                 safeAutotuneStop(chatId, type, existing.exchange(), existing.network());
             }
 
-            // ✅ фиксируем binding ДО старта
             running.put(key, newBinding);
             ignoreCounters.remove(key);
             lastTuneTriggerAtMs.remove(key);
+            lastDegradedLogAtMs.remove(key);
 
             try {
                 strategy.start(chatId, sym, ex, net);
 
-                // ✅ подписка на рынок поднимается тут
                 marketStreamService.ensureSubscribed(chatId, type, sym, tf, ex, net);
             } catch (Exception e) {
                 running.remove(key, newBinding);
                 runtimePolicyCache.remove(key);
 
-                // если старт упал — не оставляем WS-стрим висеть
-                try { marketStreamService.unsubscribe(chatId, type); } catch (Exception ignored) {}
+                try {
+                    marketStreamService.unsubscribe(chatId, type);
+                } catch (Exception ignored) {
+                }
                 log.error("❌ [ORCH] startStrategy failed type={} chatId={} ex={} net={} sym={} tf={}",
                         type, chatId, ex, net, sym, tf, e);
                 return buildRunInfo(s, false, "Ошибка запуска стратегии");
@@ -676,7 +679,7 @@ public class AiStrategyOrchestrator {
     }
 
     // =====================================================================
-    // ⏹ STOP
+    // STOP
     // =====================================================================
     public StrategyRunInfo stopStrategy(Long chatId, StrategyType type, String exchange, NetworkType network) {
 
@@ -711,13 +714,16 @@ public class AiStrategyOrchestrator {
 
             String sym = sanitizeSymbol(s.getSymbol());
 
-            // ✅ отписка от WS-рынка не зависит от UI
-            try { marketStreamService.unsubscribe(chatId, type); } catch (Exception ignored) {}
+            try {
+                marketStreamService.unsubscribe(chatId, type);
+            } catch (Exception ignored) {
+            }
 
             RunBinding removed = running.remove(key);
             ignoreCounters.remove(key);
             lastTuneTriggerAtMs.remove(key);
             runtimePolicyCache.remove(key);
+            lastDegradedLogAtMs.remove(key);
 
             String ex = removed != null ? removed.exchange() : sanitizeExchange(exchange);
             if (ex == null) ex = sanitizeExchange(s.getExchangeName());
@@ -757,7 +763,7 @@ public class AiStrategyOrchestrator {
         }
     }
 
-    /** ✅ Совместимость со старым вызовом из UI. Теперь это просто рестарт под локом. */
+    /** Совместимость со старым вызовом из UI. */
     public StrategyRunInfo onSettingsChanged(Long chatId,
                                              StrategyType type,
                                              String exchange,
@@ -766,7 +772,7 @@ public class AiStrategyOrchestrator {
     }
 
     // =====================================================================
-    // ℹ STATUS (✅ read-only, без записи в БД!)
+    // STATUS (read-only, без записи в БД)
     // =====================================================================
     public StrategyRunInfo getStatus(Long chatId, StrategyType type, String exchange, NetworkType network) {
 
@@ -782,7 +788,6 @@ public class AiStrategyOrchestrator {
                     .build();
         }
 
-        // ✅ только читаем настройки (без sync/save)
         StrategySettings s = loadSettingsReadOnly(chatId, type);
         if (s == null) {
             return StrategyRunInfo.builder()
@@ -838,7 +843,7 @@ public class AiStrategyOrchestrator {
     }
 
     // =====================================================================
-    // ✅ ML AUTO-TUNE HOOKS
+    // ML AUTO-TUNE HOOKS
     // =====================================================================
 
     private void safeAutotuneStart(Long chatId, StrategyType type, String exchange, NetworkType network) {
@@ -904,7 +909,7 @@ public class AiStrategyOrchestrator {
     }
 
     // =====================================================================
-    // ✅ MARKET STREAM входы (строгий контекст)
+    // MARKET STREAM входы (строгий контекст)
     // =====================================================================
 
     public void onPriceUpdate(long chatId,
@@ -922,15 +927,12 @@ public class AiStrategyOrchestrator {
         RunBinding b = running.get(key);
         if (b == null) return;
 
-        // ✅ подстрахуем policy-cache (после рестарта или если UI не вызывал applyRuntimePolicy)
         ensurePolicyLoadedIfMissing(chatId, type, b);
 
-        // ✅ если exchange/network не передали — берём из binding
         String ex = sanitizeExchange(exchange);
         if (ex == null) ex = b.exchange();
         NetworkType net = (network != null ? network : b.network());
 
-        // ✅ если symbol/tf не передали — берём из binding
         String sym = sanitizeSymbol(symbol);
         if (sym == null) sym = b.symbol();
         String tf = sanitizeTf(timeframe);
@@ -943,8 +945,8 @@ public class AiStrategyOrchestrator {
             return;
         }
 
-        // ✅ COLLECT/BACKTEST: не отдаём событие стратегии → исключаем торговлю
         if (isMarketEventsBlocked(key)) return;
+        if (isDegradedBlocked(key, b, sym, tf)) return;
 
         TradingStrategy strategy = strategyRegistry.get(type);
         if (strategy == null) return;
@@ -1013,12 +1015,10 @@ public class AiStrategyOrchestrator {
 
         ensurePolicyLoadedIfMissing(chatId, type, b);
 
-        // ✅ если exchange/network не передали — берём из binding
         String ex = sanitizeExchange(exchange);
         if (ex == null) ex = b.exchange();
         NetworkType net = (network != null ? network : b.network());
 
-        // ✅ если symbol/tf не передали — берём из binding
         String sym = sanitizeSymbol(symbol);
         if (sym == null) sym = b.symbol();
         String tf = sanitizeTf(timeframe);
@@ -1032,6 +1032,7 @@ public class AiStrategyOrchestrator {
         }
 
         if (isMarketEventsBlocked(key)) return;
+        if (isDegradedBlocked(key, b, sym, tf)) return;
 
         TradingStrategy strategy = strategyRegistry.get(type);
         if (strategy == null) return;
@@ -1089,8 +1090,71 @@ public class AiStrategyOrchestrator {
         }
     }
 
+    private boolean isDegradedBlocked(RunKey key, RunBinding b, String symbol, String timeframe) {
+        if (!blockWhenDegraded) return false;
+        if (key == null || b == null) return false;
+
+        String sym = sanitizeSymbol(symbol);
+        if (sym == null) sym = b.symbol();
+
+        String tf = sanitizeTf(timeframe);
+        if (tf == null) tf = b.timeframe();
+
+        if (sym == null || tf == null) return false;
+
+        try {
+            MarketDataStreamService.SubscriptionHealth health =
+                    marketDataStreamService.getSubscriptionHealth(
+                            key.chatId(),
+                            key.type(),
+                            b.exchange(),
+                            b.network(),
+                            sym,
+                            tf
+                    );
+
+            if (health != null && health.degraded()) {
+                logDegradedThrottled(key, sym, tf, health);
+                return true;
+            }
+        } catch (Exception e) {
+            log.debug("⚠ [ORCH] degraded check failed chatId={} type={} err={}",
+                    key.chatId(), key.type(), e.toString());
+        }
+
+        return false;
+    }
+
+    private void logDegradedThrottled(RunKey key,
+                                      String symbol,
+                                      String timeframe,
+                                      MarketDataStreamService.SubscriptionHealth health) {
+        long now = System.currentTimeMillis();
+        long cooldown = Math.max(2000L, degradedLogCooldownMs);
+
+        Long prev = lastDegradedLogAtMs.get(key);
+        if (prev != null && (now - prev) < cooldown) {
+            return;
+        }
+
+        lastDegradedLogAtMs.put(key, now);
+
+        log.warn("⚠️ [ORCH] MARKET_DEGRADED chatId={} type={} {} {} | reason={} | klineConnected={} aggConnected={} bookConnected={} | ageMs[kline={},agg={},book={}]",
+                key.chatId(),
+                key.type(),
+                symbol,
+                timeframe,
+                health.reason(),
+                health.klineConnected(),
+                health.aggTradeConnected(),
+                health.bookTickerConnected(),
+                health.lastKlineAgeMs(),
+                health.lastAggTradeAgeMs(),
+                health.lastBookTickerAgeMs());
+    }
+
     // =====================================================================
-    // 🌍 GLOBAL DASHBOARD (✅ source of truth = running)
+    // GLOBAL DASHBOARD
     // =====================================================================
     public record GlobalState(
             BigDecimal totalBalance,
@@ -1110,17 +1174,18 @@ public class AiStrategyOrchestrator {
     }
 
     // =====================================================================
-    // 🔑 LOAD SETTINGS
+    // LOAD SETTINGS
     // =====================================================================
 
-    /** ✅ Read-only загрузка (без sync/save, НЕ портит контекст). */
+    /** Read-only загрузка (без sync/save, не портит контекст). */
     private StrategySettings loadSettingsReadOnly(Long chatId, StrategyType type) {
         if (chatId == null || chatId <= 0 || type == null) return null;
 
         StrategySettings s = null;
         try {
             s = settingsService.getSettings(chatId, type);
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {
+        }
 
         if (s == null) {
             try {
@@ -1134,8 +1199,8 @@ public class AiStrategyOrchestrator {
     }
 
     /**
-     * ✅ Strict-load для START/STOP/RESTART: можно синхронизировать контекст (и сохранить).
-     * Важно: НЕ форсим TESTNET, если network == null.
+     * Strict-load для START/STOP/RESTART: можно синхронизировать контекст (и сохранить).
+     * Важно: не форсим TESTNET, если network == null.
      */
     private StrategySettings loadSettingsStrict(Long chatId, StrategyType type, String exchange, NetworkType network) {
         if (chatId == null || chatId <= 0 || type == null) return null;
@@ -1143,7 +1208,8 @@ public class AiStrategyOrchestrator {
         StrategySettings s = null;
         try {
             s = settingsService.getSettings(chatId, type);
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {
+        }
 
         if (s == null) {
             try {
@@ -1190,7 +1256,7 @@ public class AiStrategyOrchestrator {
     }
 
     // =====================================================================
-    // 🧱 RUN INFO (DTO)
+    // RUN INFO (DTO)
     // =====================================================================
     private StrategyRunInfo buildRunInfo(StrategySettings s, boolean active, String msg) {
         if (s == null) {
@@ -1206,17 +1272,13 @@ public class AiStrategyOrchestrator {
                 .type(s.getType())
                 .symbol(s.getSymbol())
                 .active(active)
-
                 .timeframe(s.getTimeframe())
                 .exchangeName(s.getExchangeName())
                 .networkType(s.getNetworkType())
-
                 .version(s.getVersion())
-
                 .startedAt(toInstant(s.getStartedAt()))
                 .stoppedAt(toInstant(s.getStoppedAt()))
                 .updatedAt(Instant.now())
-
                 .message(msg)
                 .build();
     }
@@ -1252,7 +1314,7 @@ public class AiStrategyOrchestrator {
     }
 
     // =====================================================================
-    // 💰 ORDER API
+    // ORDER API
     // =====================================================================
     public record OrderResult(boolean success, String message, Long orderId) {}
 
@@ -1328,7 +1390,7 @@ public class AiStrategyOrchestrator {
     }
 
     // =====================================================================
-    // ✅ ТИПОБЕЗОПАСНЫЕ ХУКИ ДЛЯ РЫНКА
+    // ТИПОБЕЗОПАСНЫЕ ХУКИ ДЛЯ РЫНКА
     // =====================================================================
     public interface PriceUpdateAware {
         void onPriceUpdate(long chatId,
@@ -1352,7 +1414,7 @@ public class AiStrategyOrchestrator {
     }
 
     // =====================================================================
-    // 🧩 small utils
+    // small utils
     // =====================================================================
     private static boolean eq(String a, String b) {
         if (a == null && b == null) return true;

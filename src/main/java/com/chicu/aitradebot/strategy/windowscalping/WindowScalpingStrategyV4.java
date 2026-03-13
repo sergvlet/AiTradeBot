@@ -1,6 +1,8 @@
 package com.chicu.aitradebot.strategy.windowscalping;
 
 import com.chicu.aitradebot.ai.ml.MlGateway;
+import com.chicu.aitradebot.ai.ml.dataset.MlSampleEntity;
+import com.chicu.aitradebot.ai.ml.dataset.MlSampleIngestService;
 import com.chicu.aitradebot.ai.ml.dto.MlPredictResponse;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
@@ -19,6 +21,8 @@ import com.chicu.aitradebot.strategy.live.StrategyLivePublisher;
 import com.chicu.aitradebot.strategy.registry.StrategyBinding;
 import com.chicu.aitradebot.trade.PositionStore;
 import com.chicu.aitradebot.trade.TradeExecutionService;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
@@ -143,6 +147,8 @@ public class WindowScalpingStrategyV4 implements
     private final TradeExecutionService tradeExecutionService;
     private final PositionStore positionStore;
     private final OrderRepository orderRepository;
+    private final MlSampleIngestService mlSampleIngestService;
+    private final ObjectMapper objectMapper;
 
     private final ObjectProvider<MlGateway> mlGatewayProvider;
     private final ObjectProvider<AiStrategyOrchestrator> orchestratorProvider;
@@ -229,6 +235,17 @@ public class WindowScalpingStrategyV4 implements
 
         Instant lastEntryBlockedAt;
         String lastEntryBlockedReason;
+
+        Map<String, Object> pendingMlFeatures;
+        Instant pendingMlFeatureTs;
+        String pendingMlSymbol;
+        String pendingMlExchange;
+        String pendingMlNetwork;
+        String pendingMlTimeframe;
+        BigDecimal pendingMlEntryPrice;
+        Double pendingMlProba;
+        String pendingMlModelKey;
+        boolean pendingMlFailOpen;
     }
 
     private static class Prediction {
@@ -343,6 +360,7 @@ public class WindowScalpingStrategyV4 implements
         st.lastZonePublishedAt = null;
 
         resetMlCache(st);
+        clearPendingMlSample(st);
         st.lastMlWarnAt = null;
         st.lastMlWarnReason = null;
         st.lastEntryBlockedAt = null;
@@ -404,6 +422,7 @@ public class WindowScalpingStrategyV4 implements
 
         ensureRuntimeContext(st, st.ss);
         st.lastEntryAt = null;
+        clearPendingMlSample(st);
 
         final String sym = st.symbol;
 
@@ -536,6 +555,14 @@ public class WindowScalpingStrategyV4 implements
 
                     if (exRes.executed()) {
                         st.exits++;
+
+                        persistClosedTradeSample(
+                                chatId,
+                                st,
+                                sym,
+                                price,
+                                time
+                        );
 
                         safeLive(() -> live.pushTrade(
                                 chatId,
@@ -726,6 +753,12 @@ public class WindowScalpingStrategyV4 implements
                 return;
             }
 
+            Map<String, Object> entryFeatures = buildMlFeatures(
+                    chatId, st, sym, price, time,
+                    low, high, range, rangePct, pos,
+                    lowZone, highZone, windowSize, diffPctForEntry
+            );
+
             Prediction pred = null;
             boolean mlBypassForThisEntry = false;
             BigDecimal previousMlConfidence = ss.getMlConfidence();
@@ -733,24 +766,21 @@ public class WindowScalpingStrategyV4 implements
             if (isMlGateAllowed(ss)) {
                 double threshold = resolveMlThreshold(ss);
 
-                Map<String, Object> feats = buildMlFeatures(
-                        chatId, st, sym, price, time,
-                        low, high, range, rangePct, pos,
-                        lowZone, highZone, windowSize, diffPctForEntry
-                );
+                Map<String, Object> feats = entryFeatures;
 
-                pred = getPredictionThrottled(st, feats, price, time);
+                pred = getPredictionThrottled(chatId, sym, st, feats, price, time);
 
                 if (!pred.ok) {
-                    String reason = (pred.reason != null ? pred.reason : "predict_failed");
+                    String reason = normalizeMlFailureReason(pred.reason);
 
-                    if (!mlFailOpen) {
-                        pushHoldThrottled(chatId, sym, st, "predict_failed", time, holdMs);
+                    if (!isMlFailOpenAllowed(ss, reason)) {
+                        logMlBlockedThrottled(chatId, sym, st, ss, reason, time);
+                        pushHoldThrottled(chatId, sym, st, mapMlFailureToHoldReason(ss, reason), time, holdMs);
                         return;
                     }
 
                     mlBypassForThisEntry = true;
-                    logMlFailureThrottled(chatId, sym, st, reason, time);
+                    logMlFailureThrottled(chatId, sym, st, ss, reason, time);
                 } else {
                     maybePersistMlConfidence(st, ss, pred.proba, time);
 
@@ -765,10 +795,10 @@ public class WindowScalpingStrategyV4 implements
 
             try {
                 if (isMlGateAllowed(ss)) {
-                    if (mlBypassForThisEntry) {
-                        ss.setMlConfidence(BigDecimal.ONE);
-                    } else if (pred != null && pred.ok) {
+                    if (pred != null && pred.ok) {
                         ss.setMlConfidence(BigDecimal.valueOf(pred.proba));
+                    } else {
+                        ss.setMlConfidence(null);
                     }
                 }
 
@@ -812,6 +842,20 @@ public class WindowScalpingStrategyV4 implements
                 resetMlCache(st);
 
                 ensureRuntimeContext(st, ss);
+
+                rememberPendingMlSample(
+                        st,
+                        entryFeatures,
+                        time,
+                        sym,
+                        st.exchange,
+                        st.network,
+                        st.timeframe,
+                        st.entryPrice != null ? st.entryPrice : price,
+                        (pred != null && pred.ok) ? pred.proba : null,
+                        (pred != null && pred.ok) ? pred.modelKey : null,
+                        mlBypassForThisEntry
+                );
 
                 publishPositionLines(chatId, sym, st);
 
@@ -1270,6 +1314,14 @@ public class WindowScalpingStrategyV4 implements
         return modeOrManual(ss) == AdvancedControlMode.MANUAL;
     }
 
+    private static boolean isHybridMode(StrategySettings ss) {
+        return modeOrManual(ss) == AdvancedControlMode.HYBRID;
+    }
+
+    private static boolean isAiMode(StrategySettings ss) {
+        return modeOrManual(ss) == AdvancedControlMode.AI;
+    }
+
     private boolean isAutoTuneAllowed(StrategySettings ss) {
         return ss != null && ss.isAutoTuneEnabled() && !isManualMode(ss);
     }
@@ -1529,13 +1581,23 @@ public class WindowScalpingStrategyV4 implements
         return mlMinProba;
     }
 
-    private Prediction tryPredict(Map<String, Object> features) {
+    private Prediction tryPredict(Long chatId,
+                                  String symbol,
+                                  Instant now,
+                                  Map<String, Object> features) {
         try {
             MlGateway gw = ml();
             if (gw == null) return Prediction.fail("ml_gateway_missing");
             if (!mlEnabled) return Prediction.fail("ml_disabled_by_strategy");
 
-            MlPredictResponse r = gw.predict(features);
+            MlPredictResponse r = gw.predict(
+                    StrategyType.WINDOW_SCALPING,
+                    chatId,
+                    symbol,
+                    features,
+                    now
+            );
+
             if (r == null) return Prediction.fail("predict_null");
 
             if (!r.isOk()) {
@@ -1548,7 +1610,9 @@ public class WindowScalpingStrategyV4 implements
             double proba = Math.max(0.0, Math.min(1.0, p));
             String mk = (r.getModelKey() != null && !r.getModelKey().isBlank())
                     ? r.getModelKey()
-                    : (r.getModelVersion() != null && !r.getModelVersion().isBlank() ? r.getModelVersion() : "unknown");
+                    : (r.getModelVersion() != null && !r.getModelVersion().isBlank()
+                    ? r.getModelVersion()
+                    : "unknown");
 
             return Prediction.ok(mk, proba);
 
@@ -1557,7 +1621,9 @@ public class WindowScalpingStrategyV4 implements
         }
     }
 
-    private Prediction getPredictionThrottled(LocalState st,
+    private Prediction getPredictionThrottled(Long chatId,
+                                              String symbol,
+                                              LocalState st,
                                               Map<String, Object> features,
                                               BigDecimal currentPrice,
                                               Instant now) {
@@ -1574,7 +1640,7 @@ public class WindowScalpingStrategyV4 implements
             }
         }
 
-        Prediction pred = tryPredict(features);
+        Prediction pred = tryPredict(chatId, symbol, now, features);
 
         st.lastMlPredictAt = now;
         st.lastMlPredictPrice = currentPrice;
@@ -1595,25 +1661,93 @@ public class WindowScalpingStrategyV4 implements
         return diffPct.compareTo(BigDecimal.valueOf(0.02)) <= 0;
     }
 
+    private String normalizeMlFailureReason(String reason) {
+        if (reason == null) return "predict_failed";
+        String s = reason.trim();
+        return s.isEmpty() ? "predict_failed" : s;
+    }
+
+    private boolean isHardMlFailureReason(String reason) {
+        String s = normalizeMlFailureReason(reason).toLowerCase(Locale.ROOT);
+
+        return s.contains("featureorder_hash_mismatch")
+               || s.contains("feature_order_hash_mismatch")
+               || s.contains("feature_hash_mismatch")
+               || s.contains("schema_mismatch")
+               || s.contains("feature_schema")
+               || s.contains("feature_spec")
+               || s.contains("missing_feature")
+               || s.contains("unknown_feature")
+               || s.contains("model_schema")
+               || s.contains("column_mismatch");
+    }
+
+    private boolean isMlFailOpenAllowed(StrategySettings ss, String reason) {
+        String normalized = normalizeMlFailureReason(reason);
+
+        if ("no_model".equalsIgnoreCase(normalized)) {
+            return true;
+        }
+
+        if (!mlFailOpen) return false;
+        if (!isHybridMode(ss)) return false;
+        return !isHardMlFailureReason(normalized);
+    }
+
+    private String mapMlFailureToHoldReason(StrategySettings ss, String reason) {
+        if (isHardMlFailureReason(reason)) {
+            return "ml_schema_mismatch";
+        }
+        if (isAiMode(ss)) {
+            return "ml_required_ai_mode";
+        }
+        return "predict_failed";
+    }
+
     private void logMlFailureThrottled(Long chatId,
                                        String sym,
                                        LocalState st,
+                                       StrategySettings ss,
                                        String reason,
                                        Instant now) {
         if (st == null || now == null) return;
 
         long throttle = Math.max(3000L, mlLogThrottleMs);
+        String key = "FAILOPEN:" + normalizeMlFailureReason(reason);
 
-        if (Objects.equals(st.lastMlWarnReason, reason) && st.lastMlWarnAt != null) {
+        if (Objects.equals(st.lastMlWarnReason, key) && st.lastMlWarnAt != null) {
             long age = Duration.between(st.lastMlWarnAt, now).toMillis();
             if (age >= 0 && age < throttle) return;
         }
 
-        st.lastMlWarnReason = reason;
+        st.lastMlWarnReason = key;
         st.lastMlWarnAt = now;
 
-        log.warn("[WINDOW] 🤖 ML недоступен, продолжаю без блокировки (fail-open) chatId={} sym={} reason={}",
-                chatId, sym, reason);
+        log.warn("[WINDOW] 🤖 ML fail-open chatId={} sym={} mode={} reason={}",
+                chatId, sym, modeOrManual(ss), reason);
+    }
+
+    private void logMlBlockedThrottled(Long chatId,
+                                       String sym,
+                                       LocalState st,
+                                       StrategySettings ss,
+                                       String reason,
+                                       Instant now) {
+        if (st == null || now == null) return;
+
+        long throttle = Math.max(3000L, mlLogThrottleMs);
+        String key = "BLOCK:" + normalizeMlFailureReason(reason);
+
+        if (Objects.equals(st.lastMlWarnReason, key) && st.lastMlWarnAt != null) {
+            long age = Duration.between(st.lastMlWarnAt, now).toMillis();
+            if (age >= 0 && age < throttle) return;
+        }
+
+        st.lastMlWarnReason = key;
+        st.lastMlWarnAt = now;
+
+        log.warn("[WINDOW] 🤖 ML BLOCKED entry chatId={} sym={} mode={} reason={}",
+                chatId, sym, modeOrManual(ss), reason);
     }
 
     private void logEntryBlockedThrottled(Long chatId,
@@ -1650,6 +1784,129 @@ public class WindowScalpingStrategyV4 implements
         st.lastMlPrediction = null;
     }
 
+    private void rememberPendingMlSample(LocalState st,
+                                         Map<String, Object> features,
+                                         Instant ts,
+                                         String symbol,
+                                         String exchange,
+                                         NetworkType network,
+                                         String timeframe,
+                                         BigDecimal entryPrice,
+                                         Double proba,
+                                         String modelKey,
+                                         boolean failOpen) {
+        if (st == null) return;
+        if (features == null || features.isEmpty()) return;
+
+        st.pendingMlFeatures = new LinkedHashMap<>(features);
+        st.pendingMlFeatureTs = ts;
+        st.pendingMlSymbol = normalizeSymbolOrNull(symbol);
+        st.pendingMlExchange = normalizeExchangeOrNull(exchange);
+        st.pendingMlNetwork = (network != null ? network.name() : null);
+        st.pendingMlTimeframe = normalizeTimeframeOrNull(timeframe);
+        st.pendingMlEntryPrice = entryPrice;
+        st.pendingMlProba = proba;
+        st.pendingMlModelKey = (modelKey != null && !modelKey.isBlank()) ? modelKey.trim() : null;
+        st.pendingMlFailOpen = failOpen;
+    }
+
+    private void clearPendingMlSample(LocalState st) {
+        if (st == null) return;
+        st.pendingMlFeatures = null;
+        st.pendingMlFeatureTs = null;
+        st.pendingMlSymbol = null;
+        st.pendingMlExchange = null;
+        st.pendingMlNetwork = null;
+        st.pendingMlTimeframe = null;
+        st.pendingMlEntryPrice = null;
+        st.pendingMlProba = null;
+        st.pendingMlModelKey = null;
+        st.pendingMlFailOpen = false;
+    }
+
+    private void persistClosedTradeSample(Long chatId,
+                                          LocalState st,
+                                          String symbol,
+                                          BigDecimal exitPrice,
+                                          Instant exitTime) {
+        if (chatId == null || st == null) return;
+        if (mlSampleIngestService == null || objectMapper == null) return;
+        if (st.pendingMlFeatures == null || st.pendingMlFeatures.isEmpty()) return;
+
+        try {
+            String sym = normalizeSymbolOrNull(symbol);
+            if (sym == null) sym = normalizeSymbolOrNull(st.pendingMlSymbol);
+            if (sym == null) {
+                clearPendingMlSample(st);
+                return;
+            }
+
+            BigDecimal entryPrice = positiveOrNull(st.pendingMlEntryPrice);
+            BigDecimal actualExit = positiveOrNull(exitPrice);
+
+            if (entryPrice == null || actualExit == null) {
+                clearPendingMlSample(st);
+                return;
+            }
+
+            String label = actualExit.compareTo(entryPrice) >= 0 ? "WIN" : "LOSS";
+
+            Map<String, Object> features = new LinkedHashMap<>(st.pendingMlFeatures);
+
+            Map<String, Object> meta = new LinkedHashMap<>();
+            meta.put("featureSpec", new ArrayList<>(features.keySet()));
+            meta.put("entryPrice", entryPrice);
+            meta.put("exitPrice", actualExit);
+            meta.put("label", label);
+            meta.put("closedAtMs", exitTime != null ? exitTime.toEpochMilli() : Instant.now().toEpochMilli());
+            meta.put("mlProba", st.pendingMlProba);
+            meta.put("mlModelKey", st.pendingMlModelKey);
+            meta.put("mlFailOpen", st.pendingMlFailOpen);
+            meta.put("strategyType", StrategyType.WINDOW_SCALPING.name());
+            meta.put("symbol", sym);
+            meta.put("exchange", st.pendingMlExchange);
+            meta.put("network", st.pendingMlNetwork);
+            meta.put("timeframe", st.pendingMlTimeframe);
+
+            JsonNode featuresJson = objectMapper.valueToTree(features);
+            JsonNode metaJson = objectMapper.valueToTree(meta);
+
+            MlSampleEntity sample = MlSampleEntity.builder()
+                    .chatId(chatId)
+                    .strategyType(StrategyType.WINDOW_SCALPING)
+                    .exchange(st.pendingMlExchange)
+                    .network(st.pendingMlNetwork)
+                    .symbol(sym)
+                    .timeframe(st.pendingMlTimeframe)
+                    .ts(st.pendingMlFeatureTs != null ? st.pendingMlFeatureTs : exitTime)
+                    .label(label)
+                    .target("TP_SL")
+                    .proba(st.pendingMlProba)
+                    .featuresJson(featuresJson)
+                    .metaJson(metaJson)
+                    .createdAt(Instant.now())
+                    .build();
+
+            mlSampleIngestService.saveAndMaybeTrain(sample);
+
+            log.info("[WINDOW] 🧠 ML sample saved chatId={} sym={} tf={} label={} entry={} exit={} modelKey={} failOpen={}",
+                    chatId,
+                    sym,
+                    st.pendingMlTimeframe,
+                    label,
+                    fmtBd(entryPrice),
+                    fmtBd(actualExit),
+                    safeNullable(st.pendingMlModelKey),
+                    st.pendingMlFailOpen);
+
+        } catch (Exception e) {
+            log.warn("[WINDOW] ⚠ Не удалось сохранить ML sample chatId={} sym={} err={}",
+                    chatId, symbol, e.toString(), e);
+        } finally {
+            clearPendingMlSample(st);
+        }
+    }
+
     private Map<String, Object> buildMlFeatures(
             Long chatId,
             LocalState st,
@@ -1676,38 +1933,19 @@ public class WindowScalpingStrategyV4 implements
         f.put("timeframe", st.timeframe);
         f.put("ts", (ts != null ? ts : Instant.now()).toEpochMilli());
 
-        f.put("windowSize", windowSize);
-
         double lastPrice = price.doubleValue();
-        f.put("price", lastPrice);
-        f.put("lastPrice", lastPrice);
-
-        f.put("low", low.doubleValue());
-        f.put("high", high.doubleValue());
-        f.put("range", range.doubleValue());
-        f.put("rangePct", rangePct);
 
         double volatilityPct = calcVolatilityPct(st);
         if (!Double.isFinite(volatilityPct) || volatilityPct <= 0.0) {
             volatilityPct = rangePct;
         }
-        f.put("volatilityPct", volatilityPct);
 
-        f.put("pos01", pos);
-        f.put("posPct", pos * 100.0);
-
-        f.put("lowZone01", lowZone);
-        f.put("highZone01", highZone);
-
-        f.put("diffPctForEntry", diffPctForEntry.doubleValue());
-
-        Deque<BigDecimal> src = (st.tickWindow != null && !st.tickWindow.isEmpty()) ? st.tickWindow : st.window;
+        Deque<BigDecimal> src = (st.tickWindow != null && !st.tickWindow.isEmpty())
+                ? st.tickWindow
+                : st.window;
 
         double retWindowPct = calcWindowReturnPct(src);
-        f.put("retWindowPct", retWindowPct);
-
         double momentum1 = calcMomentum1Pct(src, price);
-        f.put("momentum1", momentum1);
 
         double smaFast = calcSma(src, Math.max(3, Math.min(5, windowSize)));
         double smaSlow = calcSma(src, Math.max(5, Math.min(10, windowSize)));
@@ -1715,6 +1953,22 @@ public class WindowScalpingStrategyV4 implements
         double smaFastRel = relPct(lastPrice, smaFast);
         double smaSlowRel = relPct(lastPrice, smaSlow);
 
+        // ВАЖНО: порядок должен совпадать с MlGateway.WINDOW_SCALPING_SPEC
+        f.put("windowSize", windowSize);
+        f.put("lastPrice", lastPrice);
+        f.put("price", lastPrice);
+        f.put("low", low.doubleValue());
+        f.put("high", high.doubleValue());
+        f.put("range", range.doubleValue());
+        f.put("rangePct", rangePct);
+        f.put("volatilityPct", volatilityPct);
+        f.put("pos01", pos);
+        f.put("posPct", pos * 100.0);
+        f.put("lowZone01", lowZone);
+        f.put("highZone01", highZone);
+        f.put("diffPctForEntry", diffPctForEntry.doubleValue());
+        f.put("retWindowPct", retWindowPct);
+        f.put("momentum1", momentum1);
         f.put("smaFastRel", smaFastRel);
         f.put("smaSlowRel", smaSlowRel);
 
@@ -1945,6 +2199,8 @@ public class WindowScalpingStrategyV4 implements
             case "tp_sl_pct_invalid" -> "Некорректный TP/SL";
             case "predict_failed" -> "ML-прогноз недоступен";
             case "ml_below_threshold" -> "ML-прогноз ниже порога";
+            case "ml_required_ai_mode" -> "В AI-режиме вход заблокирован: ML недоступен";
+            case "ml_schema_mismatch" -> "ML схема/порядок фичей не совпадает";
             case "entry_failed" -> "Ошибка при входе в сделку";
             case "in_high_zone_wait_tp" -> "Цена у верхней границы — ждём";
             case "pos_snapshot_missing" -> "Позиция есть, но нет данных в PositionStore";
@@ -2351,3 +2607,5 @@ public class WindowScalpingStrategyV4 implements
         return (v != null && v.signum() > 0) ? v : null;
     }
 }
+
+

@@ -23,7 +23,7 @@ public class MlTrainProperties {
     private int lookbackDays = 14;
 
     /** Минимум сэмплов для обучения. */
-    private int minSamples = 300;
+    private int minSamples = 50;
 
     /** Максимум строк, которые отправляем в /train за один запуск. */
     private int rowsLimit = 5000;

@@ -53,7 +53,7 @@ public class OrderEntity {
     @Column(nullable = false, precision = 28, scale = 12)
     private BigDecimal total;
 
-    /** SMART_FUSION / SCALPING / ML_INVEST */
+    /** SMART_FUSION / SCALPING / ML_INVEST / WINDOW_SCALPING */
     @Column(name = "strategy_type", nullable = false, length = 64)
     private String strategyType;
 
@@ -126,6 +126,10 @@ public class OrderEntity {
 
     @PrePersist
     public void prePersist() {
+        if (chatId == null && userId != null) {
+            chatId = userId;
+        }
+
         normalizeContext();
 
         if (createdAt == null) {
@@ -138,10 +142,6 @@ public class OrderEntity {
 
         if (price != null && quantity != null && total == null) {
             total = price.multiply(quantity);
-        }
-
-        if (chatId == null && userId != null) {
-            chatId = userId;
         }
 
         if (filled == null) {
@@ -165,23 +165,17 @@ public class OrderEntity {
     }
 
     private void normalizeContext() {
-        if (symbol != null) {
-            symbol = symbol.trim().toUpperCase(Locale.ROOT);
-        }
-        if (side != null) {
-            side = side.trim().toUpperCase(Locale.ROOT);
-        }
-        if (status != null) {
-            status = status.trim().toUpperCase(Locale.ROOT);
-        }
-        if (strategyType != null) {
-            strategyType = strategyType.trim().toUpperCase(Locale.ROOT);
-        }
-        if (exchangeName != null) {
-            exchangeName = exchangeName.trim().toUpperCase(Locale.ROOT);
-        }
-        if (networkType != null) {
-            networkType = networkType.trim().toUpperCase(Locale.ROOT);
-        }
+        symbol = normalizeUpperOrNull(symbol);
+        side = normalizeUpperOrNull(side);
+        status = normalizeUpperOrNull(status);
+        strategyType = normalizeUpperOrNull(strategyType);
+        exchangeName = normalizeUpperOrNull(exchangeName);
+        networkType = normalizeUpperOrNull(networkType);
+    }
+
+    private static String normalizeUpperOrNull(String value) {
+        if (value == null) return null;
+        String v = value.trim().toUpperCase(Locale.ROOT);
+        return v.isEmpty() ? null : v;
     }
 }

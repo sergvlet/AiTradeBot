@@ -11,6 +11,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Instant;
@@ -49,36 +50,37 @@ public class MlGateway {
             "tsMs"
     );
 
-    /**
-     * Канонический порядок для WINDOW_SCALPING.
-     * Если какие-то поля отсутствуют — они просто будут пропущены.
-     */
-    private static final List<String> WINDOW_SCALPING_CANONICAL_ORDER = List.of(
-            "windowSize",
-            "lastPrice",
-            "price",
-            "low",
-            "high",
-            "range",
-            "rangePct",
-            "volatilityPct",
-            "pos01",
-            "posPct",
-            "lowZone01",
-            "highZone01",
-            "diffPctForEntry",
-            "retWindowPct",
-            "momentum1",
-            "smaFastRel",
-            "smaSlowRel"
+    private static final StrategyFeatureSpec WINDOW_SCALPING_SPEC = new StrategyFeatureSpec(
+            List.of(
+                    "windowSize",
+                    "lastPrice",
+                    "price",
+                    "low",
+                    "high",
+                    "range",
+                    "rangePct",
+                    "volatilityPct",
+                    "pos01",
+                    "posPct",
+                    "lowZone01",
+                    "highZone01",
+                    "diffPctForEntry",
+                    "retWindowPct",
+                    "momentum1",
+                    "smaFastRel",
+                    "smaSlowRel"
+            ),
+            List.of(
+                    "momentum1",
+                    "volatilityPct",
+                    "smaFastRel",
+                    "smaSlowRel",
+                    "lastPrice"
+            )
     );
 
-    private static final List<String> WINDOW_SCALPING_REQUIRED_FEATURES = List.of(
-            "momentum1",
-            "volatilityPct",
-            "smaFastRel",
-            "smaSlowRel",
-            "lastPrice"
+    private static final Map<StrategyType, StrategyFeatureSpec> FEATURE_SPECS = Map.of(
+            StrategyType.WINDOW_SCALPING, WINDOW_SCALPING_SPEC
     );
 
     private final MlProperties props;
@@ -89,8 +91,7 @@ public class MlGateway {
     private final ObjectProvider<MlClient> clientProvider;
 
     /**
-     * Нужен для modelKey/schemaHash/timeframe из StrategySettings,
-     * чтобы predict всегда шёл в правильную модель и с правильной схемой.
+     * Нужен для modelKey/schemaHash/timeframe из StrategySettings.
      */
     private final StrategySettingsService strategySettingsService;
 
@@ -98,6 +99,16 @@ public class MlGateway {
      * Анти-спам по предупреждениям.
      */
     private final Map<String, Long> warnThrottle = new ConcurrentHashMap<>();
+
+    private static final class StrategyFeatureSpec {
+        private final List<String> canonicalOrder;
+        private final List<String> requiredFeatures;
+
+        private StrategyFeatureSpec(List<String> canonicalOrder, List<String> requiredFeatures) {
+            this.canonicalOrder = canonicalOrder != null ? List.copyOf(canonicalOrder) : List.of();
+            this.requiredFeatures = requiredFeatures != null ? List.copyOf(requiredFeatures) : List.of();
+        }
+    }
 
     public boolean isEnabled() {
         if (props == null || !props.isEnabled()) return false;
@@ -223,7 +234,7 @@ public class MlGateway {
         // -----------------------------------------------------
         // 1) Нормализуем и очищаем features
         // -----------------------------------------------------
-        Map<String, Object> normalizedFeatures = normalizeFeatures(raw);
+        LinkedHashMap<String, Object> normalizedFeatures = normalizeFeatures(type, raw);
 
         if (normalizedFeatures.isEmpty()) {
             return MlPredictResponse.fail("no_features");
@@ -257,20 +268,23 @@ public class MlGateway {
         LinkedHashMap<String, Object> orderedFeatures = reorderFeatures(normalizedFeatures, finalFeatureOrder);
 
         // -----------------------------------------------------
-        // 5) Считаем hash схемы и валидируем
+        // 5) Считаем hash порядка фич и валидируем
         // -----------------------------------------------------
-        String computedSchemaHash = computeFeatureOrderHash(finalFeatureOrder);
+        String computedFeatureOrderHash = computeFeatureOrderHash(finalFeatureOrder);
 
-        if (schemaHashNorm != null && !schemaHashNorm.equalsIgnoreCase(computedSchemaHash)) {
-            String reason = "schema_hash_mismatch";
-            warnOnce(buildWarnKey(type, chatId, symbolNorm, reason), 15_000,
-                    "🧠 ML schema mismatch | type={} chatId={} symbol={} provided={} computed={}",
-                    type, chatId, symbolNorm, schemaHashNorm, computedSchemaHash);
-            return MlPredictResponse.fail(reason + ":provided=" + schemaHashNorm + ",computed=" + computedSchemaHash);
+        if (schemaHashNorm != null && !schemaHashNorm.equalsIgnoreCase(computedFeatureOrderHash)) {
+            String reason = "featureOrder_hash_mismatch"
+                            + " provided=" + schemaHashNorm
+                            + " req=" + computedFeatureOrderHash;
+
+            warnOnce(buildWarnKey(type, chatId, symbolNorm, "featureOrder_hash_mismatch"), 15_000,
+                    "🧠 ML feature order mismatch до sidecar | type={} chatId={} symbol={} modelKey={} provided={} req={} order={}",
+                    type, chatId, symbolNorm, modelKeyNorm, schemaHashNorm, computedFeatureOrderHash, String.join(",", finalFeatureOrder));
+
+            return MlPredictResponse.fail(reason);
         }
 
-        // если хэш не пришёл — используем вычисленный
-        schemaHashNorm = computedSchemaHash;
+        schemaHashNorm = computedFeatureOrderHash;
 
         // -----------------------------------------------------
         // 6) Собираем request
@@ -299,24 +313,28 @@ public class MlGateway {
 
                 if (isMissingFeaturesError(err)) {
                     warnOnce(buildWarnKey(type, chatId, symbolNorm, "missing_features"), 15_000,
-                            "🧠 ML sidecar отклонил predict: missing_features | type={} chatId={} symbol={} err={}",
-                            type, chatId, symbolNorm, err);
+                            "🧠 ML sidecar отклонил predict: missing_features | type={} chatId={} symbol={} modelKey={} err={}",
+                            type, chatId, symbolNorm, modelKeyNorm, err);
+                } else if (isFeatureOrderHashMismatchError(err)) {
+                    warnOnce(buildWarnKey(type, chatId, symbolNorm, "featureOrder_hash_mismatch"), 15_000,
+                            "🧠 ML sidecar отклонил predict: feature order hash mismatch | type={} chatId={} symbol={} modelKey={} err={} reqHash={} order={}",
+                            type, chatId, symbolNorm, modelKeyNorm, err, schemaHashNorm, String.join(",", finalFeatureOrder));
                 } else if (isSchemaMismatchError(err)) {
                     warnOnce(buildWarnKey(type, chatId, symbolNorm, "schema_mismatch"), 15_000,
-                            "🧠 ML sidecar отклонил predict: schema mismatch | type={} chatId={} symbol={} err={}",
-                            type, chatId, symbolNorm, err);
+                            "🧠 ML sidecar отклонил predict: schema mismatch | type={} chatId={} symbol={} modelKey={} err={} reqHash={}",
+                            type, chatId, symbolNorm, modelKeyNorm, err, schemaHashNorm);
                 } else if (isModelFormatError(err)) {
                     warnOnce(buildWarnKey(type, chatId, symbolNorm, "model_format"), 30_000,
-                            "🧠 ML sidecar: проблема формата модели | type={} chatId={} symbol={} err={}",
-                            type, chatId, symbolNorm, err);
+                            "🧠 ML sidecar: проблема формата модели | type={} chatId={} symbol={} modelKey={} err={}",
+                            type, chatId, symbolNorm, modelKeyNorm, err);
                 } else if (isNeutralStreakError(err)) {
                     warnOnce(buildWarnKey(type, chatId, symbolNorm, "neutral_streak"), 30_000,
-                            "🧠 ML sidecar: neutral-streak | type={} chatId={} symbol={} err={}",
-                            type, chatId, symbolNorm, err);
+                            "🧠 ML sidecar: neutral-streak | type={} chatId={} symbol={} modelKey={} err={}",
+                            type, chatId, symbolNorm, modelKeyNorm, err);
                 } else {
                     warnOnce(buildWarnKey(type, chatId, symbolNorm, "predict_not_ok"), 15_000,
-                            "🧠 ML predict вернул not_ok | type={} chatId={} symbol={} err={}",
-                            type, chatId, symbolNorm, err);
+                            "🧠 ML predict вернул not_ok | type={} chatId={} symbol={} modelKey={} err={} reqHash={}",
+                            type, chatId, symbolNorm, modelKeyNorm, err, schemaHashNorm);
                 }
             }
 
@@ -325,8 +343,8 @@ public class MlGateway {
         } catch (Exception e) {
             String msg = "predict_failed: " + safeMsg(e);
             warnOnce(buildWarnKey(type, chatId, symbolNorm, "predict_exception"), 15_000,
-                    "🧠 ML predict exception | type={} chatId={} symbol={} err={}",
-                    type, chatId, symbolNorm, msg);
+                    "🧠 ML predict exception | type={} chatId={} symbol={} modelKey={} err={}",
+                    type, chatId, symbolNorm, modelKeyNorm, msg);
             return MlPredictResponse.fail(msg);
         }
     }
@@ -359,15 +377,31 @@ public class MlGateway {
         if (v == null) v = features.get("schema");
         if (v == null) v = features.get("schemaFields");
 
-        if (!(v instanceof Iterable<?> iterable)) return null;
+        if (v == null) return null;
 
         List<String> out = new ArrayList<>();
-        for (Object o : iterable) {
-            String s = extractString(o);
-            if (s != null && !META_KEYS.contains(s)) {
-                out.add(s);
+
+        if (v instanceof Iterable<?> iterable) {
+            for (Object o : iterable) {
+                String s = normalizeFeatureName(extractString(o));
+                if (s != null && !META_KEYS.contains(s)) {
+                    out.add(s);
+                }
+            }
+        } else {
+            String raw = extractString(v);
+            if (raw != null) {
+                String prepared = raw.replace(';', ',').replace('|', ',');
+                String[] parts = prepared.split(",");
+                for (String part : parts) {
+                    String s = normalizeFeatureName(part);
+                    if (s != null && !META_KEYS.contains(s)) {
+                        out.add(s);
+                    }
+                }
             }
         }
+
         return out.isEmpty() ? null : out;
     }
 
@@ -377,7 +411,6 @@ public class MlGateway {
 
         LinkedHashSet<String> ordered = new LinkedHashSet<>();
 
-        // 1. Сначала берём внешний порядок, если он пришёл
         if (incomingOrder != null) {
             for (String name : incomingOrder) {
                 if (name != null && normalizedFeatures.containsKey(name)) {
@@ -386,16 +419,15 @@ public class MlGateway {
             }
         }
 
-        // 2. Для WINDOW_SCALPING — канонический порядок
-        if (type == StrategyType.WINDOW_SCALPING) {
-            for (String name : WINDOW_SCALPING_CANONICAL_ORDER) {
+        StrategyFeatureSpec spec = FEATURE_SPECS.get(type);
+        if (spec != null) {
+            for (String name : spec.canonicalOrder) {
                 if (normalizedFeatures.containsKey(name)) {
                     ordered.add(name);
                 }
             }
         }
 
-        // 3. Остальные поля — по алфавиту, чтобы порядок всегда был одинаковым
         List<String> rest = new ArrayList<>(normalizedFeatures.keySet());
         rest.sort(Comparator.naturalOrder());
 
@@ -430,7 +462,6 @@ public class MlGateway {
             }
             return sb.toString();
         } catch (Exception e) {
-            // fallback практически не должен понадобиться
             return Integer.toHexString(featureOrder.hashCode());
         }
     }
@@ -441,12 +472,13 @@ public class MlGateway {
 
     private static List<String> validateRequiredFeatures(StrategyType type,
                                                          Map<String, Object> features) {
-        if (type != StrategyType.WINDOW_SCALPING) {
+        StrategyFeatureSpec spec = FEATURE_SPECS.get(type);
+        if (spec == null || spec.requiredFeatures.isEmpty()) {
             return Collections.emptyList();
         }
 
         List<String> missing = new ArrayList<>();
-        for (String req : WINDOW_SCALPING_REQUIRED_FEATURES) {
+        for (String req : spec.requiredFeatures) {
             if (!features.containsKey(req) || features.get(req) == null) {
                 missing.add(req);
             }
@@ -454,21 +486,36 @@ public class MlGateway {
         return missing;
     }
 
-    private static Map<String, Object> normalizeFeatures(Map<String, Object> in) {
+    private static LinkedHashMap<String, Object> normalizeFeatures(StrategyType type, Map<String, Object> in) {
         LinkedHashMap<String, Object> out = new LinkedHashMap<>();
         if (in == null || in.isEmpty()) return out;
 
         for (Map.Entry<String, Object> e : in.entrySet()) {
-            String k = e.getKey();
+            String k = normalizeFeatureName(e.getKey());
             Object v = e.getValue();
 
-            if (k == null || k.isBlank()) continue;
+            if (k == null) continue;
             if (META_KEYS.contains(k)) continue;
 
             Object nv = normalizeValue(v);
             out.put(k, nv);
         }
+
+        applyStrategyAliases(type, out);
         return out;
+    }
+
+    private static void applyStrategyAliases(StrategyType type, LinkedHashMap<String, Object> out) {
+        if (out == null || out.isEmpty()) return;
+
+        if (type == StrategyType.WINDOW_SCALPING) {
+            if (!out.containsKey("lastPrice") && out.containsKey("price")) {
+                out.put("lastPrice", out.get("price"));
+            }
+            if (!out.containsKey("price") && out.containsKey("lastPrice")) {
+                out.put("price", out.get("lastPrice"));
+            }
+        }
     }
 
     private static Object normalizeValue(Object v) {
@@ -485,8 +532,17 @@ public class MlGateway {
             if (!Float.isFinite(f)) return null;
             return (double) f;
         }
+        if (v instanceof BigDecimal bd) {
+            return bd.stripTrailingZeros();
+        }
 
         return v;
+    }
+
+    private static String normalizeFeatureName(String key) {
+        if (key == null) return null;
+        String s = key.trim();
+        return s.isEmpty() ? null : s;
     }
 
     // =====================================================
@@ -562,10 +618,20 @@ public class MlGateway {
         return err.toLowerCase(Locale.ROOT).contains("missing_features");
     }
 
+    private static boolean isFeatureOrderHashMismatchError(String err) {
+        if (err == null) return false;
+        String s = err.toLowerCase(Locale.ROOT);
+        return s.contains("featureorder_hash_mismatch")
+               || s.contains("feature_order_hash_mismatch")
+               || s.contains("feature hash mismatch");
+    }
+
     private static boolean isSchemaMismatchError(String err) {
         if (err == null) return false;
         String s = err.toLowerCase(Locale.ROOT);
-        return s.contains("schema_hash_mismatch") || s.contains("feature hash mismatch") || s.contains("schema mismatch");
+        return s.contains("schema_hash_mismatch")
+               || s.contains("schema mismatch")
+               || s.contains("schema_mismatch");
     }
 
     // =====================================================
@@ -606,3 +672,4 @@ public class MlGateway {
         return s == null ? "null" : s;
     }
 }
+

@@ -24,7 +24,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class StrategyRegistry {
 
     // =====================================================================
-    // 1) UI-МЕТАДАННЫЕ (НЕ ТРОГАЕМ)
+    // 1) UI-МЕТАДАННЫЕ
     // =====================================================================
 
     @Data
@@ -35,11 +35,15 @@ public class StrategyRegistry {
         private String type;
     }
 
-    private final Map<StrategyType, List<FieldMeta>> fields =
-            new EnumMap<>(StrategyType.class);
+    private final Map<StrategyType, List<FieldMeta>> fields = new EnumMap<>(StrategyType.class);
+
+    /**
+     * Потокобезопасный runtime-реестр стратегий.
+     * Регистрируется через StrategyBindingProcessor.
+     */
+    private final Map<StrategyType, TradingStrategy> strategies = new ConcurrentHashMap<>();
 
     public StrategyRegistry() {
-
         fields.put(StrategyType.SMART_FUSION, List.of(
                 new FieldMeta("emaPeriod", "EMA период", "number"),
                 new FieldMeta("atrPeriod", "ATR период", "number"),
@@ -60,11 +64,12 @@ public class StrategyRegistry {
                 new FieldMeta("takeProfitPct", "TP (%)", "number"),
                 new FieldMeta("stopLossPct", "SL (%)", "number")
         ));
-
-
     }
 
     public List<FieldMeta> getFields(StrategyType type) {
+        if (type == null) {
+            return List.of();
+        }
         return fields.getOrDefault(type, List.of());
     }
 
@@ -72,53 +77,51 @@ public class StrategyRegistry {
     // 2) JAVA-РЕЕСТР СТРАТЕГИЙ (ENGINE)
     // =====================================================================
 
-    /**
-     * Потокобезопасно + не зависит от того, когда/как регистрируются бины.
-     */
-    private final Map<StrategyType, TradingStrategy> strategies = new ConcurrentHashMap<>();
-
-    /**
-     * Вызывается StrategyBindingProcessor
-     */
     public void register(StrategyType type, TradingStrategy strategy) {
-        if (type == null) throw new IllegalArgumentException("StrategyType is null");
-        if (strategy == null) throw new IllegalArgumentException("TradingStrategy is null for type=" + type);
+        if (type == null) {
+            throw new IllegalArgumentException("StrategyType is null");
+        }
+        if (strategy == null) {
+            throw new IllegalArgumentException("TradingStrategy is null for type=" + type);
+        }
 
         TradingStrategy prev = strategies.put(type, strategy);
 
-        if (prev != null) {
-            log.warn(
-                    "⚠ Strategy overwritten: {} | {} → {}",
-                    type,
-                    prev.getClass().getSimpleName(),
-                    strategy.getClass().getSimpleName()
-            );
-        } else {
-            log.info(
-                    "📌 Strategy registered: {} → {}",
-                    type,
-                    strategy.getClass().getSimpleName()
-            );
+        if (prev == null) {
+            log.info("📌 Strategy registered: {} → {}", type, strategy.getClass().getSimpleName());
+            return;
         }
+
+        if (prev == strategy) {
+            log.debug("ℹ Strategy already registered: {} → {}", type, strategy.getClass().getSimpleName());
+            return;
+        }
+
+        log.warn("⚠ Strategy overwritten: {} | {} → {}",
+                type,
+                prev.getClass().getSimpleName(),
+                strategy.getClass().getSimpleName());
     }
 
     /**
-     * Основной метод (nullable, как у тебя)
+     * Основной метод (nullable).
      */
     public TradingStrategy getStrategy(StrategyType type) {
-        if (type == null) return null;
+        if (type == null) {
+            return null;
+        }
 
         TradingStrategy strategy = strategies.get(type);
 
         if (strategy == null) {
             log.error("❌ Strategy NOT FOUND for type={}. Registered={}", type, strategies.keySet());
         }
+
         return strategy;
     }
 
     /**
      * Строгий вариант: если стратегии нет — кидаем понятную ошибку.
-     * Очень удобно, когда "должно быть всегда".
      */
     public TradingStrategy require(StrategyType type) {
         TradingStrategy s = getStrategy(type);
@@ -131,13 +134,21 @@ public class StrategyRegistry {
     }
 
     /**
-     * Алиас (используется в StrategyMarketBridge)
+     * Алиас.
      */
     public TradingStrategy get(StrategyType type) {
         return getStrategy(type);
     }
 
+    public boolean isRegistered(StrategyType type) {
+        return type != null && strategies.containsKey(type);
+    }
+
     public Set<StrategyType> getRegisteredTypes() {
         return Set.copyOf(strategies.keySet());
+    }
+
+    public Map<StrategyType, TradingStrategy> snapshot() {
+        return Map.copyOf(strategies);
     }
 }

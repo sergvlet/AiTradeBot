@@ -398,6 +398,12 @@ public class OrderServiceImpl implements OrderService {
             e.setStrategyType(order.getStrategyType().name());
         }
 
+        String ex = readString(order, "getExchangeName");
+        if (ex != null) e.setExchangeName(ex);
+
+        String net = readString(order, "getNetworkType");
+        if (net != null) e.setNetworkType(net);
+
         if (e.getPrice() != null && e.getQuantity() != null) {
             e.setTotal(e.getPrice().multiply(e.getQuantity()));
         }
@@ -868,8 +874,7 @@ public class OrderServiceImpl implements OrderService {
         if (st != null && !st.isBlank()) {
             try {
                 o.setStrategyType(StrategyType.valueOf(st.trim().toUpperCase(Locale.ROOT)));
-            } catch (Exception ignored) {
-            }
+            } catch (Exception ignored) { }
         }
         return o;
     }
@@ -934,5 +939,30 @@ public class OrderServiceImpl implements OrderService {
         } catch (Exception ignore) {
             return null;
         }
+    }
+
+    private static String readString(Object target, String... methodNames) {
+        if (target == null) return null;
+
+        for (String methodName : methodNames) {
+            try {
+                Method m = target.getClass().getMethod(methodName);
+                Object v = m.invoke(target);
+                if (v == null) continue;
+
+                String s;
+                if (v instanceof Enum<?> e) {
+                    s = e.name();
+                } else {
+                    s = String.valueOf(v).trim();
+                }
+
+                if (!s.isEmpty() && !"null".equalsIgnoreCase(s)) {
+                    return s.toUpperCase(Locale.ROOT);
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        return null;
     }
 }

@@ -35,215 +35,329 @@ import java.util.concurrent.ConcurrentHashMap;
 @RequiredArgsConstructor
 public class MlTrainingServiceImpl implements MlTrainingService {
 
+    private static final Set<String> META_KEYS = Set.of(
+            "chatId",
+            "strategyType",
+            "strategy",
+            "symbol",
+            "exchange",
+            "network",
+            "timeframe",
+            "modelKey",
+            "schemaHash",
+            "featureOrder",
+            "featureSchema",
+            "schema",
+            "schemaFields",
+            "ts",
+            "tsMs"
+    );
+
+    private static final Set<String> LABEL_KEYS = Set.of(
+            "label", "y", "Y", "target", "class", "win"
+    );
+
     private final MlTrainProperties props;
     private final MlSampleRepository sampleRepo;
     private final MlModelArtifactRepository artifactRepo;
     private final StrategySettingsService strategySettingsService;
     private final ObjectMapper objectMapper;
-
     private final ObjectProvider<MlClient> mlClientProvider;
     private final ApplicationEventPublisher eventPublisher;
 
+    /**
+     * cooldown по конкретному контексту
+     */
     private final Map<String, Instant> lastTrainAt = new ConcurrentHashMap<>();
 
     @Override
     public MlTrainingResult trainNow(Long chatId, StrategyType type, String reason) {
 
         if (props == null || !props.isEnabled()) {
+            log.warn("🧠 TRAIN SKIP: training disabled");
             return new MlTrainingResult(false, false, null, null, null, "training_disabled");
         }
+
         if (chatId == null || chatId <= 0 || type == null) {
+            log.warn("🧠 TRAIN SKIP: bad args chatId={} type={}", chatId, type);
             return new MlTrainingResult(false, false, null, null, null, "bad_args");
         }
 
         MlClient mlClient = mlClientProvider != null ? mlClientProvider.getIfAvailable() : null;
         if (mlClient == null) {
+            log.warn("🧠 TRAIN SKIP: MlClient missing");
             return new MlTrainingResult(false, false, null, null, null, "ml_client_missing");
         }
 
-        StrategySettings ss = strategySettingsService.getOrCreate(chatId, type);
-        if (ss == null) {
+        StrategySettings ss;
+        try {
+            ss = strategySettingsService.getOrCreate(chatId, type);
+        } catch (Exception e) {
+            log.warn("🧠 TRAIN getOrCreate settings failed chatId={} type={} err={}", chatId, type, e.toString());
             return new MlTrainingResult(false, false, null, null, null, "strategy_settings_missing");
         }
 
-        String reasonNorm = (reason == null || reason.isBlank()) ? "manual" : reason.trim();
+        if (ss == null) {
+            log.warn("🧠 TRAIN SKIP: strategy settings null chatId={} type={}", chatId, type);
+            return new MlTrainingResult(false, false, null, null, null, "strategy_settings_missing");
+        }
+
+        String reasonNorm = normTrim(reason);
+        if (reasonNorm == null) {
+            reasonNorm = "auto";
+        }
 
         Instant now = Instant.now();
         Instant from = now.minus(Math.max(1, props.getLookbackDays()), ChronoUnit.DAYS);
 
         String symbol = normUpper(ss.getSymbol());
-        String tf = normLower(ss.getTimeframe());
+        String timeframe = normLower(ss.getTimeframe());
 
-        if (symbol == null || tf == null) {
-            Pair symTf = inferSymbolTfFromSamples(chatId, type, from);
-            if (symbol == null) symbol = symTf.symbol;
-            if (tf == null) tf = symTf.timeframe;
+        // если в настройках пусто — пробуем взять из samples
+        if (symbol == null || timeframe == null) {
+            Pair inferred = inferSymbolTfFromSamples(chatId, type, from);
+            if (symbol == null) {
+                symbol = inferred.symbol();
+            }
+            if (timeframe == null) {
+                timeframe = inferred.timeframe();
+            }
         }
 
-        if (symbol == null) return new MlTrainingResult(false, false, null, null, null, "symbol_missing");
-        if (tf == null) return new MlTrainingResult(false, false, null, null, null, "timeframe_missing");
+        if (symbol == null) {
+            log.warn("🧠 TRAIN SKIP: symbol missing chatId={} type={}", chatId, type);
+            return new MlTrainingResult(false, false, null, null, null, "symbol_missing");
+        }
 
-        String cdKey = cooldownKey(chatId, type, symbol, tf);
-        Instant last = lastTrainAt.get(cdKey);
-        long cooldownMin = Math.max(0, props.getCooldownMinutes());
-        if (last != null && ChronoUnit.MINUTES.between(last, now) < cooldownMin) {
-            return new MlTrainingResult(false, false, null, null, null, "cooldown");
+        if (timeframe == null) {
+            log.warn("🧠 TRAIN SKIP: timeframe missing chatId={} type={} symbol={}", chatId, type, symbol);
+            return new MlTrainingResult(false, false, null, null, null, "timeframe_missing");
+        }
+
+        String cooldownKey = cooldownKey(chatId, type, symbol, timeframe);
+        Instant last = lastTrainAt.get(cooldownKey);
+        long cooldownMinutes = Math.max(0, props.getCooldownMinutes());
+
+        if (last != null && cooldownMinutes > 0) {
+            long passed = ChronoUnit.MINUTES.between(last, now);
+            if (passed < cooldownMinutes) {
+                log.info("🧠 TRAIN SKIP: cooldown chatId={} type={} sym={} tf={} passed={}m need={}m",
+                        chatId, type, symbol, timeframe, passed, cooldownMinutes);
+                return new MlTrainingResult(false, false, null, null, null, "cooldown");
+            }
         }
 
         List<MlSampleEntity> recent = safeFindRecent(chatId, type, from);
+        if (recent.isEmpty()) {
+            log.warn("🧠 TRAIN SKIP: no recent samples chatId={} type={} from={}", chatId, type, from);
+            return new MlTrainingResult(false, false, null, null, null, "no_samples");
+        }
 
-        List<MlSampleEntity> samples = new ArrayList<>();
+        List<MlSampleEntity> filtered = new ArrayList<>();
         for (MlSampleEntity s : recent) {
             if (s == null) continue;
-            if (s.getFeaturesJson() == null) continue;
+            if (s.getFeaturesJson() == null || !s.getFeaturesJson().isObject()) continue;
 
-            Integer y = labelToIntOrNull(s.getLabel());
-            if (y == null) continue;
+            Integer label = labelToIntOrNull(s.getLabel());
+            if (label == null) continue;
 
             String sSym = normUpper(s.getSymbol());
             String sTf = normLower(s.getTimeframe());
 
             if (sSym != null && !symbol.equals(sSym)) continue;
-            if (sTf != null && !tf.equals(sTf)) continue;
+            if (sTf != null && !timeframe.equals(sTf)) continue;
 
-            samples.add(s);
+            filtered.add(s);
         }
 
-        if (samples.size() < props.getMinSamples()) {
-            return new MlTrainingResult(false, false, null, null, null, "not_enough_samples=" + samples.size());
+        if (filtered.size() < props.getMinSamples()) {
+            log.warn("🧠 TRAIN SKIP: not enough samples chatId={} type={} sym={} tf={} samples={} minSamples={}",
+                    chatId, type, symbol, timeframe, filtered.size(), props.getMinSamples());
+            return new MlTrainingResult(
+                    false,
+                    false,
+                    null,
+                    null,
+                    null,
+                    "not_enough_samples=" + filtered.size()
+            );
         }
 
         int rowsLimit = Math.max(100, props.getRowsLimit());
-        samples.sort(Comparator.comparing(MlTrainingServiceImpl::sampleTimeMs, Comparator.nullsLast(Comparator.reverseOrder())));
-        if (samples.size() > rowsLimit) {
-            samples = new ArrayList<>(samples.subList(0, rowsLimit));
+        filtered.sort(Comparator.comparing(MlTrainingServiceImpl::sampleTimeMs, Comparator.nullsLast(Comparator.reverseOrder())));
+        if (filtered.size() > rowsLimit) {
+            filtered = new ArrayList<>(filtered.subList(0, rowsLimit));
         }
-        samples.sort(Comparator.comparing(MlTrainingServiceImpl::sampleTimeMs, Comparator.nullsLast(Comparator.naturalOrder())));
+        filtered.sort(Comparator.comparing(MlTrainingServiceImpl::sampleTimeMs, Comparator.nullsLast(Comparator.naturalOrder())));
 
-        List<String> featureSchema = resolveFeatureSchema(samples);
+        List<String> featureSchema = resolveFeatureSchema(filtered);
         if (featureSchema == null || featureSchema.isEmpty()) {
+            log.warn("🧠 TRAIN SKIP: feature schema missing chatId={} type={} sym={} tf={}",
+                    chatId, type, symbol, timeframe);
             return new MlTrainingResult(false, false, null, null, null, "feature_schema_missing");
         }
 
-        String schemaHash = computeSchemaHash(featureSchema);
-        if (schemaHash == null) schemaHash = normTrim(ss.getMlSchemaHash());
-        if (schemaHash == null) schemaHash = "schema_v1";
+        String computedSchemaHash = computeSchemaHash(featureSchema);
 
-        if (!Objects.equals(normTrim(ss.getMlSchemaHash()), schemaHash)) {
-            ss.setMlSchemaHash(schemaHash);
-            try {
-                ss = strategySettingsService.save(ss);
-            } catch (Exception ignored) {
-            }
+        String settingsSchemaHash = normTrim(ss.getMlSchemaHash());
+        String finalRequestSchemaHash = computedSchemaHash != null ? computedSchemaHash : settingsSchemaHash;
+        if (finalRequestSchemaHash == null) {
+            finalRequestSchemaHash = "schema_v1";
         }
 
         String modelKey = normTrim(ss.getMlModelKey());
         if (modelKey == null) {
-            modelKey = type.name() + ":" + symbol + ":" + tf;
+            modelKey = buildModelKey(type, symbol, timeframe);
+        }
+
+        boolean settingsChangedBeforeTrain = false;
+
+        if (!Objects.equals(normTrim(ss.getMlModelKey()), modelKey)) {
+            ss.setMlModelKey(modelKey);
+            settingsChangedBeforeTrain = true;
+        }
+
+        if (!Objects.equals(normTrim(ss.getMlSchemaHash()), finalRequestSchemaHash)) {
+            ss.setMlSchemaHash(finalRequestSchemaHash);
+            settingsChangedBeforeTrain = true;
+        }
+
+        if (settingsChangedBeforeTrain) {
+            try {
+                ss = strategySettingsService.save(ss);
+            } catch (Exception e) {
+                log.warn("🧠 TRAIN pre-save settings failed chatId={} type={} err={}", chatId, type, e.toString());
+            }
+        }
+
+        List<Map<String, Object>> rows = toRows(filtered, featureSchema);
+        if (rows.isEmpty()) {
+            log.warn("🧠 TRAIN SKIP: rows empty after normalization chatId={} type={} sym={} tf={}",
+                    chatId, type, symbol, timeframe);
+            return new MlTrainingResult(false, false, modelKey, null, finalRequestSchemaHash, "rows_empty");
         }
 
         MlTrainRequest req = new MlTrainRequest();
         req.setChatId(chatId);
         req.setStrategyType(type.name());
         req.setSymbol(symbol);
-        req.setTimeframe(tf);
+        req.setTimeframe(timeframe);
         req.setModelKey(modelKey);
-        req.setSchemaHash(schemaHash);
+        req.setSchemaHash(finalRequestSchemaHash);
         req.setFeatureSchema(featureSchema);
-        req.setRows(toRows(samples, featureSchema));
+        req.setRows(rows);
 
-        Map<String, Object> params = new HashMap<>();
+        Map<String, Object> params = new LinkedHashMap<>();
         params.put("reason", reasonNorm);
-        params.put("rows", req.getRows() != null ? req.getRows().size() : 0);
+        params.put("rows", rows.size());
         params.put("from", from.toEpochMilli());
         params.put("to", now.toEpochMilli());
         params.put("modelKey", modelKey);
+        params.put("schemaHash", finalRequestSchemaHash);
         req.setParams(params);
 
-        log.info("🧠 TRAIN START chatId={} type={} sym={} tf={} rows={} schemaHash={} modelKey={} reason={}",
-                chatId, type, symbol, tf, params.get("rows"), schemaHash, modelKey, reasonNorm);
+        log.info("🧠 TRAIN START chatId={} type={} sym={} tf={} rows={} schemaSize={} schemaHash={} modelKey={} reason={}",
+                chatId, type, symbol, timeframe, rows.size(), featureSchema.size(), finalRequestSchemaHash, modelKey, reasonNorm);
 
         MlTrainResponse resp;
         try {
             resp = mlClient.train(req);
         } catch (Exception e) {
-            log.warn("🧠 TRAIN exception chatId={} type={} err={}", chatId, type, e.toString());
-            return new MlTrainingResult(false, false, modelKey, null, schemaHash, "train_exception");
+            log.warn("🧠 TRAIN exception chatId={} type={} sym={} tf={} err={}",
+                    chatId, type, symbol, timeframe, e.toString(), e);
+            return new MlTrainingResult(false, false, modelKey, null, finalRequestSchemaHash, "train_exception");
         }
 
-        if (resp == null || !resp.isOk()) {
-            return new MlTrainingResult(false, false, modelKey, null, schemaHash,
-                    resp != null ? resp.getError() : "train_null");
+        if (resp == null) {
+            log.warn("🧠 TRAIN FAIL: response is null chatId={} type={} sym={} tf={}",
+                    chatId, type, symbol, timeframe);
+            return new MlTrainingResult(false, false, modelKey, null, finalRequestSchemaHash, "train_null");
         }
 
-        String respSchema = normTrim(resp.getSchemaHash());
-        String finalSchemaHash = (respSchema != null ? respSchema : schemaHash);
-
-        try {
-            MlModelArtifactEntity art = MlModelArtifactEntity.builder()
-                    .chatId(chatId)
-                    .strategyType(type)
-                    .symbol(symbol)
-                    .timeframe(tf)
-                    .schemaHash(finalSchemaHash)
-                    .modelKey(resp.getModelKey() != null ? resp.getModelKey() : modelKey)
-                    .modelVersion(resp.getModelVersion())
-                    .metricsJson(resp.getMetricsJson())
-                    .createdAt(now)
-                    .build();
-            artifactRepo.save(art);
-        } catch (Exception e) {
-            log.warn("🧠 TRAIN artifact save failed chatId={} type={} err={}", chatId, type, e.toString());
+        if (!resp.isOk()) {
+            String error = normTrim(resp.getError()) != null ? resp.getError() : "train_not_ok";
+            log.warn("🧠 TRAIN FAIL: not_ok chatId={} type={} sym={} tf={} err={} modelKey={} schemaHash={}",
+                    chatId, type, symbol, timeframe, error, modelKey, finalRequestSchemaHash);
+            return new MlTrainingResult(
+                    false,
+                    false,
+                    modelKey,
+                    null,
+                    finalRequestSchemaHash,
+                    error
+            );
         }
+
+        String responseModelKey = normTrim(resp.getModelKey());
+        if (responseModelKey == null) {
+            responseModelKey = modelKey;
+        }
+
+        String responseModelVersion = normTrim(resp.getModelVersion());
+
+        String responseSchemaHash = normTrim(resp.getSchemaHash());
+        String finalSchemaHash = responseSchemaHash != null ? responseSchemaHash : finalRequestSchemaHash;
+
+        log.info("🧠 TRAIN RESPONSE ok=true chatId={} type={} sym={} tf={} modelKey={} modelVersion={} schemaHash={}",
+                chatId, type, symbol, timeframe, responseModelKey, responseModelVersion, finalSchemaHash);
+
+        saveArtifactSafe(
+                chatId,
+                type,
+                symbol,
+                timeframe,
+                responseModelKey,
+                responseModelVersion,
+                finalSchemaHash,
+                resp.getMetricsJson(),
+                now
+        );
 
         boolean applied = false;
-
-        if (props.isAutoApply()) {
+        try {
             AdvancedControlMode mode = ss.getAdvancedControlMode() != null
                     ? ss.getAdvancedControlMode()
                     : AdvancedControlMode.MANUAL;
 
-            ss.setMlModelKey(resp.getModelKey() != null ? resp.getModelKey() : modelKey);
-            ss.setMlModelVersion(resp.getModelVersion());
+            ss.setMlModelKey(responseModelKey);
+            ss.setMlModelVersion(responseModelVersion);
             ss.setMlSchemaHash(finalSchemaHash);
 
-            try {
-                BigDecimal minProb = ss.getGateMinProb();
-                if ((minProb == null || minProb.signum() <= 0) && props.getThresholdAutoEnable() > 0) {
-                    ss.setGateMinProb(BigDecimal.valueOf(props.getThresholdAutoEnable())
-                            .setScale(6, RoundingMode.HALF_UP));
-                }
-            } catch (Exception ignored) {
+            BigDecimal minProb = ss.getGateMinProb();
+            if ((minProb == null || minProb.signum() <= 0) && props.getThresholdAutoEnable() > 0) {
+                ss.setGateMinProb(
+                        BigDecimal.valueOf(props.getThresholdAutoEnable())
+                                .setScale(6, RoundingMode.HALF_UP)
+                );
             }
 
-            if (mode != AdvancedControlMode.MANUAL) {
+            if (mode == AdvancedControlMode.AI || mode == AdvancedControlMode.HYBRID) {
                 ss.setMlGateEnabled(true);
-                try {
-                    ss = strategySettingsService.save(ss);
-                    applied = true;
-                } catch (Exception e) {
-                    log.warn("🧠 TRAIN apply settings failed chatId={} type={} err={}", chatId, type, e.toString());
-                }
-            } else {
-                try {
-                    strategySettingsService.save(ss);
-                } catch (Exception ignored) {
-                }
             }
 
-            publishSettingsUpdated(chatId, type, "ml_train:" + reasonNorm);
+            strategySettingsService.save(ss);
+            applied = true;
+
+        } catch (Exception e) {
+            log.warn("🧠 TRAIN apply settings failed chatId={} type={} err={}", chatId, type, e.toString(), e);
         }
 
-        lastTrainAt.put(cdKey, now);
+        publishSettingsUpdated(chatId, type, "ml_train:" + reasonNorm);
 
-        log.info("🧠 TRAIN DONE chatId={} type={} applied={} modelKey={} ver={} schemaHash={}",
-                chatId, type, applied, (resp.getModelKey() != null ? resp.getModelKey() : modelKey), resp.getModelVersion(), finalSchemaHash);
+        // cooldown ставим только после успешного train
+        lastTrainAt.put(cooldownKey, now);
 
-        return new MlTrainingResult(true, applied,
-                (resp.getModelKey() != null ? resp.getModelKey() : modelKey),
-                resp.getModelVersion(),
+        log.info("🧠 TRAIN DONE chatId={} type={} sym={} tf={} applied={} modelKey={} ver={} schemaHash={}",
+                chatId, type, symbol, timeframe, applied, responseModelKey, responseModelVersion, finalSchemaHash);
+
+        return new MlTrainingResult(
+                true,
+                applied,
+                responseModelKey,
+                responseModelVersion,
                 finalSchemaHash,
-                null);
+                null
+        );
     }
 
     private List<MlSampleEntity> safeFindRecent(Long chatId, StrategyType type, Instant from) {
@@ -257,35 +371,50 @@ public class MlTrainingServiceImpl implements MlTrainingService {
     }
 
     private List<Map<String, Object>> toRows(List<MlSampleEntity> samples, List<String> featureSchema) {
-        List<Map<String, Object>> rows = new ArrayList<>(samples.size());
+        List<Map<String, Object>> rows = new ArrayList<>();
+        if (samples == null || samples.isEmpty() || featureSchema == null || featureSchema.isEmpty()) {
+            return rows;
+        }
 
         for (MlSampleEntity s : samples) {
-            JsonNode fj = s.getFeaturesJson();
-            if (fj == null) continue;
-
-            Integer y = labelToIntOrNull(s.getLabel());
-            if (y == null) continue;
-
-            @SuppressWarnings("unchecked")
-            Map<String, Object> features = objectMapper.convertValue(fj, Map.class);
-
-            Map<String, Object> row = new LinkedHashMap<>();
-
-            if (featureSchema != null && !featureSchema.isEmpty()) {
-                for (String k : featureSchema) {
-                    row.put(k, features.get(k));
-                }
-            } else {
-                TreeMap<String, Object> sorted = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
-                sorted.putAll(features);
-                row.putAll(sorted);
+            if (s == null || s.getFeaturesJson() == null || !s.getFeaturesJson().isObject()) {
+                continue;
             }
 
-            // ✅ Только один label-ключ.
+            Integer y = labelToIntOrNull(s.getLabel());
+            if (y == null) {
+                continue;
+            }
+
+            @SuppressWarnings("unchecked")
+            Map<String, Object> raw = objectMapper.convertValue(s.getFeaturesJson(), Map.class);
+
+            Map<String, Object> features = normalizeFeatureMap(raw);
+            if (features.isEmpty()) {
+                continue;
+            }
+
+            Map<String, Object> row = new LinkedHashMap<>();
+            boolean hasAll = true;
+
+            for (String key : featureSchema) {
+                if (!features.containsKey(key)) {
+                    hasAll = false;
+                    break;
+                }
+                row.put(key, features.get(key));
+            }
+
+            if (!hasAll) {
+                continue;
+            }
+
             row.put("y", y);
 
             if (s.getTs() != null) {
                 row.put("tsMs", s.getTs().toEpochMilli());
+            } else if (s.getCreatedAt() != null) {
+                row.put("tsMs", s.getCreatedAt().toEpochMilli());
             }
 
             rows.add(row);
@@ -294,13 +423,52 @@ public class MlTrainingServiceImpl implements MlTrainingService {
         return rows;
     }
 
+    private void saveArtifactSafe(Long chatId,
+                                  StrategyType type,
+                                  String symbol,
+                                  String timeframe,
+                                  String modelKey,
+                                  String modelVersion,
+                                  String schemaHash,
+                                  String metricsJson,
+                                  Instant createdAt) {
+        try {
+            MlModelArtifactEntity art = MlModelArtifactEntity.builder()
+                    .chatId(chatId)
+                    .strategyType(type)
+                    .symbol(symbol)
+                    .timeframe(timeframe)
+                    .schemaHash(schemaHash)
+                    .modelKey(modelKey)
+                    .modelVersion(modelVersion)
+                    .metricsJson(metricsJson)
+                    .createdAt(createdAt)
+                    .build();
+
+            artifactRepo.save(art);
+
+            log.info("🧠 TRAIN artifact saved chatId={} type={} sym={} tf={} modelKey={} modelVersion={}",
+                    chatId, type, symbol, timeframe, modelKey, modelVersion);
+
+        } catch (Exception e) {
+            log.warn("🧠 TRAIN artifact save failed chatId={} type={} err={}", chatId, type, e.toString(), e);
+        }
+    }
+
     private void publishSettingsUpdated(Long chatId, StrategyType type, String source) {
         try {
-            if (eventPublisher == null) return;
-            long cid = chatId != null ? chatId : 0L;
-            String src = (source == null || source.isBlank()) ? "ml_train" : source.trim();
-            eventPublisher.publishEvent(new StrategySettingsUpdatedEvent(cid, type, src));
-        } catch (Exception ignored) {
+            if (eventPublisher == null || chatId == null || type == null) {
+                return;
+            }
+
+            String src = normTrim(source);
+            if (src == null) {
+                src = "ml_train";
+            }
+
+            eventPublisher.publishEvent(new StrategySettingsUpdatedEvent(chatId, type, src));
+        } catch (Exception e) {
+            log.debug("🧠 TRAIN publishSettingsUpdated ignored: {}", e.toString());
         }
     }
 
@@ -308,61 +476,89 @@ public class MlTrainingServiceImpl implements MlTrainingService {
         return chatId + ":" + type.name() + ":" + symbol + ":" + tf;
     }
 
-    private static List<String> resolveFeatureSchema(List<MlSampleEntity> samples) {
-        if (samples == null || samples.isEmpty()) return null;
+    private static String buildModelKey(StrategyType type, String symbol, String tf) {
+        return type.name() + ":" + symbol + ":" + tf;
+    }
 
-        JsonNode meta = samples.get(0).getMetaJson();
-        if (meta != null) {
-            JsonNode spec = meta.get("featureSpec");
+    private static List<String> resolveFeatureSchema(List<MlSampleEntity> samples) {
+        if (samples == null || samples.isEmpty()) {
+            return null;
+        }
+
+        for (MlSampleEntity s : samples) {
+            if (s == null || s.getMetaJson() == null) continue;
+
+            JsonNode spec = s.getMetaJson().get("featureSpec");
             if (spec != null && spec.isArray() && spec.size() > 0) {
-                List<String> out = new ArrayList<>();
+                LinkedHashSet<String> ordered = new LinkedHashSet<>();
+
                 for (JsonNode n : spec) {
                     if (n == null || n.isNull()) continue;
-                    String s = n.asText(null);
-                    if (s != null && !s.isBlank()) out.add(s.trim());
+                    String name = normKey(n.asText(null));
+                    if (name == null) continue;
+                    if (META_KEYS.contains(name)) continue;
+                    if (LABEL_KEYS.contains(name)) continue;
+                    ordered.add(name);
                 }
-                if (!out.isEmpty()) return out;
+
+                if (!ordered.isEmpty()) {
+                    return new ArrayList<>(ordered);
+                }
             }
         }
 
-        JsonNode fj = samples.get(0).getFeaturesJson();
-        if (fj != null && fj.isObject()) {
+        TreeSet<String> all = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+
+        for (MlSampleEntity s : samples) {
+            JsonNode fj = s != null ? s.getFeaturesJson() : null;
+            if (fj == null || !fj.isObject()) continue;
+
             Iterator<String> it = fj.fieldNames();
-            List<String> keys = new ArrayList<>();
-            while (it.hasNext()) keys.add(it.next());
-            keys.sort(String.CASE_INSENSITIVE_ORDER);
-            return keys.isEmpty() ? null : keys;
-        }
-
-        try {
-            Set<String> all = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
-            for (MlSampleEntity s : samples) {
-                JsonNode x = s != null ? s.getFeaturesJson() : null;
-                if (x == null || !x.isObject()) continue;
-                Iterator<String> it = x.fieldNames();
-                while (it.hasNext()) all.add(it.next());
+            while (it.hasNext()) {
+                String raw = it.next();
+                String key = normKey(raw);
+                if (key == null) continue;
+                if (META_KEYS.contains(key)) continue;
+                if (LABEL_KEYS.contains(key)) continue;
+                all.add(key);
             }
-            if (!all.isEmpty()) return new ArrayList<>(all);
-        } catch (Exception ignored) {
         }
 
-        return null;
+        if (all.isEmpty()) {
+            return null;
+        }
+
+        return new ArrayList<>(all);
     }
 
     private static String computeSchemaHash(List<String> keys) {
         if (keys == null || keys.isEmpty()) return null;
-        return sha256(String.join(",", keys));
+
+        List<String> normalized = new ArrayList<>();
+        for (String k : keys) {
+            String nk = normKey(k);
+            if (nk != null) {
+                normalized.add(nk);
+            }
+        }
+
+        if (normalized.isEmpty()) return null;
+
+        return sha256(String.join("|", normalized));
     }
 
     private static String sha256(String s) {
         try {
             MessageDigest md = MessageDigest.getInstance("SHA-256");
             byte[] dig = md.digest((s == null ? "" : s).getBytes(StandardCharsets.UTF_8));
+
             StringBuilder sb = new StringBuilder(dig.length * 2);
-            for (byte b : dig) sb.append(String.format("%02x", b));
+            for (byte b : dig) {
+                sb.append(String.format("%02x", b));
+            }
             return sb.toString();
         } catch (Exception e) {
-            return "sha256_error";
+            return null;
         }
     }
 
@@ -377,30 +573,54 @@ public class MlTrainingServiceImpl implements MlTrainingService {
 
     private Pair inferSymbolTfFromSamples(Long chatId, StrategyType type, Instant from) {
         try {
-            List<MlSampleEntity> r = safeFindRecent(chatId, type, from);
-            if (r == null || r.isEmpty()) return new Pair(null, null);
+            List<MlSampleEntity> recent = safeFindRecent(chatId, type, from);
+            if (recent.isEmpty()) {
+                return new Pair(null, null);
+            }
 
-            r.sort(Comparator.comparing(MlTrainingServiceImpl::sampleTimeMs, Comparator.nullsLast(Comparator.reverseOrder())));
-            for (MlSampleEntity s : r) {
+            recent.sort(Comparator.comparing(MlTrainingServiceImpl::sampleTimeMs, Comparator.nullsLast(Comparator.reverseOrder())));
+
+            for (MlSampleEntity s : recent) {
+                if (s == null) continue;
+                if (s.getFeaturesJson() == null || !s.getFeaturesJson().isObject()) continue;
+                if (labelToIntOrNull(s.getLabel()) == null) continue;
+
                 String sym = normUpper(s.getSymbol());
                 String tf = normLower(s.getTimeframe());
-                if (sym != null && tf != null) return new Pair(sym, tf);
+
+                if (sym != null && tf != null) {
+                    return new Pair(sym, tf);
+                }
             }
-            return new Pair(null, null);
         } catch (Exception ignored) {
-            return new Pair(null, null);
         }
+
+        return new Pair(null, null);
     }
 
     private static Integer labelToIntOrNull(String lbl) {
         if (lbl == null) return null;
+
         String s = lbl.trim();
         if (s.isEmpty()) return null;
 
         String u = s.toUpperCase(Locale.ROOT);
 
-        if (u.equals("WIN") || u.equals("TP") || u.equals("TAKE_PROFIT") || u.equals("PROFIT") || u.equals("TRUE")) return 1;
-        if (u.equals("LOSS") || u.equals("SL") || u.equals("STOP_LOSS") || u.equals("STOP") || u.equals("FALSE")) return 0;
+        if (u.equals("WIN") || u.equals("TP") || u.equals("TAKE_PROFIT") || u.equals("PROFIT") || u.equals("TRUE")) {
+            return 1;
+        }
+
+        if (u.equals("LOSS") || u.equals("SL") || u.equals("STOP_LOSS") || u.equals("STOP") || u.equals("FALSE")) {
+            return 0;
+        }
+
+        if (u.equals("YES") || u.equals("Y")) {
+            return 1;
+        }
+
+        if (u.equals("NO") || u.equals("N")) {
+            return 0;
+        }
 
         try {
             int v = Integer.parseInt(s);
@@ -408,10 +628,56 @@ public class MlTrainingServiceImpl implements MlTrainingService {
         } catch (Exception ignored) {
         }
 
-        if (u.equals("YES") || u.equals("Y")) return 1;
-        if (u.equals("NO") || u.equals("N")) return 0;
-
         return null;
+    }
+
+    private static Map<String, Object> normalizeFeatureMap(Map<String, Object> in) {
+        LinkedHashMap<String, Object> out = new LinkedHashMap<>();
+        if (in == null || in.isEmpty()) {
+            return out;
+        }
+
+        for (Map.Entry<String, Object> e : in.entrySet()) {
+            String key = normKey(e.getKey());
+            if (key == null) continue;
+            if (META_KEYS.contains(key)) continue;
+            if (LABEL_KEYS.contains(key)) continue;
+
+            Object value = normalizeValue(e.getValue());
+            out.put(key, value);
+        }
+
+        return out;
+    }
+
+    private static Object normalizeValue(Object v) {
+        if (v == null) return null;
+
+        if (v instanceof Enum<?> en) {
+            return en.name();
+        }
+
+        if (v instanceof Instant inst) {
+            return inst.toEpochMilli();
+        }
+
+        if (v instanceof Float f) {
+            if (!Float.isFinite(f)) return null;
+            return (double) f;
+        }
+
+        if (v instanceof Double d) {
+            if (!Double.isFinite(d)) return null;
+            return d;
+        }
+
+        return v;
+    }
+
+    private static String normKey(String s) {
+        if (s == null) return null;
+        String v = s.trim();
+        return v.isEmpty() ? null : v;
     }
 
     private static String normTrim(String s) {

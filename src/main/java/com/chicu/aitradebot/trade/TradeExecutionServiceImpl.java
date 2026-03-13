@@ -166,10 +166,23 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         boolean paperBlocksNow = paperMode && paperBlocksRealOrders && net == NetworkType.MAINNET;
 
         MlGateDecision mlGate = evaluateMlGate(ss);
+
+        if (mlGate.bypassed()) {
+            String logKey = buildMlGateLogKey(chatId, strategyType, ex, net, sym) + ":bypass";
+            if (shouldLogNow(logKey, ML_GATE_LOG_THROTTLE_MS)) {
+                log.info("⚠️ [Вход] ML gate BYPASS | reason={} | conf={} minProb={} | chatId={} {} {} ex={} net={}",
+                        mlGate.reason(),
+                        QtyMath.strip(mlGate.confidence()),
+                        QtyMath.strip(mlGate.minProb()),
+                        chatId, strategyType, sym, ex, net);
+            }
+        }
+
         if (mlGate.reject()) {
             String logKey = buildMlGateLogKey(chatId, strategyType, ex, net, sym);
             if (shouldLogNow(logKey, ML_GATE_LOG_THROTTLE_MS)) {
-                log.info("⛔ [Вход] ML gate отклонил вход | conf={} < minProb={} | chatId={} {} {} ex={} net={}",
+                log.info("⛔ [Вход] ML gate отклонил вход | reason={} | conf={} < minProb={} | chatId={} {} {} ex={} net={}",
+                        mlGate.reason(),
                         QtyMath.strip(mlGate.confidence()),
                         QtyMath.strip(mlGate.minProb()),
                         chatId, strategyType, sym, ex, net);
@@ -332,7 +345,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             BigDecimal tpExec = calcTp(executedPrice, tpPct);
             BigDecimal slExec = calcSl(executedPrice, slPct);
 
-            persistEntryRisk(orderId, tpExec, slExec);
+            persistEntryRisk(orderId, ex, net, tpExec, slExec);
 
             failCooldown.clear(key);
             failCooldown.clear(key + EXIT_KEY_SUFFIX);
@@ -493,7 +506,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         } catch (Exception ignored) {}
 
         if (posOpt.isEmpty()) {
-            Optional<RecoveredPosition> recovered = recoverOpenPositionFromOrders(chatId, strategyType, sym, effectiveTime);
+            Optional<RecoveredPosition> recovered = recoverOpenPositionFromOrders(chatId, strategyType, sym, ex, net, effectiveTime);
             if (recovered.isPresent()) {
                 RecoveredPosition rp = recovered.get();
 
@@ -530,8 +543,8 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                 if (posOpt.isPresent()) {
                     PositionStore.PositionSnapshot snap = posOpt.get();
                     if (snap.qty() != null && snap.qty().signum() > 0) effQty = snap.qty();
-                    if (snap.tp() != null && snap.tp().signum() > 0) effTp = snap.tp();
-                    if (snap.sl() != null && snap.sl().signum() > 0) effSl = snap.sl();
+                    if (snap.tp()  != null && snap.tp().signum()  > 0) effTp  = snap.tp();
+                    if (snap.sl()  != null && snap.sl().signum()  > 0) effSl  = snap.sl();
                     if (snap.entryPrice() != null && snap.entryPrice().signum() > 0) entryPriceFromStore = snap.entryPrice();
 
                     log.warn("♻️ [Выход] Позиция восстановлена из истории перед SELL | chatId={} {} {} ex={} net={} qty={} entry={}",
@@ -783,13 +796,20 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                                String reason) {}
 
     private record MlGateDecision(boolean reject,
+                                  boolean bypassed,
                                   BigDecimal confidence,
-                                  BigDecimal minProb) {
+                                  BigDecimal minProb,
+                                  String reason) {
         static MlGateDecision pass(BigDecimal confidence, BigDecimal minProb) {
-            return new MlGateDecision(false, confidence, minProb);
+            return new MlGateDecision(false, false, confidence, minProb, "pass");
         }
-        static MlGateDecision reject(BigDecimal confidence, BigDecimal minProb) {
-            return new MlGateDecision(true, confidence, minProb);
+
+        static MlGateDecision bypass(BigDecimal confidence, BigDecimal minProb, String reason) {
+            return new MlGateDecision(false, true, confidence, minProb, reason);
+        }
+
+        static MlGateDecision reject(BigDecimal confidence, BigDecimal minProb, String reason) {
+            return new MlGateDecision(true, false, confidence, minProb, reason);
         }
     }
 
@@ -898,7 +918,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             return false;
         }
 
-        Optional<RecoveredPosition> recovered = recoverOpenPositionFromOrders(chatId, strategyType, symbol, now);
+        Optional<RecoveredPosition> recovered = recoverOpenPositionFromOrders(chatId, strategyType, symbol, exchange, network, now);
         if (recovered.isEmpty()) {
             return false;
         }
@@ -954,6 +974,8 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
     private Optional<RecoveredPosition> recoverOpenPositionFromOrders(Long chatId,
                                                                       StrategyType strategyType,
                                                                       String symbol,
+                                                                      String exchange,
+                                                                      NetworkType network,
                                                                       Instant fallbackNow) {
         if (chatId == null || strategyType == null || symbol == null) {
             return Optional.empty();
@@ -975,14 +997,19 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             return Optional.empty();
         }
 
+        List<OrderEntity> scoped = filterOrdersByContext(orders, strategyType, exchange, network);
+        if (scoped.isEmpty()) {
+            scoped = filterOrdersLegacy(orders, strategyType);
+        }
+        if (scoped.isEmpty()) {
+            return Optional.empty();
+        }
+
         List<OpenLot> openLots = new ArrayList<>();
 
-        for (OrderEntity order : orders) {
+        for (OrderEntity order : scoped) {
             if (order == null) continue;
             if (!Boolean.TRUE.equals(order.getFilled())) continue;
-
-            String orderStrategy = safe(order.getStrategyType());
-            if (orderStrategy == null || !orderStrategy.equalsIgnoreCase(strategyType.name())) continue;
 
             String side = normalizeUpperNullable(order.getSide());
             BigDecimal qty = positiveOrNull(order.getQuantity());
@@ -1068,6 +1095,44 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         ));
     }
 
+    private List<OrderEntity> filterOrdersByContext(List<OrderEntity> orders,
+                                                    StrategyType strategyType,
+                                                    String exchange,
+                                                    NetworkType network) {
+        List<OrderEntity> out = new ArrayList<>();
+        String st = strategyType.name();
+        String ex = safeExchange(exchange);
+        String net = (network != null ? network.name() : null);
+
+        for (OrderEntity o : orders) {
+            if (o == null) continue;
+            if (!st.equalsIgnoreCase(safe(o.getStrategyType()))) continue;
+
+            String rowEx = safeExchange(o.getExchangeName());
+            String rowNet = normalizeUpperNullable(o.getNetworkType());
+
+            if (rowEx == null || rowNet == null) continue;
+            if (!rowEx.equals(ex)) continue;
+            if (!rowNet.equals(net)) continue;
+
+            out.add(o);
+        }
+        return out;
+    }
+
+    private List<OrderEntity> filterOrdersLegacy(List<OrderEntity> orders,
+                                                 StrategyType strategyType) {
+        List<OrderEntity> out = new ArrayList<>();
+        String st = strategyType.name();
+
+        for (OrderEntity o : orders) {
+            if (o == null) continue;
+            if (!st.equalsIgnoreCase(safe(o.getStrategyType()))) continue;
+            out.add(o);
+        }
+        return out;
+    }
+
     private Instant resolveOrderInstant(OrderEntity order, Instant fallback) {
         if (order == null) return fallback;
 
@@ -1091,8 +1156,11 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             return MlGateDecision.pass(BigDecimal.ZERO, BigDecimal.ZERO);
         }
 
+        BigDecimal confidenceRaw = ss.getMlConfidence();
+        BigDecimal confidence = normalizeProb(confidenceRaw);
+
         if (!ss.isMlGateEnabled()) {
-            return MlGateDecision.pass(normalizeProb(ss.getMlConfidence()), BigDecimal.ZERO);
+            return MlGateDecision.pass(confidence, BigDecimal.ZERO);
         }
 
         AdvancedControlMode mode = ss.getAdvancedControlMode() != null
@@ -1100,20 +1168,37 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                 : AdvancedControlMode.MANUAL;
 
         if (mode == AdvancedControlMode.MANUAL) {
-            return MlGateDecision.pass(normalizeProb(ss.getMlConfidence()), BigDecimal.ZERO);
+            return MlGateDecision.pass(confidence, BigDecimal.ZERO);
         }
 
         BigDecimal minProb = normalizeProb(ss.getGateMinProb());
         if (minProb.signum() <= 0) {
-            return MlGateDecision.pass(normalizeProb(ss.getMlConfidence()), minProb);
+            return MlGateDecision.pass(confidence, minProb);
         }
 
-        BigDecimal conf = normalizeProb(ss.getMlConfidence());
-        if (conf.compareTo(minProb) < 0) {
-            return MlGateDecision.reject(conf, minProb);
+        boolean mlConfidenceMissing = (confidenceRaw == null);
+
+        if (mlConfidenceMissing && mode == AdvancedControlMode.HYBRID) {
+            return MlGateDecision.bypass(
+                    BigDecimal.ZERO,
+                    minProb,
+                    "hybrid_fail_open_no_ml_confidence"
+            );
         }
 
-        return MlGateDecision.pass(conf, minProb);
+        if (mlConfidenceMissing && mode == AdvancedControlMode.AI) {
+            return MlGateDecision.reject(
+                    BigDecimal.ZERO,
+                    minProb,
+                    "ai_mode_requires_ml_confidence"
+            );
+        }
+
+        if (confidence.compareTo(minProb) < 0) {
+            return MlGateDecision.reject(confidence, minProb, "confidence_below_threshold");
+        }
+
+        return MlGateDecision.pass(confidence, minProb);
     }
 
     private BigDecimal normalizeProb(BigDecimal value) {
@@ -1305,6 +1390,8 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
     }
 
     private void persistEntryRisk(Long orderId,
+                                  String exchange,
+                                  NetworkType network,
                                   BigDecimal tp,
                                   BigDecimal sl) {
         if (orderId == null || orderRepository == null) return;
@@ -1312,6 +1399,18 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         try {
             orderRepository.findById(orderId).ifPresent(entity -> {
                 boolean changed = false;
+
+                String ex = safeExchange(exchange);
+                if (ex != null && !ex.equalsIgnoreCase(entity.getExchangeName())) {
+                    entity.setExchangeName(ex);
+                    changed = true;
+                }
+
+                String net = (network != null ? network.name() : null);
+                if (net != null && !net.equalsIgnoreCase(safe(entity.getNetworkType()))) {
+                    entity.setNetworkType(net);
+                    changed = true;
+                }
 
                 if (tp != null && tp.signum() > 0 &&
                     (entity.getTakeProfitPrice() == null || entity.getTakeProfitPrice().compareTo(tp) != 0)) {
@@ -1330,7 +1429,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                 }
             });
         } catch (Exception e) {
-            log.warn("⚠️ [Вход] Не удалось дописать TP/SL в orders id={} err={}", orderId, e.toString());
+            log.warn("⚠️ [Вход] Не удалось дописать TP/SL/context в orders id={} err={}", orderId, e.toString());
         }
     }
 

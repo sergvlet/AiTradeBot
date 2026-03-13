@@ -8,6 +8,7 @@ import com.chicu.aitradebot.market.model.Candle;
 import com.chicu.aitradebot.market.model.UnifiedKline;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 
@@ -24,26 +25,34 @@ public class MarketDataStreamService {
 
     private static final int MAX_CANDLES = 2_000;
 
-    /** ✅ цикл разорван — берём лениво */
+    /** цикл разорван — берём лениво */
     private final ObjectProvider<BinanceSpotWebSocketClient> binanceWsProvider;
 
-    /** ✅ общий кэш свечей для бэктеста/дашборда */
+    /** общий кэш свечей для бэктеста/дашборда */
     private final MarketStreamManager streamManager;
 
-    /** ✅ публикуем события (если оркестратор слушает @EventListener) */
+    /** публикуем события */
     private final ApplicationEventPublisher eventPublisher;
 
     /** seq для логов/троттлинга */
     private final AtomicLong seq = new AtomicLong(0);
 
     /**
-     * ✅ Хранилище свечей строго по ключу:
+     * Хранилище свечей строго по ключу:
      * (chatId, type, ex, net, symbol, tf)
      */
     private final ConcurrentMap<CandleStoreKey, Deque<Candle>> candleStorage = new ConcurrentHashMap<>();
 
-    /** chatId → set of подписок (строго с ex+net+sym+tf) */
+    /**
+     * chatId -> set of подписок
+     */
     private final ConcurrentMap<Long, Set<SubscriptionKey>> activeSubscriptions = new ConcurrentHashMap<>();
+
+    @Value("${market.stream.health.maxSilenceMs:45000}")
+    private long maxSilenceMs;
+
+    @Value("${market.stream.health.requireFastChannel:false}")
+    private boolean requireFastChannel;
 
     public MarketDataStreamService(ObjectProvider<BinanceSpotWebSocketClient> binanceWsProvider,
                                    MarketStreamManager streamManager,
@@ -54,7 +63,7 @@ public class MarketDataStreamService {
     }
 
     // =====================================================================
-    // ✅ EVENTS (должны быть public, т.к. их читает другой пакет)
+    // EVENTS
     // =====================================================================
 
     public static record MarketTickEvent(
@@ -79,8 +88,20 @@ public class MarketDataStreamService {
             UnifiedKline kline
     ) {}
 
+    public static record SubscriptionHealth(
+            boolean subscribed,
+            boolean klineConnected,
+            boolean aggTradeConnected,
+            boolean bookTickerConnected,
+            long lastKlineAgeMs,
+            long lastAggTradeAgeMs,
+            long lastBookTickerAgeMs,
+            boolean degraded,
+            String reason
+    ) {}
+
     // =====================================================================
-    // ✅ API ДЛЯ MarketStreamServiceImpl
+    // API ДЛЯ MarketStreamServiceImpl
     // =====================================================================
 
     public void subscribe(String exchange,
@@ -99,9 +120,9 @@ public class MarketDataStreamService {
                             String symbol,
                             String timeframe) {
 
-        String ex  = normExchange(exchange);
+        String ex = normExchange(exchange);
         String sym = normSymbol(symbol);
-        String tf  = normTf(timeframe);
+        String tf = normTf(timeframe);
 
         if (ex == null || networkType == null || strategyType == null || sym == null || tf == null) return;
 
@@ -133,7 +154,7 @@ public class MarketDataStreamService {
     }
 
     /**
-     * ✅ Реальный tick:
+     * Реальный tick:
      * - строим synthetic candle по timeframe (из тиков)
      * - обновляем candleStorage + streamManager
      * - при смене бакета возвращаем candleClosed (UnifiedKline)
@@ -150,9 +171,9 @@ public class MarketDataStreamService {
 
         long n = seq.incrementAndGet();
 
-        String ex  = normExchange(exchange);
+        String ex = normExchange(exchange);
         String sym = normSymbol(symbol);
-        String tf  = normTf(timeframe);
+        String tf = normTf(timeframe);
 
         if (ex == null || networkType == null || chatId <= 0 || strategyType == null || sym == null) {
             return new MarketPushResult(n, false, false, false, null);
@@ -162,7 +183,6 @@ public class MarketDataStreamService {
             return new MarketPushResult(n, false, false, false, null);
         }
 
-        // ✅ публикуем тик-событие (если оркестратор слушает)
         publishSafe(new MarketTickEvent(ex, networkType, chatId, strategyType, sym, tf, price, qty, tradeTsMs));
 
         boolean pushedCandle = false;
@@ -191,11 +211,10 @@ public class MarketDataStreamService {
                     pushedCandle = true;
 
                 } else if (last.getTime() == openTime) {
-                    // update forming candle
                     double open = last.getOpen();
                     double high = Math.max(last.getHigh(), p);
-                    double low  = Math.min(last.getLow(), p);
-                    double vol  = last.getVolume() + v;
+                    double low = Math.min(last.getLow(), p);
+                    double vol = last.getVolume() + v;
 
                     Candle c = new Candle(openTime, open, high, low, p, vol, false);
                     deque.pollLast();
@@ -203,7 +222,6 @@ public class MarketDataStreamService {
                     pushedCandle = true;
 
                 } else if (last.getTime() < openTime) {
-                    // закрываем предыдущий бакет
                     Candle prevClosed = new Candle(
                             last.getTime(),
                             last.getOpen(),
@@ -229,10 +247,8 @@ public class MarketDataStreamService {
                             .closed(true)
                             .build();
 
-                    // ✅ публикуем закрытие свечи
                     publishSafe(new CandleClosedEvent(ex, networkType, chatId, strategyType, sym, tf, candleClosed));
 
-                    // новый forming бакет
                     Candle c = new Candle(openTime, p, p, p, p, v, false);
                     deque.addLast(c);
                     createdCandle = true;
@@ -263,16 +279,15 @@ public class MarketDataStreamService {
 
         if (kline == null || strategyType == null) return;
 
-        String ex  = normExchange(exchange);
+        String ex = normExchange(exchange);
         String sym = normSymbol(symbol);
-        String tf  = normTf(timeframe);
+        String tf = normTf(timeframe);
 
         if (ex == null || networkType == null || sym == null || tf == null) return;
 
         if (kline.getSymbol() == null || kline.getSymbol().isBlank()) kline.setSymbol(sym);
         if (kline.getTimeframe() == null || kline.getTimeframe().isBlank()) kline.setTimeframe(tf);
 
-        // ✅ если это закрытая свеча — публикуем событие закрытия
         if (kline.isClosed()) {
             publishSafe(new CandleClosedEvent(ex, networkType, chatId, strategyType, sym, tf, kline));
         }
@@ -295,7 +310,7 @@ public class MarketDataStreamService {
         if (ex == null || networkType == null) return;
 
         String sym = normSymbol(kline.getSymbol());
-        String tf  = normTf(kline.getTimeframe());
+        String tf = normTf(kline.getTimeframe());
 
         if (sym == null || tf == null) return;
 
@@ -311,7 +326,7 @@ public class MarketDataStreamService {
     ) {}
 
     // =====================================================================
-    // 🕯 + 🔥 Подписка на свечи и live ticks
+    // Подписка на свечи и live ticks
     // =====================================================================
 
     public void subscribeCandles(String exchange,
@@ -321,9 +336,9 @@ public class MarketDataStreamService {
                                  String symbol,
                                  String timeframe) {
 
-        String ex  = normExchange(exchange);
+        String ex = normExchange(exchange);
         String sym = normSymbol(symbol);
-        String tf  = normTf(timeframe);
+        String tf = normTf(timeframe);
 
         if (ex == null || networkType == null || strategyType == null || sym == null || tf == null) {
             log.warn("⚠️ [STREAM] subscribeCandles пропуск: chatId={} type={} ex={} net={} symbol={} tf={}",
@@ -342,38 +357,51 @@ public class MarketDataStreamService {
                 activeSubscriptions.computeIfAbsent(chatId, __ -> ConcurrentHashMap.newKeySet());
 
         SubscriptionKey key = new SubscriptionKey(strategyType, ex, networkType, sym, tf);
-
-        if (!subs.add(key)) {
-            log.debug("⏭ [STREAM] Уже подписаны: chatId={} type={} ex={} net={} {} {}",
-                    chatId, strategyType, ex, networkType, sym, tf);
-            return;
-        }
+        boolean added = subs.add(key);
 
         if (!"BINANCE".equalsIgnoreCase(ex)) {
-            subs.remove(key);
-            candleStorage.remove(new CandleStoreKey(chatId, strategyType, ex, networkType, sym, tf));
+            if (added) {
+                subs.remove(key);
+                candleStorage.remove(new CandleStoreKey(chatId, strategyType, ex, networkType, sym, tf));
+            }
             log.warn("⚠️ [STREAM] subscribeCandles: биржа '{}' пока не подключена для WS", ex);
             return;
         }
 
         BinanceSpotWebSocketClient ws = binanceWsProvider.getIfAvailable();
         if (ws == null) {
-            subs.remove(key);
-            candleStorage.remove(new CandleStoreKey(chatId, strategyType, ex, networkType, sym, tf));
+            if (added) {
+                subs.remove(key);
+                candleStorage.remove(new CandleStoreKey(chatId, strategyType, ex, networkType, sym, tf));
+            }
             log.error("❌ [STREAM] BINANCE ws client отсутствует (bean not available) chatId={} type={}", chatId, strategyType);
             return;
         }
 
         try {
+            // даже если ключ уже был в activeSubscriptions — повторно подтверждаем желаемые подписки.
             ws.subscribeKline(networkType, sym, tf, chatId, strategyType);
             ws.subscribeAggTrade(networkType, sym, tf, chatId, strategyType);
             ws.subscribeBookTicker(networkType, sym, chatId, strategyType);
 
-            log.info("📡 [STREAM] SUBSCRIBE WS: chatId={} type={} ex={} net={} {} {} (KLINE+AGGTRADE+BOOK_TICKER)",
-                    chatId, strategyType, ex, networkType, sym, tf);
+            if (added) {
+                log.info("📡 [STREAM] SUBSCRIBE WS: chatId={} type={} ex={} net={} {} {} (KLINE+AGGTRADE+BOOK_TICKER)",
+                        chatId, strategyType, ex, networkType, sym, tf);
+            } else {
+                log.debug("⏭ [STREAM] Подписка уже была, подтверждаю каналы: chatId={} type={} ex={} net={} {} {}",
+                        chatId, strategyType, ex, networkType, sym, tf);
+            }
         } catch (Exception e) {
+            try { ws.unsubscribeKline(networkType, sym, tf, chatId, strategyType); } catch (Exception ignored) {}
+            try { ws.unsubscribeAggTrade(networkType, sym, tf, chatId, strategyType); } catch (Exception ignored) {}
+            try { ws.unsubscribeBookTicker(networkType, sym, chatId, strategyType); } catch (Exception ignored) {}
+
             subs.remove(key);
             candleStorage.remove(new CandleStoreKey(chatId, strategyType, ex, networkType, sym, tf));
+
+            if (subs.isEmpty()) {
+                activeSubscriptions.remove(chatId, subs);
+            }
 
             log.error("❌ [STREAM] SUBSCRIBE FAILED chatId={} type={} ex={} net={} {} {} err={}",
                     chatId, strategyType, ex, networkType, sym, tf, e.getMessage(), e);
@@ -399,12 +427,114 @@ public class MarketDataStreamService {
 
             try {
                 unsubscribe(k.exchange(), k.networkType(), chatId, k.strategyType(), k.symbol(), k.timeframe());
-            } catch (Exception ignored) {}
+            } catch (Exception ignored) {
+            }
         }
     }
 
     // =====================================================================
-    // 🕯 CALLBACK ДЛЯ LIVE СВЕЧЕЙ
+    // HEALTH / DEGRADED
+    // =====================================================================
+
+    public SubscriptionHealth getSubscriptionHealth(long chatId,
+                                                    StrategyType strategyType,
+                                                    String exchange,
+                                                    NetworkType networkType,
+                                                    String symbol,
+                                                    String timeframe) {
+
+        String ex = normExchange(exchange);
+        String sym = normSymbol(symbol);
+        String tf = normTf(timeframe);
+
+        if (chatId <= 0 || strategyType == null || ex == null || networkType == null || sym == null || tf == null) {
+            return new SubscriptionHealth(false, false, false, false, -1L, -1L, -1L, true, "invalid_args");
+        }
+
+        SubscriptionKey subKey = new SubscriptionKey(strategyType, ex, networkType, sym, tf);
+        Set<SubscriptionKey> subs = activeSubscriptions.get(chatId);
+        boolean subscribed = subs != null && subs.contains(subKey);
+
+        if (!subscribed) {
+            return new SubscriptionHealth(false, false, false, false, -1L, -1L, -1L, true, "not_subscribed");
+        }
+
+        if (!"BINANCE".equalsIgnoreCase(ex)) {
+            return new SubscriptionHealth(true, false, false, false, -1L, -1L, -1L, false, "health_unsupported_exchange");
+        }
+
+        BinanceSpotWebSocketClient ws = binanceWsProvider.getIfAvailable();
+        if (ws == null) {
+            return new SubscriptionHealth(true, false, false, false, -1L, -1L, -1L, true, "ws_client_missing");
+        }
+
+        String wsSym = sym.toLowerCase(Locale.ROOT);
+        String wsTf = tf.toLowerCase(Locale.ROOT);
+
+        boolean klineConnected = ws.isConnected(chatId, strategyType, networkType, wsSym, wsTf, "KLINE");
+        boolean aggConnected = ws.isConnected(chatId, strategyType, networkType, wsSym, wsTf, "AGG_TRADE");
+        boolean bookConnected = ws.isConnected(chatId, strategyType, networkType, wsSym, wsTf, "BOOK_TICKER");
+
+        long now = System.currentTimeMillis();
+        long klineAge = ageMs(ws.getLastMessageAt(buildWsKeyKline(chatId, strategyType, networkType, wsSym, wsTf)), now);
+        long aggAge = ageMs(ws.getLastMessageAt(buildWsKeyAgg(chatId, strategyType, networkType, wsSym)), now);
+        long bookAge = ageMs(ws.getLastMessageAt(buildWsKeyBook(chatId, strategyType, networkType, wsSym)), now);
+
+        long silence = Math.max(5_000L, maxSilenceMs);
+
+        boolean klineFresh = klineConnected && isFresh(klineAge, silence);
+        boolean aggFresh = aggConnected && isFresh(aggAge, silence);
+        boolean bookFresh = bookConnected && isFresh(bookAge, silence);
+
+        boolean fastOk = aggFresh || bookFresh;
+        boolean degraded;
+
+        if (requireFastChannel) {
+            degraded = !klineFresh || !fastOk;
+        } else {
+            degraded = !klineFresh && !fastOk;
+        }
+
+        String reason;
+        if (!klineConnected && !aggConnected && !bookConnected) {
+            reason = "all_channels_disconnected";
+            degraded = true;
+        } else if (!klineFresh && !fastOk) {
+            reason = "all_channels_stale";
+        } else if (!klineFresh && requireFastChannel) {
+            reason = "kline_stale";
+        } else if (!fastOk && requireFastChannel) {
+            reason = "fast_channels_stale";
+        } else if (degraded) {
+            reason = "degraded";
+        } else {
+            reason = "ok";
+        }
+
+        return new SubscriptionHealth(
+                true,
+                klineConnected,
+                aggConnected,
+                bookConnected,
+                klineAge,
+                aggAge,
+                bookAge,
+                degraded,
+                reason
+        );
+    }
+
+    public boolean isDegraded(long chatId,
+                              StrategyType strategyType,
+                              String exchange,
+                              NetworkType networkType,
+                              String symbol,
+                              String timeframe) {
+        return getSubscriptionHealth(chatId, strategyType, exchange, networkType, symbol, timeframe).degraded();
+    }
+
+    // =====================================================================
+    // CALLBACK ДЛЯ LIVE СВЕЧЕЙ
     // =====================================================================
 
     public void onCandle(long chatId,
@@ -415,9 +545,9 @@ public class MarketDataStreamService {
                          String timeframe,
                          Candle candle) {
 
-        String ex  = normExchange(exchange);
+        String ex = normExchange(exchange);
         String sym = normSymbol(symbol);
-        String tf  = normTf(timeframe);
+        String tf = normTf(timeframe);
 
         if (ex == null || networkType == null || strategyType == null || sym == null || tf == null || candle == null) return;
 
@@ -447,7 +577,7 @@ public class MarketDataStreamService {
     }
 
     // =====================================================================
-    // ✅ ПУБЛИЧНЫЙ API ДЛЯ БЭКТЕСТА/ТЮНЕРА (КЭШ С LIMIT)
+    // ПУБЛИЧНЫЙ API ДЛЯ БЭКТЕСТА/ТЮНЕРА (КЭШ С LIMIT)
     // =====================================================================
 
     public List<Candle> getCachedCandles(long chatId,
@@ -458,9 +588,9 @@ public class MarketDataStreamService {
                                          String timeframe,
                                          int limit) {
 
-        String ex  = normExchange(exchange);
+        String ex = normExchange(exchange);
         String sym = normSymbol(symbol);
-        String tf  = normTf(timeframe);
+        String tf = normTf(timeframe);
 
         if (chatId <= 0 || strategyType == null || ex == null || networkType == null || sym == null || tf == null) {
             return List.of();
@@ -495,10 +625,10 @@ public class MarketDataStreamService {
         for (Map.Entry<CandleStoreKey, Deque<Candle>> e : candleStorage.entrySet()) {
             CandleStoreKey k = e.getKey();
             if (k == null) continue;
-            if (k.chatId != chatId) continue;
-            if (k.strategyType != strategyType) continue;
-            if (!sym.equals(k.symbol)) continue;
-            if (!tf.equals(k.timeframe)) continue;
+            if (k.chatId() != chatId) continue;
+            if (k.strategyType() != strategyType) continue;
+            if (!sym.equals(k.symbol())) continue;
+            if (!tf.equals(k.timeframe())) continue;
 
             Deque<Candle> d = e.getValue();
             if (d == null) continue;
@@ -538,9 +668,9 @@ public class MarketDataStreamService {
                                    String symbol,
                                    String timeframe) {
 
-        String ex  = normExchange(exchange);
+        String ex = normExchange(exchange);
         String sym = normSymbol(symbol);
-        String tf  = normTf(timeframe);
+        String tf = normTf(timeframe);
 
         if (ex == null || networkType == null || strategyType == null || sym == null || tf == null) return List.of();
 
@@ -560,9 +690,9 @@ public class MarketDataStreamService {
                            String timeframe,
                            List<Candle> candles) {
 
-        String ex  = normExchange(exchange);
+        String ex = normExchange(exchange);
         String sym = normSymbol(symbol);
-        String tf  = normTf(timeframe);
+        String tf = normTf(timeframe);
 
         if (ex == null || networkType == null || strategyType == null || sym == null || tf == null) return;
 
@@ -602,7 +732,8 @@ public class MarketDataStreamService {
         for (SubscriptionKey key : List.copyOf(subs)) {
             try {
                 unsubscribe(key.exchange(), key.networkType(), chatId, key.strategyType(), key.symbol(), key.timeframe());
-            } catch (Exception ignored) {}
+            } catch (Exception ignored) {
+            }
         }
 
         activeSubscriptions.remove(chatId);
@@ -633,25 +764,27 @@ public class MarketDataStreamService {
     }
 
     // =====================================================================
-    // MarketStreamManager (без reflection)
+    // MarketStreamManager
     // =====================================================================
 
     private void pushToStreamManager(String exchange, NetworkType network, String symbol, String timeframe, Candle candle) {
         if (streamManager == null || candle == null) return;
         try {
             streamManager.addCandle(exchange, network, symbol, timeframe, candle);
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {
+        }
     }
 
     // =====================================================================
-    // events: safe publish
+    // events
     // =====================================================================
 
     private void publishSafe(Object event) {
         if (eventPublisher == null || event == null) return;
         try {
             eventPublisher.publishEvent(event);
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {
+        }
     }
 
     // =====================================================================
@@ -690,7 +823,7 @@ public class MarketDataStreamService {
     }
 
     // =====================================================================
-    // ✅ timeframe parser
+    // timeframe parser
     // =====================================================================
 
     private static long parseTimeframeMs(String tf) {
@@ -705,8 +838,11 @@ public class MarketDataStreamService {
         if (numStr.isEmpty()) return -1;
 
         long n;
-        try { n = Long.parseLong(numStr); }
-        catch (Exception e) { return -1; }
+        try {
+            n = Long.parseLong(numStr);
+        } catch (Exception e) {
+            return -1;
+        }
 
         if (n <= 0) return -1;
 
@@ -721,11 +857,15 @@ public class MarketDataStreamService {
     }
 
     private static double safeDouble(BigDecimal v) {
-        try { return v.doubleValue(); } catch (Exception e) { return 0.0; }
+        try {
+            return v.doubleValue();
+        } catch (Exception e) {
+            return 0.0;
+        }
     }
 
     // =====================================================================
-    // ✅ UnifiedKline -> Candle (safe)
+    // UnifiedKline -> Candle
     // =====================================================================
 
     private Candle toCandleSafe(UnifiedKline kline) {
@@ -751,5 +891,41 @@ public class MarketDataStreamService {
         double vd = (v != null ? safeDouble(v) : 0.0);
 
         return new Candle(openTime, od, hd, ld, cd, vd, closed);
+    }
+
+    // =====================================================================
+    // WS health helpers
+    // =====================================================================
+
+    private static String buildWsKeyAgg(long chatId,
+                                        StrategyType strategyType,
+                                        NetworkType net,
+                                        String symLower) {
+        return "BINANCE:" + net + ":" + chatId + ":" + strategyType.name() + ":" + symLower + ":AGG_TRADE";
+    }
+
+    private static String buildWsKeyBook(long chatId,
+                                         StrategyType strategyType,
+                                         NetworkType net,
+                                         String symLower) {
+        return "BINANCE:" + net + ":" + chatId + ":" + strategyType.name() + ":" + symLower + ":BOOK_TICKER";
+    }
+
+    private static String buildWsKeyKline(long chatId,
+                                          StrategyType strategyType,
+                                          NetworkType net,
+                                          String symLower,
+                                          String tfLower) {
+        return "BINANCE:" + net + ":" + chatId + ":" + strategyType.name() + ":" + symLower + ":" + tfLower + ":KLINE";
+    }
+
+    private static boolean isFresh(long ageMs, long maxSilenceMs) {
+        return ageMs >= 0 && ageMs <= maxSilenceMs;
+    }
+
+    private static long ageMs(Long lastTs, long now) {
+        if (lastTs == null || lastTs <= 0L) return -1L;
+        long age = now - lastTs;
+        return Math.max(age, 0L);
     }
 }

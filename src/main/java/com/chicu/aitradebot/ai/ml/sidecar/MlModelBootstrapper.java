@@ -8,16 +8,22 @@ import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
 
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.nio.file.StandardCopyOption;
+import java.io.IOException;
+import java.nio.file.*;
+import java.nio.file.attribute.FileTime;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Locale;
 
 @Slf4j
 @Component
 @RequiredArgsConstructor
-@Order(Ordered.HIGHEST_PRECEDENCE) // ✅ 1) сначала кладём модель
+@Order(Ordered.HIGHEST_PRECEDENCE) // ✅ сначала пытаемся восстановить базовую модель
 public class MlModelBootstrapper implements ApplicationRunner {
+
+    private static final String MODEL_FILE_NAME = "model.joblib";
+    private static final String META_SUFFIX = ".meta.json";
 
     private final MlSidecarProperties sidecar;
 
@@ -32,7 +38,7 @@ public class MlModelBootstrapper implements ApplicationRunner {
 
             Path target = Paths.get(targetStr).toAbsolutePath().normalize();
 
-            if (Files.exists(target)) {
+            if (Files.exists(target) && isUsableModelFile(target)) {
                 log.info("🧠 [ML-BOOT] model exists: {}", target);
                 return;
             }
@@ -42,14 +48,13 @@ public class MlModelBootstrapper implements ApplicationRunner {
                 Files.createDirectories(parent);
             }
 
-            Path found = findCandidateModel();
+            Path found = findBestCandidateModel(target);
             if (found == null) {
                 log.warn("🧠 [ML-BOOT] model.joblib не найден (target останется пуст): {}", target);
                 return;
             }
 
-            // если вдруг target и found указывают на одно и то же
-            if (found.equals(target)) {
+            if (sameFileSafe(found, target)) {
                 log.info("🧠 [ML-BOOT] source == target, skip copy: {}", target);
                 return;
             }
@@ -57,33 +62,176 @@ public class MlModelBootstrapper implements ApplicationRunner {
             Files.copy(found, target, StandardCopyOption.REPLACE_EXISTING);
             log.info("🧠 [ML-BOOT] copied model: {} -> {}", found, target);
 
+            copyMetaIfExists(found, target);
+
         } catch (Exception e) {
             log.warn("🧠 [ML-BOOT] failed: {}", e.getMessage(), e);
         }
     }
 
-    private Path findCandidateModel() {
+    /**
+     * Ищем ЛУЧШУЮ модель:
+     * 1) сначала прямой model.joblib в известных местах
+     * 2) потом самый свежий *.joblib во всех известных каталогах
+     */
+    private Path findBestCandidateModel(Path target) {
+        List<Path> roots = collectSearchRoots(target);
+
+        // 1. Сначала пробуем точное имя model.joblib
+        for (Path root : roots) {
+            if (root == null) continue;
+
+            Path direct = root.resolve(MODEL_FILE_NAME).toAbsolutePath().normalize();
+            if (sameFileSafe(direct, target)) continue;
+
+            if (isUsableModelFile(direct)) {
+                log.info("🧠 [ML-BOOT] found direct candidate: {}", direct);
+                return direct;
+            }
+        }
+
+        // 2. Затем ищем любой самый свежий *.joblib
+        List<Path> allCandidates = new ArrayList<>();
+
+        for (Path root : roots) {
+            if (root == null || !Files.isDirectory(root)) continue;
+
+            try (DirectoryStream<Path> ds = Files.newDirectoryStream(root, "*.joblib")) {
+                for (Path p : ds) {
+                    Path abs = p.toAbsolutePath().normalize();
+
+                    if (sameFileSafe(abs, target)) continue;
+                    if (!isUsableModelFile(abs)) continue;
+
+                    allCandidates.add(abs);
+                }
+            } catch (Exception e) {
+                log.debug("🧠 [ML-BOOT] scan skipped root={} err={}", root, e.toString());
+            }
+        }
+
+        if (allCandidates.isEmpty()) {
+            return null;
+        }
+
+        allCandidates.sort(Comparator
+                .comparing(this::lastModifiedSafe, Comparator.nullsLast(Comparator.naturalOrder()))
+                .reversed()
+                .thenComparing(Path::toString));
+
+        Path best = allCandidates.get(0);
+        log.info("🧠 [ML-BOOT] found latest candidate: {}", best);
+        return best;
+    }
+
+    private List<Path> collectSearchRoots(Path target) {
+        List<Path> roots = new ArrayList<>();
+
         String userDir = safe(System.getProperty("user.dir"));
         String workDir = safe(sidecar.getWorkDir());
 
-        Path[] candidates = new Path[] {
-                // где чаще всего лежит “старая” модель
-                (userDir != null ? Paths.get(userDir, "model.joblib") : null),
-                (workDir != null ? Paths.get(workDir, "model.joblib") : null),
-                (userDir != null ? Paths.get(userDir, "ml-models", "model.joblib") : null),
-                (workDir != null ? Paths.get(workDir, "ml-models", "model.joblib") : null),
-        };
+        addIfDirectoryOrPotentialRoot(roots, userDir);
+        addIfDirectoryOrPotentialRoot(roots, workDir);
 
-        for (Path c : candidates) {
-            try {
-                if (c != null && Files.exists(c)) {
-                    return c.toAbsolutePath().normalize();
+        if (userDir != null) {
+            roots.add(Paths.get(userDir, "ml-models").toAbsolutePath().normalize());
+        }
+        if (workDir != null) {
+            roots.add(Paths.get(workDir, "ml-models").toAbsolutePath().normalize());
+        }
+
+        Path targetParent = target != null ? target.getParent() : null;
+        if (targetParent != null) {
+            roots.add(targetParent.toAbsolutePath().normalize());
+        }
+
+        // убираем дубли
+        List<Path> unique = new ArrayList<>();
+        for (Path p : roots) {
+            if (p == null) continue;
+
+            boolean exists = false;
+            for (Path u : unique) {
+                if (samePath(u, p)) {
+                    exists = true;
+                    break;
                 }
-            } catch (Exception ignore) {
-                // ignore
+            }
+            if (!exists) {
+                unique.add(p);
             }
         }
-        return null;
+
+        return unique;
+    }
+
+    private void addIfDirectoryOrPotentialRoot(List<Path> roots, String raw) {
+        if (raw == null) return;
+        try {
+            Path p = Paths.get(raw).toAbsolutePath().normalize();
+            roots.add(p);
+        } catch (Exception ignored) {
+            // ignore
+        }
+    }
+
+    private void copyMetaIfExists(Path sourceModel, Path targetModel) {
+        try {
+            Path sourceMeta = metaPath(sourceModel);
+            Path targetMeta = metaPath(targetModel);
+
+            if (Files.exists(sourceMeta) && Files.isRegularFile(sourceMeta)) {
+                Files.copy(sourceMeta, targetMeta, StandardCopyOption.REPLACE_EXISTING);
+                log.info("🧠 [ML-BOOT] copied meta: {} -> {}", sourceMeta, targetMeta);
+            } else {
+                log.info("🧠 [ML-BOOT] meta not found for source model: {}", sourceMeta);
+            }
+        } catch (Exception e) {
+            log.warn("🧠 [ML-BOOT] meta copy failed: {}", e.getMessage());
+        }
+    }
+
+    private Path metaPath(Path modelPath) {
+        return Paths.get(modelPath.toString() + META_SUFFIX).toAbsolutePath().normalize();
+    }
+
+    private boolean isUsableModelFile(Path path) {
+        try {
+            if (path == null) return false;
+            if (!Files.exists(path)) return false;
+            if (!Files.isRegularFile(path)) return false;
+
+            String fileName = path.getFileName() != null ? path.getFileName().toString() : "";
+            if (!fileName.toLowerCase(Locale.ROOT).endsWith(".joblib")) return false;
+
+            long size = Files.size(path);
+            return size > 0;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private FileTime lastModifiedSafe(Path path) {
+        try {
+            return Files.getLastModifiedTime(path);
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    private boolean sameFileSafe(Path a, Path b) {
+        if (a == null || b == null) return false;
+        try {
+            return Files.exists(a) && Files.exists(b) && Files.isSameFile(a, b);
+        } catch (Exception ignored) {
+            return samePath(a, b);
+        }
+    }
+
+    private boolean samePath(Path a, Path b) {
+        if (a == null || b == null) return false;
+        return a.toAbsolutePath().normalize().toString()
+                .equalsIgnoreCase(b.toAbsolutePath().normalize().toString());
     }
 
     private static String safe(String s) {

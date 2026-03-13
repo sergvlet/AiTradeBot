@@ -27,15 +27,18 @@ public class MlHealthProbe implements ApplicationRunner {
     private final ObjectProvider<MlClient> clientProvider;
 
     /**
-     * Прод-режим: если ML включён и недоступен — валим старт приложения.
-     * По умолчанию false (удобно для dev).
+     * Если sidecar/health реально недоступен — можно валить старт.
+     * Но отсутствие модели не должно убивать приложение:
+     * иначе бот не сможет подняться и сам обучить новую модель.
      */
     @Value("${ml.failFast:false}")
     private boolean failFast;
 
     /**
-     * Прод-режим: если ML включён, но модели нет — считаем это проблемой.
-     * По умолчанию false.
+     * Требовать наличие модели на старте.
+     * ВАЖНО:
+     * теперь это только WARNING, а не падение приложения.
+     * Иначе после самочистки/ротации бот не сможет стартовать.
      */
     @Value("${ml.requireModel:false}")
     private boolean requireModel;
@@ -51,7 +54,9 @@ public class MlHealthProbe implements ApplicationRunner {
         MlClient client = clientProvider != null ? clientProvider.getIfAvailable() : null;
         if (client == null) {
             String msg = "🧠 ML включён (ml.enabled=true), но MlClient bean отсутствует (проверь MlConfig/ConditionalOnProperty)";
-            if (failFast) throw new IllegalStateException(msg);
+            if (failFast) {
+                throw new IllegalStateException(msg);
+            }
             startup("WARN", msg);
             return;
         }
@@ -59,7 +64,9 @@ public class MlHealthProbe implements ApplicationRunner {
         String baseUrl = (props.getBaseUrl() == null ? "" : props.getBaseUrl().trim());
         if (baseUrl.isEmpty()) {
             String msg = "🧠 ML включён (ml.enabled=true), но ml.baseUrl пустой";
-            if (failFast) throw new IllegalStateException(msg);
+            if (failFast) {
+                throw new IllegalStateException(msg);
+            }
             startup("WARN", msg);
             return;
         }
@@ -70,23 +77,28 @@ public class MlHealthProbe implements ApplicationRunner {
         try {
             MlHealthResponse h = client.health();
 
-            // ✅ НИКАКИХ прямых getOk()/getModelExists() — всё через reflection
             Boolean ok = asBool(readAny(h, "getOk", "isOk", "ok"));
             if (ok == null || !ok) {
                 String err = asStr(readAny(h, "getError", "error", "getMessage", "message"));
                 String msg = "❌ ML service NOT OK: ok=" + ok + " error=" + (err == null ? "null" : err);
-                if (failFast) throw new IllegalStateException(msg);
+
+                if (failFast) {
+                    throw new IllegalStateException(msg);
+                }
+
                 startup("WARN", "🧠 {}", msg);
                 return;
             }
 
             Boolean xgboost = asBool(readAny(h, "isXgboost", "getXgboost", "getXGBoost", "xgboost"));
-            Boolean modelExists = asBool(readAny(h,
+            Boolean modelExists = asBool(readAny(
+                    h,
                     "isModelExists", "getModelExists", "modelExists",
                     "getModel_exists", "model_exists"
             ));
 
-            String modelVersion = asStr(readAny(h,
+            String modelVersion = asStr(readAny(
+                    h,
                     "getModelVersion", "modelVersion",
                     "getModel_version", "model_version"
             ));
@@ -94,22 +106,31 @@ public class MlHealthProbe implements ApplicationRunner {
             String version = asStr(readAny(h, "getVersion", "version"));
             String modelsDir = asStr(readAny(h, "getModelsDir", "modelsDir"));
 
-            startup("INFO", "✅ ML service OK: ok=true version={} xgboost={} model_exists={} modelVersion={} modelsDir={}",
-                    nn(version), nn(xgboost), nn(modelExists), nn(modelVersion), nn(modelsDir));
+            startup("INFO",
+                    "✅ ML service OK: ok=true version={} xgboost={} model_exists={} modelVersion={} modelsDir={}",
+                    nn(version), nn(xgboost), nn(modelExists), nn(modelVersion), nn(modelsDir)
+            );
 
+            // ✅ КЛЮЧЕВАЯ ПРАВКА:
+            // отсутствие модели больше НЕ валит приложение.
+            // Это только предупреждение, чтобы бот мог подняться и затем обучить новую модель.
             if (requireModel) {
                 if (modelExists == null) {
-                    startup("WARN", "⚠️ ml.requireModel=true, но в health-ответе нет model_exists (нужен геттер/поле в MlHealthResponse).");
+                    startup("WARN",
+                            "⚠️ ml.requireModel=true, но в health-ответе нет model_exists (нужен геттер/поле в MlHealthResponse).");
                 } else if (!modelExists) {
-                    String msg = "❌ ml.requireModel=true, но model_exists=false — сначала обучи модель (/train), потом запускай AI/HYBRID";
-                    if (failFast) throw new IllegalStateException(msg);
-                    startup("WARN", msg);
+                    startup("WARN",
+                            "⚠️ ml.requireModel=true, но model_exists=false — приложение НЕ останавливается. Сначала обучи новую модель (/train), затем включай AI/HYBRID для торговли.");
                 }
             }
 
         } catch (Exception e) {
             String msg = "❌ ML health-check failed: " + e.getMessage();
-            if (failFast) throw new IllegalStateException(msg, e);
+
+            if (failFast) {
+                throw new IllegalStateException(msg, e);
+            }
+
             startup("WARN", "🧠 {}", msg);
         }
     }
@@ -135,27 +156,39 @@ public class MlHealthProbe implements ApplicationRunner {
         try {
             if (props != null && props.getHealth() != null) {
                 String v = props.getHealth().getStartupLogLevel();
-                if (v != null && !v.isBlank()) lvl = v;
+                if (v != null && !v.isBlank()) {
+                    lvl = v;
+                }
             }
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {
+        }
 
         // ✅ backward-compat: ml.healthStartupLogLevel
         if (lvl == null) {
             try {
                 String v = props != null ? props.getHealthStartupLogLevel() : null;
-                if (v != null && !v.isBlank()) lvl = v;
-            } catch (Exception ignored) {}
+                if (v != null && !v.isBlank()) {
+                    lvl = v;
+                }
+            } catch (Exception ignored) {
+            }
         }
 
-        if (lvl == null || lvl.isBlank()) lvl = defaultLevel;
+        if (lvl == null || lvl.isBlank()) {
+            lvl = defaultLevel;
+        }
 
         return lvl.trim().toUpperCase(Locale.ROOT);
     }
 
     private static String trimSlash(String s) {
-        if (s == null) return "";
+        if (s == null) {
+            return "";
+        }
         String t = s.trim();
-        while (t.endsWith("/")) t = t.substring(0, t.length() - 1);
+        while (t.endsWith("/")) {
+            t = t.substring(0, t.length() - 1);
+        }
         return t;
     }
 
@@ -166,19 +199,28 @@ public class MlHealthProbe implements ApplicationRunner {
      * 3) поле по имени (включая private)
      */
     private static Object readAny(Object target, String... names) {
-        if (target == null || names == null) return null;
+        if (target == null || names == null) {
+            return null;
+        }
 
         for (String n : names) {
-            if (n == null || n.isBlank()) continue;
+            if (n == null || n.isBlank()) {
+                continue;
+            }
 
             // 1) public method exact
             try {
                 for (Method m : target.getClass().getMethods()) {
-                    if (!m.getName().equals(n)) continue;
-                    if (m.getParameterCount() != 0) continue;
+                    if (!m.getName().equals(n)) {
+                        continue;
+                    }
+                    if (m.getParameterCount() != 0) {
+                        continue;
+                    }
                     return m.invoke(target);
                 }
-            } catch (Exception ignore) { /* ignore */ }
+            } catch (Exception ignore) {
+            }
 
             // 2) getter/is variants если n выглядит как "ok"
             if (!n.startsWith("get") && !n.startsWith("is")) {
@@ -187,17 +229,21 @@ public class MlHealthProbe implements ApplicationRunner {
                 try {
                     Method m = target.getClass().getMethod("get" + cap);
                     return m.invoke(target);
-                } catch (Exception ignore) { /* ignore */ }
+                } catch (Exception ignore) {
+                }
 
                 try {
                     Method m = target.getClass().getMethod("is" + cap);
                     return m.invoke(target);
-                } catch (Exception ignore) { /* ignore */ }
+                } catch (Exception ignore) {
+                }
             }
 
             // 3) field exact (including private)
             Object fv = readField(target, n);
-            if (fv != null) return fv;
+            if (fv != null) {
+                return fv;
+            }
         }
 
         return null;
@@ -216,24 +262,38 @@ public class MlHealthProbe implements ApplicationRunner {
                 }
             }
         } catch (Exception ignore) {
-            // ignore
         }
         return null;
     }
 
     private static Boolean asBool(Object v) {
-        if (v == null) return null;
-        if (v instanceof Boolean b) return b;
-        if (v instanceof Number n) return n.intValue() != 0;
+        if (v == null) {
+            return null;
+        }
+        if (v instanceof Boolean b) {
+            return b;
+        }
+        if (v instanceof Number n) {
+            return n.intValue() != 0;
+        }
+
         String s = String.valueOf(v).trim().toLowerCase(Locale.ROOT);
-        if (s.isEmpty()) return null;
-        if (s.equals("true") || s.equals("1") || s.equals("yes") || s.equals("y")) return true;
-        if (s.equals("false") || s.equals("0") || s.equals("no") || s.equals("n")) return false;
+        if (s.isEmpty()) {
+            return null;
+        }
+        if (s.equals("true") || s.equals("1") || s.equals("yes") || s.equals("y")) {
+            return true;
+        }
+        if (s.equals("false") || s.equals("0") || s.equals("no") || s.equals("n")) {
+            return false;
+        }
         return null;
     }
 
     private static String asStr(Object v) {
-        if (v == null) return null;
+        if (v == null) {
+            return null;
+        }
         String s = String.valueOf(v).trim();
         return s.isEmpty() ? null : s;
     }
