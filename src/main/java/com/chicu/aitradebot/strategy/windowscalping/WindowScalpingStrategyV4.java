@@ -109,6 +109,12 @@ public class WindowScalpingStrategyV4 implements
     @Value("${strategy.window.mlLogThrottleMs:30000}")
     private long mlLogThrottleMs;
 
+    @Value("${strategy.window.mlBelowThresholdCooldownMs:2500}")
+    private long mlBelowThresholdCooldownMs;
+
+    @Value("${strategy.window.mlRecheckMinPriceMovePct:0.03}")
+    private double mlRecheckMinPriceMovePct;
+
     // =====================================================
     // AUTO-TUNE ON HOLD
     // =====================================================
@@ -229,6 +235,11 @@ public class WindowScalpingStrategyV4 implements
         Instant lastMlPredictAt;
         BigDecimal lastMlPredictPrice;
         Prediction lastMlPrediction;
+
+        Instant lastMlBelowThresholdAt;
+        BigDecimal lastMlBelowThresholdPrice;
+        Double lastMlBelowThresholdProba;
+        Double lastMlBelowThresholdThreshold;
 
         Instant lastMlWarnAt;
         String lastMlWarnReason;
@@ -361,6 +372,7 @@ public class WindowScalpingStrategyV4 implements
 
         resetMlCache(st);
         clearPendingMlSample(st);
+        clearMlBelowThreshold(st);
         st.lastMlWarnAt = null;
         st.lastMlWarnReason = null;
         st.lastEntryBlockedAt = null;
@@ -753,6 +765,11 @@ public class WindowScalpingStrategyV4 implements
                 return;
             }
 
+            if (isMlGateAllowed(ss) && shouldSkipMlRecheckAfterBelowThreshold(st, price, time)) {
+                pushHoldThrottled(chatId, sym, st, "ml_below_threshold", time, holdMs);
+                return;
+            }
+
             Map<String, Object> entryFeatures = buildMlFeatures(
                     chatId, st, sym, price, time,
                     low, high, range, rangePct, pos,
@@ -785,11 +802,13 @@ public class WindowScalpingStrategyV4 implements
                     maybePersistMlConfidence(st, ss, pred.proba, time);
 
                     if (pred.proba + 1e-12 < threshold) {
-                        log.info("[WINDOW] 🤖 HOLD: ML ниже порога chatId={} sym={} proba={} threshold={}",
-                                chatId, sym, fmt(pred.proba), fmt(threshold));
+                        rememberMlBelowThreshold(st, price, pred.proba, threshold, time);
+                        logMlBelowThresholdThrottled(chatId, sym, st, pred.proba, threshold, time);
                         pushHoldThrottled(chatId, sym, st, "ml_below_threshold", time, holdMs);
                         return;
                     }
+
+                    clearMlBelowThreshold(st);
                 }
             }
 
@@ -1782,6 +1801,94 @@ public class WindowScalpingStrategyV4 implements
         st.lastMlPredictAt = null;
         st.lastMlPredictPrice = null;
         st.lastMlPrediction = null;
+        clearMlBelowThreshold(st);
+    }
+
+    private void clearMlBelowThreshold(LocalState st) {
+        if (st == null) return;
+        st.lastMlBelowThresholdAt = null;
+        st.lastMlBelowThresholdPrice = null;
+        st.lastMlBelowThresholdProba = null;
+        st.lastMlBelowThresholdThreshold = null;
+    }
+
+    private void rememberMlBelowThreshold(LocalState st,
+                                          BigDecimal price,
+                                          double proba,
+                                          double threshold,
+                                          Instant now) {
+        if (st == null) return;
+        st.lastMlBelowThresholdAt = now;
+        st.lastMlBelowThresholdPrice = price;
+        st.lastMlBelowThresholdProba = proba;
+        st.lastMlBelowThresholdThreshold = threshold;
+    }
+
+    private boolean shouldSkipMlRecheckAfterBelowThreshold(LocalState st,
+                                                           BigDecimal currentPrice,
+                                                           Instant now) {
+        if (st == null || now == null) return false;
+        if (st.lastMlBelowThresholdAt == null) return false;
+
+        long cooldownMs = Math.max(300L, mlBelowThresholdCooldownMs);
+        long ageMs = Duration.between(st.lastMlBelowThresholdAt, now).toMillis();
+        if (ageMs < 0) return false;
+        if (ageMs >= cooldownMs) return false;
+
+        return !hasEnoughPriceMoveForMlRecheck(st.lastMlBelowThresholdPrice, currentPrice);
+    }
+
+    private boolean hasEnoughPriceMoveForMlRecheck(BigDecimal prevPrice, BigDecimal currentPrice) {
+        if (prevPrice == null || currentPrice == null) return true;
+        if (prevPrice.signum() <= 0 || currentPrice.signum() <= 0) return true;
+
+        double movePct = priceMovePct(prevPrice, currentPrice);
+        double minMovePct = mlRecheckMinPriceMovePct;
+        if (!Double.isFinite(minMovePct) || minMovePct <= 0.0) {
+            minMovePct = 0.03d;
+        }
+
+        return movePct >= minMovePct;
+    }
+
+    private double priceMovePct(BigDecimal a, BigDecimal b) {
+        if (a == null || b == null) return Double.POSITIVE_INFINITY;
+        if (a.signum() <= 0 || b.signum() <= 0) return Double.POSITIVE_INFINITY;
+
+        return a.subtract(b).abs()
+                .divide(a.abs().max(BigDecimal.ONE), 10, RoundingMode.HALF_UP)
+                .multiply(BigDecimal.valueOf(100))
+                .doubleValue();
+    }
+
+    private void logMlBelowThresholdThrottled(Long chatId,
+                                              String sym,
+                                              LocalState st,
+                                              double proba,
+                                              double threshold,
+                                              Instant now) {
+        if (st == null || now == null) return;
+
+        long throttle = Math.max(1000L, holdThrottleMs);
+        String key = "LOWPROBA:" + fmt(threshold);
+
+        if (Objects.equals(st.lastMlWarnReason, key) && st.lastMlWarnAt != null) {
+            long age = Duration.between(st.lastMlWarnAt, now).toMillis();
+            if (age >= 0 && age < throttle) {
+                return;
+            }
+        }
+
+        st.lastMlWarnReason = key;
+        st.lastMlWarnAt = now;
+
+        log.info("[WINDOW] 🤖 HOLD: ML ниже порога chatId={} sym={} proba={} threshold={} cooldownMs={} recheckMovePct={}",
+                chatId,
+                sym,
+                fmt(proba),
+                fmt(threshold),
+                Math.max(300L, mlBelowThresholdCooldownMs),
+                fmt(mlRecheckMinPriceMovePct));
     }
 
     private void rememberPendingMlSample(LocalState st,
@@ -2607,5 +2714,6 @@ public class WindowScalpingStrategyV4 implements
         return (v != null && v.signum() > 0) ? v : null;
     }
 }
+
 
 

@@ -560,7 +560,11 @@ public class MarketStreamServiceImpl implements MarketStreamService {
         boolean marketDegraded = health != null && health.degraded();
 
         // 4) kline -> price update (forming candle тоже)
-        if (klinePriceDispatchEnabled && !marketDegraded) {
+        // Для WINDOW_SCALPING это лишний дубль:
+        // цена и так идёт через AGG_TRADE, а свеча отдельно через onCandleClosed().
+        // Если не отключить этот путь, стратегия получает лишние onPriceUpdate(),
+        // повторно логирует HOLD и чаще дёргает ML.
+        if (klinePriceDispatchEnabled && !marketDegraded && type != StrategyType.WINDOW_SCALPING) {
             Optional<AiStrategyOrchestrator.RunBinding> bindingOpt = bindingOf(chatId, type);
             if (bindingOpt.isPresent()) {
                 AiStrategyOrchestrator.RunBinding b = bindingOpt.get();
