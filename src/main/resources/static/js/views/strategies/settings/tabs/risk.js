@@ -309,6 +309,7 @@ window.SettingsTabRisk = (function () {
         const valInp = byId("riskValueInput");
 
         const payload = {
+            chatId: String(ctx.chatId || ""),
             saveScope: "risk",
             tab: "risk",
             exchange: ctx.exchange || "",
@@ -473,7 +474,27 @@ window.SettingsTabRisk = (function () {
 
         modeSel.addEventListener("change", () => {
             const m = normalizeMode(modeSel.value);
-            if (m === "ALL") valInp.value = "";
+
+            const freeValueEl = byId("riskFreeBalanceValue");
+            const free = toNum(freeValueEl?.value);
+            const currentRaw = String(valInp?.value || "").trim();
+
+            if (m === "ALL") {
+                valInp.value = "";
+            } else if (m === "FIX") {
+                if (!currentRaw) {
+                    if (free !== null && free > 0) {
+                        valInp.value = String(Math.min(free, 20));
+                    } else {
+                        valInp.value = "20";
+                    }
+                }
+            } else if (m === "PCT") {
+                if (!currentRaw) {
+                    valInp.value = "25";
+                }
+            }
+
             clampRiskIfNeeded();
             applyModeUi(m, currentAsset);
             calcPreview();

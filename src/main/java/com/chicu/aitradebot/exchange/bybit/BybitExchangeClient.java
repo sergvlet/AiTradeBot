@@ -388,14 +388,24 @@ public class BybitExchangeClient implements ExchangeClient {
         String finalStatus = finalState.status();
         boolean filled = "FILLED".equalsIgnoreCase(finalStatus);
 
-        log.info("✅ BYBIT MARKET итог sym={} side={} status={} filled={} execQty={} avgPrice={} orderId={}",
-                sym,
-                side.name(),
-                finalStatus,
-                filled,
-                strip(finalQty),
-                strip(finalPrice),
-                orderId);
+        if (side == OrderSide.SELL && !filled) {
+            log.error("⛔ BYBIT MARKET SELL исполнен не полностью sym={} status={} requestedQty={} executedQty={} avgPrice={} orderId={}",
+                    sym,
+                    finalStatus,
+                    strip(dtoBaseQty),
+                    strip(finalQty),
+                    strip(finalPrice),
+                    orderId);
+        } else {
+            log.info("✅ BYBIT MARKET итог sym={} side={} status={} filled={} execQty={} avgPrice={} orderId={}",
+                    sym,
+                    side.name(),
+                    finalStatus,
+                    filled,
+                    strip(finalQty),
+                    strip(finalPrice),
+                    orderId);
+        }
 
         return Order.builder()
                 .orderId(orderId)
@@ -404,7 +414,7 @@ public class BybitExchangeClient implements ExchangeClient {
                 .side(side.name())
                 .type("MARKET")
                 .price(finalPrice)
-                .quantity(finalQty)
+                .quantity(dtoBaseQty)
                 .executedQty(finalQty)
                 .avgPrice(finalPrice)
                 .status(finalStatus)
@@ -1437,4 +1447,5 @@ public class BybitExchangeClient implements ExchangeClient {
         return safe.setScale(4, RoundingMode.DOWN).stripTrailingZeros();
     }
 }
+
 

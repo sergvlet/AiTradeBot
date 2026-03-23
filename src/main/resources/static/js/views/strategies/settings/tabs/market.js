@@ -3,11 +3,11 @@
 /**
  * Trade tab (market.js)
  *
- * ✅ FIXES:
- * - init() не "умирает" если вызвали слишком рано (started=true только после checks)
- * - publishState() публикует только валидный UiState (не {ok:true})
- * - advancedControlMode берётся из state (если control tab не был открыт)
- * - initialSymbol не берётся из текстового placeholder
+ * FIX:
+ * - ctx всегда берётся из актуального DOM/state, а не из старого window.StrategySettingsContext
+ * - после смены exchange/network вкладка сама перезагружает symbols/limits
+ * - publishState публикует только валидный UiState
+ * - initialSymbol не берётся из label/placeholder
  */
 window.SettingsTabTrade = (function () {
 
@@ -30,34 +30,91 @@ window.SettingsTabTrade = (function () {
             && ("chatId" in obj) && ("type" in obj) && ("exchange" in obj) && ("network" in obj));
     }
 
-    // ✅ гарантируем StrategySettingsContext из data-* корня страницы
-    function ensureCtx() {
-        if (window.StrategySettingsContext && window.StrategySettingsContext.chatId) return window.StrategySettingsContext;
+    function getRoot() {
+        return document.querySelector(".strategy-settings-page[data-chat-id][data-type]");
+    }
 
-        const root = document.querySelector(".strategy-settings-page[data-chat-id][data-type]");
-        if (!root) return window.StrategySettingsContext || null;
+    function normalizeNetworkValue(v) {
+        if (v === null || v === undefined) return "";
+        if (typeof v === "object" && v.name) return String(v.name).trim().toUpperCase();
+        return String(v).trim().toUpperCase();
+    }
 
+    function syncCtxFromRoot() {
+        const root = getRoot();
         const ctx = window.StrategySettingsContext || {};
-        ctx.chatId = ctx.chatId || root.dataset.chatId;
-        ctx.type = ctx.type || root.dataset.type;
-        ctx.exchange = ctx.exchange || root.dataset.exchange;
-        ctx.network = ctx.network || root.dataset.network;
+
+        if (root) {
+            const chatId = root.dataset.chatId || "";
+            const type = root.dataset.type || "";
+            const exchange = root.dataset.exchange || "";
+            const network = root.dataset.network || "";
+
+            if (!isBlank(chatId)) ctx.chatId = String(chatId);
+            if (!isBlank(type)) ctx.type = String(type);
+            if (!isBlank(exchange)) ctx.exchange = normalizeUpper(exchange);
+            if (!isBlank(network)) ctx.network = normalizeNetworkValue(network);
+        }
+
+        if (!ctx.baseUrl) ctx.baseUrl = window.location.pathname;
 
         window.StrategySettingsContext = ctx;
         return ctx;
+    }
+
+    function syncCtxFromState(state) {
+        if (!looksLikeUiState(state)) return window.StrategySettingsContext || null;
+
+        const ctx = window.StrategySettingsContext || {};
+
+        if (!isBlank(state.chatId)) ctx.chatId = String(state.chatId);
+        if (!isBlank(state.type)) ctx.type = String(state.type);
+        if (!isBlank(state.exchange)) ctx.exchange = normalizeUpper(state.exchange);
+        if (!isBlank(state.network)) ctx.network = normalizeNetworkValue(state.network);
+        if (!isBlank(state.accountAsset)) ctx.accountAsset = normalizeUpper(state.accountAsset);
+        if (!ctx.baseUrl) ctx.baseUrl = window.location.pathname;
+
+        window.StrategySettingsContext = ctx;
+
+        const root = getRoot();
+        if (root) {
+            if (!isBlank(ctx.chatId)) root.dataset.chatId = String(ctx.chatId);
+            if (!isBlank(ctx.type)) root.dataset.type = String(ctx.type);
+            if (!isBlank(ctx.exchange)) root.dataset.exchange = String(ctx.exchange);
+            if (!isBlank(ctx.network)) root.dataset.network = String(ctx.network);
+        }
+
+        return ctx;
+    }
+
+    function ensureCtx() {
+        return syncCtxFromRoot();
     }
 
     function getCtx() {
         return ensureCtx();
     }
 
-    // ✅ publish helpers (чтобы Risk/General гарантированно получали state)
+    function getCtxKey(ctx) {
+        if (!ctx) return "";
+        return [
+            String(ctx.chatId || ""),
+            String(ctx.type || ""),
+            String(ctx.exchange || ""),
+            String(ctx.network || "")
+        ].join("|");
+    }
+
     function publishState(state) {
         if (!looksLikeUiState(state)) return;
+
+        syncCtxFromState(state);
 
         try {
             if (window.StrategySettingsStore && typeof window.StrategySettingsStore.setState === "function") {
                 window.StrategySettingsStore.setState(state);
+            } else if (window.StrategySettingsStore && typeof window.StrategySettingsStore.set === "function") {
+                window.StrategySettingsStore.set(state);
             }
         } catch (e) {}
 
@@ -83,7 +140,7 @@ window.SettingsTabTrade = (function () {
         if (ctx.chatId) q.set("chatId", String(ctx.chatId));
         if (ctx.exchange) q.set("exchange", String(ctx.exchange));
         if (ctx.network) q.set("network", String(ctx.network));
-        q.set("_ts", String(Date.now())); // cache-buster
+        q.set("_ts", String(Date.now()));
         return q.toString();
     }
 
@@ -99,12 +156,13 @@ window.SettingsTabTrade = (function () {
     function setUiValue(el, val) {
         if (!el) return;
         const tag = (el.tagName || "").toUpperCase();
-
-        // ⚠️ В input нельзя пихать "—"
         const v = (val === null || val === undefined || val === "") ? "" : String(val);
 
-        if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") el.value = v;
-        else el.textContent = (v === "" ? "—" : v);
+        if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") {
+            el.value = v;
+        } else {
+            el.textContent = (v === "" ? "—" : v);
+        }
     }
 
     function fmtNum(v, digits) {
@@ -163,12 +221,12 @@ window.SettingsTabTrade = (function () {
         if (hint) hint.textContent = finalA || "—";
 
         const ctx = getCtx();
-        if (ctx) ctx.accountAsset = finalA || "";
+        if (ctx) {
+            ctx.accountAsset = finalA || "";
+            window.StrategySettingsContext = ctx;
+        }
     }
 
-    // =====================================================
-    // UI STATE (auto-refresh между вкладками)
-    // =====================================================
     function rebuildAssetsIfNeeded(assetsUpper) {
         const sel = byId("accountAssetSelect");
         if (!sel || !Array.isArray(assetsUpper) || assetsUpper.length === 0) return;
@@ -192,17 +250,16 @@ window.SettingsTabTrade = (function () {
     function applyUiState(state) {
         if (!looksLikeUiState(state)) return;
 
-        // ✅ если control tab не открыт — всё равно узнаём режим из state
+        syncCtxFromState(state);
+
         if (state.advancedControlMode) {
             window.__StrategyControlMode = normalizeUpper(state.advancedControlMode);
         }
 
-        // список активов может поменяться
         if (Array.isArray(state.availableAssets)) {
             rebuildAssetsIfNeeded(state.availableAssets);
         }
 
-        // выбранный актив
         const bal = state.selectedBalance || state.balance || null;
         const asset =
             normalizeUpper(
@@ -213,11 +270,9 @@ window.SettingsTabTrade = (function () {
 
         if (asset) setAccountAssetUi(asset);
 
-        // баланс (обновляем общие поля на странице)
         if (bal) {
             const free = (bal.free ?? null);
             const locked = (bal.locked ?? null);
-
             const total = (Number(free) || 0) + (Number(locked) || 0);
 
             setUiValue(byId("assetFreeView"), fmtNum(free, 8));
@@ -225,7 +280,22 @@ window.SettingsTabTrade = (function () {
             setUiValue(byId("assetTotalView"), fmtNum(total, 8));
         }
 
-        // ✅ после state — актуализируем lock/unlock UI
+        if (!isBlank(state.symbol)) {
+            setSymbolUi(state.symbol);
+        }
+
+        if (!isBlank(state.timeframe)) {
+            const tfSelect = byId("tradeTimeframeSelect");
+            const tfReadonly = byId("tradeTimeframeReadonly");
+            if (tfSelect) tfSelect.value = String(state.timeframe);
+            if (tfReadonly) setUiValue(tfReadonly, String(state.timeframe));
+        }
+
+        if (state.cachedCandlesLimit !== null && state.cachedCandlesLimit !== undefined) {
+            const candlesInput = byId("tradeCachedCandlesLimit");
+            if (candlesInput) candlesInput.value = String(state.cachedCandlesLimit);
+        }
+
         setModeUi();
     }
 
@@ -264,9 +334,6 @@ window.SettingsTabTrade = (function () {
         }
     }
 
-    // -----------------------------
-    // Limits UI
-    // -----------------------------
     function setLimitsUiEmpty() {
         setUiValue(byId("exMinNotional"), "—");
         setUiValue(byId("exMinNotionalScope"), "—");
@@ -302,7 +369,10 @@ window.SettingsTabTrade = (function () {
         const sym = normalizeUpper(symbol);
         const asset = getAccountAsset();
 
-        if (!sym || !asset) { setLimitsUiEmpty(); return; }
+        if (!sym || !asset) {
+            setLimitsUiEmpty();
+            return;
+        }
 
         const url =
             `/api/market/symbol-info?${marketQuery(asset)}&symbol=${encodeURIComponent(sym)}`;
@@ -316,9 +386,6 @@ window.SettingsTabTrade = (function () {
         }
     }
 
-    // -----------------------------
-    // Symbol UI
-    // -----------------------------
     function setSymbolUi(symbol) {
         const label = byId("symbolLabel");
         const hidden = byId("symbolHidden");
@@ -385,9 +452,6 @@ window.SettingsTabTrade = (function () {
         }
     }
 
-    // -----------------------------
-    // Save
-    // -----------------------------
     async function saveTradeSettings() {
         const ctx = getCtx();
         if (!ctx?.type || !ctx?.chatId) return null;
@@ -413,9 +477,6 @@ window.SettingsTabTrade = (function () {
         return await window.SettingsApi.postForm(url, payload);
     }
 
-    // -----------------------------
-    // Init
-    // -----------------------------
     let started = false;
 
     function init() {
@@ -464,12 +525,15 @@ window.SettingsTabTrade = (function () {
 
         let timer = null;
         let inFlight = false;
+        let contextReloadInFlight = false;
+        let lastCtxKey = getCtxKey(getCtx());
 
         async function doSave() {
             if (inFlight) return;
 
             inFlight = true;
             setSave("Сохраняю…", "info");
+
             try {
                 const state = await saveTradeSettings();
 
@@ -477,6 +541,7 @@ window.SettingsTabTrade = (function () {
                     applyUiState(state);
                     publishState(state);
                     dispatchAccountAssetChanged(state.accountAsset || getAccountAsset(), "trade_save_ok");
+                    lastCtxKey = getCtxKey(getCtx());
                 }
 
                 setSave("Сохранено", "ok");
@@ -535,7 +600,30 @@ window.SettingsTabTrade = (function () {
             });
         }
 
-        // mode buttons
+        async function reloadAfterContextChange(state) {
+            if (contextReloadInFlight) return;
+            contextReloadInFlight = true;
+
+            try {
+                if (looksLikeUiState(state)) {
+                    applyUiState(state);
+                }
+
+                await reloadSymbols();
+
+                const currentSymbol = normalizeUpper(symbolHidden?.value || "");
+                if (currentSymbol) {
+                    await loadLimits(currentSymbol);
+                } else {
+                    setLimitsUiEmpty();
+                }
+            } catch (e) {
+                console.error("[trade] reloadAfterContextChange failed:", e);
+            } finally {
+                contextReloadInFlight = false;
+            }
+        }
+
         const modeHost = byId("tradeSymbolModes");
         if (modeHost) {
             modeHost.querySelectorAll("[data-symbol-mode]").forEach(btn => {
@@ -547,7 +635,6 @@ window.SettingsTabTrade = (function () {
             });
         }
 
-        // accountAsset change
         assetSelect.addEventListener("change", async () => {
             const asset = normalizeUpper(assetSelect.value || "");
             setAccountAssetUi(asset);
@@ -561,10 +648,8 @@ window.SettingsTabTrade = (function () {
             await reloadSymbols();
         });
 
-        // timeframe
         tfSelect.addEventListener("change", () => scheduleSave(180));
 
-        // candles
         if (candlesInput) {
             let t = null;
             candlesInput.addEventListener("input", () => {
@@ -578,26 +663,37 @@ window.SettingsTabTrade = (function () {
             });
         }
 
-        // control mode changed
         window.addEventListener("strategy:controlModeChanged", () => setModeUi());
 
-        // first load
         setModeUi();
         setLimitsUiEmpty();
-
         setAccountAssetUi(getAccountAsset());
 
-        // ✅ ВАЖНО: initialSymbol только из hidden (не из label)
         const initialSymbol = normalizeUpper(symbolHidden?.value || "");
-        if (initialSymbol) loadLimits(initialSymbol).catch(() => {});
+        if (initialSymbol) {
+            loadLimits(initialSymbol).catch(() => {});
+        }
 
         reloadSymbols().catch(() => {});
 
-        // =====================================================
-        // авто-обновление: другие вкладки меняют state
-        // =====================================================
-        const onState = (state) => {
-            try { applyUiState(state); } catch (e) {}
+        const onState = async (state) => {
+            try {
+                if (!looksLikeUiState(state)) return;
+
+                const before = lastCtxKey;
+
+                applyUiState(state);
+
+                const after = getCtxKey(getCtx());
+                if (before !== after) {
+                    lastCtxKey = after;
+                    await reloadAfterContextChange(state);
+                } else {
+                    lastCtxKey = after;
+                }
+            } catch (e) {
+                console.error("[trade] onState failed:", e);
+            }
         };
 
         if (window.StrategySettingsStore && typeof window.StrategySettingsStore.subscribe === "function") {

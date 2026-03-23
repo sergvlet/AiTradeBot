@@ -10,9 +10,9 @@
         hasSymbol=${!#strings.isEmpty(symbolSafe)},
         infoSafe=${info},
         activeSafe=${infoSafe != null and infoSafe.active},
-        exchangeSafe=${(infoSafe != null and infoSafe.exchangeName != null) ? infoSafe.exchangeName : 'BINANCE'},
-        networkSafe=${(infoSafe != null and infoSafe.networkType != null) ? infoSafe.networkType : 'MAINNET'},
-        tfSafe=${(infoSafe != null and infoSafe.timeframe != null) ? infoSafe.timeframe : ''}
+        exchangeSafe=${(infoSafe != null and infoSafe.exchangeName != null) ? infoSafe.exchangeName : (exchange != null ? exchange : 'BINANCE')},
+        networkSafe=${(infoSafe != null and infoSafe.networkType != null) ? infoSafe.networkType : (network != null ? network : 'MAINNET')},
+        tfSafe=${(infoSafe != null and infoSafe.timeframe != null) ? infoSafe.timeframe : (timeframe != null ? timeframe : '1m')}
      ">
 
     <!-- ROOT ДЛЯ JS -->
@@ -20,13 +20,13 @@
          th:attr="
             data-chat-id=${chatId},
             data-type=${type},
-            data-symbol=${hasSymbol ? symbolSafe : ''}
+            data-symbol=${hasSymbol ? symbolSafe : ''},
+            data-exchange=${exchangeSafe},
+            data-network=${networkSafe},
+            data-timeframe=${tfSafe}
          ">
     </div>
 
-    <!-- =========================================
-         ⚠️ NOT CONFIGURED WARNING
-         ========================================= -->
     <div th:if="${!hasSymbol}"
          class="alert alert-warning d-flex align-items-center gap-2 mb-4"
          role="alert">
@@ -37,7 +37,6 @@
         </div>
     </div>
 
-    <!-- Заголовок -->
     <div class="d-flex justify-content-between align-items-center mb-4">
         <div>
             <h2 class="fw-bold mb-1 d-flex align-items-center gap-2">
@@ -54,32 +53,29 @@
 
         <div class="d-flex align-items-center gap-2">
 
-            <!-- STATUS -->
             <span class="badge px-3 py-2"
                   th:classappend="${activeSafe} ? ' bg-success' : ' bg-danger'">
                 <span th:text="${activeSafe} ? '🟢 Работает' : '🔴 Остановлена'">—</span>
             </span>
 
-            <!-- ▶ START (только если НЕ активна и ЕСТЬ символ) -->
             <form method="post"
                   th:action="@{/strategies/toggle}"
                   th:if="${!activeSafe}"
-                  th:classappend="${!hasSymbol} ? ' opacity-50 pe-none' : ''">
-
-                <input type="hidden" name="chatId" th:value="${chatId}">
+                  th:classappend="${!hasSymbol ? ' opacity-50 pe-none' : ''}">
                 <input type="hidden" name="type" th:value="${type}">
                 <input type="hidden" name="exchange" th:value="${exchangeSafe}">
                 <input type="hidden" name="network" th:value="${networkSafe}">
+                <input type="hidden" name="symbol" th:value="${hasSymbol ? symbolSafe : ''}">
+                <input type="hidden" name="timeframe" th:value="${tfSafe}">
 
                 <button type="submit"
                         class="btn btn-outline-success"
                         th:disabled="${!hasSymbol}"
-                        th:attr="title=${hasSymbol} ? 'Запустить' : 'Сначала настрой стратегию'">
+                        th:title="${hasSymbol ? 'Запустить' : 'Сначала настрой стратегию'}">
                     <i class="bi bi-play-fill"></i> Запустить
                 </button>
             </form>
 
-            <!-- ⏹ STOP (только если активна) -->
             <form method="post"
                   th:action="@{/strategies/toggle}"
                   th:if="${activeSafe}">
@@ -88,6 +84,8 @@
                 <input type="hidden" name="type" th:value="${type}">
                 <input type="hidden" name="exchange" th:value="${exchangeSafe}">
                 <input type="hidden" name="network" th:value="${networkSafe}">
+                <input type="hidden" name="symbol" th:value="${hasSymbol ? symbolSafe : ''}">
+                <input type="hidden" name="timeframe" th:value="${tfSafe}">
 
                 <button type="submit" class="btn btn-outline-danger">
                     <i class="bi bi-stop-fill"></i> Остановить
@@ -97,7 +95,6 @@
         </div>
     </div>
 
-    <!-- КАРТОЧКИ -->
     <div class="row g-4 mb-4">
 
         <div class="col-md-3">
@@ -144,7 +141,6 @@
 
     </div>
 
-    <!-- ГРАФИК -->
     <div class="card card-theme p-3 mb-4" id="chart-card">
         <div class="d-flex justify-content-between align-items-center mb-2">
             <h5 class="mb-0">
@@ -173,7 +169,6 @@
             </div>
         </div>
 
-        <!-- Кнопки -->
         <div class="chart-controls d-flex flex-wrap gap-2 mb-3">
             <div class="btn-group btn-group-sm">
                 <button class="btn btn-outline-secondary" type="button" onclick="window.chartCtrl?.setTimeframe?.('1m')">1m</button>
@@ -189,7 +184,6 @@
             </div>
         </div>
 
-        <!-- Tooltip -->
         <div id="tooltip-date"
              style="position:absolute;top:8px;right:12px;
                 background:rgba(0,0,0,.75);
@@ -245,7 +239,6 @@
                 });
             }
 
-            // подсказка даты под курсором — только когда chart реально готов
             const tryBindCrosshair = () => {
                 if (!window.chartCtrl?.chart?.subscribeCrosshairMove) return false;
 
@@ -268,7 +261,6 @@
                 return true;
             };
 
-            // несколько попыток, т.к. chartCtrl поднимается асинхронно
             let tries = 0;
             const timer = setInterval(() => {
                 tries++;
@@ -277,10 +269,8 @@
         })();
     </script>
 
-    <!-- НИЖНИЕ БЛОКИ -->
     <div class="row g-4">
 
-        <!-- ЖУРНАЛ -->
         <div class="col-lg-7">
             <div class="card card-theme p-3 h-100">
                 <h5 class="mb-2">
@@ -310,7 +300,6 @@
             </div>
         </div>
 
-        <!-- НАСТРОЙКИ -->
         <div class="col-lg-5">
             <div class="card card-theme p-3 h-100">
                 <h5 class="mb-3">
@@ -325,7 +314,6 @@
                     <li>Комиссия: <b th:text="${infoSafe != null and infoSafe.commissionPct != null ? infoSafe.commissionPct : '—'}">—</b>%</li>
                 </ul>
 
-                <!-- config: передаём chatId + (если есть) exchange/network -->
                 <a class="btn btn-outline-primary w-100 mt-3"
                    th:href="@{'/strategies/' + ${type} + '/config'(
                         chatId=${chatId},

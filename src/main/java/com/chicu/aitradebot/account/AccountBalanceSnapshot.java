@@ -5,7 +5,6 @@ import lombok.Value;
 
 import java.math.BigDecimal;
 import java.util.Collections;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -29,31 +28,11 @@ public class AccountBalanceSnapshot {
      */
     Map<String, AssetBalance> balances;
 
-    /** true если успешно получили баланс с биржи */
+    /** True если успешно получили баланс с биржи */
     boolean connectionOk;
 
-    /** опционально: текст ошибки, чтобы красиво выводить в UI/логах */
+    /** Опционально: текст ошибки, чтобы красиво выводить в UI/логах */
     String error;
-
-    public BigDecimal getSelectedFreeBalance() {
-        return selectedBalance != null ? selectedBalance.getFreeSafe() : BigDecimal.ZERO;
-    }
-
-    public BigDecimal getSelectedLockedBalance() {
-        return selectedBalance != null ? selectedBalance.getLockedSafe() : BigDecimal.ZERO;
-    }
-
-    public BigDecimal getSelectedTotalBalance() {
-        return selectedBalance != null ? selectedBalance.getTotalSafe() : BigDecimal.ZERO;
-    }
-
-    public boolean hasAnyAssets() {
-        return availableAssets != null && !availableAssets.isEmpty();
-    }
-
-    public boolean hasSelectedBalance() {
-        return selectedBalance != null && selectedBalance.getTotalSafe().signum() > 0;
-    }
 
     /** Backward-compat для старого кода */
     public AssetBalance getBalance(String asset) {

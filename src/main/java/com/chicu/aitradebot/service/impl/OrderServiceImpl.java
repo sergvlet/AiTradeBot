@@ -565,12 +565,16 @@ public class OrderServiceImpl implements OrderService {
             throw (e instanceof RuntimeException re) ? re : new RuntimeException(e);
         }
 
-        BigDecimal executedQtyRaw = executed != null && executed.getQuantity() != null && executed.getQuantity().signum() > 0
+        BigDecimal executedQtyRaw = executed != null && executed.getExecutedQty() != null && executed.getExecutedQty().signum() > 0
+                ? executed.getExecutedQty()
+                : (executed != null && executed.getQuantity() != null && executed.getQuantity().signum() > 0
                 ? executed.getQuantity()
-                : finalQty;
-        BigDecimal executedPrice = executed != null && executed.getPrice() != null && executed.getPrice().signum() > 0
+                : finalQty);
+        BigDecimal executedPrice = executed != null && executed.getAvgPrice() != null && executed.getAvgPrice().signum() > 0
+                ? executed.getAvgPrice()
+                : (executed != null && executed.getPrice() != null && executed.getPrice().signum() > 0
                 ? executed.getPrice()
-                : finalPrice;
+                : finalPrice);
 
         BigDecimal executedQty = normalizeExecutedQtyForPersistence(sideNorm, executedQtyRaw, descriptor);
         String status = executed != null && executed.getStatus() != null && !executed.getStatus().isBlank()
@@ -1035,3 +1039,4 @@ public class OrderServiceImpl implements OrderService {
         return guard != null ? guard.minNotional() : null;
     }
 }
+

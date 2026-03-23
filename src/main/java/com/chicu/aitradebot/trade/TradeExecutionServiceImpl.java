@@ -108,7 +108,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
     /**
      * true  -> PAPER = симуляция на MAINNET
      * false -> PAPER = реальные ордера
-     *
+
      * На TESTNET PAPER не блокируется этим флагом.
      */
     @Value("${trade.paperBlocksRealOrders:${trade.paper.blocksRealOrders:true}}")
@@ -359,40 +359,75 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
 
         if (effectiveNotional.compareTo(minNotional) < 0) {
             BigDecimal requiredQty = minNotional.divide(price, QTY_SCALE, RoundingMode.UP);
-            BigDecimal requiredQtyRounded = normalizeTradableQty(requiredQty, stepSize);
-            String reason = "precheck: qty*price=" + QtyMath.strip(effectiveNotional)
-                    + " < minNotional=" + QtyMath.strip(minNotional)
-                    + " (нужно qty≥" + QtyMath.strip(requiredQtyRounded) + ")";
+            BigDecimal requiredQtyRounded = normalizeTradableQtyUp(requiredQty, stepSize);
+            BigDecimal requiredNotional = requiredQtyRounded.multiply(price).setScale(8, RoundingMode.HALF_UP);
 
-            log.warn("⛔ [Вход] PRECHECK MIN_NOTIONAL | {} quote={} plannedQty={} tradableQty={} stepSize={} notional={} minNotional={} needQty={} | chatId={} ex={} net={}",
-                    sym,
-                    QtyMath.strip(quoteAmount),
-                    QtyMath.strip(plannedQty),
-                    QtyMath.strip(tradableQty),
-                    QtyMath.strip(stepSize),
-                    QtyMath.strip(effectiveNotional),
-                    QtyMath.strip(minNotional),
-                    QtyMath.strip(requiredQtyRounded),
-                    chatId,
-                    ex,
-                    net);
+            BigDecimal freeQuote = (budget.free() != null ? budget.free() : BigDecimal.ZERO);
+            BigDecimal extraNeeded = requiredNotional.subtract(quoteAmount).max(BigDecimal.ZERO);
 
-            failCooldown.recordFailure(key, "min_notional", reason);
-            return EntryResult.fail("min_notional");
+            // Разрешаем маленький автодобор, чтобы не падать на 4.9995 < 5.0000
+            BigDecimal maxAutoBump = minNotional.multiply(new BigDecimal("0.03")).max(new BigDecimal("0.10"));
+
+            if (QtyMath.isPositive(requiredQtyRounded)
+                && requiredNotional.compareTo(minNotional) >= 0
+                && freeQuote.compareTo(requiredNotional) >= 0
+                && extraNeeded.compareTo(maxAutoBump) <= 0) {
+
+                log.info("↗️ [Вход] AUTO-BUMP MIN_NOTIONAL | {} quote {} -> {} | qty {} -> {} | minNotional={} extra={} | chatId={} ex={} net={}",
+                        sym,
+                        QtyMath.strip(quoteAmount),
+                        QtyMath.strip(requiredNotional),
+                        QtyMath.strip(tradableQty),
+                        QtyMath.strip(requiredQtyRounded),
+                        QtyMath.strip(minNotional),
+                        QtyMath.strip(extraNeeded),
+                        chatId,
+                        ex,
+                        net);
+
+                quoteAmount = requiredNotional.stripTrailingZeros();
+                tradableQty = requiredQtyRounded.stripTrailingZeros();
+                effectiveNotional = requiredNotional;
+            } else {
+                String reason = "precheck: qty*price=" + QtyMath.strip(effectiveNotional)
+                                + " < minNotional=" + QtyMath.strip(minNotional)
+                                + " (нужно qty≥" + QtyMath.strip(requiredQtyRounded) + ", quote≥" + QtyMath.strip(requiredNotional) + ")";
+
+                log.warn("⛔ [Вход] PRECHECK MIN_NOTIONAL | {} quote={} plannedQty={} tradableQty={} stepSize={} notional={} minNotional={} needQty={} needQuote={} | chatId={} ex={} net={}",
+                        sym,
+                        QtyMath.strip(quoteAmount),
+                        QtyMath.strip(plannedQty),
+                        QtyMath.strip(tradableQty),
+                        QtyMath.strip(stepSize),
+                        QtyMath.strip(effectiveNotional),
+                        QtyMath.strip(minNotional),
+                        QtyMath.strip(requiredQtyRounded),
+                        QtyMath.strip(requiredNotional),
+                        chatId,
+                        ex,
+                        net);
+
+                failCooldown.recordFailure(key, "min_notional", reason);
+                return EntryResult.fail("min_notional");
+            }
         }
 
         BigDecimal commissionPct = resolveCommissionPctOrNull(chatId, ex, net, ss);
         if (commissionPct != null && commissionPct.signum() > 0) {
-            BigDecimal minTpToNotLose = commissionPct.multiply(BigDecimal.valueOf(2)).add(TP_FEE_BUFFER_PCT);
+            BigDecimal minTpToNotLose = commissionPct
+                    .multiply(BigDecimal.valueOf(2))
+                    .add(TP_FEE_BUFFER_PCT)
+                    .setScale(8, RoundingMode.HALF_UP);
+
             if (tpPct.compareTo(minTpToNotLose) < 0) {
-                log.warn("⛔ [Вход] TP слишком маленький относительно комиссий | tpPct={} < minTp={} (feePct={} x2 + buffer={}) | chatId={} {} {}",
+                log.warn("↗️ [Вход] AUTO-BUMP TP относительно комиссий | tpPct {} -> {} (feePct={} x2 + buffer={}) | chatId={} {} {}",
                         tpPct.stripTrailingZeros().toPlainString(),
                         minTpToNotLose.stripTrailingZeros().toPlainString(),
                         commissionPct.stripTrailingZeros().toPlainString(),
                         TP_FEE_BUFFER_PCT.stripTrailingZeros().toPlainString(),
                         chatId, strategyType, sym
                 );
-                return EntryResult.fail("tp_too_small_for_fees");
+                tpPct = minTpToNotLose;
             }
         }
 
@@ -473,8 +508,21 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             BigDecimal executedPrice = pickExecutedPrice(order, price);
             BigDecimal runtimeQty = normalizeRuntimeQty(executedQty, ex, net, sym);
 
+            if (!QtyMath.isPositive(runtimeQty)) {
+                failCooldown.recordFailure(key, "buy_not_filled", "executedQty<=0");
+                log.warn("⛔ [Вход] BUY вернул нулевой executedQty | {} requestedQty={} rawExecutedQty={} | chatId={} ex={} net={}",
+                        sym,
+                        QtyMath.strip(tradableQty),
+                        QtyMath.strip(executedQty),
+                        chatId,
+                        ex,
+                        net);
+                return EntryResult.fail("buy_not_filled");
+            }
+
             BigDecimal tpExec = calcTp(executedPrice, tpPct);
             BigDecimal slExec = calcSl(executedPrice, slPct);
+            BigDecimal quoteSpent = executedPrice.multiply(runtimeQty).setScale(8, RoundingMode.HALF_UP).stripTrailingZeros();
 
             persistEntryRisk(orderId, ex, net, tpExec, slExec);
 
@@ -491,7 +539,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                     runtimeQty,
                     tpExec,
                     slExec,
-                    quoteAmount,
+                    quoteSpent,
                     orderId,
                     effectiveTime
             );
@@ -701,6 +749,11 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         if (effQty == null || effQty.signum() <= 0) return ExitResult.fail("entryQty_invalid");
         if (effTp == null || effSl == null) return ExitResult.fail("tp/sl_null");
 
+        BigDecimal positionQtyBeforeSell = normalizeRuntimeQty(effQty, ex, net, sym);
+        if (!QtyMath.isPositive(positionQtyBeforeSell)) {
+            positionQtyBeforeSell = effQty;
+        }
+
         boolean tpHit = price.compareTo(effTp) >= 0;
         boolean slHit = price.compareTo(effSl) <= 0;
         if (!tpHit && !slHit) return ExitResult.fail("not_hit");
@@ -765,20 +818,24 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         );
 
         BigDecimal freeBase = resolveFreeBaseQty(chatId, strategyType, ss, ex, net, sym);
+        BigDecimal originalQty = effQty;
 
         if (freeBase != null) {
-            if (QtyMath.isPositive(freeBase)) {
-                if (freeBase.compareTo(effQty) < 0) {
-                    log.warn("⚠️ [Выход] Корректирую qty по свободному base балансу | {} baseFree={} plannedQty={} tpHit={} slHit={} | chatId={} ex={} net={}",
-                            sym, QtyMath.strip(freeBase), QtyMath.strip(effQty), tpHit, slHit, chatId, ex, net);
-                    effQty = freeBase;
-                }
-            } else {
-                failCooldown.recordFailure(exitKey, "balance", "base_free=0 for " + sym);
-                log.error("⛔ [Выход] Нет свободного base баланса | {} qty={} tpHit={} slHit={} | chatId={} ex={} net={}",
-                        sym, QtyMath.strip(effQty), tpHit, slHit, chatId, ex, net);
-                try { positionStore.clearPosition(chatId, strategyType, ex, net, sym); } catch (Exception ignored) {}
-                return ExitResult.fail("balance");
+            BigDecimal normalizedFreeBase = normalizeRuntimeQty(freeBase, ex, net, sym);
+
+            if (!QtyMath.isPositive(normalizedFreeBase)) {
+                failCooldown.recordFailure(exitKey, "position_sync_mismatch", "base_free=0 for " + sym);
+                log.error("⛔ [Выход] Полный SELL запрещён: на бирже нет доступного base для закрытия позиции | {} positionQty={} tpHit={} slHit={} | chatId={} ex={} net={}",
+                        sym, QtyMath.strip(originalQty), tpHit, slHit, chatId, ex, net);
+                return ExitResult.fail("position_sync_mismatch");
+            }
+
+            if (normalizedFreeBase.compareTo(originalQty) < 0) {
+                failCooldown.recordFailure(exitKey, "position_sync_mismatch",
+                        "base_free=" + QtyMath.strip(normalizedFreeBase) + ", positionQty=" + QtyMath.strip(originalQty));
+                log.error("⛔ [Выход] Полный SELL запрещён: свободного base меньше размера позиции | {} baseFree={} positionQty={} tpHit={} slHit={} | chatId={} ex={} net={}",
+                        sym, QtyMath.strip(normalizedFreeBase), QtyMath.strip(originalQty), tpHit, slHit, chatId, ex, net);
+                return ExitResult.fail("position_sync_mismatch");
             }
         }
 
@@ -789,9 +846,17 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             if (!QtyMath.isPositive(floored)) {
                 String msg = "qty меньше stepSize (" + QtyMath.strip(stepSize) + ")";
                 failCooldown.recordFailure(exitKey, "lot_step", msg);
-                log.warn("⛔ [Выход] DUST: qty слишком маленький | {} qty={} stepSize={} tpHit={} slHit={} | chatId={} ex={} net={}",
+                log.warn("⛔ [Выход] DUST: qty слишком маленький для полного закрытия | {} qty={} stepSize={} tpHit={} slHit={} | chatId={} ex={} net={}",
                         sym, QtyMath.strip(effQty), QtyMath.strip(stepSize), tpHit, slHit, chatId, ex, net);
                 return ExitResult.fail("lot_step");
+            }
+
+            if (floored.compareTo(effQty) < 0) {
+                failCooldown.recordFailure(exitKey, "position_sync_mismatch",
+                        "qty_not_aligned_to_step raw=" + QtyMath.strip(effQty) + ", floored=" + QtyMath.strip(floored));
+                log.error("⛔ [Выход] Полный SELL запрещён: qty не кратен stepSize, округление вниз привело бы к частичной продаже | {} rawQty={} flooredQty={} stepSize={} | chatId={} ex={} net={}",
+                        sym, QtyMath.strip(effQty), QtyMath.strip(floored), QtyMath.strip(stepSize), chatId, ex, net);
+                return ExitResult.fail("position_sync_mismatch");
             }
 
             effQty = floored;
@@ -812,66 +877,26 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             );
 
             Order order = orderService.placeMarket(ctx, OrderSide.SELL, effQty, price);
-            BigDecimal executedExitPrice = pickExecutedPrice(order, price);
-
-            safeLive(() -> live.clearTpSl(chatId, strategyType, sym));
-            safeLive(() -> live.clearPriceLines(chatId, strategyType, sym));
-            safeLive(() -> live.pushSignal(chatId, strategyType, sym, null,
-                    Signal.sell(executedExitPrice.doubleValue(), tpHit ? "TP" : "SL")));
-
-            BigDecimal pnlPct = calcPnlPct(entryPriceFromStore, executedExitPrice);
-
-            log.info("✅ [Выход] SELL исполнен | {} qty={} exitPrice={} pnlPct={} tpHit={} slHit={} | chatId={} ex={} net={}",
-                    sym,
-                    effQty.stripTrailingZeros().toPlainString(),
-                    executedExitPrice.stripTrailingZeros().toPlainString(),
-                    pnlPct != null ? pnlPct.stripTrailingZeros().toPlainString() : "null",
-                    tpHit,
-                    slHit,
-                    chatId,
-                    ex,
-                    net
-            );
-
-            publishTradeClosedEvent(
+            return handleSellExecutionResult(
                     chatId,
                     strategyType,
                     sym,
-                    (ss != null ? ss.getTimeframe() : null),
+                    ss,
                     ex,
                     net,
                     effectiveTime,
-                    tpHit ? "TP" : "SL",
-                    pnlPct,
-                    executedExitPrice,
-                    entryPriceFromStore,
+                    tpHit,
+                    slHit,
                     effQty,
                     effTp,
                     effSl,
-                    tpHit,
-                    slHit
+                    positionQtyBeforeSell,
+                    entryPriceFromStore,
+                    posOpt,
+                    order,
+                    price,
+                    exitKey
             );
-
-            try { positionStore.clearPosition(chatId, strategyType, ex, net, sym); } catch (Exception ignored) {}
-            failCooldown.clear(exitKey);
-
-            boolean isLoss = (pnlPct != null && pnlPct.signum() < 0);
-
-            if ((slHit || isLoss) && allowAutoTune(ss)) {
-                String reason = slHit ? "after-close:sl" : "after-close:loss";
-                if (pnlPct != null) reason += ":pnlPct=" + pnlPct.stripTrailingZeros().toPlainString();
-
-                mlAutoTuneRuntime.triggerTuneDebounced(
-                        chatId,
-                        strategyType,
-                        ex,
-                        net,
-                        reason,
-                        Duration.ofSeconds(5)
-                );
-            }
-
-            return ExitResult.ok(tpHit, slHit, executedExitPrice, pnlPct != null ? pnlPct : BigDecimal.ZERO);
 
         } catch (Exception e) {
             String code = mapTradeErrorCode(e);
@@ -884,82 +909,290 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
 
             if ("balance".equals(code)) {
                 failCooldown.recordFailure(exitKey, code, e.getMessage());
-
-                BigDecimal retryQty = null;
-                if (QtyMath.isPositive(stepSize)) {
-                    retryQty = QtyMath.floorToStepOrZero(effQty.subtract(stepSize), stepSize);
-                }
-
-                if (QtyMath.isPositive(retryQty) && retryQty.compareTo(effQty) < 0) {
-                    try {
-                        log.warn("♻️ [Выход] Повторяю SELL с уменьшенным qty после balance error | {} oldQty={} retryQty={} step={} | chatId={} ex={} net={}",
-                                sym,
-                                QtyMath.strip(effQty),
-                                QtyMath.strip(retryQty),
-                                QtyMath.strip(stepSize),
-                                chatId,
-                                ex,
-                                net);
-
-                        Order retryOrder = orderService.placeMarket(ctx, OrderSide.SELL, retryQty, price);
-                        BigDecimal executedExitPrice = pickExecutedPrice(retryOrder, price);
-                        BigDecimal pnlPct = calcPnlPct(entryPriceFromStore, executedExitPrice);
-
-                        safeLive(() -> live.clearTpSl(chatId, strategyType, sym));
-                        safeLive(() -> live.clearPriceLines(chatId, strategyType, sym));
-                        safeLive(() -> live.pushSignal(chatId, strategyType, sym, null,
-                                Signal.sell(executedExitPrice.doubleValue(), tpHit ? "TP" : "SL")));
-
-                        publishTradeClosedEvent(
-                                chatId,
-                                strategyType,
-                                sym,
-                                (ss != null ? ss.getTimeframe() : null),
-                                ex,
-                                net,
-                                effectiveTime,
-                                tpHit ? "TP" : "SL",
-                                pnlPct,
-                                executedExitPrice,
-                                entryPriceFromStore,
-                                retryQty,
-                                effTp,
-                                effSl,
-                                tpHit,
-                                slHit
-                        );
-
-                        try { positionStore.clearPosition(chatId, strategyType, ex, net, sym); } catch (Exception ignored) {}
-                        failCooldown.clear(exitKey);
-
-                        log.info("✅ [Выход] SELL исполнен после qty-retry | {} qty={} exitPrice={} pnlPct={} | chatId={} ex={} net={}",
-                                sym,
-                                QtyMath.strip(retryQty),
-                                QtyMath.strip(executedExitPrice),
-                                (pnlPct != null ? QtyMath.strip(pnlPct) : "null"),
-                                chatId,
-                                ex,
-                                net);
-
-                        return ExitResult.ok(tpHit, slHit, executedExitPrice, pnlPct != null ? pnlPct : BigDecimal.ZERO);
-
-                    } catch (Exception retryEx) {
-                        log.warn("⚠️ [Выход] Повторный SELL после balance error тоже не удался chatId={} sym={} retryQty={} err={}",
-                                chatId,
-                                sym,
-                                QtyMath.strip(retryQty),
-                                retryEx.toString());
-                    }
-                }
-
-                clearDustPositionFromRuntime(chatId, strategyType, ex, net, sym, effQty, price, code, e.getMessage());
-                return ExitResult.fail("dust_position");
+                log.error("⛔ [Выход] Биржа отклонила полный SELL по балансу, повтор с уменьшенным qty запрещён | {} qty={} | chatId={} ex={} net={} err={}",
+                        sym,
+                        QtyMath.strip(effQty),
+                        chatId,
+                        ex,
+                        net,
+                        e.toString());
+                return ExitResult.fail("balance");
             }
 
             log.error("💥 [Выход] SELL не удался | {} | code={} | chatId={} ex={} net={} | err={}",
                     sym, code, chatId, ex, net, e.toString(), e);
             return ExitResult.fail(code);
         }
+    }
+
+
+    public BigDecimal alignPositionQtyToExchangeBalance(Long chatId,
+                                                    StrategyType strategyType,
+                                                    String exchange,
+                                                    NetworkType network,
+                                                    String symbol,
+                                                    BigDecimal requestedQty) {
+        String ex = safeExchange(exchange);
+        NetworkType net = network;
+        String sym = normalizeSymbol(symbol);
+
+        BigDecimal normalizedRequested = normalizeRuntimeQty(requestedQty, ex, net, sym);
+        if (!QtyMath.isPositive(normalizedRequested)) {
+            return normalizedRequested;
+        }
+
+        BigDecimal baseFree = resolveFreeBaseQty(chatId, strategyType, null, ex, net, sym);
+        if (baseFree == null) {
+            return normalizedRequested;
+        }
+
+        BigDecimal normalizedFree = normalizeRuntimeQty(baseFree, ex, net, sym);
+        if (!QtyMath.isPositive(normalizedFree)) {
+            return normalizedFree;
+        }
+
+        return normalizeRuntimeQty(normalizedRequested.min(normalizedFree), ex, net, sym);
+    }
+
+
+    private ExitResult handleSellExecutionResult(Long chatId,
+                                                 StrategyType strategyType,
+                                                 String symbol,
+                                                 StrategySettings ss,
+                                                 String exchange,
+                                                 NetworkType network,
+                                                 Instant effectiveTime,
+                                                 boolean tpHit,
+                                                 boolean slHit,
+                                                 BigDecimal requestedQty,
+                                                 BigDecimal tpPrice,
+                                                 BigDecimal slPrice,
+                                                 BigDecimal positionQtyBeforeSell,
+                                                 BigDecimal entryPrice,
+                                                 Optional<PositionStore.PositionSnapshot> posOpt,
+                                                 Order order,
+                                                 BigDecimal fallbackTickPrice,
+                                                 String exitKey) {
+
+        String sym = normalizeSymbol(symbol);
+        String ex = safeExchange(exchange);
+        NetworkType net = network;
+
+        BigDecimal executedExitPrice = pickExecutedPrice(order, fallbackTickPrice);
+        BigDecimal executedQtyRaw = pickExecutedQty(order, requestedQty);
+        BigDecimal executedQty = normalizeRuntimeQty(executedQtyRaw, ex, net, sym);
+
+        if (!QtyMath.isPositive(executedQty)) {
+            failCooldown.recordFailure(exitKey, "sell_not_filled", "executedQty<=0");
+            log.warn("⛔ [Выход] SELL вернул нулевой executedQty | {} requestedQty={} rawExecutedQty={} | chatId={} ex={} net={}",
+                    sym,
+                    QtyMath.strip(requestedQty),
+                    QtyMath.strip(executedQtyRaw),
+                    chatId,
+                    ex,
+                    net);
+            return ExitResult.fail("sell_not_filled");
+        }
+
+        BigDecimal basePositionQty = normalizeRuntimeQty(positionQtyBeforeSell, ex, net, sym);
+        if (!QtyMath.isPositive(basePositionQty)) {
+            basePositionQty = requestedQty;
+        }
+
+        BigDecimal remainingQty = basePositionQty.subtract(executedQty);
+        if (remainingQty.signum() < 0) {
+            remainingQty = BigDecimal.ZERO;
+        }
+        remainingQty = normalizeRuntimeQty(remainingQty, ex, net, sym);
+
+        BigDecimal effectiveEntryPrice = positiveOrNull(entryPrice);
+        if (effectiveEntryPrice == null && posOpt != null && posOpt.isPresent()) {
+            effectiveEntryPrice = positiveOrNull(posOpt.get().entryPrice());
+        }
+        if (effectiveEntryPrice == null) {
+            effectiveEntryPrice = fallbackTickPrice;
+        }
+
+        BigDecimal pnlPct = calcPnlPct(effectiveEntryPrice, executedExitPrice);
+
+        if (QtyMath.isPositive(remainingQty)) {
+            failCooldown.recordFailure(
+                    exitKey,
+                    "sell_not_fully_filled",
+                    "requestedQty=" + QtyMath.strip(requestedQty) + ", executedQty=" + QtyMath.strip(executedQty)
+            );
+
+            syncRemainingPositionAfterIncompleteSell(
+                    chatId,
+                    strategyType,
+                    ex,
+                    net,
+                    sym,
+                    effectiveEntryPrice,
+                    remainingQty,
+                    tpPrice,
+                    slPrice,
+                    posOpt,
+                    effectiveTime
+            );
+
+            log.error("⛔ [Выход] Частичное исполнение SELL запрещено | {} requestedQty={} executedQty={} remainingQty={} exitPrice={} pnlPct={} tpHit={} slHit={} | chatId={} ex={} net={}",
+                    sym,
+                    QtyMath.strip(basePositionQty),
+                    QtyMath.strip(executedQty),
+                    QtyMath.strip(remainingQty),
+                    QtyMath.strip(executedExitPrice),
+                    pnlPct != null ? QtyMath.strip(pnlPct) : "null",
+                    tpHit,
+                    slHit,
+                    chatId,
+                    ex,
+                    net);
+
+            return ExitResult.fail("sell_not_fully_filled");
+        }
+
+        safeLive(() -> live.clearTpSl(chatId, strategyType, sym));
+        safeLive(() -> live.clearPriceLines(chatId, strategyType, sym));
+        safeLive(() -> live.pushSignal(chatId, strategyType, sym, null,
+                Signal.sell(executedExitPrice.doubleValue(), tpHit ? "TP" : "SL")));
+
+        log.info("✅ [Выход] SELL исполнен полностью | {} qty={} exitPrice={} pnlPct={} tpHit={} slHit={} | chatId={} ex={} net={}",
+                sym,
+                QtyMath.strip(executedQty),
+                QtyMath.strip(executedExitPrice),
+                pnlPct != null ? QtyMath.strip(pnlPct) : "null",
+                tpHit,
+                slHit,
+                chatId,
+                ex,
+                net
+        );
+
+        publishTradeClosedEvent(
+                chatId,
+                strategyType,
+                sym,
+                (ss != null ? ss.getTimeframe() : null),
+                ex,
+                net,
+                effectiveTime,
+                tpHit ? "TP" : "SL",
+                pnlPct,
+                executedExitPrice,
+                effectiveEntryPrice,
+                executedQty,
+                tpPrice,
+                slPrice,
+                tpHit,
+                slHit
+        );
+
+        try {
+            positionStore.clearPosition(chatId, strategyType, ex, net, sym);
+        } catch (Exception ignored) {
+        }
+        failCooldown.clear(exitKey);
+
+        boolean isLoss = (pnlPct != null && pnlPct.signum() < 0);
+
+        if ((slHit || isLoss) && allowAutoTune(ss)) {
+            String reason = slHit ? "after-close:sl" : "after-close:loss";
+            if (pnlPct != null) {
+                reason += ":pnlPct=" + pnlPct.stripTrailingZeros().toPlainString();
+            }
+
+            mlAutoTuneRuntime.triggerTuneDebounced(
+                    chatId,
+                    strategyType,
+                    ex,
+                    net,
+                    reason,
+                    Duration.ofSeconds(5)
+            );
+        }
+
+        return ExitResult.ok(tpHit, slHit, executedExitPrice, pnlPct != null ? pnlPct : BigDecimal.ZERO);
+    }
+
+    private void syncRemainingPositionAfterIncompleteSell(Long chatId,
+                                                          StrategyType strategyType,
+                                                          String exchange,
+                                                          NetworkType network,
+                                                          String symbol,
+                                                          BigDecimal entryPrice,
+                                                          BigDecimal remainingQty,
+                                                          BigDecimal tpPrice,
+                                                          BigDecimal slPrice,
+                                                          Optional<PositionStore.PositionSnapshot> posOpt,
+                                                          Instant effectiveTime) {
+        String ex = safeExchange(exchange);
+        NetworkType net = network;
+        String sym = normalizeSymbol(symbol);
+
+        BigDecimal syncedRemainingQty = normalizeRuntimeQty(remainingQty, ex, net, sym);
+        if (!QtyMath.isPositive(syncedRemainingQty)) {
+            clearDustPositionFromRuntime(
+                    chatId,
+                    strategyType,
+                    ex,
+                    net,
+                    sym,
+                    remainingQty,
+                    entryPrice,
+                    "sell_not_fully_filled_zero_remaining",
+                    "remainingQty<=0 after normalize"
+            );
+            return;
+        }
+
+        BigDecimal remainingNotional = entryPrice.multiply(syncedRemainingQty).setScale(8, RoundingMode.HALF_UP);
+        if (remainingNotional.compareTo(MIN_RESTORABLE_NOTIONAL) < 0) {
+            clearDustPositionFromRuntime(
+                    chatId,
+                    strategyType,
+                    ex,
+                    net,
+                    sym,
+                    syncedRemainingQty,
+                    entryPrice,
+                    "sell_not_fully_filled_dust",
+                    "remainingQty=" + QtyMath.strip(syncedRemainingQty) + ", remainingNotional=" + QtyMath.strip(remainingNotional)
+            );
+            return;
+        }
+
+        Long entryOrderId = null;
+        Instant openedAt = effectiveTime;
+        if (posOpt != null && posOpt.isPresent()) {
+            try {
+                entryOrderId = posOpt.get().entryOrderId();
+            } catch (Exception ignored) {
+            }
+            try {
+                if (posOpt.get().openedAt() != null) {
+                    openedAt = posOpt.get().openedAt();
+                }
+            } catch (Exception ignored) {
+            }
+        }
+
+        BigDecimal remainingQuoteSpent = entryPrice.multiply(syncedRemainingQty).setScale(8, RoundingMode.HALF_UP).stripTrailingZeros();
+
+        positionStore.markOpened(
+                chatId,
+                strategyType,
+                ex,
+                net,
+                sym,
+                entryPrice,
+                syncedRemainingQty,
+                tpPrice,
+                slPrice,
+                remainingQuoteSpent,
+                entryOrderId,
+                openedAt
+        );
     }
 
     // =====================================================
@@ -1259,7 +1492,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
 
         for (OrderEntity order : scoped) {
             if (order == null) continue;
-            if (!Boolean.TRUE.equals(order.getFilled())) continue;
+            if (!isRecoverableExecutedOrder(order)) continue;
 
             String side = normalizeUpperNullable(order.getSide());
             BigDecimal qty = positiveOrNull(order.getQuantity());
@@ -1415,6 +1648,32 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         } catch (Exception ignored) {}
 
         return fallback;
+    }
+
+
+    private boolean isRecoverableExecutedOrder(OrderEntity order) {
+        if (order == null) return false;
+
+        BigDecimal qty = positiveOrNull(order.getQuantity());
+        if (qty == null) return false;
+
+        String status = normalizeUpperNullable(order.getStatus());
+        if ("REJECTED".equals(status)
+                || "CANCELED".equals(status)
+                || "CANCELLED".equals(status)
+                || "EXPIRED".equals(status)) {
+            return false;
+        }
+
+        if (Boolean.TRUE.equals(order.getFilled())) {
+            return true;
+        }
+
+        return "FILLED".equals(status)
+                || "PARTIALLY_FILLED".equals(status)
+                || "PARTIALLYFILLED".equals(status)
+                || "PARTIALLY_FILLED_CANCELED".equals(status)
+                || "PARTIALLYFILLEDCANCELED".equals(status);
     }
 
     private MlGateDecision evaluateMlGate(StrategySettings ss) {
@@ -2027,13 +2286,6 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         }
     }
 
-
-    
-
-
-    
-
-
     private BigDecimal calcPnlPct(BigDecimal entryPrice, BigDecimal exitPrice) {
         if (entryPrice == null || entryPrice.signum() <= 0) return null;
         if (exitPrice == null || exitPrice.signum() <= 0) return null;
@@ -2055,6 +2307,197 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         BigDecimal floored = QtyMath.floorToStepOrZero(qty, stepSize);
         return QtyMath.isPositive(floored) ? floored.stripTrailingZeros() : BigDecimal.ZERO;
     }
+
+    private BigDecimal normalizeTradableQtyUp(BigDecimal qty, BigDecimal stepSize) {
+        if (!QtyMath.isPositive(qty)) return BigDecimal.ZERO;
+
+        if (!QtyMath.isPositive(stepSize)) {
+            return qty.stripTrailingZeros();
+        }
+
+        BigDecimal steps = qty.divide(stepSize, 0, RoundingMode.UP);
+        BigDecimal ceiled = stepSize.multiply(steps);
+
+        return QtyMath.isPositive(ceiled) ? ceiled.stripTrailingZeros() : BigDecimal.ZERO;
+    }
+
+    public EntryPrecheckResult precheckEntryFast(Long chatId,
+                                                 StrategyType strategyType,
+                                                 String symbol,
+                                                 BigDecimal price,
+                                                 StrategySettings ss,
+                                                 Instant now) {
+
+        if (chatId == null) {
+            return EntryPrecheckResult.block("chatId_null", "chatId=null");
+        }
+        if (strategyType == null) {
+            return EntryPrecheckResult.block("strategyType_null", "strategyType=null");
+        }
+        if (ss == null) {
+            return EntryPrecheckResult.block("no_settings", "StrategySettings=null");
+        }
+
+        String sym = normalizeSymbol(symbol);
+        if (sym == null) {
+            return EntryPrecheckResult.block("symbol_invalid", "symbol пустой");
+        }
+
+        if (!QtyMath.isPositive(price)) {
+            return EntryPrecheckResult.block("price_invalid", "price<=0");
+        }
+
+        String ex = resolveExchange(ss);
+        NetworkType net = resolveNetwork(ss);
+
+        if (ex == null || net == null) {
+            return EntryPrecheckResult.block("no_settings", "exchange/network не определены");
+        }
+
+        Instant effectiveNow = (now != null ? now : Instant.now());
+        String key = entryKey(chatId, strategyType, ex, net, sym);
+
+        if (failCooldown.isBlocked(key)) {
+            long leftMs = failCooldown.remainingMs(key);
+            return EntryPrecheckResult.block(
+                    "cooldown",
+                    "entry cooldown leftMs=" + leftMs
+            );
+        }
+
+        boolean restoredBeforeEntry = ensurePositionRecoveredBeforeEntry(
+                chatId,
+                strategyType,
+                sym,
+                ex,
+                net,
+                null,
+                null,
+                effectiveNow
+        );
+
+        if (positionStore.isInPosition(chatId, strategyType, ex, net, sym)) {
+            return EntryPrecheckResult.block(
+                    restoredBeforeEntry ? "already_in_position_restored" : "already_in_position",
+                    restoredBeforeEntry
+                            ? "позиция восстановлена до входа"
+                            : "позиция уже есть в PositionStore"
+            );
+        }
+
+        BigDecimal minNotional = tryResolveMinNotional(ex, net, sym);
+        if (!QtyMath.isPositive(minNotional)) {
+            minNotional = DEFAULT_MIN_NOTIONAL;
+        }
+
+        BigDecimal baseFree = resolveFreeBaseQty(chatId, strategyType, ss, ex, net, sym);
+        BigDecimal baseFreeTradable = normalizeRuntimeQty(baseFree, ex, net, sym);
+
+        if (QtyMath.isPositive(baseFreeTradable)) {
+            BigDecimal walletBaseNotional = baseFreeTradable
+                    .multiply(price)
+                    .setScale(8, RoundingMode.HALF_UP);
+
+            if (walletBaseNotional.compareTo(minNotional) >= 0) {
+                String details = "wallet base detected qty=" + QtyMath.strip(baseFreeTradable)
+                                 + ", notional=" + QtyMath.strip(walletBaseNotional)
+                                 + ", minNotional=" + QtyMath.strip(minNotional);
+
+                failCooldown.recordFailure(key, "wallet_base_untracked_position", details);
+
+                log.warn("⛔ [Вход] PRECHECK WALLET BASE POSITION | {} baseFree={} baseNotional={} minNotional={} | chatId={} ex={} net={}",
+                        sym,
+                        QtyMath.strip(baseFreeTradable),
+                        QtyMath.strip(walletBaseNotional),
+                        QtyMath.strip(minNotional),
+                        chatId,
+                        ex,
+                        net
+                );
+
+                return EntryPrecheckResult.block("wallet_base_untracked_position", details);
+            }
+        }
+
+        QuoteBudget budget = resolveQuoteBudget(chatId, strategyType, ss, ex, net);
+        if (!QtyMath.isPositive(budget.quoteAmount())) {
+            return EntryPrecheckResult.block(
+                    safe(budget.reason()) != null ? budget.reason() : "no_budget",
+                    "budget reason=" + budget.reason()
+                    + ", mode=" + budget.mode()
+                    + ", value=" + QtyMath.strip(budget.value())
+                    + ", free=" + QtyMath.strip(budget.free())
+            );
+        }
+
+        BigDecimal quoteAmount = budget.quoteAmount();
+        BigDecimal plannedQty = quoteAmount.divide(price, QTY_SCALE, RoundingMode.DOWN);
+
+        if (!QtyMath.isPositive(plannedQty)) {
+            return EntryPrecheckResult.block(
+                    "qty=0",
+                    "plannedQty=0 quote=" + QtyMath.strip(quoteAmount) + ", price=" + QtyMath.strip(price)
+            );
+        }
+
+        BigDecimal stepSize = tryResolveStepSize(ex, net, sym);
+        BigDecimal tradableQty = normalizeTradableQty(plannedQty, stepSize);
+
+        if (!QtyMath.isPositive(tradableQty)) {
+            String details = "qty=0 after step rounding, plannedQty=" + QtyMath.strip(plannedQty)
+                             + ", stepSize=" + QtyMath.strip(stepSize);
+
+            failCooldown.recordFailure(key, "lot_step", details);
+
+            return EntryPrecheckResult.block("lot_step", details);
+        }
+
+        BigDecimal effectiveNotional = tradableQty.multiply(price).setScale(8, RoundingMode.HALF_UP);
+        if (effectiveNotional.compareTo(minNotional) < 0) {
+            BigDecimal requiredQty = minNotional.divide(price, QTY_SCALE, RoundingMode.UP);
+            BigDecimal requiredQtyRounded = normalizeTradableQty(requiredQty, stepSize);
+
+            String details = "precheck: qty*price=" + QtyMath.strip(effectiveNotional)
+                             + " < minNotional=" + QtyMath.strip(minNotional)
+                             + " (нужно qty≥" + QtyMath.strip(requiredQtyRounded) + ")";
+
+            failCooldown.recordFailure(key, "min_notional", details);
+
+            log.warn("⛔ [Вход] PRECHECK MIN_NOTIONAL | {} quote={} plannedQty={} tradableQty={} stepSize={} notional={} minNotional={} needQty={} | chatId={} ex={} net={}",
+                    sym,
+                    QtyMath.strip(quoteAmount),
+                    QtyMath.strip(plannedQty),
+                    QtyMath.strip(tradableQty),
+                    QtyMath.strip(stepSize),
+                    QtyMath.strip(effectiveNotional),
+                    QtyMath.strip(minNotional),
+                    QtyMath.strip(requiredQtyRounded),
+                    chatId,
+                    ex,
+                    net
+            );
+
+            return EntryPrecheckResult.block("min_notional", details);
+        }
+
+        return EntryPrecheckResult.allow();
+    }
+
+    public record EntryPrecheckResult(
+            boolean allowed,
+            String code,
+            String details
+    ) {
+        public static EntryPrecheckResult allow() {
+            return new EntryPrecheckResult(true, "ok", null);
+        }
+
+        public static EntryPrecheckResult block(String code, String details) {
+            return new EntryPrecheckResult(false, code, details);
+        }
+    }
 }
+
+
 
 

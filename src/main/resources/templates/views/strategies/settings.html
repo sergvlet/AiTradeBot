@@ -746,11 +746,11 @@
                       onsubmit="return false;"
                       novalidate>
 
-                    <!-- ✅ чтобы автосейв мог постить как обычную форму -->
+                    <input type="hidden" name="chatId" th:value="${chatId}"/>
                     <input type="hidden" name="saveScope" value="risk"/>
                     <input type="hidden" name="tab" value="risk"/>
                     <input type="hidden" name="exchange" th:value="${selectedExchange}"/>
-                    <input type="hidden" name="network"  th:value="${selectedNetwork != null ? selectedNetwork.name() : 'TESTNET'}"/>
+                    <input type="hidden" name="network" th:value="${selectedNetwork != null ? selectedNetwork.name() : 'TESTNET'}"/>
 
                     <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-2">
                         <div class="section-title mb-0">Контроль суммы входа</div>
@@ -779,13 +779,30 @@
                                     data-confirm-text="Изменение лимита входа влияет на объём ордеров. Сохранить?"
                                     data-lock-mode="AI"
                                     data-lock-type="disabled">
-                                <option value="ALL">Весь доступный баланс</option>
-                                <option value="FIX">Фиксированная сумма</option>
-                                <option value="PCT">Процент от доступного баланса</option>
+                                <option value="ALL"
+                                        th:selected="${strategy == null || strategy.capitalMode == null || strategy.capitalMode.name() == 'ALL'}">
+                                    Весь доступный баланс
+                                </option>
+                                <option value="FIX"
+                                        th:selected="${strategy != null && strategy.capitalMode != null && strategy.capitalMode.name() == 'FIX'}">
+                                    Фиксированная сумма
+                                </option>
+                                <option value="PCT"
+                                        th:selected="${strategy != null && strategy.capitalMode != null && strategy.capitalMode.name() == 'PCT'}">
+                                    Процент от доступного баланса
+                                </option>
                             </select>
 
                             <div class="form-text" id="riskModeHelp">
-                                ALL — стратегия может использовать весь доступный баланс выбранного актива.
+                        <span th:if="${strategy == null || strategy.capitalMode == null || strategy.capitalMode.name() == 'ALL'}">
+                            ALL — стратегия может использовать весь доступный баланс выбранного актива.
+                        </span>
+                                <span th:if="${strategy != null && strategy.capitalMode != null && strategy.capitalMode.name() == 'FIX'}">
+                            FIX — стратегия использует фиксированную сумму выбранного актива.
+                        </span>
+                                <span th:if="${strategy != null && strategy.capitalMode != null && strategy.capitalMode.name() == 'PCT'}">
+                            PCT — стратегия использует долю от доступного баланса.
+                        </span>
                             </div>
                         </div>
 
@@ -797,8 +814,9 @@
                                        class="form-control"
                                        id="riskValueInput"
                                        name="capitalValue"
-                                       step="1"
+                                       step="0.0001"
                                        min="0"
+                                       th:value="${strategy != null && strategy.capitalValue != null ? strategy.capitalValue : ''}"
                                        placeholder="Напр. 40"
                                        data-confirm="true"
                                        data-confirm-title="Подтверждение"
@@ -812,8 +830,8 @@
                             <div class="form-text" id="riskValueHint">Укажи число.</div>
 
                             <div class="mt-2 d-flex flex-wrap gap-2" id="riskQuickButtons">
-                                <button type="button" class="btn btn-outline-secondary btn-sm" data-risk-set="20"  data-risk-mode="FIX">20</button>
-                                <button type="button" class="btn btn-outline-secondary btn-sm" data-risk-set="40"  data-risk-mode="FIX">40</button>
+                                <button type="button" class="btn btn-outline-secondary btn-sm" data-risk-set="20" data-risk-mode="FIX">20</button>
+                                <button type="button" class="btn btn-outline-secondary btn-sm" data-risk-set="40" data-risk-mode="FIX">40</button>
                                 <button type="button" class="btn btn-outline-secondary btn-sm" data-risk-set="100" data-risk-mode="FIX">100</button>
 
                                 <button type="button" class="btn btn-outline-secondary btn-sm" data-risk-set="10" data-risk-mode="PCT">10%</button>
@@ -839,12 +857,16 @@
                     </div>
 
                     <input type="hidden" id="riskInitMode"
-                           th:value="${strategy != null && strategy.capitalMode != null ? strategy.capitalMode : 'ALL'}"/>
+                           th:value="${strategy != null && strategy.capitalMode != null ? strategy.capitalMode.name() : 'ALL'}"/>
+
                     <input type="hidden" id="riskInitValue"
                            th:value="${strategy != null && strategy.capitalValue != null ? strategy.capitalValue : ''}"/>
 
-                    <input type="hidden" id="riskFreeBalanceValue" th:value="${availableBalance != null ? availableBalance : ''}"/>
-                    <input type="hidden" id="riskSelectedAsset" th:value="${selectedAsset != null ? selectedAsset : 'USDT'}"/>
+                    <input type="hidden" id="riskFreeBalanceValue"
+                           th:value="${availableBalance != null ? availableBalance : ''}"/>
+
+                    <input type="hidden" id="riskSelectedAsset"
+                           th:value="${selectedAsset != null ? selectedAsset : 'USDT'}"/>
 
                 </form>
             </div>

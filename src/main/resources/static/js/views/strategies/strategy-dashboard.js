@@ -7,9 +7,6 @@ import { ScalpingStrategy }    from "../../strategies/scalping.strategy.js";
 import { FibonacciStrategy }   from "../../strategies/fibonacci.strategy.js";
 import { SmartFusionStrategy } from "../../strategies/smartfusion.strategy.js";
 
-/**
- * Заглушка для неизвестных стратегий.
- */
 class GenericStrategy {
     constructor({ layers, ctx }) {
         this.layers = layers;
@@ -22,20 +19,22 @@ class GenericStrategy {
 document.addEventListener("DOMContentLoaded", () => {
     console.log("📊 Strategy Dashboard START");
 
-    // =====================================================
-    // CONTEXT
-    // =====================================================
-    const root = document.querySelector("[data-chat-id][data-type][data-symbol]");
+    const root = document.querySelector(
+        "[data-chat-id][data-type][data-symbol][data-exchange][data-network]"
+    );
     if (!root) {
         console.error("❌ Context root not found");
         return;
     }
 
-    const chatId = String(root.dataset.chatId || "").trim();
-    const type   = String(root.dataset.type || "").trim();
-    const symbol = String(root.dataset.symbol || "").trim().toUpperCase();
+    const chatId    = String(root.dataset.chatId || "").trim();
+    const type      = String(root.dataset.type || "").trim();
+    const symbol    = String(root.dataset.symbol || "").trim().toUpperCase();
+    const exchange  = String(root.dataset.exchange || "").trim().toUpperCase();
+    const network   = String(root.dataset.network || "").trim().toUpperCase();
+    const timeframe = String(root.dataset.timeframe || "1m").trim().toLowerCase();
 
-    console.log("🧩 Context:", { chatId, type, symbol });
+    console.log("🧩 Context:", { chatId, type, symbol, exchange, network, timeframe });
 
     const container = document.getElementById("strategy-chart");
     if (!container) {
@@ -46,23 +45,24 @@ document.addEventListener("DOMContentLoaded", () => {
     const symbolUpper = symbol;
     const symbolLower = symbol.toLowerCase();
 
-    // =====================================================
-    // CHART
-    // =====================================================
     const chartCtrl = new ChartController(container);
     chartCtrl.symbol = symbol;
-
-    // дефолт (позже может переписаться из REST)
-    chartCtrl.timeframe = "1m";
+    chartCtrl.timeframe = timeframe || "1m";
+    window.chartCtrl = chartCtrl;
 
     const layers = new LayerRenderer(chartCtrl.chart, chartCtrl.candles);
     layers.candlesData = chartCtrl.candlesData;
     chartCtrl.layerRenderer = layers;
 
-    // =====================================================
-    // STRATEGY OVERLAY
-    // =====================================================
-    const ctx = { chatId, type, symbol };
+    const ctx = {
+        chatId,
+        type,
+        symbol,
+        exchange,
+        network,
+        timeframe: chartCtrl.timeframe
+    };
+
     let strategy;
 
     switch (type) {
@@ -89,11 +89,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     console.log("🧠 Strategy initialized:", type, strategy?.constructor?.name);
 
-    // =====================================================
-    // UI LAYERS CACHE
-    // =====================================================
-
-    const layerCacheKey = `uiLayers:${chatId}:${type}:${symbolUpper}`;
+    const layerCacheKey = `uiLayers:${chatId}:${type}:${exchange}:${network}:${symbolUpper}`;
 
     let _layerState = null;
     let _persistTimer = null;
@@ -198,21 +194,24 @@ document.addEventListener("DOMContentLoaded", () => {
         applyLayerState(bootLayers);
     }
 
-    // =====================================================
-    // REST SNAPSHOT
-    // =====================================================
     const snapshotUrl =
         `/api/chart/strategy` +
         `?chatId=${encodeURIComponent(chatId)}` +
         `&type=${encodeURIComponent(type)}` +
-        `&symbol=${encodeURIComponent(symbol)}`;
+        `&exchange=${encodeURIComponent(exchange)}` +
+        `&network=${encodeURIComponent(network)}` +
+        `&symbol=${encodeURIComponent(symbol)}` +
+        `&timeframe=${encodeURIComponent(chartCtrl.timeframe || timeframe || "1m")}`;
 
     fetch(snapshotUrl)
         .then(r => r.json())
         .then(data => {
             if (data?.timeframe) {
                 const tf = String(data.timeframe).trim().toLowerCase();
-                if (tf) chartCtrl.timeframe = tf;
+                if (tf) {
+                    chartCtrl.timeframe = tf;
+                    ctx.timeframe = tf;
+                }
             }
 
             if (Array.isArray(data?.candles)) {
@@ -233,10 +232,7 @@ document.addEventListener("DOMContentLoaded", () => {
         })
         .catch(err => console.error("❌ REST snapshot error", err));
 
-    // =====================================================
-    // WS DEDUP
-    // =====================================================
-    const _wsDedup = new Map(); // key -> lastSeenMs
+    const _wsDedup = new Map();
 
     function getNestedKline(ev) {
         return ev?.kline || ev?.k || ev?.data?.k || null;
@@ -280,6 +276,8 @@ document.addEventListener("DOMContentLoaded", () => {
         const sym = eventSymbolUpper(ev);
         const tf  = normValue(ev?.timeframe || k?.timeframe || k?.i || "");
         const st  = normValue(ev?.strategyType || type || "");
+        const ex  = normValue(ev?.exchange || exchange || "");
+        const net = normValue(ev?.network || network || "");
         const t   = normValue(eventTimeValue(ev));
 
         const o = normValue(k.open ?? k.o ?? ev?.open);
@@ -287,16 +285,18 @@ document.addEventListener("DOMContentLoaded", () => {
         const l = normValue(k.low  ?? k.l ?? ev?.low);
         const c = normValue(k.close ?? k.c ?? ev?.close);
 
-        return `candle|${st}|${sym}|${tf}|${t}|${o}|${h}|${l}|${c}`;
+        return `candle|${st}|${ex}|${net}|${sym}|${tf}|${t}|${o}|${h}|${l}|${c}`;
     }
 
     function priceDedupKey(ev) {
         const sym = eventSymbolUpper(ev);
         const tf  = normValue(ev?.timeframe || "");
         const st  = normValue(ev?.strategyType || type || "");
+        const ex  = normValue(ev?.exchange || exchange || "");
+        const net = normValue(ev?.network || network || "");
         const t   = normValue(eventTimeValue(ev));
         const p   = normValue(ev?.price);
-        return `price|${st}|${sym}|${tf}|${t}|${p}`;
+        return `price|${st}|${ex}|${net}|${sym}|${tf}|${t}|${p}`;
     }
 
     function genericDedupKey(ev) {
@@ -305,6 +305,8 @@ document.addEventListener("DOMContentLoaded", () => {
         const sym = eventSymbolUpper(ev);
         const tf  = normValue(ev?.timeframe || "");
         const st  = normValue(ev?.strategyType || type || "");
+        const ex  = normValue(ev?.exchange || exchange || "");
+        const net = normValue(ev?.network || network || "");
         const et  = normValue(ev?.type || "");
 
         const extra =
@@ -314,28 +316,19 @@ document.addEventListener("DOMContentLoaded", () => {
             normValue(ev?.signal?.name) ||
             normValue(k?.close ?? k?.c);
 
-        return `${et}|${st}|${sym}|${tf}|${t}|${extra}`;
+        return `${et}|${st}|${ex}|${net}|${sym}|${tf}|${t}|${extra}`;
     }
 
     function wsDedupMeta(ev) {
         if (isCandleEvent(ev)) {
-            return {
-                key: candleDedupKey(ev),
-                ttlMs: 180
-            };
+            return { key: candleDedupKey(ev), ttlMs: 180 };
         }
 
         if (isPriceEvent(ev)) {
-            return {
-                key: priceDedupKey(ev),
-                ttlMs: 120
-            };
+            return { key: priceDedupKey(ev), ttlMs: 120 };
         }
 
-        return {
-            key: genericDedupKey(ev),
-            ttlMs: 1200
-        };
+        return { key: genericDedupKey(ev), ttlMs: 1200 };
     }
 
     function wsSeenRecently(meta) {
@@ -356,9 +349,6 @@ document.addEventListener("DOMContentLoaded", () => {
         return false;
     }
 
-    // =====================================================
-    // WEBSOCKET (STOMP)
-    // =====================================================
     if (typeof SockJS === "undefined" || typeof Stomp === "undefined") {
         console.error("❌ SockJS / Stomp not loaded");
         return;
@@ -378,6 +368,15 @@ document.addEventListener("DOMContentLoaded", () => {
     let wsCount = 0;
     let lastLogAt = 0;
 
+    function setWsStatus(online) {
+        const el = document.getElementById("chart-ws-status");
+        if (!el) return;
+
+        el.textContent = online ? "ONLINE" : "OFFLINE";
+        el.classList.remove("text-success", "text-danger");
+        el.classList.add(online ? "text-success" : "text-danger");
+    }
+
     function cleanupWs() {
         try { if (reconnectTimer) clearTimeout(reconnectTimer); } catch (_) {}
         reconnectTimer = null;
@@ -390,6 +389,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
         try { if (socket) socket.close(); } catch (_) {}
         socket = null;
+
+        setWsStatus(false);
     }
 
     function scheduleReconnect(reason) {
@@ -419,6 +420,7 @@ document.addEventListener("DOMContentLoaded", () => {
             {},
             () => {
                 reconnectAttempt = 0;
+                setWsStatus(true);
                 console.log("✅ STOMP CONNECTED");
 
                 destinations.forEach(dest => {
@@ -470,9 +472,6 @@ document.addEventListener("DOMContentLoaded", () => {
 
     connectWs();
 
-    // =====================================================
-    // RESIZE
-    // =====================================================
     window.addEventListener("resize", () => {
         try {
             chartCtrl.chart.applyOptions({ width: container.clientWidth });

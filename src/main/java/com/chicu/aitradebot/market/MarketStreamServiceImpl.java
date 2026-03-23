@@ -235,7 +235,7 @@ public class MarketStreamServiceImpl implements MarketStreamService {
 
         // если из тиков построили/обновили свечу — публикуем forming-candle
         if (push != null && push.pushedCandle()) {
-            tryPublishUiCandleFromCache(chatId, type, ex, networkType, sym, tf, tradeTsMs);
+            tryPublishUiCandleFromCache(chatId, type, ex, networkType, sym, tf);
         }
 
         // 2) UI живёт всегда
@@ -406,8 +406,9 @@ public class MarketStreamServiceImpl implements MarketStreamService {
 
         SubBinding sb = lastSub.get(new SubKey(chatId, type));
         if (sb != null && eq(ex, sb.exchange) && net == sb.networkType && eq(sym, sb.symbol)) {
-            String tf = sanitizeTf(sb.timeframe);
-            if (tf != null) return tf;
+            String tf;
+            tf = sanitizeTf(sb.timeframe);
+            return tf;
         }
 
         return null;
@@ -421,8 +422,7 @@ public class MarketStreamServiceImpl implements MarketStreamService {
                                              String exchange,
                                              NetworkType networkType,
                                              String symbol,
-                                             String timeframe,
-                                             long tradeTsMs) {
+                                             String timeframe) {
 
         String ex = sanitizeExchange(exchange);
         String sym = sanitizeSymbol(symbol);
@@ -443,7 +443,7 @@ public class MarketStreamServiceImpl implements MarketStreamService {
             var tail = marketDataStreamService.getCachedCandles(chatId, type, ex, networkType, sym, tf, 1);
             if (tail == null || tail.isEmpty()) return;
 
-            var c = tail.get(tail.size() - 1);
+            var c = tail.getLast();
             if (c == null) return;
 
             Instant ts = Instant.ofEpochMilli(c.getTime());
@@ -683,18 +683,6 @@ public class MarketStreamServiceImpl implements MarketStreamService {
         }
     }
 
-    // старый вызов без env, если где-то остался
-    public void onKline(long chatId,
-                        StrategyType type,
-                        String symbol,
-                        String timeframe,
-                        UnifiedKline kline) {
-        Optional<AiStrategyOrchestrator.RunBinding> b = bindingOf(chatId, type);
-        if (b.isEmpty()) return;
-        AiStrategyOrchestrator.RunBinding rb = b.get();
-        onKline(chatId, type, rb.exchange(), rb.network(), symbol, timeframe, kline);
-    }
-
     private void cleanupKlineKeyIfOld(KlineKey key, long nowMs) {
         Long lastSeen = lastKlineSeenAtMs.get(key);
         if (lastSeen == null) return;
@@ -733,7 +721,7 @@ public class MarketStreamServiceImpl implements MarketStreamService {
                             long sinceLastDispatchMs,
                             MarketDataStreamService.MarketPushResult push) {
 
-        if (!shouldLog(seq)) return;
+        if (shouldLog(seq)) return;
 
         String priceStr = price.stripTrailingZeros().toPlainString();
         String qtyStr = qty != null ? qty.stripTrailingZeros().toPlainString() : "null";
@@ -763,7 +751,7 @@ public class MarketStreamServiceImpl implements MarketStreamService {
                              String reason,
                              MarketDataStreamService.MarketPushResult push) {
 
-        if (!shouldLog(seq)) return;
+        if (shouldLog(seq)) return;
 
         String priceStr = price.stripTrailingZeros().toPlainString();
         String qtyStr = qty != null ? qty.stripTrailingZeros().toPlainString() : "null";
@@ -794,11 +782,11 @@ public class MarketStreamServiceImpl implements MarketStreamService {
     }
 
     private boolean shouldLog(long seq) {
-        if (seq <= 0) return true;
+        if (seq <= 0) return false;
         long first = Math.max(0L, logFirstSeq);
         long every = Math.max(1L, logEverySeq);
-        if (seq <= first) return true;
-        return (seq % every) == 0;
+        if (seq <= first) return false;
+        return (seq % every) != 0;
     }
 
     private boolean isKlineClosed(UnifiedKline kline) {
@@ -930,6 +918,7 @@ public class MarketStreamServiceImpl implements MarketStreamService {
         }
     }
 }
+
 
 
 

@@ -25,8 +25,11 @@ $Manifest    = Join-Path $ExportDir "manifest.txt"
 $FileNamesToPack = @(
     "WindowScalpingStrategyV4.java",
     "TradeExecutionServiceImpl.java",
-    "MarketStreamServiceImpl.java",
-    "MlTrainingServiceImpl.java"
+    "AiStrategyOrchestrator.java",
+    "StrategyChartApiController.java",
+    "StrategyReplayApiController.java",
+    "WebChartFacadeImpl.java",
+    "application.properties"
 )
 
 # =========================================================

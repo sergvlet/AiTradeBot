@@ -1,5 +1,6 @@
 package com.chicu.aitradebot.web.controller.web;
 
+import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
 import com.chicu.aitradebot.orchestrator.dto.StrategyRunInfo;
@@ -24,6 +25,10 @@ import java.util.Locale;
 @RequestMapping("/strategies")
 public class StrategyDashboardController {
 
+    private static final String DEFAULT_EXCHANGE = "BINANCE";
+    private static final NetworkType DEFAULT_NETWORK = NetworkType.MAINNET;
+    private static final String DEFAULT_TIMEFRAME = "1m";
+
     private final WebStrategyFacade webStrategyFacade;
     private final StrategySettingsService strategySettingsService;
 
@@ -31,96 +36,123 @@ public class StrategyDashboardController {
     public String strategyDashboardPage(
             @PathVariable StrategyType type,
             @RequestParam Long chatId,
+            @RequestParam(required = false) String exchange,
+            @RequestParam(required = false) String network,
+            @RequestParam(required = false) String symbol,
+            @RequestParam(required = false) String timeframe,
             Model model
     ) {
-        // =====================================================
-        // 0) БАЗОВЫЙ UI-КОНТЕКСТ
-        // =====================================================
         model.addAttribute("page", "strategies/strategy_dashboard");
         model.addAttribute("chatId", chatId);
         model.addAttribute("type", type);
 
-        // =====================================================
-        // 1) LOAD STRATEGY SETTINGS (baseline)
-        // =====================================================
         StrategySettings settings = resolveBaselineSettings(chatId, type);
 
         if (settings == null) {
             log.warn("⚠️ DASHBOARD: StrategySettings not found (NOT CONFIGURED) chatId={} type={}", chatId, type);
 
-            model.addAttribute("configured", false);
+            String exchangeUi = normalizeExchangeOrDefault(exchange);
+            NetworkType networkUi = parseNetworkOrDefault(network);
+            String symbolUi = normalizeSymbolOrNull(symbol);
+            String timeframeUi = normalizeTimeframeOrDefault(timeframe);
 
+            model.addAttribute("configured", false);
             model.addAttribute("strategy", null);
-            model.addAttribute("symbol", null);
-            model.addAttribute("exchange", null);
-            model.addAttribute("network", null);
+            model.addAttribute("symbol", symbolUi);
+            model.addAttribute("exchange", exchangeUi);
+            model.addAttribute("network", networkUi.name());
+            model.addAttribute("timeframe", timeframeUi);
 
             StrategyRunInfo info = new StrategyRunInfo();
             info.setActive(false);
+            info.setExchangeName(exchangeUi);
+            info.setNetworkType(networkUi);
+            info.setSymbol(symbolUi);
+            info.setTimeframe(timeframeUi);
 
             model.addAttribute("info", info);
-            model.addAttribute("notice",
-                    "Стратегия ещё не настроена. Зайди в «Настройки», выбери символ и таймфрейм, затем открой дашборд.");
+            model.addAttribute(
+                    "notice",
+                    "Стратегия ещё не настроена. Зайди в «Настройки», выбери символ, таймфрейм, биржу и сеть, затем открой дашборд."
+            );
 
             return "layout/app";
         }
 
-        // =====================================================
-        // 2) VALIDATE REQUIRED FIELDS
-        // =====================================================
-        String rawSymbol = settings.getSymbol();
-        String rawTimeframe = settings.getTimeframe();
+        String symbolFromSettings = normalizeSymbolOrNull(settings.getSymbol());
+        String timeframeFromSettings = normalizeTimeframeOrNull(settings.getTimeframe());
+        String exchangeFromSettings = normalizeExchangeOrNull(settings.getExchangeName());
+        NetworkType networkFromSettings = settings.getNetworkType();
 
-        // Нормализуем аккуратно (но null не трогаем)
-        String symbol = (rawSymbol == null) ? null : rawSymbol.trim().toUpperCase(Locale.ROOT);
-        String timeframe = (rawTimeframe == null) ? null : rawTimeframe.trim().toLowerCase(Locale.ROOT);
+        // ✅ UI-контекст: сначала query-параметры, потом settings, потом дефолт
+        String symbolUi = firstNonBlankSymbol(
+                normalizeSymbolOrNull(symbol),
+                symbolFromSettings
+        );
 
-        // exchange/network для потоков/ключей тоже должны быть консистентны
-        String exchangeNorm = (settings.getExchangeName() == null) ? null : settings.getExchangeName().trim().toUpperCase(Locale.ROOT);
+        String timeframeUi = firstNonBlankTimeframe(
+                normalizeTimeframeOrNull(timeframe),
+                timeframeFromSettings,
+                DEFAULT_TIMEFRAME
+        );
+
+        String exchangeUi = firstNonBlankExchange(
+                normalizeExchangeOrNull(exchange),
+                exchangeFromSettings,
+                DEFAULT_EXCHANGE
+        );
+
+        NetworkType networkUi = firstNonNullNetwork(
+                parseNetworkOrNull(network),
+                networkFromSettings,
+                DEFAULT_NETWORK
+        );
 
         boolean configuredBase =
-                symbol != null && !symbol.isBlank() &&
-                timeframe != null && !timeframe.isBlank();
+                symbolUi != null && !symbolUi.isBlank() &&
+                timeframeUi != null && !timeframeUi.isBlank();
 
         boolean configuredMarket =
                 configuredBase &&
-                exchangeNorm != null && !exchangeNorm.isBlank() &&
-                settings.getNetworkType() != null;
+                exchangeUi != null && !exchangeUi.isBlank() &&
+                networkUi != null;
 
-        model.addAttribute("configured", configuredMarket); // ✅ “сконфигурировано” = можно реально стримить/рисовать
+        model.addAttribute("configured", configuredMarket);
         model.addAttribute("strategy", settings);
 
-        // для UI — отдаём НОРМАЛИЗОВАННЫЕ значения, чтобы JS не ловил кашу
-        model.addAttribute("symbol", symbol);
-        model.addAttribute("exchange", exchangeNorm);
-        model.addAttribute("network", settings.getNetworkType() != null ? settings.getNetworkType().name() : null);
+        model.addAttribute("symbol", symbolUi);
+        model.addAttribute("exchange", exchangeUi);
+        model.addAttribute("network", networkUi != null ? networkUi.name() : null);
+        model.addAttribute("timeframe", timeframeUi);
 
-        // если частично пусто — не падаем
         if (!configuredBase) {
             log.warn("⚠️ DASHBOARD: StrategySettings present but incomplete chatId={} type={} id={} symbol={} timeframe={}",
-                    chatId, type, settings.getId(), rawSymbol, rawTimeframe);
+                    chatId, type, settings.getId(), settings.getSymbol(), settings.getTimeframe());
 
             StrategyRunInfo info = new StrategyRunInfo();
             info.setActive(settings.isActive());
-            info.setSymbol(symbol);
-            info.setTimeframe(timeframe);
-            info.setExchangeName(exchangeNorm);
-            info.setNetworkType(settings.getNetworkType());
+            info.setSymbol(symbolUi);
+            info.setTimeframe(timeframeUi);
+            info.setExchangeName(exchangeUi);
+            info.setNetworkType(networkUi);
 
             model.addAttribute("info", info);
-            model.addAttribute("notice",
-                    "Настройки стратегии неполные. Укажи символ и таймфрейм в «Настройки», затем вернись на дашборд.");
+            model.addAttribute(
+                    "notice",
+                    "Настройки стратегии неполные. Укажи символ и таймфрейм в «Настройки», затем вернись на дашборд."
+            );
 
             return "layout/app";
         }
 
-        // Если символ/ТФ есть, но биржа/сеть не выбраны — тоже покажем подсказку
         if (!configuredMarket) {
             log.warn("⚠️ DASHBOARD: Settings ok, but exchange/network missing chatId={} type={} id={} ex={} net={}",
                     chatId, type, settings.getId(), settings.getExchangeName(), settings.getNetworkType());
 
-            model.addAttribute("notice",
-                    "Не выбрана биржа/сеть. Укажи их в «Настройки», иначе поток рынка и график не подключатся.");
+            model.addAttribute(
+                    "notice",
+                    "Не выбрана биржа/сеть. Укажи их в «Настройки», иначе поток рынка и график не подключатся."
+            );
         }
 
         log.info(
@@ -128,43 +160,28 @@ public class StrategyDashboardController {
                 settings.getId(),
                 chatId,
                 type,
-                symbol,
-                timeframe,
+                symbolUi,
+                timeframeUi,
                 settings.getCachedCandlesLimit(),
-                exchangeNorm,
-                settings.getNetworkType(),
+                exchangeUi,
+                networkUi,
                 settings.isActive()
         );
 
-        // =====================================================
-        // 3) STRATEGY LIVE STATE (RUN INFO)
-        // ✅ Тут тоже передаём нормализованный exchange
-        //
-        // ВАЖНО:
-        // - WS-подписка теперь НЕ зависит от открытия дашборда.
-        // - Поток рынка подключается/отключается оркестратором при START/STOP стратегии.
-        // =====================================================
-        StrategyRunInfo info =
-                webStrategyFacade.getRunInfo(
-                        chatId,
-                        type,
-                        exchangeNorm,
-                        settings.getNetworkType()
-                );
+        StrategyRunInfo info = webStrategyFacade.getRunInfo(chatId, type, exchangeUi, networkUi);
 
         if (info == null) {
             log.warn("⚠️ StrategyRunInfo is null chatId={} type={} ex={} net={}",
-                    chatId, type, exchangeNorm, settings.getNetworkType());
+                    chatId, type, exchangeUi, networkUi);
 
             info = new StrategyRunInfo();
             info.setActive(false);
         }
 
-        // Подстраховка полей для UI
-        if (info.getSymbol() == null) info.setSymbol(symbol);
-        if (info.getTimeframe() == null) info.setTimeframe(timeframe);
-        if (info.getExchangeName() == null) info.setExchangeName(exchangeNorm);
-        if (info.getNetworkType() == null) info.setNetworkType(settings.getNetworkType());
+        if (info.getSymbol() == null) info.setSymbol(symbolUi);
+        if (info.getTimeframe() == null) info.setTimeframe(timeframeUi);
+        if (info.getExchangeName() == null) info.setExchangeName(exchangeUi);
+        if (info.getNetworkType() == null) info.setNetworkType(networkUi);
 
         model.addAttribute("info", info);
 
@@ -193,5 +210,87 @@ public class StrategyDashboardController {
                 .sorted(cmp)
                 .findFirst()
                 .orElse(null);
+    }
+
+    private static String normalizeSymbolOrNull(String symbol) {
+        if (symbol == null) return null;
+        String s = symbol.trim().toUpperCase(Locale.ROOT);
+        return s.isEmpty() ? null : s;
+    }
+
+    private static String normalizeTimeframeOrNull(String timeframe) {
+        if (timeframe == null) return null;
+        String s = timeframe.trim().toLowerCase(Locale.ROOT);
+        return s.isEmpty() ? null : s;
+    }
+
+    private static String normalizeTimeframeOrDefault(String timeframe) {
+        String s = normalizeTimeframeOrNull(timeframe);
+        return s != null ? s : DEFAULT_TIMEFRAME;
+    }
+
+    private static String normalizeExchangeOrNull(String exchange) {
+        if (exchange == null) return null;
+        String s = exchange.trim().toUpperCase(Locale.ROOT);
+        return s.isEmpty() ? null : s;
+    }
+
+    private static String normalizeExchangeOrDefault(String exchange) {
+        String s = normalizeExchangeOrNull(exchange);
+        return s != null ? s : DEFAULT_EXCHANGE;
+    }
+
+    private static NetworkType parseNetworkOrNull(String network) {
+        if (network == null) return null;
+        String s = network.trim();
+        if (s.isEmpty()) return null;
+
+        for (NetworkType nt : NetworkType.values()) {
+            if (nt.name().equalsIgnoreCase(s)) {
+                return nt;
+            }
+        }
+
+        return null;
+    }
+
+    private static NetworkType parseNetworkOrDefault(String network) {
+        NetworkType parsed = parseNetworkOrNull(network);
+        return parsed != null ? parsed : DEFAULT_NETWORK;
+    }
+
+    private static String firstNonBlankSymbol(String... values) {
+        if (values == null) return null;
+        for (String v : values) {
+            String n = normalizeSymbolOrNull(v);
+            if (n != null) return n;
+        }
+        return null;
+    }
+
+    private static String firstNonBlankTimeframe(String... values) {
+        if (values == null) return null;
+        for (String v : values) {
+            String n = normalizeTimeframeOrNull(v);
+            if (n != null) return n;
+        }
+        return null;
+    }
+
+    private static String firstNonBlankExchange(String... values) {
+        if (values == null) return null;
+        for (String v : values) {
+            String n = normalizeExchangeOrNull(v);
+            if (n != null) return n;
+        }
+        return null;
+    }
+
+    private static NetworkType firstNonNullNetwork(NetworkType... values) {
+        if (values == null) return null;
+        for (NetworkType v : values) {
+            if (v != null) return v;
+        }
+        return null;
     }
 }

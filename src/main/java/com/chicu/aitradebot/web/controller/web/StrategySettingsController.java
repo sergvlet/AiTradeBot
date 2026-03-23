@@ -539,14 +539,17 @@ public class StrategySettingsController {
                     value = null;
                 } else if (mode == StrategySettings.CapitalMode.FIX) {
                     value = validateMoneyOrNull(value);
-                    if (value == null) mode = StrategySettings.CapitalMode.ALL;
+                    // ✅ режим НЕ откатываем в ALL, даже если значение пока пустое
                 } else if (mode == StrategySettings.CapitalMode.PCT) {
                     value = validatePctOrNull(value);
-                    if (value == null) mode = StrategySettings.CapitalMode.ALL;
+                    // ✅ режим НЕ откатываем в ALL, даже если значение пока пустое
                 }
 
                 s.setCapitalMode(mode);
                 s.setCapitalValue(value);
+
+                log.info("🛡️ [RISK SAVE] chatId={} type={} mode={} value={}",
+                        chatId, strategyType, mode, value);
 
                 return saveStrategySettings(chatId, strategyType, s);
             }

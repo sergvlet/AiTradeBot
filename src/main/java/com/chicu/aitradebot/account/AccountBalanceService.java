@@ -43,7 +43,8 @@ public class AccountBalanceService {
             String selectedAssetHint
     ) {
         String ex = normalize(exchangeName);
-        NetworkType net = networkType;
+        NetworkType net;
+        net = networkType;
         String selectedHint = normalize(selectedAssetHint);
 
         StrategySettings settings = null;
@@ -105,7 +106,7 @@ public class AccountBalanceService {
             availableAssets.sort(String.CASE_INSENSITIVE_ORDER);
 
             if (availableAssets.remove(PREFERRED_ASSET)) {
-                availableAssets.add(0, PREFERRED_ASSET);
+                availableAssets.addFirst(PREFERRED_ASSET);
             }
 
             String selected = firstNonBlank(selectedHint, selectedFromSettings);
@@ -158,7 +159,8 @@ public class AccountBalanceService {
 
     public AccountFees getAccountFees(long chatId, String exchangeName, NetworkType networkType) {
         String ex = normalize(exchangeName);
-        NetworkType net = networkType;
+        NetworkType net;
+        net = networkType;
 
         if (ex == null || net == null) {
             return null;
@@ -251,7 +253,7 @@ public class AccountBalanceService {
         }
 
         if (best != null) return best;
-        return availableAssets.isEmpty() ? null : availableAssets.get(0);
+        return availableAssets.isEmpty() ? null : availableAssets.getFirst();
     }
 
     private String normalize(String s) {

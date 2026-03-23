@@ -58,7 +58,7 @@ window.SettingsTabNetwork = (function () {
     function getChatId() {
         const ctx = getCtx();
         if (ctx && ctx.chatId) return String(ctx.chatId);
-        // fallback
+
         const el = document.querySelector("[data-chat-id]");
         return el?.dataset?.chatId ? String(el.dataset.chatId) : "";
     }
@@ -66,12 +66,12 @@ window.SettingsTabNetwork = (function () {
     function getType() {
         const ctx = getCtx();
         if (ctx && ctx.type) return String(ctx.type);
+
         const el = document.querySelector("[data-type]");
         return el?.dataset?.type ? String(el.dataset.type) : "";
     }
 
     function getActiveTabId() {
-        // ✅ теперь НЕ используем старый localStorage key
         const activeBtn = document.querySelector(".tab-btn.active");
         const tabId = activeBtn?.dataset?.tab;
         return tabId || "tab-network";
@@ -84,7 +84,7 @@ window.SettingsTabNetwork = (function () {
         if (!isBlank(chatId)) q.set("chatId", String(chatId));
         if (!isBlank(exchange)) q.set("exchange", String(exchange));
         if (!isBlank(network)) q.set("network", String(network));
-        if (!isBlank(tabId)) q.set("tab", String(tabId).replace("tab-", "")); // на сервер часто уходит "network/control/.."
+        if (!isBlank(tabId)) q.set("tab", String(tabId).replace("tab-", ""));
 
         return base + "?" + q.toString();
     }
@@ -92,6 +92,17 @@ window.SettingsTabNetwork = (function () {
     function replaceUrlWithoutReload(exchange, network) {
         const url = buildSettingsUrl(getChatId(), exchange, network, getActiveTabId());
         try { history.replaceState(null, "", url); } catch (_) {}
+        return url;
+    }
+
+    function reloadToContext(exchange, network) {
+        const url = buildSettingsUrl(getChatId(), exchange, network, getActiveTabId());
+
+        try { history.replaceState(null, "", url); } catch (_) {}
+
+        // Надёжный способ полностью применить новый exchange/network
+        // ко всем вкладкам и данным без ручного F5.
+        window.location.replace(url);
     }
 
     function buildDiagnoseUrl(chatId, exchange, network) {
@@ -102,7 +113,7 @@ window.SettingsTabNetwork = (function () {
                 `&exchange=${encodeURIComponent(String(exchange))}` +
                 `&network=${encodeURIComponent(String(network))}`;
         }
-        // fallback legacy
+
         return `/strategies/network/diagnose` +
             `?chatId=${encodeURIComponent(String(chatId))}` +
             `&exchange=${encodeURIComponent(String(exchange))}` +
@@ -110,7 +121,7 @@ window.SettingsTabNetwork = (function () {
     }
 
     // =====================================================
-    // UI alerts (внутри таба)
+    // UI alerts
     // =====================================================
     function ensureAlertHost() {
         let host = $("network-alert");
@@ -121,10 +132,11 @@ window.SettingsTabNetwork = (function () {
             host = document.createElement("div");
             host.id = "network-alert";
             host.className = "mb-3";
-            // ставим в начало карточки, чтобы не прыгало
+
             const card = pane.querySelector(".card");
             if (card) card.insertBefore(host, card.firstChild);
             else pane.insertBefore(host, pane.firstChild);
+
             return host;
         }
 
@@ -211,9 +223,7 @@ window.SettingsTabNetwork = (function () {
     let started = false;
 
     function init() {
-        // ✅ важно: не стартуем, пока page.js не создал контекст
         if (!window.StrategySettingsContext) {
-            // page.js создаёт контекст на DOMContentLoaded; сеть инициализируется оттуда
             return;
         }
 
@@ -222,7 +232,7 @@ window.SettingsTabNetwork = (function () {
 
         const api = window.SettingsApi;
         if (!api) {
-            console.error("SettingsTabNetwork: SettingsApi не найден (api.js не подключён?)");
+            console.error("SettingsTabNetwork: SettingsApi не найден");
             return;
         }
 
@@ -244,8 +254,10 @@ window.SettingsTabNetwork = (function () {
 
         function setAutosave(text, kind) {
             if (!autosaveEl) return;
+
             autosaveEl.textContent = text || "";
             autosaveEl.className = "small";
+
             if (kind === "info") autosaveEl.classList.add("text-info");
             else if (kind === "ok") autosaveEl.classList.add("text-success");
             else if (kind === "err") autosaveEl.classList.add("text-danger");
@@ -257,13 +269,9 @@ window.SettingsTabNetwork = (function () {
             if (keysNetwork)  keysNetwork.value  = networkSelect.value  || "";
         }
 
-        // ---------------------------------
-        // on load
-        // ---------------------------------
         const initialExchange = exchangeSelect.value || "";
         const initialNetwork  = networkSelect.value  || "";
 
-        // сброс диагностики по бирже
         if (!isDiagnosticsSupported(initialExchange)) {
             resetDiagnosticsUI({
                 text: "Диагностика недоступна для выбранной биржи.",
@@ -278,17 +286,14 @@ window.SettingsTabNetwork = (function () {
             if (notSupported) notSupported.style.display = "none";
         }
 
-        // ---------------------------------
-        // AUTOSAVE (exchange/network)
-        // ---------------------------------
         let inFlight = false;
         let timer = null;
+        let reloadScheduled = false;
 
         let lastExchange = initialExchange;
         let lastNetwork  = initialNetwork;
 
         function prepareForChange(ex, net) {
-            // сбрасываем диагностику, чтобы не оставалось “старое OK”
             if (!isDiagnosticsSupported(ex)) {
                 resetDiagnosticsUI({
                     text: "Диагностика недоступна для выбранной биржи.",
@@ -322,6 +327,8 @@ window.SettingsTabNetwork = (function () {
             if (inFlight) return;
 
             inFlight = true;
+            reloadScheduled = false;
+
             exchangeSelect.disabled = true;
             networkSelect.disabled  = true;
 
@@ -331,7 +338,6 @@ window.SettingsTabNetwork = (function () {
                 syncKeysHidden();
                 prepareForChange(ex, net);
 
-                // ✅ используем SettingsApi.postForm, он сам добавит CSRF
                 await api.postForm(networkForm.action, {
                     saveScope: "network",
                     tab: "network",
@@ -344,39 +350,30 @@ window.SettingsTabNetwork = (function () {
 
                 replaceUrlWithoutReload(ex, net);
 
-                setAutosave("Сохранено", "ok");
-                showAlert("ok", "Биржа/сеть сохранены", `Биржа: ${ex}\nСеть: ${net}`);
-
-                // ✅ обновляем общий контекст без перезагрузки
                 if (btnDiagnose) {
                     btnDiagnose.dataset.exchange = ex;
                     btnDiagnose.dataset.network = net;
                 }
 
-                if (window.SettingsPage && window.SettingsPage.setCtx) {
-                    window.SettingsPage.setCtx({ exchange: ex, network: net }, "network_saved");
-                } else if (window.SettingsApi && window.SettingsApi.emit) {
-                    window.SettingsApi.emit(window.SettingsApi.EVT_CONTEXT_CHANGED, {
-                        exchange: ex,
-                        network: net,
-                        reason: "network_saved",
-                        ts: Date.now()
-                    });
-                }
+                setAutosave("Сохранено. Применяю новый контекст…", "ok");
 
-                // ✅ обновим диагностику сразу (чтобы пользователь видел актуальный connectionOk)
-                diagnose().catch(() => {});
+                reloadScheduled = true;
+
+                setTimeout(() => {
+                    reloadToContext(ex, net);
+                }, 120);
 
             } catch (e) {
                 const pretty = prettifyError(e);
                 setAutosave("Ошибка сохранения", "err");
                 showAlert("err", "Ошибка сохранения биржи/сети", pretty);
-
             } finally {
-                inFlight = false;
-                exchangeSelect.disabled = false;
-                networkSelect.disabled  = false;
-                setTimeout(() => setAutosave("", "idle"), 1200);
+                if (!reloadScheduled) {
+                    inFlight = false;
+                    exchangeSelect.disabled = false;
+                    networkSelect.disabled  = false;
+                    setTimeout(() => setAutosave("", "idle"), 1200);
+                }
             }
         }
 
@@ -397,13 +394,10 @@ window.SettingsTabNetwork = (function () {
             scheduleAutosave();
         });
 
-        // ---------------------------------
-        // DIAGNOSTICS
-        // ---------------------------------
         async function diagnose() {
             if (!btnDiagnose || !statusEl) return;
 
-            const chatId  = getChatId() || (btnDiagnose.dataset.chatId || "");
+            const chatId   = getChatId() || (btnDiagnose.dataset.chatId || "");
             const exchange = exchangeSelect.value || btnDiagnose.dataset.exchange || "";
             const network  = networkSelect.value  || btnDiagnose.dataset.network  || "";
 
@@ -433,8 +427,6 @@ window.SettingsTabNetwork = (function () {
 
             try {
                 const url = buildDiagnoseUrl(chatId, exchange, network);
-
-                // ✅ diagnose у тебя POST без body
                 const d = await api.postJson(url, {});
 
                 const ok = !!d.ok;
@@ -469,15 +461,13 @@ window.SettingsTabNetwork = (function () {
             }
         }
 
-        if (btnDiagnose) btnDiagnose.addEventListener("click", () => diagnose().catch(() => {}));
+        if (btnDiagnose) {
+            btnDiagnose.addEventListener("click", () => diagnose().catch(() => {}));
+        }
 
-        // init sync
         syncKeysHidden();
         replaceUrlWithoutReload(initialExchange, initialNetwork);
     }
-
-    // ✅ ВАЖНО: больше НЕ автозапускаемся тут.
-    // init() вызовет page.js, когда вкладка реально активна.
 
     return { init };
 })();
