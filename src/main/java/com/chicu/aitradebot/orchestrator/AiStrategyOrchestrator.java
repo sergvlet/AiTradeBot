@@ -1,5 +1,6 @@
 package com.chicu.aitradebot.orchestrator;
 
+import com.chicu.aitradebot.ai.ml.MlGateway;
 import com.chicu.aitradebot.ai.runtime.MlAutoTuneRuntime;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
@@ -56,6 +57,7 @@ public class AiStrategyOrchestrator {
      * ObjectProvider — защита от циклов и от временного отсутствия ML-слоя
      */
     private final ObjectProvider<MlAutoTuneRuntime> mlAutoTuneRuntime;
+    private final ObjectProvider<MlGateway> mlGatewayProvider;
 
     @Value("${orch.market-events.listener-enabled:false}")
     private boolean eventBridgeEnabled;
@@ -68,6 +70,66 @@ public class AiStrategyOrchestrator {
 
     private MlAutoTuneRuntime ml() {
         return mlAutoTuneRuntime != null ? mlAutoTuneRuntime.getIfAvailable() : null;
+    }
+
+    private MlGateway mlGateway() {
+        return mlGatewayProvider != null ? mlGatewayProvider.getIfAvailable() : null;
+    }
+
+    private static String blankToNull(String s) {
+        if (s == null) return null;
+        String x = s.trim();
+        return x.isEmpty() ? null : x;
+    }
+
+    private static String readStringNoThrow(Object target, String... methodNames) {
+        if (target == null || methodNames == null) return null;
+
+        for (String methodName : methodNames) {
+            if (methodName == null || methodName.isBlank()) continue;
+            try {
+                var m = target.getClass().getMethod(methodName);
+                Object v = m.invoke(target);
+                if (v == null) continue;
+
+                String s = String.valueOf(v).trim();
+                if (!s.isEmpty() && !"null".equalsIgnoreCase(s)) {
+                    return s;
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        return null;
+    }
+
+    private String resolveEffectiveModelVersion(StrategySettings s) {
+        String fromSettings = blankToNull(s != null ? s.getMlModelVersion() : null);
+        if (fromSettings != null) {
+            return fromSettings;
+        }
+
+        try {
+            MlGateway gw = mlGateway();
+            if (gw == null || !gw.isEnabled()) {
+                return null;
+            }
+
+            Object health = gw.health();
+            if (health == null) {
+                return null;
+            }
+
+            return blankToNull(readStringNoThrow(
+                    health,
+                    "getModelVersion",
+                    "getModel_version",
+                    "getVersion",
+                    "getCurrentModelVersion",
+                    "getCurrent_model_version"
+            ));
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     // =====================================================================
@@ -134,7 +196,7 @@ public class AiStrategyOrchestrator {
         boolean autoTune = (s != null) && s.isAutoTuneEnabled();
         boolean gate = (s != null) && s.isMlGateEnabled();
         BigDecimal thr = (s != null) ? s.getGateMinProb() : null;
-        String modelVer = (s != null) ? s.getMlModelVersion() : null;
+        String modelVer = resolveEffectiveModelVersion(s);
 
         return new RuntimePolicy(m, rp, autoTune, gate, thr, modelVer);
     }
@@ -330,13 +392,15 @@ public class AiStrategyOrchestrator {
         }
 
         BigDecimal effThr = desiredGateEnabled ? desiredGateMinProb : null;
+        String effectiveModelVer = resolveEffectiveModelVersion(s);
+
         RuntimePolicy rp = new RuntimePolicy(
                 mode,
                 phase,
                 desiredAutoTune,
                 desiredGateEnabled,
                 effThr,
-                s.getMlModelVersion()
+                effectiveModelVer
         );
         runtimePolicyCache.put(key, rp);
 
@@ -352,7 +416,7 @@ public class AiStrategyOrchestrator {
                 desiredAutoTune,
                 desiredGateEnabled,
                 (effThr != null ? effThr.toPlainString() : "null"),
-                (s.getMlModelVersion() != null ? s.getMlModelVersion() : "null")
+                (effectiveModelVer != null ? effectiveModelVer : "null")
         );
     }
 

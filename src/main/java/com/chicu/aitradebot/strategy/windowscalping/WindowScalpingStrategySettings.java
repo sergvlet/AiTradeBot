@@ -32,21 +32,81 @@ public class WindowScalpingStrategySettings {
     private Long chatId;
 
     // =====================================================
-    // ✅ TP/SL ДЛЯ ЭТОЙ СТРАТЕГИИ (в %)
+    // TP / SL (fallback static, в %)
     // =====================================================
 
-    /** Take Profit в процентах (например 0.60 = 0.60%) */
+    /**
+     * Fallback TP в процентах.
+     * Используется если auto TP/SL выключен или динамика не смогла рассчитаться.
+     */
     @Builder.Default
     @Column(name = "take_profit_pct", nullable = false, precision = 19, scale = 8)
     private BigDecimal takeProfitPct = new BigDecimal("0.60");
 
-    /** Stop Loss в процентах (например 0.35 = 0.35%) */
+    /**
+     * Fallback SL в процентах.
+     * Используется если auto TP/SL выключен или динамика не смогла рассчитаться.
+     */
     @Builder.Default
     @Column(name = "stop_loss_pct", nullable = false, precision = 19, scale = 8)
     private BigDecimal stopLossPct = new BigDecimal("0.35");
 
     // =====================================================
-    // ✅ ТОЛЬКО ПОЛЯ WINDOW SCALPING
+    // AUTO TP / SL
+    // =====================================================
+
+    /** Включить автоподстройку TP/SL под текущий диапазон окна. */
+    @Builder.Default
+    @Column(name = "auto_tp_sl_enabled", nullable = false)
+    private Boolean autoTpSlEnabled = Boolean.TRUE;
+
+    /** SL = rangePct * autoSlFromRangeFactor */
+    @Builder.Default
+    @Column(name = "auto_sl_from_range_factor", nullable = false, precision = 19, scale = 8)
+    private BigDecimal autoSlFromRangeFactor = new BigDecimal("1.80");
+
+    /** TP = max(rangePct * autoTpFromRangeFactor, SL * autoMinRiskReward) */
+    @Builder.Default
+    @Column(name = "auto_tp_from_range_factor", nullable = false, precision = 19, scale = 8)
+    private BigDecimal autoTpFromRangeFactor = new BigDecimal("5.50");
+
+    /** Минимальный RR для динамического TP. */
+    @Builder.Default
+    @Column(name = "auto_min_risk_reward", nullable = false, precision = 19, scale = 8)
+    private BigDecimal autoMinRiskReward = new BigDecimal("2.40");
+
+    /** Нижняя граница динамического SL, %. */
+    @Builder.Default
+    @Column(name = "auto_sl_min_pct", nullable = false, precision = 19, scale = 8)
+    private BigDecimal autoSlMinPct = new BigDecimal("0.04");
+
+    /** Верхняя граница динамического SL, %. */
+    @Builder.Default
+    @Column(name = "auto_sl_max_pct", nullable = false, precision = 19, scale = 8)
+    private BigDecimal autoSlMaxPct = new BigDecimal("0.18");
+
+    /** Нижняя граница динамического TP, %. */
+    @Builder.Default
+    @Column(name = "auto_tp_min_pct", nullable = false, precision = 19, scale = 8)
+    private BigDecimal autoTpMinPct = new BigDecimal("0.10");
+
+    /** Верхняя граница динамического TP, %. */
+    @Builder.Default
+    @Column(name = "auto_tp_max_pct", nullable = false, precision = 19, scale = 8)
+    private BigDecimal autoTpMaxPct = new BigDecimal("0.80");
+
+    /** Мультипликатор TP для сильного ML-сигнала. */
+    @Builder.Default
+    @Column(name = "auto_tp_ml_boost_factor", nullable = false, precision = 19, scale = 8)
+    private BigDecimal autoTpMlBoostFactor = new BigDecimal("1.15");
+
+    /** Мультипликатор TP для слабого сигнала около порога. */
+    @Builder.Default
+    @Column(name = "auto_tp_weak_signal_factor", nullable = false, precision = 19, scale = 8)
+    private BigDecimal autoTpWeakSignalFactor = new BigDecimal("0.90");
+
+    // =====================================================
+    // WINDOW
     // =====================================================
 
     /** Размер окна (кол-во тиков/баров для high/low) */
@@ -99,4 +159,3 @@ public class WindowScalpingStrategySettings {
         updatedAt = Instant.now();
     }
 }
-

@@ -5,6 +5,8 @@ import java.math.RoundingMode;
 
 public final class QtyMath {
 
+    private static final int DEFAULT_SCALE = 16;
+
     private QtyMath() {}
 
     /**
@@ -14,7 +16,7 @@ public final class QtyMath {
      *  step=0.00001000   -> 5
      */
     public static int scaleOfStep(BigDecimal step) {
-        if (step == null) return 8;
+        if (step == null) return DEFAULT_SCALE;
         BigDecimal s = step.stripTrailingZeros();
         int sc = s.scale();
         return Math.max(0, sc);
@@ -37,6 +39,20 @@ public final class QtyMath {
         return v == null ? "null" : v.stripTrailingZeros().toPlainString();
     }
 
+    /** Округление вниз по scale, когда step неизвестен */
+    public static BigDecimal normalizeDown(BigDecimal value, int scale) {
+        if (value == null) return null;
+        if (value.signum() <= 0) return BigDecimal.ZERO;
+        return value.setScale(Math.max(0, scale), RoundingMode.DOWN);
+    }
+
+    /** Округление вверх по scale, когда step неизвестен */
+    public static BigDecimal normalizeUp(BigDecimal value, int scale) {
+        if (value == null) return null;
+        if (value.signum() <= 0) return BigDecimal.ZERO;
+        return value.setScale(Math.max(0, scale), RoundingMode.UP);
+    }
+
     /**
      * Проверка кратности step (биржевой формат).
      */
@@ -44,7 +60,6 @@ public final class QtyMath {
         if (value == null || step == null) return false;
         if (value.signum() <= 0 || step.signum() <= 0) return false;
 
-        // приводим к одному scale, иначе remainder может вести себя неожиданно
         int sc = Math.max(value.stripTrailingZeros().scale(), step.stripTrailingZeros().scale());
         BigDecimal v = value.setScale(sc, RoundingMode.DOWN);
         BigDecimal s = step.setScale(sc, RoundingMode.DOWN);
@@ -55,8 +70,6 @@ public final class QtyMath {
     /**
      * Округление ВНИЗ к шагу:
      * floor(value / step) * step
-     *
-     * Возвращает число со scale шага (важно для биржи).
      */
     public static BigDecimal floorToStep(BigDecimal value, BigDecimal step) {
         if (value == null || step == null) return value;
@@ -73,10 +86,6 @@ public final class QtyMath {
     /**
      * Округление ВВЕРХ к шагу:
      * ceil(value / step) * step
-     *
-     * Возвращает число со scale шага (важно для биржи).
-     *
-     * ⚠️ Важно: финальный setScale делаем DOWN, потому что кратность step уже гарантирована.
      */
     public static BigDecimal ceilToStep(BigDecimal value, BigDecimal step) {
         if (value == null || step == null) return value;
@@ -90,18 +99,11 @@ public final class QtyMath {
         return out.setScale(sc, RoundingMode.DOWN);
     }
 
-    /**
-     * floorToStep, но если получилось 0 — возвращаем 0 (явно).
-     */
     public static BigDecimal floorToStepOrZero(BigDecimal value, BigDecimal step) {
         BigDecimal out = floorToStep(value, step);
         return isPositive(out) ? out : BigDecimal.ZERO;
     }
 
-    /**
-     * ceilToStep, но гарантирует минимум step (если value > 0, но меньше шага).
-     * Удобно для requiredQty.
-     */
     public static BigDecimal ceilToStepAtLeastStep(BigDecimal value, BigDecimal step) {
         if (!isPositive(value)) return BigDecimal.ZERO;
         if (!isPositive(step)) return value;
@@ -115,14 +117,76 @@ public final class QtyMath {
     }
 
     /**
-     * Минимальное qty, чтобы выполнить minNotional при цене price, с учётом step.
-     * requiredQty = ceil( (minNotional / price) to step )
+     * Универсальное округление вниз:
+     * - если step есть -> floorToStep
+     * - если step нет  -> scale DOWN
      */
-    public static BigDecimal requiredMinQtyForNotional(BigDecimal minNotional, BigDecimal price, BigDecimal step) {
-        if (!isPositive(minNotional) || !isPositive(price) || !isPositive(step)) return null;
+    public static BigDecimal floorSmart(BigDecimal value, BigDecimal step, int fallbackScale) {
+        if (!isPositive(value)) return BigDecimal.ZERO;
+        if (isPositive(step)) return floorToStepOrZero(value, step);
+        return normalizeDown(value, Math.max(DEFAULT_SCALE, fallbackScale));
+    }
 
-        BigDecimal raw = minNotional.divide(price, 32, RoundingMode.UP);
-        return ceilToStepAtLeastStep(raw, step);
+    /**
+     * Универсальное округление вверх:
+     * - если step есть -> ceilToStepAtLeastStep
+     * - если step нет  -> scale UP
+     */
+    public static BigDecimal ceilSmart(BigDecimal value, BigDecimal step, int fallbackScale) {
+        if (!isPositive(value)) return BigDecimal.ZERO;
+        if (isPositive(step)) return ceilToStepAtLeastStep(value, step);
+        return normalizeUp(value, Math.max(DEFAULT_SCALE, fallbackScale));
+    }
+
+    /**
+     * Минимальное qty, чтобы выполнить minNotional при цене price.
+     * Работает и когда step неизвестен.
+     */
+    public static BigDecimal requiredMinQtyForNotional(BigDecimal minNotional,
+                                                       BigDecimal price,
+                                                       BigDecimal step,
+                                                       int fallbackScale) {
+        if (!isPositive(minNotional) || !isPositive(price)) return null;
+
+        BigDecimal raw = minNotional.divide(
+                price,
+                Math.max(DEFAULT_SCALE, fallbackScale + 4),
+                RoundingMode.UP
+        );
+
+        return ceilSmart(raw, step, fallbackScale);
+    }
+
+    public static BigDecimal requiredMinQtyForNotional(BigDecimal minNotional,
+                                                       BigDecimal price,
+                                                       BigDecimal step) {
+        return requiredMinQtyForNotional(minNotional, price, step, DEFAULT_SCALE);
+    }
+
+    /** value + max(relativeBuffer, absoluteBuffer) */
+    public static BigDecimal addBuffer(BigDecimal value,
+                                       BigDecimal relativePct,
+                                       BigDecimal absoluteMin,
+                                       int scale) {
+        if (!isPositive(value)) return value;
+
+        BigDecimal rel = BigDecimal.ZERO;
+        if (isPositive(relativePct)) {
+            rel = value.multiply(relativePct);
+        }
+
+        BigDecimal abs = isPositive(absoluteMin) ? absoluteMin : BigDecimal.ZERO;
+        BigDecimal bump = rel.max(abs);
+
+        return value.add(bump).setScale(Math.max(0, scale), RoundingMode.HALF_UP);
+    }
+
+    /** Вычитание без ухода ниже 0 */
+    public static BigDecimal subtractFloorZero(BigDecimal value, BigDecimal minus) {
+        if (value == null) return null;
+        if (minus == null) return value;
+        BigDecimal out = value.subtract(minus);
+        return out.signum() > 0 ? out : BigDecimal.ZERO;
     }
 
     /** Умножение без NPE */

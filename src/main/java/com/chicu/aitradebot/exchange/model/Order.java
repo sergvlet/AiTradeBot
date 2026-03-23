@@ -1,13 +1,17 @@
 package com.chicu.aitradebot.exchange.model;
 
+import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
-import lombok.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
 
 import java.math.BigDecimal;
 
 /**
- * 💹 DTO ордера — используется между стратегиями, API и графиком.
- * ❗ НЕ Entity
+ * DTO ордера между стратегиями, сервисами и UI.
+ * Не является JPA Entity.
  */
 @Data
 @Builder
@@ -15,9 +19,7 @@ import java.math.BigDecimal;
 @AllArgsConstructor
 public class Order {
 
-    // ===== Идентификаторы =====
-
-    /** id ордера в локальной БД (если есть) */
+    /** id ордера в локальной БД */
     private Long id;
 
     /** id ордера на бирже */
@@ -26,9 +28,7 @@ public class Order {
     /** chatId пользователя */
     private Long chatId;
 
-    // ===== Основные поля =====
-
-    /** Символ, например BTCUSDT */
+    /** Торговая пара, например BTCUSDT */
     private String symbol;
 
     /** BUY / SELL */
@@ -38,17 +38,16 @@ public class Order {
     private String type;
 
     /**
-     * Старое поле количества (legacy).
+     * Старое поле количества.
+     * Оставлено для совместимости.
      */
     @Deprecated
     private BigDecimal qty;
 
-    /**
-     * Новое поле количества.
-     */
+    /** Новое поле количества */
     private BigDecimal quantity;
 
-    /** Цена ордера (limit) или ожидаемая */
+    /** Цена ордера или фактическая цена исполнения */
     private BigDecimal price;
 
     /** Средняя цена исполнения */
@@ -57,25 +56,30 @@ public class Order {
     /** Фактически исполненное количество */
     private BigDecimal executedQty;
 
-    /** Статус: NEW / FILLED / PARTIALLY_FILLED / CANCELED */
+    /** Статус ордера */
     private String status;
 
     /**
-     * Старое поле времени (ms).
+     * Старое поле времени.
+     * Оставлено для совместимости.
      */
     @Deprecated
     private Long timestamp;
 
-    /**
-     * Новое поле времени (ms).
-     */
+    /** Новое поле времени */
     private Long time;
 
-    /** Исполнен ли полностью */
+    /** Исполнен ли ордер полностью */
     private boolean filled;
 
     /** Стратегия-инициатор */
     private StrategyType strategyType;
+
+    /** Биржа исполнения */
+    private String exchangeName;
+
+    /** Сеть исполнения */
+    private NetworkType networkType;
 
     // =====================================================
     // Legacy sync
@@ -100,7 +104,7 @@ public class Order {
     }
 
     // =====================================================
-    // Safety helpers (НЕ ЛОМАЮТ старый код)
+    // Safety helpers
     // =====================================================
 
     public String getSideUpper() {
@@ -112,30 +116,28 @@ public class Order {
     }
 
     // =====================================================
-    // Factory — РЕКОМЕНДУЕМО для стратегий
+    // Factory
     // =====================================================
 
-    public static Order market(
-            Long chatId,
-            String symbol,
-            String side,
-            BigDecimal quantity,
-            BigDecimal executionPrice,
-            StrategyType strategyType
-    ) {
-        Order o = new Order();
-        o.chatId = chatId;
-        o.symbol = symbol;
-        o.side = side.toUpperCase();
-        o.type = "MARKET";
-        o.setQuantity(quantity);
-        o.price = executionPrice;
-        o.avgPrice = executionPrice;
-        o.executedQty = quantity;
-        o.status = "FILLED";
-        o.filled = true;
-        o.time = System.currentTimeMillis();
-        o.strategyType = strategyType;
-        return o;
+    public static Order market(Long chatId,
+                               String symbol,
+                               String side,
+                               BigDecimal quantity,
+                               BigDecimal executionPrice,
+                               StrategyType strategyType) {
+        Order order = new Order();
+        order.chatId = chatId;
+        order.symbol = symbol;
+        order.side = side != null ? side.toUpperCase() : null;
+        order.type = "MARKET";
+        order.setQuantity(quantity);
+        order.price = executionPrice;
+        order.avgPrice = executionPrice;
+        order.executedQty = quantity;
+        order.status = "FILLED";
+        order.filled = true;
+        order.time = System.currentTimeMillis();
+        order.strategyType = strategyType;
+        return order;
     }
 }

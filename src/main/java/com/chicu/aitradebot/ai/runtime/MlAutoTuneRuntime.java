@@ -73,6 +73,16 @@ public class MlAutoTuneRuntime {
     @Value("${ai.autotune.minDebounceMillis:30000}")
     private long minDebounceMillis;
 
+    /**
+     * Реактивные триггеры по HOLD/low-confidence лучше держать выключенными по умолчанию,
+     * иначе стратегия начинает тюнить себя на шуме в live.
+     */
+    @Value("${ai.autotune.allowReactiveTriggers:false}")
+    private boolean allowReactiveTriggers;
+
+    @Value("${ai.autotune.reactiveReasonPrefixes:hold:,low_confidence:}")
+    private String reactiveReasonPrefixes;
+
     // =====================================================
     // CONFIG (TRAIN)
     // =====================================================
@@ -443,6 +453,13 @@ public class MlAutoTuneRuntime {
                                      Duration debounce) {
 
         if (chatId == null || type == null) return;
+        if (shouldSkipReactiveTrigger(reason)) {
+            if (log.isDebugEnabled()) {
+                log.debug("🧠 AUTO-TUNE reactive trigger skipped chatId={} type={} ex={} net={} reason={}",
+                        chatId, type, exchange, network, safe(reason));
+            }
+            return;
+        }
 
         ResolvedEnv env = resolveEnvSafe(chatId, type, exchange, network);
         if (!env.ok) return;
@@ -544,6 +561,7 @@ public class MlAutoTuneRuntime {
 
     private void safeTune(Long chatId, StrategyType type, String exchange, NetworkType network, String reason) {
         if (chatId == null || type == null) return;
+        if (shouldSkipReactiveTrigger(reason)) return;
 
         ResolvedEnv env = resolveEnvSafe(chatId, type, exchange, network);
         if (!env.ok) return;
@@ -619,6 +637,36 @@ public class MlAutoTuneRuntime {
         } finally {
             running.remove(k);
         }
+    }
+
+    private boolean shouldSkipReactiveTrigger(String reason) {
+        if (reason == null || reason.isBlank()) return false;
+        if (allowReactiveTriggers) return false;
+
+        String normalized = reason.trim().toLowerCase(Locale.ROOT);
+        for (String prefix : parsedReactiveReasonPrefixes()) {
+            if (normalized.startsWith(prefix)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private Set<String> parsedReactiveReasonPrefixes() {
+        String raw = reactiveReasonPrefixes == null ? "" : reactiveReasonPrefixes.trim();
+        if (raw.isEmpty()) {
+            return Set.of("hold:", "low_confidence:");
+        }
+
+        Set<String> out = new HashSet<>();
+        for (String part : raw.split(",")) {
+            String v = part == null ? "" : part.trim().toLowerCase(Locale.ROOT);
+            if (!v.isEmpty()) out.add(v);
+        }
+        if (out.isEmpty()) {
+            return Set.of("hold:", "low_confidence:");
+        }
+        return out;
     }
 
     // =====================================================

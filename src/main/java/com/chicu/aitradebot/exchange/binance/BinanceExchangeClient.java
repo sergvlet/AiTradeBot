@@ -3,6 +3,7 @@ package com.chicu.aitradebot.exchange.binance;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.domain.ExchangeSettings;
 import com.chicu.aitradebot.exchange.client.ExchangeClient;
+import com.chicu.aitradebot.exchange.client.ExchangeClient.OrderAmountType;
 import com.chicu.aitradebot.exchange.enums.OrderSide;
 import com.chicu.aitradebot.exchange.model.AccountFees;
 import com.chicu.aitradebot.exchange.model.AccountInfo;
@@ -25,7 +26,10 @@ import java.math.RoundingMode;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
+
+import static com.chicu.aitradebot.trade.TradeExecutionServiceImpl.positiveOrNull;
 
 @Slf4j
 @Component
@@ -35,6 +39,9 @@ public class BinanceExchangeClient implements ExchangeClient {
     private static final String TEST = "https://testnet.binance.vision";
 
     private static final String RECV_WINDOW = "5000";
+    private static final int FALLBACK_QTY_SCALE = 8;
+
+    private final Map<String, BigDecimal> qtyStepCache = new ConcurrentHashMap<>();
 
     /**
      * Смещение времени клиента относительно Binance serverTime.
@@ -338,12 +345,33 @@ public class BinanceExchangeClient implements ExchangeClient {
         BigDecimal executedQty = bdOrZero(json.optString("executedQty", null));
         BigDecimal cummulativeQuoteQty = bdOrZero(json.optString("cummulativeQuoteQty", null));
         BigDecimal avgPrice = computeAvgPrice(json, executedQty, cummulativeQuoteQty);
+        BigDecimal baseCommission = extractBaseAssetCommission(sym, json.optJSONArray("fills"));
+        BigDecimal sellableQty = executedQty;
+
+        if ("BUY".equalsIgnoreCase(sd) && executedQty.signum() > 0 && baseCommission.signum() > 0) {
+            sellableQty = executedQty.subtract(baseCommission);
+            if (sellableQty.signum() < 0) {
+                sellableQty = BigDecimal.ZERO;
+            }
+
+            log.info("🧾 BINANCE BUY commission applied sym={} grossQty={} baseCommission={} netQty={}",
+                    sym,
+                    strip(executedQty),
+                    strip(baseCommission),
+                    strip(sellableQty));
+        }
 
         BigDecimal qtyOut;
         BigDecimal priceOut;
 
         if ("MARKET".equalsIgnoreCase(tp)) {
-            qtyOut = executedQty.signum() > 0 ? executedQty : (quantity != null ? quantity : BigDecimal.ZERO);
+            if ("BUY".equalsIgnoreCase(sd)) {
+                qtyOut = sellableQty.signum() > 0
+                        ? sellableQty
+                        : (executedQty.signum() > 0 ? executedQty : (quantity != null ? quantity : BigDecimal.ZERO));
+            } else {
+                qtyOut = executedQty.signum() > 0 ? executedQty : (quantity != null ? quantity : BigDecimal.ZERO);
+            }
             priceOut = avgPrice.signum() > 0 ? avgPrice : bdOrZero(json.optString("price", null));
         } else {
             qtyOut = (quantity != null ? quantity : bdOrZero(json.optString("origQty", null)));
@@ -381,58 +409,212 @@ public class BinanceExchangeClient implements ExchangeClient {
         if (amount == null || amount.signum() <= 0) throw new IllegalArgumentException("amount invalid (<=0)");
         if (amountType == null) throw new IllegalArgumentException("amountType=null");
 
+        BigDecimal usedPrice = positiveOrNull(priceHint);
+        if (usedPrice == null) {
+            double p = getPrice(sym);
+            if (p > 0) {
+                usedPrice = BigDecimal.valueOf(p);
+            }
+        }
+
         OrderResult r;
 
         if (amountType == OrderAmountType.BASE_QTY) {
+            BigDecimal qtyBase = normalizeBaseQty(sym, network, amount);
+            if (qtyBase == null || qtyBase.signum() <= 0) {
+                throw new RuntimeException("BINANCE BASE_QTY normalization produced qtyBase=0");
+            }
+
+            log.info("🔄 BINANCE MARKET {} base->base sym={} baseQty={}",
+                    side.name(),
+                    sym,
+                    strip(qtyBase));
+
             r = placeOrder(
                     chatId,
                     network,
                     sym,
                     side.name(),
                     "MARKET",
-                    amount,
+                    qtyBase,
                     null,
                     Map.of()
             );
+
         } else {
-            // QUOTE_QTY: Binance поддерживает quoteOrderQty только для BUY
-            if (side == OrderSide.SELL) {
-                throw new IllegalArgumentException("BINANCE SPOT SELL не поддерживает QUOTE_QTY (нужен BASE_QTY)");
+            BigDecimal qtyQuote = normalizeQuoteQty(amount);
+            if (qtyQuote == null || qtyQuote.signum() <= 0) {
+                throw new RuntimeException("BINANCE QUOTE_QTY normalization produced qtyQuote=0");
             }
 
             Map<String, String> extra = new LinkedHashMap<>();
-            extra.put("quoteOrderQty", strip(amount));
+            extra.put("quoteOrderQty", strip(qtyQuote));
 
-            r = placeOrder(
-                    chatId,
-                    network,
-                    sym,
-                    side.name(),
-                    "MARKET",
-                    BigDecimal.ZERO,
-                    null,
-                    extra
-            );
+            try {
+                log.info("🔄 BINANCE MARKET {} quote->quote sym={} quoteQty={} priceHint={}",
+                        side.name(),
+                        sym,
+                        strip(qtyQuote),
+                        strip(usedPrice));
+
+                r = placeOrder(
+                        chatId,
+                        network,
+                        sym,
+                        side.name(),
+                        "MARKET",
+                        BigDecimal.ZERO,
+                        null,
+                        extra
+                );
+
+            } catch (RuntimeException ex) {
+                String msg = ex.getMessage() == null ? "" : ex.getMessage();
+
+                if (!msg.contains("Quote order qty market orders are not support for this symbol")) {
+                    throw ex;
+                }
+
+                if (usedPrice == null || usedPrice.signum() <= 0) {
+                    throw new RuntimeException(
+                            "BINANCE symbol не поддерживает quoteOrderQty, а цена для fallback-конвертации недоступна: " + sym,
+                            ex
+                    );
+                }
+
+                BigDecimal rawBase = qtyQuote.divide(usedPrice, 16, RoundingMode.DOWN);
+                BigDecimal qtyBaseFallback = normalizeBaseQty(sym, network, rawBase);
+
+                if (qtyBaseFallback == null || qtyBaseFallback.signum() <= 0) {
+                    throw new RuntimeException(
+                            "BINANCE fallback BASE_QTY conversion produced qtyBase=0 for symbol=" + sym,
+                            ex
+                    );
+                }
+
+                log.warn("⚠️ BINANCE sym={} не поддерживает quoteOrderQty. Перехожу на fallback через BASE_QTY: quoteQty={} price={} rawBase={} normBase={}",
+                        sym,
+                        strip(qtyQuote),
+                        strip(usedPrice),
+                        strip(rawBase),
+                        strip(qtyBaseFallback));
+
+                r = placeOrder(
+                        chatId,
+                        network,
+                        sym,
+                        side.name(),
+                        "MARKET",
+                        qtyBaseFallback,
+                        null,
+                        Map.of()
+                );
+            }
         }
 
-        BigDecimal px = (r.price() != null && r.price().signum() > 0)
+        BigDecimal px = positiveOrNull(r.price()) != null
                 ? r.price()
-                : (priceHint != null ? priceHint : BigDecimal.ZERO);
+                : (positiveOrNull(usedPrice) != null ? usedPrice : BigDecimal.ZERO);
 
-        BigDecimal q = r.qty() != null ? r.qty() : BigDecimal.ZERO;
+        BigDecimal q = positiveOrNull(r.qty()) != null
+                ? r.qty()
+                : BigDecimal.ZERO;
 
         return Order.builder()
                 .orderId(r.orderId())
                 .chatId(chatId)
-                .symbol(r.symbol())
-                .side(r.side())
-                .type(r.type())
+                .symbol(r.symbol() != null ? r.symbol() : sym)
+                .side(r.side() != null ? r.side() : side.name())
+                .type(r.type() != null ? r.type() : "MARKET")
                 .price(px)
                 .quantity(q)
                 .status(r.status())
                 .filled("FILLED".equalsIgnoreCase(r.status()))
                 .time(r.timestamp())
                 .build();
+    }
+
+
+
+    private BigDecimal normalizeBaseQty(String symbol, NetworkType network, BigDecimal qty) {
+        BigDecimal safeQty = positiveOrNull(qty);
+        if (safeQty == null) return BigDecimal.ZERO;
+
+        BigDecimal step = getQtyStep(symbol, network);
+        if (positiveOrNull(step) != null) {
+            BigDecimal normalized = safeQty.divide(step, 0, RoundingMode.DOWN).multiply(step);
+            return normalized.setScale(Math.max(0, step.stripTrailingZeros().scale()), RoundingMode.DOWN).stripTrailingZeros();
+        }
+
+        return safeQty.setScale(FALLBACK_QTY_SCALE, RoundingMode.DOWN).stripTrailingZeros();
+    }
+
+    private BigDecimal getQtyStep(String symbol, NetworkType network) {
+        String sym = normalizeSymbolOrThrow(symbol);
+        NetworkType net = (network != null ? network : NetworkType.MAINNET);
+        String cacheKey = net.name() + ":" + sym;
+
+        BigDecimal cached = qtyStepCache.get(cacheKey);
+        if (cached != null) {
+            return cached;
+        }
+
+        try {
+            String url = baseUrl(net) + "/api/v3/exchangeInfo?symbol=" + sym;
+            String raw = rest.getForObject(url, String.class);
+            if (raw == null || raw.isBlank()) return null;
+
+            JSONObject root = new JSONObject(raw);
+            JSONArray symbols = root.optJSONArray("symbols");
+            if (symbols == null || symbols.isEmpty()) return null;
+
+            JSONObject item = symbols.optJSONObject(0);
+            if (item == null) return null;
+
+            JSONArray filters = item.optJSONArray("filters");
+            if (filters == null || filters.isEmpty()) return null;
+
+            BigDecimal marketLotStep = null;
+            BigDecimal lotStep = null;
+
+            for (int i = 0; i < filters.length(); i++) {
+                JSONObject filter = filters.optJSONObject(i);
+                if (filter == null) continue;
+
+                String filterType = filter.optString("filterType", "");
+                if ("MARKET_LOT_SIZE".equalsIgnoreCase(filterType)) {
+                    marketLotStep = bdOrNull(filter.optString("stepSize", null));
+                } else if ("LOT_SIZE".equalsIgnoreCase(filterType)) {
+                    lotStep = bdOrNull(filter.optString("stepSize", null));
+                }
+            }
+
+            BigDecimal step = firstPositive(marketLotStep, lotStep);
+            if (positiveOrNull(step) != null) {
+                qtyStepCache.put(cacheKey, step);
+            }
+            return step;
+
+        } catch (Exception e) {
+            log.debug("BINANCE qtyStep resolve failed sym={} net={} msg={}", sym, net, e.toString());
+            return null;
+        }
+    }
+
+    private static BigDecimal firstPositive(BigDecimal... values) {
+        if (values == null) return null;
+        for (BigDecimal value : values) {
+            if (positiveOrNull(value) != null) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    private BigDecimal normalizeQuoteQty(BigDecimal quoteQty) {
+        BigDecimal safe = positiveOrNull(quoteQty);
+        if (safe == null) return BigDecimal.ZERO;
+        return safe.stripTrailingZeros();
     }
 
     /**
@@ -1051,6 +1233,38 @@ public class BinanceExchangeClient implements ExchangeClient {
     // AVG PRICE HELPERS
     // =====================================================================
 
+    private BigDecimal extractBaseAssetCommission(String symbol, JSONArray fills) {
+        if (fills == null || fills.isEmpty()) return BigDecimal.ZERO;
+
+        String baseAsset = guessBaseAsset(symbol);
+        if (baseAsset == null || baseAsset.isBlank()) return BigDecimal.ZERO;
+
+        BigDecimal total = BigDecimal.ZERO;
+        for (int i = 0; i < fills.length(); i++) {
+            JSONObject f = fills.optJSONObject(i);
+            if (f == null) continue;
+
+            String commissionAsset = f.optString("commissionAsset", "").trim().toUpperCase(Locale.ROOT);
+            if (!baseAsset.equalsIgnoreCase(commissionAsset)) continue;
+
+            BigDecimal commission = bdOrNull(f.optString("commission", null));
+            if (commission != null && commission.signum() > 0) {
+                total = total.add(commission);
+            }
+        }
+        return total;
+    }
+
+    private String guessBaseAsset(String symbol) {
+        String s = normalizeSymbolOrThrow(symbol);
+        for (String quote : List.of("USDT", "USDC", "BUSD", "FDUSD", "TUSD", "BTC", "ETH", "BNB", "EUR", "TRY", "BRL", "GBP", "UAH", "PLN")) {
+            if (s.endsWith(quote) && s.length() > quote.length()) {
+                return s.substring(0, s.length() - quote.length());
+            }
+        }
+        return null;
+    }
+
     private BigDecimal computeAvgPrice(JSONObject orderJson, BigDecimal executedQty, BigDecimal cummulativeQuoteQty) {
 
         // 1) fills[] (FULL response)
@@ -1199,3 +1413,6 @@ public class BinanceExchangeClient implements ExchangeClient {
         return v.stripTrailingZeros().toPlainString();
     }
 }
+
+
+

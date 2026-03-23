@@ -4,7 +4,11 @@ import lombok.Builder;
 import lombok.Value;
 
 import java.math.BigDecimal;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 
 @Value
 @Builder
@@ -19,23 +23,22 @@ public class AccountBalanceSnapshot {
     /** Баланс выбранного актива (для UI: free/locked/total) */
     AssetBalance selectedBalance;
 
+    /**
+     * Полная карта балансов аккаунта по активам.
+     * Нужна для SELL по base-активу: BTC из BTCUSDT, ETH из ETHUSDT и т.д.
+     */
+    Map<String, AssetBalance> balances;
+
     /** true если успешно получили баланс с биржи */
     boolean connectionOk;
 
     /** опционально: текст ошибки, чтобы красиво выводить в UI/логах */
     String error;
 
-    /**
-     * ✅ Backward-compat: старый код мог ожидать именно это имя.
-     * Возвращаем НЕ null (чтобы нигде не падало на .compareTo/.signum).
-     */
     public BigDecimal getSelectedFreeBalance() {
         return selectedBalance != null ? selectedBalance.getFreeSafe() : BigDecimal.ZERO;
     }
 
-    /**
-     * Часто удобно для UI/логики.
-     */
     public BigDecimal getSelectedLockedBalance() {
         return selectedBalance != null ? selectedBalance.getLockedSafe() : BigDecimal.ZERO;
     }
@@ -44,15 +47,42 @@ public class AccountBalanceSnapshot {
         return selectedBalance != null ? selectedBalance.getTotalSafe() : BigDecimal.ZERO;
     }
 
-    /**
-     * Упрощённые флаги для UI.
-     */
     public boolean hasAnyAssets() {
         return availableAssets != null && !availableAssets.isEmpty();
     }
 
     public boolean hasSelectedBalance() {
         return selectedBalance != null && selectedBalance.getTotalSafe().signum() > 0;
+    }
+
+    /** Backward-compat для старого кода */
+    public AssetBalance getBalance(String asset) {
+        if (asset == null) return null;
+        return getBalances().get(normalize(asset));
+    }
+
+    /** Backward-compat для старого кода */
+    public AssetBalance getAssetBalance(String asset) {
+        return getBalance(asset);
+    }
+
+    /** Backward-compat для reflection в TradeExecutionServiceImpl */
+    public Map<String, AssetBalance> getBalances() {
+        if (balances == null || balances.isEmpty()) {
+            return Collections.emptyMap();
+        }
+        return balances;
+    }
+
+    /** Backward-compat для reflection в TradeExecutionServiceImpl */
+    public Map<String, AssetBalance> getFullBalance() {
+        return getBalances();
+    }
+
+    private static String normalize(String s) {
+        if (s == null) return null;
+        String t = s.trim().toUpperCase(Locale.ROOT);
+        return t.isEmpty() ? null : t;
     }
 
     @Value
@@ -80,7 +110,6 @@ public class AccountBalanceSnapshot {
             return nz(free).add(nz(locked));
         }
 
-        // Backward-compat: если где-то уже дергают getTotal()
         public BigDecimal getTotal() {
             return getTotalSafe();
         }

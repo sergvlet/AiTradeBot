@@ -6,12 +6,20 @@ import com.chicu.aitradebot.domain.OrderEntity;
 import com.chicu.aitradebot.repository.OrderRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
@@ -22,12 +30,66 @@ public class InMemoryPositionStoreImpl implements PositionStore {
     /** если старый код не передал symbol */
     private static final String ANY_SYMBOL = "__ANY__";
 
+    /** безопасный дефолт для отсечения пыли при restore */
+    private static final BigDecimal DEFAULT_RESTORE_MIN_NOTIONAL = new BigDecimal("5");
+    private static final long DEFAULT_RESTORE_RETRY_COOLDOWN_MS = 5_000L;
+    private static final long DEFAULT_DUST_LOG_THROTTLE_MS = 60_000L;
+    private static final long DEFAULT_DUST_SUPPRESS_RESTORE_MS = 21_600_000L;
+
     private final OrderRepository orderRepository;
 
     /**
      * in-memory cache уже восстановленных позиций
      */
     private final Map<String, PositionSnapshot> positions = new ConcurrentHashMap<>();
+
+    /**
+     * negative-cache для неудачных restore, чтобы не ходить в БД на каждом тике
+     */
+    private final Map<String, Instant> restoreMissUntil = new ConcurrentHashMap<>();
+
+    /**
+     * throttle для dust-логов, чтобы не засорять журнал
+     */
+    private final Map<String, Instant> dustSkipLogAt = new ConcurrentHashMap<>();
+
+    /**
+     * Явное подавление lazy-restore для dust / проблемных позиций.
+     * Нужно, чтобы старая BUY-запись в БД не поднимала позицию заново после неудачного EXIT.
+     */
+    private final Map<String, Instant> suppressedRestoreUntil = new ConcurrentHashMap<>();
+
+    /**
+     * Если true — остатки позиции меньше порога не восстанавливаются как активные.
+     */
+    @Value("${trade.position-restore.drop-dust:true}")
+    private boolean dropDustOnRestore;
+
+    /**
+     * Минимальный notional для восстановления позиции из БД.
+     * Нужен именно для restore, чтобы не поднимать «мертвую пыль».
+     */
+    @Value("${trade.position-restore.min-notional:5}")
+    private BigDecimal restoreMinNotional;
+
+    /**
+     * На сколько миллисекунд запоминать неудачную попытку restore.
+     * Нужен, чтобы при отсутствии/пыли не дёргать историю на каждом тике.
+     */
+    @Value("${trade.position-restore.retry-cooldown-ms:5000}")
+    private long restoreRetryCooldownMs;
+
+    /**
+     * Throttle для dust-логов.
+     */
+    @Value("${trade.position-restore.dust-log-throttle-ms:60000}")
+    private long dustLogThrottleMs;
+
+    /**
+     * На сколько подавлять повторное восстановление dust-позиции.
+     */
+    @Value("${trade.position-restore.dust-suppress-ms:21600000}")
+    private long dustSuppressRestoreMs;
 
     private static final class OpenLot {
         private BigDecimal qty;
@@ -68,13 +130,25 @@ public class InMemoryPositionStoreImpl implements PositionStore {
         if (sym == null) {
             String prefix = prefixKey(chatId, type, ex, netKey);
             for (String k : positions.keySet()) {
-                if (k != null && k.startsWith(prefix)) return true;
+                if (k != null && k.startsWith(prefix)) {
+                    PositionSnapshot snap = positions.get(k);
+                    if (snap != null && !isDustSnapshot(snap)) {
+                        return true;
+                    }
+                }
             }
             return false;
         }
 
         String k = key(chatId, type, ex, netKey, sym);
-        if (positions.containsKey(k)) return true;
+        PositionSnapshot cached = positions.get(k);
+        if (cached != null) {
+            if (isDustSnapshot(cached)) {
+                positions.remove(k);
+                return false;
+            }
+            return true;
+        }
 
         return tryRestorePosition(chatId, type, ex, network, netKey, sym).isPresent();
     }
@@ -94,14 +168,17 @@ public class InMemoryPositionStoreImpl implements PositionStore {
         String sym = normUpper(symbol);
         if (sym == null) sym = ANY_SYMBOL;
 
+        String storeKey = key(chatId, type, ex, netKey, sym);
+
         positions.putIfAbsent(
-                key(chatId, type, ex, netKey, sym),
+                storeKey,
                 new PositionSnapshot(
                         chatId, type, ex, network, sym,
                         null, null, null, null,
                         null, null, Instant.now()
                 )
         );
+        clearRestoreCaches(storeKey);
 
         if (log.isDebugEnabled()) {
             log.debug("[POS] OPEN(fact) chatId={} type={} ex={} net={} sym={}",
@@ -146,7 +223,9 @@ public class InMemoryPositionStoreImpl implements PositionStore {
                 openedAt != null ? openedAt : Instant.now()
         );
 
-        positions.put(key(chatId, type, ex, netKey, sym), snap);
+        String storeKey = key(chatId, type, ex, netKey, sym);
+        positions.put(storeKey, snap);
+        clearRestoreCaches(storeKey);
 
         if (log.isDebugEnabled()) {
             log.debug("[POS] OPEN chatId={} type={} ex={} net={} sym={} entryPrice={} qty={} tp={} sl={} orderId={}",
@@ -179,6 +258,7 @@ public class InMemoryPositionStoreImpl implements PositionStore {
             }
 
             toRemove.forEach(positions::remove);
+            clearRestoreCachesByPrefix(prefix);
 
             if (log.isDebugEnabled()) {
                 log.debug("[POS] CLOSE(all) chatId={} type={} ex={} net={} removed={}",
@@ -186,6 +266,9 @@ public class InMemoryPositionStoreImpl implements PositionStore {
             }
             return;
         }
+
+        clearRestoreCaches(key(chatId, type, ex, netKey, sym));
+        clearRestoreCaches(key(chatId, type, ex, netKey, ANY_SYMBOL));
 
         positions.remove(key(chatId, type, ex, netKey, sym));
         positions.remove(key(chatId, type, ex, netKey, ANY_SYMBOL));
@@ -214,17 +297,33 @@ public class InMemoryPositionStoreImpl implements PositionStore {
 
             for (Map.Entry<String, PositionSnapshot> e : positions.entrySet()) {
                 String k = e.getKey();
-                if (k != null && k.startsWith(prefix) && !k.endsWith(":" + ANY_SYMBOL)) {
-                    return Optional.ofNullable(e.getValue());
+                PositionSnapshot snap = e.getValue();
+
+                if (k != null
+                        && k.startsWith(prefix)
+                        && !k.endsWith(":" + ANY_SYMBOL)
+                        && snap != null
+                        && !isDustSnapshot(snap)) {
+                    return Optional.of(snap);
                 }
             }
 
             PositionSnapshot any = positions.get(key(chatId, type, ex, netKey, ANY_SYMBOL));
+            if (any != null && isDustSnapshot(any)) {
+                positions.remove(key(chatId, type, ex, netKey, ANY_SYMBOL));
+                return Optional.empty();
+            }
+
             return Optional.ofNullable(any);
         }
 
-        PositionSnapshot snap = positions.get(key(chatId, type, ex, netKey, sym));
+        String posKey = key(chatId, type, ex, netKey, sym);
+        PositionSnapshot snap = positions.get(posKey);
         if (snap != null) {
+            if (isDustSnapshot(snap)) {
+                positions.remove(posKey);
+                return Optional.empty();
+            }
             return Optional.of(snap);
         }
 
@@ -233,7 +332,13 @@ public class InMemoryPositionStoreImpl implements PositionStore {
             return restored;
         }
 
-        return Optional.ofNullable(positions.get(key(chatId, type, ex, netKey, ANY_SYMBOL)));
+        PositionSnapshot any = positions.get(key(chatId, type, ex, netKey, ANY_SYMBOL));
+        if (any != null && isDustSnapshot(any)) {
+            positions.remove(key(chatId, type, ex, netKey, ANY_SYMBOL));
+            return Optional.empty();
+        }
+
+        return Optional.ofNullable(any);
     }
 
     @Override
@@ -243,6 +348,70 @@ public class InMemoryPositionStoreImpl implements PositionStore {
                               NetworkType network,
                               String symbol) {
         markClosed(chatId, type, exchange, network, symbol);
+    }
+
+    public void suppressRestore(Long chatId,
+                                StrategyType type,
+                                String exchange,
+                                NetworkType network,
+                                String symbol,
+                                long ttlMs,
+                                String reason) {
+
+        if (chatId == null || type == null) return;
+
+        String ex = normUpper(exchange);
+        String netKey = normUpper(network != null ? network.name() : null);
+        String sym = normUpper(symbol);
+        if (sym == null) sym = ANY_SYMBOL;
+
+        long effectiveTtlMs = Math.max(60_000L, ttlMs > 0 ? ttlMs : positiveMillisOrDefault(dustSuppressRestoreMs, DEFAULT_DUST_SUPPRESS_RESTORE_MS));
+        Instant until = Instant.now().plusMillis(effectiveTtlMs);
+
+        String exactKey = key(chatId, type, ex, netKey, sym);
+        String anyKey = key(chatId, type, ex, netKey, ANY_SYMBOL);
+
+        positions.remove(exactKey);
+        positions.remove(anyKey);
+
+        restoreMissUntil.put(exactKey, until);
+        restoreMissUntil.put(anyKey, until);
+        suppressedRestoreUntil.put(exactKey, until);
+        suppressedRestoreUntil.put(anyKey, until);
+
+        log.warn("[POS] ⛔ SUPPRESS RESTORE chatId={} type={} ex={} net={} sym={} until={} reason={}",
+                chatId,
+                type,
+                ex,
+                netKey,
+                sym,
+                until,
+                reason);
+    }
+
+
+    public boolean isRestoreSuppressed(Long chatId,
+                                       StrategyType type,
+                                       String exchange,
+                                       NetworkType network,
+                                       String symbol) {
+
+        if (chatId == null || type == null) return false;
+
+        String ex = normUpper(exchange);
+        String netKey = normUpper(network != null ? network.name() : null);
+        String sym = normUpper(symbol);
+        if (sym == null) sym = ANY_SYMBOL;
+
+        Instant now = Instant.now();
+
+        String exactKey = key(chatId, type, ex, netKey, sym);
+        if (isRestoreSuppressed(exactKey, now)) {
+            return true;
+        }
+
+        String anyKey = key(chatId, type, ex, netKey, ANY_SYMBOL);
+        return isRestoreSuppressed(anyKey, now);
     }
 
     // =====================================================
@@ -261,19 +430,42 @@ public class InMemoryPositionStoreImpl implements PositionStore {
         }
 
         String k = key(chatId, type, exchange, networkKey, symbol);
+        Instant now = Instant.now();
+
+        if (isRestoreSuppressed(k, now)) {
+            return Optional.empty();
+        }
+
+        if (isRestoreRetryOnCooldown(k, now)) {
+            return Optional.empty();
+        }
+
         PositionSnapshot cached = positions.get(k);
         if (cached != null) {
+            if (isDustSnapshot(cached)) {
+                positions.remove(k);
+                rememberRestoreMiss(k, now);
+                return Optional.empty();
+            }
+            clearRestoreCaches(k);
             return Optional.of(cached);
         }
 
         synchronized (positions) {
             cached = positions.get(k);
             if (cached != null) {
+                if (isDustSnapshot(cached)) {
+                    positions.remove(k);
+                    rememberRestoreMiss(k, now);
+                    return Optional.empty();
+                }
+                clearRestoreCaches(k);
                 return Optional.of(cached);
             }
 
             List<OrderEntity> orders = loadContextOrders(chatId, type, symbol, exchange, networkKey);
             if (orders == null || orders.isEmpty()) {
+                rememberRestoreMiss(k, now);
                 return Optional.empty();
             }
 
@@ -281,7 +473,6 @@ public class InMemoryPositionStoreImpl implements PositionStore {
 
             for (OrderEntity order : orders) {
                 if (order == null) continue;
-                if (!isFilledOrder(order)) continue;
 
                 String side = normUpper(order.getSide());
                 BigDecimal qty = positiveOrNull(order.getQuantity());
@@ -290,6 +481,8 @@ public class InMemoryPositionStoreImpl implements PositionStore {
                 if (qty == null || price == null) continue;
 
                 if ("BUY".equals(side)) {
+                    if (!shouldCountBuyForRestore(order)) continue;
+
                     openLots.add(new OpenLot(
                             qty,
                             price,
@@ -302,6 +495,8 @@ public class InMemoryPositionStoreImpl implements PositionStore {
                 }
 
                 if ("SELL".equals(side)) {
+                    if (!shouldCountSellForRestore(order)) continue;
+
                     BigDecimal leftToClose = qty;
 
                     while (leftToClose.signum() > 0 && !openLots.isEmpty()) {
@@ -319,6 +514,7 @@ public class InMemoryPositionStoreImpl implements PositionStore {
             }
 
             if (openLots.isEmpty()) {
+                rememberRestoreMiss(k, now);
                 return Optional.empty();
             }
 
@@ -339,7 +535,9 @@ public class InMemoryPositionStoreImpl implements PositionStore {
                 if (lot.tp != null) tp = lot.tp;
                 if (lot.sl != null) sl = lot.sl;
 
-                entryOrderId = lot.entryOrderId;
+                if (entryOrderId == null) {
+                    entryOrderId = lot.entryOrderId;
+                }
 
                 if (openedAt == null || (lot.openedAt != null && lot.openedAt.isBefore(openedAt))) {
                     openedAt = lot.openedAt;
@@ -347,10 +545,30 @@ public class InMemoryPositionStoreImpl implements PositionStore {
             }
 
             if (totalQty.signum() <= 0 || totalCost.signum() <= 0) {
+                rememberRestoreMiss(k, now);
                 return Optional.empty();
             }
 
-            BigDecimal avgEntry = totalCost.divide(totalQty, 12, BigDecimal.ROUND_HALF_UP);
+            BigDecimal avgEntry = totalCost.divide(totalQty, 12, RoundingMode.HALF_UP);
+            BigDecimal restoreNotional = totalQty.multiply(avgEntry);
+
+            if (shouldSkipDustRestore(totalQty, restoreNotional)) {
+                if (shouldLogDustSkip(k, now)) {
+                    log.warn("[POS] 🚫 SKIP RESTORE DUST chatId={} type={} ex={} net={} sym={} qty={} entry={} notional={} floor={}",
+                            chatId,
+                            type,
+                            exchange,
+                            networkKey,
+                            symbol,
+                            toStr(totalQty),
+                            toStr(avgEntry),
+                            toStr(restoreNotional),
+                            toStr(effectiveRestoreMinNotional()));
+                }
+                positions.remove(k);
+                rememberRestoreMiss(k, now);
+                return Optional.empty();
+            }
 
             PositionSnapshot restored = new PositionSnapshot(
                     chatId,
@@ -360,16 +578,17 @@ public class InMemoryPositionStoreImpl implements PositionStore {
                     symbol,
                     avgEntry.stripTrailingZeros(),
                     totalQty.stripTrailingZeros(),
-                    tp,
-                    sl,
-                    totalCost.stripTrailingZeros(),
+                    positiveOrNull(tp),
+                    positiveOrNull(sl),
+                    restoreNotional.stripTrailingZeros(),
                     entryOrderId,
                     openedAt != null ? openedAt : Instant.now()
             );
 
             positions.put(k, restored);
+            clearRestoreCaches(k);
 
-            log.warn("[POS] ♻️ RESTORED chatId={} type={} ex={} net={} sym={} qty={} entry={} tp={} sl={} entryOrderId={}",
+            log.warn("[POS] ♻️ RESTORED chatId={} type={} ex={} net={} sym={} qty={} entry={} tp={} sl={} entryOrderId={} notional={}",
                     chatId,
                     type,
                     exchange,
@@ -379,7 +598,8 @@ public class InMemoryPositionStoreImpl implements PositionStore {
                     toStr(restored.entryPrice()),
                     toStr(restored.tp()),
                     toStr(restored.sl()),
-                    restored.entryOrderId());
+                    restored.entryOrderId(),
+                    toStr(restored.quoteSpent()));
 
             return Optional.of(restored);
         }
@@ -445,6 +665,24 @@ public class InMemoryPositionStoreImpl implements PositionStore {
         return "FILLED".equals(status);
     }
 
+    private boolean shouldCountBuyForRestore(OrderEntity order) {
+        if (order == null) return false;
+        if (Boolean.TRUE.equals(order.getFilled())) return true;
+
+        String status = normUpper(order.getStatus());
+        if (status == null) return false;
+
+        return switch (status) {
+            case "NEW", "OPEN", "PARTIALLY_FILLED", "FILLED" -> true;
+            case "CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "FAILED" -> false;
+            default -> false;
+        };
+    }
+
+    private boolean shouldCountSellForRestore(OrderEntity order) {
+        return isFilledOrder(order);
+    }
+
     private Instant resolveOrderInstant(OrderEntity order) {
         if (order == null) return Instant.now();
 
@@ -463,6 +701,96 @@ public class InMemoryPositionStoreImpl implements PositionStore {
         }
 
         return Instant.now();
+    }
+
+    private boolean shouldSkipDustRestore(BigDecimal qty, BigDecimal notional) {
+        if (!dropDustOnRestore) return false;
+
+        BigDecimal safeQty = positiveOrNull(qty);
+        BigDecimal safeNotional = positiveOrNull(notional);
+
+        if (safeQty == null || safeNotional == null) {
+            return true;
+        }
+
+        return safeNotional.compareTo(effectiveRestoreMinNotional()) < 0;
+    }
+
+    private boolean isDustSnapshot(PositionSnapshot snapshot) {
+        if (snapshot == null) return true;
+        return shouldSkipDustRestore(snapshot.qty(), snapshot.quoteSpent());
+    }
+
+    private BigDecimal effectiveRestoreMinNotional() {
+        BigDecimal v = positiveOrNull(restoreMinNotional);
+        return v != null ? v : DEFAULT_RESTORE_MIN_NOTIONAL;
+    }
+
+
+    private boolean isRestoreSuppressed(String key, Instant now) {
+        if (key == null || now == null) return false;
+
+        Instant until = suppressedRestoreUntil.get(key);
+        if (until == null) return false;
+
+        if (now.isBefore(until)) {
+            return true;
+        }
+
+        suppressedRestoreUntil.remove(key);
+        return false;
+    }
+
+    private boolean isRestoreRetryOnCooldown(String key, Instant now) {
+        if (key == null || now == null) return false;
+
+        Instant until = restoreMissUntil.get(key);
+        if (until == null) return false;
+
+        return now.isBefore(until);
+    }
+
+    private void rememberRestoreMiss(String key, Instant now) {
+        if (key == null || now == null) return;
+
+        long cooldownMs = Math.max(250L, positiveMillisOrDefault(restoreRetryCooldownMs, DEFAULT_RESTORE_RETRY_COOLDOWN_MS));
+        restoreMissUntil.put(key, now.plusMillis(cooldownMs));
+    }
+
+    private boolean shouldLogDustSkip(String key, Instant now) {
+        if (key == null || now == null) return true;
+
+        long throttleMs = Math.max(1_000L, positiveMillisOrDefault(dustLogThrottleMs, DEFAULT_DUST_LOG_THROTTLE_MS));
+        Instant prev = dustSkipLogAt.get(key);
+
+        if (prev != null) {
+            long ageMs = Duration.between(prev, now).toMillis();
+            if (ageMs >= 0 && ageMs < throttleMs) {
+                return false;
+            }
+        }
+
+        dustSkipLogAt.put(key, now);
+        return true;
+    }
+
+    private void clearRestoreCaches(String key) {
+        if (key == null) return;
+        restoreMissUntil.remove(key);
+        dustSkipLogAt.remove(key);
+        suppressedRestoreUntil.remove(key);
+    }
+
+    private void clearRestoreCachesByPrefix(String prefix) {
+        if (prefix == null) return;
+
+        restoreMissUntil.keySet().removeIf(k -> k != null && k.startsWith(prefix));
+        dustSkipLogAt.keySet().removeIf(k -> k != null && k.startsWith(prefix));
+        suppressedRestoreUntil.keySet().removeIf(k -> k != null && k.startsWith(prefix));
+    }
+
+    private long positiveMillisOrDefault(long value, long def) {
+        return value > 0 ? value : def;
     }
 
     // =====================================================
@@ -494,3 +822,4 @@ public class InMemoryPositionStoreImpl implements PositionStore {
         return v == null ? "null" : v.stripTrailingZeros().toPlainString();
     }
 }
+

@@ -64,7 +64,7 @@ public class MlSampleIngestServiceImpl implements MlSampleIngestService {
         try {
             maybeTriggerTraining(saved);
         } catch (Exception e) {
-            log.warn("🧠 SAMPLE save ok, but maybeTrain failed: chatId={} type={} symbol={} tf={} err= {}",
+            log.warn("🧠 SAMPLE save ok, but maybeTrain failed: chatId={} type={} symbol={} tf={} err={}",
                     saved.getChatId(),
                     saved.getStrategyType(),
                     saved.getSymbol(),
@@ -115,8 +115,8 @@ public class MlSampleIngestServiceImpl implements MlSampleIngestService {
         try {
             trainable = sampleRepository.findForTraining(chatId, type, symbol, timeframe, from, now);
         } catch (Exception e) {
-            log.warn("🧠 SAMPLE findForTraining failed chatId={} type={} symbol={} tf={} err={}",
-                    chatId, type, symbol, timeframe, e.toString(), e);
+            log.warn("🧠 SAMPLE findForTraining failed chatId={} type={} symbol={} tf={} from={} to={} err={}",
+                    chatId, type, symbol, timeframe, from, now, e.toString(), e);
             return;
         }
 
@@ -272,3 +272,7 @@ public class MlSampleIngestServiceImpl implements MlSampleIngestService {
         return v == null ? null : v.toLowerCase(Locale.ROOT);
     }
 }
+
+
+
+

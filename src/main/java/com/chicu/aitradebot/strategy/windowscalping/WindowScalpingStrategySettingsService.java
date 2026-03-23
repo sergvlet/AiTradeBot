@@ -7,5 +7,4 @@ public interface WindowScalpingStrategySettingsService {
     WindowScalpingStrategySettings update(Long chatId, WindowScalpingStrategySettings incoming);
 
     Long getVersion(Long chatId);
-
 }

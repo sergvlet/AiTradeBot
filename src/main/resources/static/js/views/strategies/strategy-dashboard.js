@@ -56,7 +56,7 @@ document.addEventListener("DOMContentLoaded", () => {
     chartCtrl.timeframe = "1m";
 
     const layers = new LayerRenderer(chartCtrl.chart, chartCtrl.candles);
-    layers.candlesData = chartCtrl.candlesData; // ✅ одна и та же ссылка
+    layers.candlesData = chartCtrl.candlesData;
     chartCtrl.layerRenderer = layers;
 
     // =====================================================
@@ -90,12 +90,12 @@ document.addEventListener("DOMContentLoaded", () => {
     console.log("🧠 Strategy initialized:", type, strategy?.constructor?.name);
 
     // =====================================================
-    // ✅ UI LAYERS CACHE (persist across refresh)
+    // UI LAYERS CACHE
     // =====================================================
 
     const layerCacheKey = `uiLayers:${chatId}:${type}:${symbolUpper}`;
 
-    let _layerState = null;      // {levels, zone, tpSl, windowZone}
+    let _layerState = null;
     let _persistTimer = null;
 
     function normalizeLayerState(raw) {
@@ -107,11 +107,9 @@ document.addEventListener("DOMContentLoaded", () => {
         if (Array.isArray(L.levels)) out.levels = L.levels;
         if ("zone" in L) out.zone = L.zone ?? null;
 
-        // tp_sl может быть tpSl или tp_sl
         if ("tpSl" in L) out.tpSl = L.tpSl ?? null;
         else if ("tp_sl" in L) out.tpSl = L.tp_sl ?? null;
 
-        // window_zone может быть windowZone или window_zone
         if ("windowZone" in L) out.windowZone = L.windowZone ?? null;
         else if ("window_zone" in L) out.windowZone = L.window_zone ?? null;
 
@@ -122,7 +120,6 @@ document.addEventListener("DOMContentLoaded", () => {
         const state = normalizeLayerState(raw);
         if (!state) return;
 
-        // ВАЖНО: фичи ждут события, а не "layers" объект
         if ("levels" in state) {
             strategy.onEvent?.({ type: "levels", levels: state.levels || [] });
         }
@@ -195,7 +192,6 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
-    // 1) мгновенно восстанавливаем слои из localStorage (чтобы после refresh не было "пусто")
     const bootLayers = loadLayerStateFromLocalStorage();
     if (bootLayers) {
         _layerState = bootLayers;
@@ -203,7 +199,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     // =====================================================
-    // REST SNAPSHOT (ВАЖНО: timeframe ДО setHistory)
+    // REST SNAPSHOT
     // =====================================================
     const snapshotUrl =
         `/api/chart/strategy` +
@@ -214,24 +210,19 @@ document.addEventListener("DOMContentLoaded", () => {
     fetch(snapshotUrl)
         .then(r => r.json())
         .then(data => {
-            // ✅ 1) применяем timeframe СНАЧАЛА
             if (data?.timeframe) {
                 const tf = String(data.timeframe).trim().toLowerCase();
                 if (tf) chartCtrl.timeframe = tf;
             }
 
-            // ✅ 2) история уже в правильном бакете
             if (Array.isArray(data?.candles)) {
                 chartCtrl.setHistory(data.candles);
                 strategy.onCandleHistory?.(chartCtrl.candlesData);
             }
 
-            // ✅ 3) слои (НЕ ТОЛЬКО "layers" — раскладываем в события)
             if (data?.layers) {
-                // оставляем как есть (на будущее/диагностику)
                 strategy.onEvent?.({ type: "layers", layers: data.layers });
 
-                // ✅ главное: применяем в формате событий
                 const st = normalizeLayerState(data.layers);
                 if (st) {
                     _layerState = st;
@@ -243,33 +234,12 @@ document.addEventListener("DOMContentLoaded", () => {
         .catch(err => console.error("❌ REST snapshot error", err));
 
     // =====================================================
-    // WS de-dup (мы подписаны на несколько топиков)
+    // WS DEDUP
     // =====================================================
     const _wsDedup = new Map(); // key -> lastSeenMs
 
-    function wsDedupKey(ev) {
-        const k = ev?.kline || ev?.k || ev?.data?.k;
-        const t = ev?.time ?? k?.openTime ?? k?.t ?? k?.startTime ?? k?.T ?? "";
-        const sym = String(ev?.symbol || k?.symbol || "").trim().toUpperCase();
-        const tf  = String(ev?.timeframe || "").trim();
-        const st  = String(ev?.strategyType || type || "").trim();
-        const et  = String(ev?.type || "").trim();
-        return `${et}|${st}|${sym}|${tf}|${t}`;
-    }
-
-    function wsSeenRecently(key, ttlMs) {
-        const now = Date.now();
-        const last = _wsDedup.get(key);
-        if (last && (now - last) < ttlMs) return true;
-        _wsDedup.set(key, now);
-
-        // лёгкая чистка
-        if (_wsDedup.size > 3000) {
-            for (const [k, v] of _wsDedup) {
-                if ((now - v) > 15_000) _wsDedup.delete(k);
-            }
-        }
-        return false;
+    function getNestedKline(ev) {
+        return ev?.kline || ev?.k || ev?.data?.k || null;
     }
 
     function isCandleEvent(ev) {
@@ -281,14 +251,113 @@ document.addEventListener("DOMContentLoaded", () => {
         );
     }
 
+    function isPriceEvent(ev) {
+        return ev?.type === "price" && ev?.price != null;
+    }
+
+    function isMarketEvent(ev) {
+        return isCandleEvent(ev) || isPriceEvent(ev);
+    }
+
     function eventSymbolUpper(ev) {
-        const k = ev?.kline || ev?.k || ev?.data?.k;
+        const k = getNestedKline(ev);
         const s = ev?.symbol || k?.symbol || "";
         return String(s).trim().toUpperCase();
     }
 
+    function eventTimeValue(ev) {
+        const k = getNestedKline(ev);
+        return ev?.time ?? k?.openTime ?? k?.t ?? k?.startTime ?? k?.T ?? "";
+    }
+
+    function normValue(v) {
+        if (v === null || v === undefined) return "";
+        return String(v).trim();
+    }
+
+    function candleDedupKey(ev) {
+        const k = getNestedKline(ev) || {};
+        const sym = eventSymbolUpper(ev);
+        const tf  = normValue(ev?.timeframe || k?.timeframe || k?.i || "");
+        const st  = normValue(ev?.strategyType || type || "");
+        const t   = normValue(eventTimeValue(ev));
+
+        const o = normValue(k.open ?? k.o ?? ev?.open);
+        const h = normValue(k.high ?? k.h ?? ev?.high);
+        const l = normValue(k.low  ?? k.l ?? ev?.low);
+        const c = normValue(k.close ?? k.c ?? ev?.close);
+
+        return `candle|${st}|${sym}|${tf}|${t}|${o}|${h}|${l}|${c}`;
+    }
+
+    function priceDedupKey(ev) {
+        const sym = eventSymbolUpper(ev);
+        const tf  = normValue(ev?.timeframe || "");
+        const st  = normValue(ev?.strategyType || type || "");
+        const t   = normValue(eventTimeValue(ev));
+        const p   = normValue(ev?.price);
+        return `price|${st}|${sym}|${tf}|${t}|${p}`;
+    }
+
+    function genericDedupKey(ev) {
+        const k = getNestedKline(ev);
+        const t = normValue(eventTimeValue(ev));
+        const sym = eventSymbolUpper(ev);
+        const tf  = normValue(ev?.timeframe || "");
+        const st  = normValue(ev?.strategyType || type || "");
+        const et  = normValue(ev?.type || "");
+
+        const extra =
+            normValue(ev?.state) ||
+            normValue(ev?.metric) ||
+            normValue(ev?.price) ||
+            normValue(ev?.signal?.name) ||
+            normValue(k?.close ?? k?.c);
+
+        return `${et}|${st}|${sym}|${tf}|${t}|${extra}`;
+    }
+
+    function wsDedupMeta(ev) {
+        if (isCandleEvent(ev)) {
+            return {
+                key: candleDedupKey(ev),
+                ttlMs: 180
+            };
+        }
+
+        if (isPriceEvent(ev)) {
+            return {
+                key: priceDedupKey(ev),
+                ttlMs: 120
+            };
+        }
+
+        return {
+            key: genericDedupKey(ev),
+            ttlMs: 1200
+        };
+    }
+
+    function wsSeenRecently(meta) {
+        if (!meta?.key) return false;
+
+        const now = Date.now();
+        const last = _wsDedup.get(meta.key);
+        if (last && (now - last) < meta.ttlMs) return true;
+
+        _wsDedup.set(meta.key, now);
+
+        if (_wsDedup.size > 4000) {
+            for (const [k, v] of _wsDedup) {
+                if ((now - v) > 15_000) _wsDedup.delete(k);
+            }
+        }
+
+        return false;
+    }
+
     // =====================================================
-    // WEBSOCKET (STOMP) — production reconnect
+    // WEBSOCKET (STOMP)
     // =====================================================
     if (typeof SockJS === "undefined" || typeof Stomp === "undefined") {
         console.error("❌ SockJS / Stomp not loaded");
@@ -303,8 +372,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const destinations = [
         `/topic/strategy/${chatId}/${type}/${symbolUpper}`,
         `/topic/strategy/${chatId}/${type}/${symbolLower}`,
-        `/topic/strategy/${chatId}/${type}`,
-        `/topic/strategy/${chatId}`,
+        `/topic/strategy/${chatId}/${type}`
     ];
 
     let wsCount = 0;
@@ -328,8 +396,6 @@ document.addEventListener("DOMContentLoaded", () => {
         cleanupWs();
 
         reconnectAttempt = Math.min(10, reconnectAttempt + 1);
-
-        // backoff: 0.5s, 1s, 2s, 4s, ... max 15s
         const delay = Math.min(15_000, 500 * Math.pow(2, reconnectAttempt - 1));
 
         console.warn(`⚠ WS reconnect scheduled in ${delay}ms (attempt=${reconnectAttempt}) reason=${reason}`);
@@ -346,7 +412,6 @@ document.addEventListener("DOMContentLoaded", () => {
         stomp = Stomp.over(socket);
         stomp.debug = null;
 
-        // если sockjs умер — переподключаемся
         socket.onclose = () => scheduleReconnect("socket_close");
         socket.onerror = () => scheduleReconnect("socket_error");
 
@@ -359,36 +424,32 @@ document.addEventListener("DOMContentLoaded", () => {
                 destinations.forEach(dest => {
                     stomp.subscribe(dest, msg => {
                         let ev;
-                        try { ev = JSON.parse(msg.body); } catch { return; }
+                        try {
+                            ev = JSON.parse(msg.body);
+                        } catch {
+                            return;
+                        }
 
-                        // ✅ дедуп по ключу (между разными подписками)
-                        const key = wsDedupKey(ev);
-                        if (wsSeenRecently(key, 1500)) return;
+                        const meta = wsDedupMeta(ev);
+                        if (wsSeenRecently(meta)) return;
 
-                        // антиспам лог
                         wsCount++;
                         const now = Date.now();
                         if (now - lastLogAt > 3000) {
                             lastLogAt = now;
-                            console.log(`📡 WS IN (#${wsCount}) from ${dest}:`, msg.body?.slice(0, 200));
+                            console.log(`📡 WS IN (#${wsCount}) from ${dest}:`, msg.body?.slice(0, 220));
                         }
 
-                        // ✅ фильтр по symbol (для candle сообщений — symbol обязателен)
                         const evSym = eventSymbolUpper(ev);
                         if (evSym && evSym !== symbolUpper) return;
 
-                        // ✅ график
-                        if (isCandleEvent(ev)) {
+                        if (isMarketEvent(ev)) {
                             chartCtrl.onWsMessage(ev);
                         }
 
-                        // ✅ стратегия получает всё
                         strategy.onEvent?.(ev);
-
-                        // ✅ сохраняем слои, чтобы после refresh они появлялись сразу
                         updateLayerStateFromEvent(ev);
 
-                        // ✅ оверлеи пересчитываем только когда реально свеча
                         if ((type === "SCALPING" || type === "WINDOW_SCALPING") && isCandleEvent(ev)) {
                             strategy.onCandleHistory?.(chartCtrl.candlesData);
                         }
@@ -397,7 +458,6 @@ document.addEventListener("DOMContentLoaded", () => {
                     console.log("✅ SUBSCRIBED", dest);
                 });
 
-                // replay
                 fetch(`/api/strategy/${chatId}/${type}/replay`, { method: "POST" })
                     .catch(() => {});
             },

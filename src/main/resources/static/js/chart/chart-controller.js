@@ -1,14 +1,14 @@
 "use strict";
 
 /**
- * ChartController (FIX v2)
- * =======================
+ * ChartController (LIVE FIX v3)
+ * =============================
  * Что исправлено:
- * 1) ✅ _candlesByTime всегда инициализирован
- * 2) ✅ время нормализуется: ms -> sec, потом bucket по timeframe
- * 3) ✅ upsertCandle НЕ использует _lastCandle как prev для другого времени (это ломало свечи)
- * 4) ✅ WS partial-merge: если пришёл только close/high/low - корректно достраиваем
- * 5) ✅ candlesData всегда синхронизирован с map
+ * 1) candlesData / _candlesByTime всегда синхронизированы
+ * 2) время нормализуется в bucket таймфрейма
+ * 3) candle event остаётся источником истины по OHLC
+ * 4) price event теперь тоже двигает текущую свечу в реальном времени
+ * 5) старые price events не переписывают уже закрытую историю
  */
 
 export class ChartController {
@@ -49,18 +49,14 @@ export class ChartController {
             borderVisible: false
         });
 
-        // ===========================================
-        // state
-        // ===========================================
         this.symbol = null;
         this.timeframe = "1m";
 
         this.candlesData = [];
         this._candlesByTime = new Map();
         this._lastCandle = null;
-
-        // log throttling
         this._lastWarnAt = 0;
+        this._lastPrice = null;
     }
 
     // =====================================================
@@ -71,26 +67,22 @@ export class ChartController {
         const s = String(tf || "1m").trim().toLowerCase();
         const m = s.match(/^(\d+)\s*([smhd])$/);
         if (!m) return 60;
+
         const n = parseInt(m[1], 10);
         const u = m[2];
+
         if (u === "s") return n;
         if (u === "m") return n * 60;
         if (u === "h") return n * 60 * 60;
         if (u === "d") return n * 60 * 60 * 24;
+
         return 60;
     }
 
-    /**
-     * rawTime может прийти в:
-     *  - ms (1770501120000)
-     *  - sec (1770501120)
-     *  - ISO string
-     */
     getTimeSeconds(rawTime) {
         if (rawTime === null || rawTime === undefined) return null;
 
         if (typeof rawTime === "number") {
-            // ms -> sec (в Binance/в твоём WINDOW_SCALPING часто ms)
             if (rawTime > 4_000_000_000) return Math.floor(rawTime / 1000);
             return Math.floor(rawTime);
         }
@@ -112,10 +104,6 @@ export class ChartController {
         return null;
     }
 
-    /**
-     * Приводим любое время к "бакету" таймфрейма.
-     * Пример: tf=1m => time всегда кратен 60 сек.
-     */
     normalizeTimeToBucket(rawTime) {
         const sec = this.getTimeSeconds(rawTime);
         if (sec === null) return null;
@@ -125,28 +113,27 @@ export class ChartController {
     }
 
     // =====================================================
-    // Candle parsing
+    // Parse helpers
     // =====================================================
 
     parseNum(v) {
         if (v === null || v === undefined) return null;
         if (typeof v === "number") return Number.isFinite(v) ? v : null;
+
         const s = String(v).trim();
         if (!s) return null;
+
         const n = Number(s);
         return Number.isFinite(n) ? n : null;
     }
 
-    /**
-     * Поддерживаем разные форматы:
-     * - REST: {time, open, high, low, close}
-     * - WS:  ev.kline / ev.k / ev.data.k
-     * - Binance: k.o/k.h/k.l/k.c и t/T
-     */
+    getNestedKline(ev) {
+        return ev?.kline || ev?.k || ev?.data?.k || null;
+    }
+
     extractCandle(ev) {
         if (!ev) return null;
 
-        // REST уже может прислать candle напрямую
         if (ev.time !== undefined && (ev.open !== undefined || ev.close !== undefined)) {
             return {
                 time: ev.time,
@@ -157,11 +144,9 @@ export class ChartController {
             };
         }
 
-        const k = ev.kline || ev.k || ev?.data?.k || null;
+        const k = this.getNestedKline(ev);
         if (!k) return null;
 
-        // ВАЖНО: приоритет OPEN TIME (начало свечи), а не closeTime.
-        // Для бинанса: t = open time, T = close time.
         const rawTime =
             k.openTime ?? k.open_time ?? k.t ??
             k.startTime ?? k.start_time ??
@@ -174,6 +159,17 @@ export class ChartController {
         const c = (k.close ?? k.c);
 
         return { time: rawTime, open: o, high: h, low: l, close: c };
+    }
+
+    extractPriceTick(ev) {
+        if (!ev || ev.type !== "price") return null;
+
+        const price = this.parseNum(ev.price);
+        const time = ev.time;
+
+        if (price === null || time === null || time === undefined) return null;
+
+        return { time, price };
     }
 
     // =====================================================
@@ -196,7 +192,6 @@ export class ChartController {
 
             if (o === null || h === null || l === null || cl === null) continue;
 
-            // защита от мусора
             const hi = Math.max(h, o, cl);
             const lo = Math.min(l, o, cl);
 
@@ -209,6 +204,7 @@ export class ChartController {
         this.candlesData = out;
         this._candlesByTime = map;
         this._lastCandle = out.length ? out[out.length - 1] : null;
+        this._lastPrice = this._lastCandle ? this._lastCandle.close : null;
 
         this.candles.setData(out);
 
@@ -216,14 +212,9 @@ export class ChartController {
     }
 
     // =====================================================
-    // Upsert (WS)
+    // Core upsert
     // =====================================================
 
-    /**
-     * Вставка/обновление свечи.
-     * КРИТИЧНО: prev берём ТОЛЬКО по тому же bucket-time.
-     * НЕЛЬЗЯ подмешивать _lastCandle другого времени — это делает "рваные" свечи.
-     */
     upsertCandle(partial) {
         const t = this.normalizeTimeToBucket(partial?.time);
         if (t === null) return;
@@ -235,7 +226,6 @@ export class ChartController {
         let l = this.parseNum(partial.low);
         let c = this.parseNum(partial.close);
 
-        // 1) Если prev есть — достраиваем из prev
         if (prev) {
             if (o === null) o = prev.open;
             if (c === null) c = prev.close;
@@ -243,21 +233,16 @@ export class ChartController {
             if (l === null) l = prev.low;
         }
 
-        // 2) Если prev нет — минимальные правила, чтобы не рисовать мусор
-        //    Если прилетел только close — считаем это "тик" внутри свечи и делаем open=close
         if (!prev) {
             if (o === null && c !== null) o = c;
             if (c === null && o !== null) c = o;
         }
 
-        // если всё ещё не хватает базовых значений — пропускаем
         if (o === null || c === null) return;
 
-        // high/low если не пришли — строим из o/c
         if (h === null) h = Math.max(o, c);
         if (l === null) l = Math.min(o, c);
 
-        // защита от перевёрнутых значений
         h = Math.max(h, o, c);
         l = Math.min(l, o, c);
 
@@ -266,12 +251,11 @@ export class ChartController {
         const existed = this._candlesByTime.has(t);
         this._candlesByTime.set(t, candle);
 
-        // _lastCandle обновляем только если это реально самая новая свеча
         if (!this._lastCandle || t >= this._lastCandle.time) {
             this._lastCandle = candle;
+            this._lastPrice = candle.close;
         }
 
-        // sync candlesData
         if (!this.candlesData || this.candlesData.length === 0) {
             this.candlesData = [candle];
         } else {
@@ -282,25 +266,78 @@ export class ChartController {
             } else if (last.time < t) {
                 this.candlesData.push(candle);
             } else {
-                // insert/replace in the middle (редко, но бывает из-за дублей топиков)
-                let lo = 0, hi = this.candlesData.length - 1, idx = -1;
-                while (lo <= hi) {
-                    const mid = (lo + hi) >> 1;
+                let loIdx = 0;
+                let hiIdx = this.candlesData.length - 1;
+                let idx = -1;
+
+                while (loIdx <= hiIdx) {
+                    const mid = (loIdx + hiIdx) >> 1;
                     const mt = this.candlesData[mid].time;
-                    if (mt === t) { idx = mid; break; }
-                    if (mt < t) lo = mid + 1;
-                    else hi = mid - 1;
+
+                    if (mt === t) {
+                        idx = mid;
+                        break;
+                    }
+                    if (mt < t) loIdx = mid + 1;
+                    else hiIdx = mid - 1;
                 }
+
                 if (idx >= 0) this.candlesData[idx] = candle;
-                else this.candlesData.splice(lo, 0, candle);
+                else this.candlesData.splice(loIdx, 0, candle);
             }
         }
 
-        // render
         this.candles.update(candle);
 
-        // spacing иногда полезно, но не спамим
         if (!existed) this.adjustBarSpacing();
+    }
+
+    // =====================================================
+    // Live price -> current candle
+    // =====================================================
+
+    applyPriceTick(tick) {
+        if (!tick) return;
+
+        const t = this.normalizeTimeToBucket(tick.time);
+        const price = this.parseNum(tick.price);
+
+        if (t === null || price === null) return;
+
+        this._lastPrice = price;
+
+        if (this._lastCandle && t < this._lastCandle.time) {
+            return;
+        }
+
+        const sameBucket = this._candlesByTime.get(t);
+        if (sameBucket) {
+            this.upsertCandle({
+                time: t,
+                open: sameBucket.open,
+                high: Math.max(sameBucket.high, price),
+                low: Math.min(sameBucket.low, price),
+                close: price
+            });
+            return;
+        }
+
+        const prevClose =
+            this._lastCandle && Number.isFinite(this._lastCandle.close)
+                ? this._lastCandle.close
+                : price;
+
+        const open = prevClose;
+        const high = Math.max(open, price);
+        const low = Math.min(open, price);
+
+        this.upsertCandle({
+            time: t,
+            open,
+            high,
+            low,
+            close: price
+        });
     }
 
     // =====================================================
@@ -310,16 +347,16 @@ export class ChartController {
     onWsMessage(ev) {
         if (!ev) return;
 
-        const candleEv =
-            ev?.type === "candle" ||
-            !!ev?.kline || !!ev?.k || !!ev?.data?.k;
+        const priceTick = this.extractPriceTick(ev);
+        if (priceTick) {
+            this.applyPriceTick(priceTick);
+            return;
+        }
 
-        if (!candleEv) return;
-
-        const c = this.extractCandle(ev);
-        if (!c) return;
-
-        this.upsertCandle(c);
+        const candle = this.extractCandle(ev);
+        if (candle) {
+            this.upsertCandle(candle);
+        }
     }
 
     // =====================================================

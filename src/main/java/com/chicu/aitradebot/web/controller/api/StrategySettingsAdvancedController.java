@@ -26,16 +26,11 @@ import java.util.Map;
 @RequestMapping("/api/strategy/settings")
 public class StrategySettingsAdvancedController {
 
-    // “Железные” фазы (UI ставит только безопасные, runtime может менять сам)
     private static final String PHASE_PAPER = "PAPER";
     private static final String PHASE_LIVE  = "LIVE";
 
     private final StrategySettingsService strategySettingsService;
     private final StrategyAdvancedRegistry advancedRegistry;
-
-    // =========================================================
-    // helpers
-    // =========================================================
 
     private static String normalizeExchange(String exchange) {
         if (exchange == null) return "BINANCE";
@@ -52,17 +47,13 @@ public class StrategySettingsAdvancedController {
         if (raw == null) return null;
         String v = raw.trim().toUpperCase(Locale.ROOT);
         if (v.isEmpty()) return null;
-        try { return AdvancedControlMode.valueOf(v); }
-        catch (Exception ignored) { return null; }
+        try {
+            return AdvancedControlMode.valueOf(v);
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
-    /**
-     * Контекст — не ключ, но нужен UI.
-     * Синхронизируем exchange/network в одной записи settings (chatId+type).
-     *
-     * ВАЖНО: тут НЕ сохраняем. Сохранение делаем снаружи единым save(),
-     * чтобы не плодить лишние события/гонки.
-     */
     private boolean syncContextIfNeeded(StrategySettings ss, String exchange, NetworkType network) {
         if (ss == null) return false;
 
@@ -83,17 +74,6 @@ public class StrategySettingsAdvancedController {
         return changed;
     }
 
-    /**
-     * ✅ “ЖЕЛЕЗНО”:
-     * MANUAL: autotune=false, mlGate=false, runPhase=LIVE, чистим ML-хвосты (gate/model/schema).
-     * HYBRID: autotune=true,  mlGate=true,  runPhase=PAPER на testnet иначе LIVE.
-     * AI:     autotune=true,  mlGate=true,  runPhase=PAPER на testnet иначе LIVE.
-     *
-     * Почему AI НЕ ставит COLLECT:
-     * - UI не должен фиксировать внутренние фазы рантайма (COLLECT/BACKTEST/…).
-     * - Иначе легко “заклинить” тюнинг/гейт настройками (особенно если где-то COLLECT скипается).
-     * - COLLECT должен выставляться/сниматься runtime’ом по реальным условиям (данные/модель/тюнинг).
-     */
     private static void enforceModeRules(StrategySettings ss, AdvancedControlMode mode, NetworkType network) {
         if (ss == null || mode == null) return;
 
@@ -106,12 +86,10 @@ public class StrategySettingsAdvancedController {
                 ss.setMlGateEnabled(false);
                 ss.setRunPhase(PHASE_LIVE);
 
-                // важное: не оставлять “AI хвосты” в MANUAL
                 ss.setGateMinProb(null);
                 ss.setMlModelKey(null);
                 ss.setMlSchemaHash(null);
                 ss.setMlModelVersion(null);
-                // mlConfidence можно оставить как статистику (не сбрасываем)
             }
             case HYBRID -> {
                 ss.setAutoTuneEnabled(true);
@@ -126,9 +104,6 @@ public class StrategySettingsAdvancedController {
         }
     }
 
-    // =========================================================
-    // GET /advanced
-    // =========================================================
     @GetMapping("/advanced")
     public AdvancedTabDto getAdvanced(
             @RequestParam long chatId,
@@ -143,7 +118,6 @@ public class StrategySettingsAdvancedController {
 
         boolean ctxChanged = syncContextIfNeeded(ss, ex, net);
         if (ctxChanged) {
-            // save чтобы UI контекст не “прыгал”, но это единичное сохранение
             strategySettingsService.save(ss);
         }
 
@@ -185,9 +159,6 @@ public class StrategySettingsAdvancedController {
         );
     }
 
-    // =========================================================
-    // POST /advanced/submit (FORM)
-    // =========================================================
     @Transactional
     @PostMapping(value = "/advanced/submit", consumes = MediaType.APPLICATION_FORM_URLENCODED_VALUE)
     public Map<String, Object> submitAdvanced(
@@ -204,7 +175,6 @@ public class StrategySettingsAdvancedController {
 
         boolean dirty = syncContextIfNeeded(ss, ex, net);
 
-        // 1) режим (если пришёл)
         AdvancedControlMode requestedMode = parseModeOrNull(allParams.get("advancedControlMode"));
         if (requestedMode == null) requestedMode = parseModeOrNull(allParams.get("controlMode"));
 
@@ -223,7 +193,6 @@ public class StrategySettingsAdvancedController {
             return Map.of("ok", false, "message", "Нет renderer для стратегии " + type);
         }
 
-        // 2) params -> renderer (без системных ключей)
         HashMap<String, String> clean = new HashMap<>(allParams);
         clean.remove("chatId");
         clean.remove("type");
@@ -241,28 +210,21 @@ public class StrategySettingsAdvancedController {
                 .params(clean)
                 .build();
 
-        // “железно”: AI не принимает ручные параметры
         if (!ctx.canSubmit()) {
             return Map.of("ok", false, "message", "Режим AI: ручные параметры запрещены");
         }
 
         renderer.handleSubmit(ctx);
 
-        // сохраняем базовые поля (если renderer их трогал внутри)
-        // + сохраняем смену режима/контекста одной операцией
         if (dirty) {
             strategySettingsService.save(ss);
         } else {
-            // renderer мог поменять ss внутри — сохраняем в любом случае (без лишней логики)
             strategySettingsService.save(ss);
         }
 
         return Map.of("ok", true);
     }
 
-    // =========================================================
-    // POST /apply (JSON) — отдельный apply для UI
-    // =========================================================
     public record ApplyModeRequest(
             long chatId,
             StrategyType type,

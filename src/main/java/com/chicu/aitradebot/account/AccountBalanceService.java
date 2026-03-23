@@ -32,10 +32,20 @@ public class AccountBalanceService {
             String exchangeName,
             NetworkType networkType
     ) {
+        return getSnapshot(chatId, type, exchangeName, networkType, null);
+    }
+
+    public AccountBalanceSnapshot getSnapshot(
+            long chatId,
+            StrategyType type,
+            String exchangeName,
+            NetworkType networkType,
+            String selectedAssetHint
+    ) {
         String ex = normalize(exchangeName);
         NetworkType net = networkType;
+        String selectedHint = normalize(selectedAssetHint);
 
-        // ✅ StrategySettings: 1 строка на (chatId,type) + патчим контекст
         StrategySettings settings = null;
         try {
             settings = strategySettingsService.getOrCreateAndPatchContext(chatId, type, ex, net);
@@ -44,107 +54,105 @@ public class AccountBalanceService {
                     chatId, type, ex, net, e.toString());
         }
 
-        // если контекст не передан — не идём в биржу
+        String selectedFromSettings = settings != null ? normalize(settings.getAccountAsset()) : null;
+        String selectedFallback = firstNonBlank(selectedHint, selectedFromSettings);
+
         if (ex == null) {
-            return AccountBalanceSnapshot.builder()
-                    .availableAssets(List.of())
-                    .selectedAsset(settings != null ? normalize(settings.getAccountAsset()) : null)
-                    .selectedBalance(null)
-                    .connectionOk(false)
-                    .error("exchangeName не задан")
-                    .build();
+            return buildErrorSnapshot(
+                    selectedFallback,
+                    "exchangeName не задан"
+            );
         }
+
         if (net == null) {
-            return AccountBalanceSnapshot.builder()
-                    .availableAssets(List.of())
-                    .selectedAsset(settings != null ? normalize(settings.getAccountAsset()) : null)
-                    .selectedBalance(null)
-                    .connectionOk(false)
-                    .error("networkType не задан")
-                    .build();
+            return buildErrorSnapshot(
+                    selectedFallback,
+                    "networkType не задан"
+            );
         }
 
         try {
             ExchangeClient client = exchangeClientFactory.get(ex, net);
 
             Map<String, Balance> full = safeMap(client.getFullBalance(chatId, net));
+            Map<String, Balance> normalized = normalizeBalanceMap(full);
 
-            Map<String, Balance> positiveTotal = full.entrySet().stream()
-                    .filter(e -> e.getKey() != null)
-                    .filter(e -> e.getValue() != null)
-                    .filter(e -> (e.getValue().free() + e.getValue().locked()) > 0.0d)
-                    .collect(Collectors.toMap(
-                            e -> normalize(e.getKey()),
-                            Map.Entry::getValue,
-                            (a, b) -> a,
-                            LinkedHashMap::new
-                    ));
+            if (normalized.isEmpty()) {
+                log.warn("⚠️ Пустой баланс от биржи (chatId={}, type={}, ex={}, net={})",
+                        chatId, type, ex, net);
 
-            List<String> availableAssets = new ArrayList<>(positiveTotal.keySet());
+                String msg = "Пустой баланс от биржи";
+                if ("BYBIT".equals(ex)) {
+                    msg = "BYBIT вернул пустой баланс. Проверь API key, права Wallet/Account Transfer и тип аккаунта UNIFIED/SPOT.";
+                }
+
+                return buildErrorSnapshot(selectedFallback, msg);
+            }
+
+            Map<String, AccountBalanceSnapshot.AssetBalance> balances = new LinkedHashMap<>();
+            for (Map.Entry<String, Balance> e : normalized.entrySet()) {
+                String asset = normalize(e.getKey());
+                Balance b = e.getValue();
+                if (asset == null || b == null) continue;
+
+                balances.put(asset, AccountBalanceSnapshot.AssetBalance.of(
+                        bdFromDouble(b.free()),
+                        bdFromDouble(b.locked())
+                ));
+            }
+
+            List<String> availableAssets = new ArrayList<>(balances.keySet());
             availableAssets.sort(String.CASE_INSENSITIVE_ORDER);
 
-            // USDT — первый в списке (если есть)
             if (availableAssets.remove(PREFERRED_ASSET)) {
                 availableAssets.add(0, PREFERRED_ASSET);
             }
 
-            String selected = (settings != null) ? normalize(settings.getAccountAsset()) : null;
-
-            if (availableAssets.isEmpty()) {
-                if (settings != null && selected != null) {
-                    settings.setAccountAsset(null);
-                    strategySettingsService.save(settings);
-                }
-
-                return AccountBalanceSnapshot.builder()
-                        .availableAssets(List.of())
-                        .selectedAsset(null)
-                        .selectedBalance(null)
-                        .connectionOk(true)
-                        .build();
-            }
-
+            String selected = firstNonBlank(selectedHint, selectedFromSettings);
             boolean changed = false;
-            if (selected == null || !positiveTotal.containsKey(selected)) {
-                selected = pickDefaultAsset(positiveTotal, availableAssets);
-                changed = true;
+
+            if (selected == null || !balances.containsKey(selected)) {
+                selected = pickDefaultAsset(normalized, availableAssets);
+                changed = !Objects.equals(selected, selectedFromSettings);
             }
 
-            if (changed && settings != null) {
+            if (changed && settings != null && selected != null) {
                 settings.setAccountAsset(selected);
                 strategySettingsService.save(settings);
                 log.info("💰 accountAsset синхронизирован: chatId={}, type={}, ex={}, net={}, asset={}",
                         chatId, type, ex, net, selected);
             }
 
-            Balance b = positiveTotal.get(selected);
+            AccountBalanceSnapshot.AssetBalance selectedBalance = balances.get(selected);
 
-            BigDecimal free = bdFromDouble(b != null ? b.free() : 0.0d);
-            BigDecimal locked = bdFromDouble(b != null ? b.locked() : 0.0d);
+            log.info("💰 SNAPSHOT chatId={} type={} ex={} net={} selected={} free={} locked={} total={} assets={}",
+                    chatId,
+                    type,
+                    ex,
+                    net,
+                    selected,
+                    selectedBalance != null ? selectedBalance.getFreeSafe() : BigDecimal.ZERO,
+                    selectedBalance != null ? selectedBalance.getLockedSafe() : BigDecimal.ZERO,
+                    selectedBalance != null ? selectedBalance.getTotalSafe() : BigDecimal.ZERO,
+                    availableAssets);
 
             return AccountBalanceSnapshot.builder()
                     .availableAssets(availableAssets)
                     .selectedAsset(selected)
-                    .selectedBalance(AccountBalanceSnapshot.AssetBalance.of(free, locked))
+                    .selectedBalance(selectedBalance)
+                    .balances(Collections.unmodifiableMap(balances))
                     .connectionOk(true)
+                    .error(null)
                     .build();
 
         } catch (Exception exx) {
-            String selectedFallback = (settings != null) ? normalize(settings.getAccountAsset()) : null;
-
             log.warn("⚠️ Не удалось получить баланс (chatId={}, type={}, ex={}, net={}): {}",
                     chatId, type, ex, net, exx.toString());
 
             String msg = exx.getMessage();
             if (msg == null || msg.isBlank()) msg = exx.toString();
 
-            return AccountBalanceSnapshot.builder()
-                    .availableAssets(List.of())
-                    .selectedAsset(selectedFallback)
-                    .selectedBalance(null)
-                    .connectionOk(false)
-                    .error(msg)
-                    .build();
+            return buildErrorSnapshot(selectedFallback, msg);
         }
     }
 
@@ -164,6 +172,63 @@ public class AccountBalanceService {
                     chatId, ex, net, e.toString());
             return null;
         }
+    }
+
+    private AccountBalanceSnapshot buildErrorSnapshot(String selectedAsset, String error) {
+        String selected = normalize(selectedAsset);
+
+        Map<String, AccountBalanceSnapshot.AssetBalance> balances =
+                selected != null
+                        ? Map.of(selected, AccountBalanceSnapshot.AssetBalance.of(BigDecimal.ZERO, BigDecimal.ZERO))
+                        : Map.of();
+
+        return AccountBalanceSnapshot.builder()
+                .availableAssets(selected != null ? List.of(selected) : List.of())
+                .selectedAsset(selected)
+                .selectedBalance(selected != null
+                        ? AccountBalanceSnapshot.AssetBalance.of(BigDecimal.ZERO, BigDecimal.ZERO)
+                        : null)
+                .balances(balances)
+                .connectionOk(false)
+                .error(error)
+                .build();
+    }
+
+    private Map<String, Balance> normalizeBalanceMap(Map<String, Balance> full) {
+        if (full == null || full.isEmpty()) {
+            return Collections.emptyMap();
+        }
+
+        return full.entrySet().stream()
+                .filter(e -> e.getKey() != null)
+                .filter(e -> e.getValue() != null)
+                .map(e -> Map.entry(normalize(e.getKey()), sanitizeBalance(e.getKey(), e.getValue())))
+                .filter(e -> e.getKey() != null)
+                .filter(e -> e.getValue() != null)
+                .filter(e -> (e.getValue().free() + e.getValue().locked()) > 0.0d)
+                .collect(Collectors.toMap(
+                        Map.Entry::getKey,
+                        Map.Entry::getValue,
+                        (a, b) -> new Balance(a.asset(), a.free() + b.free(), a.locked() + b.locked()),
+                        LinkedHashMap::new
+                ));
+    }
+
+    private Balance sanitizeBalance(String asset, Balance b) {
+        if (b == null) return null;
+
+        double free = sanitizeDouble(b.free());
+        double locked = sanitizeDouble(b.locked());
+
+        if (free < 0) free = 0.0d;
+        if (locked < 0) locked = 0.0d;
+
+        return new Balance(normalize(asset), free, locked);
+    }
+
+    private double sanitizeDouble(double v) {
+        if (Double.isNaN(v) || Double.isInfinite(v)) return 0.0d;
+        return v;
     }
 
     private String pickDefaultAsset(Map<String, Balance> positiveTotal, List<String> availableAssets) {
@@ -186,15 +251,19 @@ public class AccountBalanceService {
         }
 
         if (best != null) return best;
-
-        // крайний fallback
-        return availableAssets.get(0);
+        return availableAssets.isEmpty() ? null : availableAssets.get(0);
     }
 
     private String normalize(String s) {
         if (s == null) return null;
         String t = s.trim();
         return t.isEmpty() ? null : t.toUpperCase(Locale.ROOT);
+    }
+
+    private String firstNonBlank(String a, String b) {
+        String x = normalize(a);
+        if (x != null) return x;
+        return normalize(b);
     }
 
     private <T> Map<String, T> safeMap(Map<String, T> m) {

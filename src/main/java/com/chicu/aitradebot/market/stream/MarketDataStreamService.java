@@ -3,6 +3,7 @@ package com.chicu.aitradebot.market.stream;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.exchange.binance.ws.BinanceSpotWebSocketClient;
+import com.chicu.aitradebot.exchange.bybit.BybitMarketStreamAdapter;
 import com.chicu.aitradebot.market.MarketStreamManager;
 import com.chicu.aitradebot.market.model.Candle;
 import com.chicu.aitradebot.market.model.UnifiedKline;
@@ -27,6 +28,7 @@ public class MarketDataStreamService {
 
     /** цикл разорван — берём лениво */
     private final ObjectProvider<BinanceSpotWebSocketClient> binanceWsProvider;
+    private final ObjectProvider<BybitMarketStreamAdapter> bybitWsProvider;
 
     /** общий кэш свечей для бэктеста/дашборда */
     private final MarketStreamManager streamManager;
@@ -54,10 +56,26 @@ public class MarketDataStreamService {
     @Value("${market.stream.health.requireFastChannel:false}")
     private boolean requireFastChannel;
 
+    /**
+     * BOOK_TICKER часто даёт лишний шум для скальпинга.
+     * По умолчанию выключаем его и включаем только осознанно через properties.
+     */
+    @Value("${market.stream.bookTicker.enabled:false}")
+    private boolean bookTickerEnabled;
+
+    /**
+     * Отдельный флаг именно для WindowScalping.
+     * Даже если bookTicker глобально включён, для WINDOW_SCALPING его можно держать выключенным.
+     */
+    @Value("${market.stream.bookTicker.windowScalping.enabled:false}")
+    private boolean windowScalpingBookTickerEnabled;
+
     public MarketDataStreamService(ObjectProvider<BinanceSpotWebSocketClient> binanceWsProvider,
+                                   ObjectProvider<BybitMarketStreamAdapter> bybitWsProvider,
                                    MarketStreamManager streamManager,
                                    ApplicationEventPublisher eventPublisher) {
         this.binanceWsProvider = binanceWsProvider;
+        this.bybitWsProvider = bybitWsProvider;
         this.streamManager = streamManager;
         this.eventPublisher = eventPublisher;
     }
@@ -136,13 +154,15 @@ public class MarketDataStreamService {
 
         candleStorage.remove(new CandleStoreKey(chatId, strategyType, ex, networkType, sym, tf));
 
-        if ("BINANCE".equalsIgnoreCase(ex)) {
-            BinanceSpotWebSocketClient ws = binanceWsProvider.getIfAvailable();
-            if (ws != null) {
-                try { ws.unsubscribeKline(networkType, sym, tf, chatId, strategyType); } catch (Exception ignored) {}
-                try { ws.unsubscribeAggTrade(networkType, sym, tf, chatId, strategyType); } catch (Exception ignored) {}
-                try { ws.unsubscribeBookTicker(networkType, sym, chatId, strategyType); } catch (Exception ignored) {}
+        try {
+            switch (ex) {
+                case "BINANCE" -> unsubscribeBinanceChannels(networkType, sym, tf, chatId, strategyType);
+                case "BYBIT" -> unsubscribeBybitChannels(networkType, sym, tf, chatId, strategyType);
+                default -> log.debug("⏭ [STREAM] unsubscribe: WS cleanup skipped for unsupported exchange={}", ex);
             }
+        } catch (Exception e) {
+            log.warn("⚠️ [STREAM] unsubscribe channel cleanup failed chatId={} type={} ex={} net={} {} {} err={}",
+                    chatId, strategyType, ex, networkType, sym, tf, e.getMessage());
         }
 
         if (subs.isEmpty()) {
@@ -359,53 +379,135 @@ public class MarketDataStreamService {
         SubscriptionKey key = new SubscriptionKey(strategyType, ex, networkType, sym, tf);
         boolean added = subs.add(key);
 
-        if (!"BINANCE".equalsIgnoreCase(ex)) {
-            if (added) {
-                subs.remove(key);
-                candleStorage.remove(new CandleStoreKey(chatId, strategyType, ex, networkType, sym, tf));
-            }
-            log.warn("⚠️ [STREAM] subscribeCandles: биржа '{}' пока не подключена для WS", ex);
-            return;
-        }
-
-        BinanceSpotWebSocketClient ws = binanceWsProvider.getIfAvailable();
-        if (ws == null) {
-            if (added) {
-                subs.remove(key);
-                candleStorage.remove(new CandleStoreKey(chatId, strategyType, ex, networkType, sym, tf));
-            }
-            log.error("❌ [STREAM] BINANCE ws client отсутствует (bean not available) chatId={} type={}", chatId, strategyType);
-            return;
-        }
-
         try {
-            // даже если ключ уже был в activeSubscriptions — повторно подтверждаем желаемые подписки.
-            ws.subscribeKline(networkType, sym, tf, chatId, strategyType);
-            ws.subscribeAggTrade(networkType, sym, tf, chatId, strategyType);
-            ws.subscribeBookTicker(networkType, sym, chatId, strategyType);
-
-            if (added) {
-                log.info("📡 [STREAM] SUBSCRIBE WS: chatId={} type={} ex={} net={} {} {} (KLINE+AGGTRADE+BOOK_TICKER)",
-                        chatId, strategyType, ex, networkType, sym, tf);
-            } else {
-                log.debug("⏭ [STREAM] Подписка уже была, подтверждаю каналы: chatId={} type={} ex={} net={} {} {}",
-                        chatId, strategyType, ex, networkType, sym, tf);
+            switch (ex) {
+                case "BINANCE" -> subscribeBinanceChannels(networkType, sym, tf, chatId, strategyType, added, ex);
+                case "BYBIT" -> subscribeBybitChannels(networkType, sym, tf, chatId, strategyType, added, ex);
+                default -> {
+                    if (added) {
+                        rollbackFailedSubscription(subs, key, chatId, strategyType, ex, networkType, sym, tf);
+                    }
+                    log.warn("⚠️ [STREAM] subscribeCandles: биржа '{}' пока не подключена для WS", ex);
+                }
             }
         } catch (Exception e) {
-            try { ws.unsubscribeKline(networkType, sym, tf, chatId, strategyType); } catch (Exception ignored) {}
-            try { ws.unsubscribeAggTrade(networkType, sym, tf, chatId, strategyType); } catch (Exception ignored) {}
-            try { ws.unsubscribeBookTicker(networkType, sym, chatId, strategyType); } catch (Exception ignored) {}
-
-            subs.remove(key);
-            candleStorage.remove(new CandleStoreKey(chatId, strategyType, ex, networkType, sym, tf));
-
-            if (subs.isEmpty()) {
-                activeSubscriptions.remove(chatId, subs);
-            }
-
+            rollbackFailedSubscription(subs, key, chatId, strategyType, ex, networkType, sym, tf);
             log.error("❌ [STREAM] SUBSCRIBE FAILED chatId={} type={} ex={} net={} {} {} err={}",
                     chatId, strategyType, ex, networkType, sym, tf, e.getMessage(), e);
         }
+    }
+
+    private void subscribeBinanceChannels(NetworkType networkType,
+                                          String sym,
+                                          String tf,
+                                          long chatId,
+                                          StrategyType strategyType,
+                                          boolean added,
+                                          String ex) {
+
+        BinanceSpotWebSocketClient ws = binanceWsProvider.getIfAvailable();
+        if (ws == null) {
+            throw new IllegalStateException("BINANCE ws client отсутствует");
+        }
+
+        boolean enableBookTickerForThisStrategy = bookTickerEnabled
+                && !(strategyType == StrategyType.WINDOW_SCALPING && !windowScalpingBookTickerEnabled);
+
+        ws.subscribeKline(networkType, sym, tf, chatId, strategyType);
+        ws.subscribeAggTrade(networkType, sym, tf, chatId, strategyType);
+
+        if (enableBookTickerForThisStrategy) {
+            ws.subscribeBookTicker(networkType, sym, chatId, strategyType);
+        } else {
+            try { ws.unsubscribeBookTicker(networkType, sym, chatId, strategyType); } catch (Exception ignored) {}
+        }
+
+        if (added) {
+            log.info("📡 [STREAM] SUBSCRIBE WS: chatId={} type={} ex={} net={} {} {} ({})",
+                    chatId, strategyType, ex, networkType, sym, tf,
+                    enableBookTickerForThisStrategy ? "KLINE+AGGTRADE+BOOK_TICKER" : "KLINE+AGGTRADE");
+        } else {
+            log.debug("⏭ [STREAM] Подписка уже была, подтверждаю каналы: chatId={} type={} ex={} net={} {} {} bookTicker={}",
+                    chatId, strategyType, ex, networkType, sym, tf, enableBookTickerForThisStrategy);
+        }
+    }
+
+    private void subscribeBybitChannels(NetworkType networkType,
+                                        String sym,
+                                        String tf,
+                                        long chatId,
+                                        StrategyType strategyType,
+                                        boolean added,
+                                        String ex) {
+
+        BybitMarketStreamAdapter ws = bybitWsProvider.getIfAvailable();
+        if (ws == null) {
+            throw new IllegalStateException("BYBIT ws client отсутствует");
+        }
+
+        boolean enableBookTickerForThisStrategy = bookTickerEnabled
+                && !(strategyType == StrategyType.WINDOW_SCALPING && !windowScalpingBookTickerEnabled);
+
+        ws.subscribeKline(networkType, sym, tf, chatId, strategyType);
+        ws.subscribeAggTrade(networkType, sym, tf, chatId, strategyType);
+
+        if (enableBookTickerForThisStrategy) {
+            ws.subscribeBookTicker(networkType, sym, chatId, strategyType);
+        } else {
+            try { ws.unsubscribeBookTicker(networkType, sym, chatId, strategyType); } catch (Exception ignored) {}
+        }
+
+        if (added) {
+            log.info("📡 [STREAM] SUBSCRIBE WS: chatId={} type={} ex={} net={} {} {} ({})",
+                    chatId, strategyType, ex, networkType, sym, tf,
+                    enableBookTickerForThisStrategy ? "KLINE+AGGTRADE+BOOK_TICKER" : "KLINE+AGGTRADE");
+        } else {
+            log.debug("⏭ [STREAM] Подписка уже была, подтверждаю каналы: chatId={} type={} ex={} net={} {} {} bookTicker={}",
+                    chatId, strategyType, ex, networkType, sym, tf, enableBookTickerForThisStrategy);
+        }
+    }
+
+    private void unsubscribeBinanceChannels(NetworkType networkType,
+                                            String sym,
+                                            String tf,
+                                            long chatId,
+                                            StrategyType strategyType) {
+        BinanceSpotWebSocketClient ws = binanceWsProvider.getIfAvailable();
+        if (ws == null) return;
+
+        try { ws.unsubscribeKline(networkType, sym, tf, chatId, strategyType); } catch (Exception ignored) {}
+        try { ws.unsubscribeAggTrade(networkType, sym, tf, chatId, strategyType); } catch (Exception ignored) {}
+        try { ws.unsubscribeBookTicker(networkType, sym, chatId, strategyType); } catch (Exception ignored) {}
+    }
+
+    private void unsubscribeBybitChannels(NetworkType networkType,
+                                          String sym,
+                                          String tf,
+                                          long chatId,
+                                          StrategyType strategyType) {
+        BybitMarketStreamAdapter ws = bybitWsProvider.getIfAvailable();
+        if (ws == null) return;
+
+        try { ws.unsubscribeKline(networkType, sym, tf, chatId, strategyType); } catch (Exception ignored) {}
+        try { ws.unsubscribeAggTrade(networkType, sym, tf, chatId, strategyType); } catch (Exception ignored) {}
+        try { ws.unsubscribeBookTicker(networkType, sym, chatId, strategyType); } catch (Exception ignored) {}
+    }
+
+    private void rollbackFailedSubscription(Set<SubscriptionKey> subs,
+                                            SubscriptionKey key,
+                                            long chatId,
+                                            StrategyType strategyType,
+                                            String ex,
+                                            NetworkType networkType,
+                                            String sym,
+                                            String tf) {
+        if (subs != null) {
+            subs.remove(key);
+            if (subs.isEmpty()) {
+                activeSubscriptions.remove(chatId, subs);
+            }
+        }
+        candleStorage.remove(new CandleStoreKey(chatId, strategyType, ex, networkType, sym, tf));
     }
 
     private void dropOtherSubscriptionsSameType(long chatId,
@@ -459,10 +561,18 @@ public class MarketDataStreamService {
             return new SubscriptionHealth(false, false, false, false, -1L, -1L, -1L, true, "not_subscribed");
         }
 
-        if (!"BINANCE".equalsIgnoreCase(ex)) {
-            return new SubscriptionHealth(true, false, false, false, -1L, -1L, -1L, false, "health_unsupported_exchange");
-        }
+        return switch (ex) {
+            case "BINANCE" -> resolveBinanceHealth(chatId, strategyType, networkType, sym, tf);
+            case "BYBIT" -> resolveBybitHealth(chatId, strategyType, networkType, sym, tf);
+            default -> new SubscriptionHealth(true, false, false, false, -1L, -1L, -1L, false, "health_unsupported_exchange");
+        };
+    }
 
+    private SubscriptionHealth resolveBinanceHealth(long chatId,
+                                                    StrategyType strategyType,
+                                                    NetworkType networkType,
+                                                    String sym,
+                                                    String tf) {
         BinanceSpotWebSocketClient ws = binanceWsProvider.getIfAvailable();
         if (ws == null) {
             return new SubscriptionHealth(true, false, false, false, -1L, -1L, -1L, true, "ws_client_missing");
@@ -476,9 +586,44 @@ public class MarketDataStreamService {
         boolean bookConnected = ws.isConnected(chatId, strategyType, networkType, wsSym, wsTf, "BOOK_TICKER");
 
         long now = System.currentTimeMillis();
-        long klineAge = ageMs(ws.getLastMessageAt(buildWsKeyKline(chatId, strategyType, networkType, wsSym, wsTf)), now);
-        long aggAge = ageMs(ws.getLastMessageAt(buildWsKeyAgg(chatId, strategyType, networkType, wsSym)), now);
-        long bookAge = ageMs(ws.getLastMessageAt(buildWsKeyBook(chatId, strategyType, networkType, wsSym)), now);
+        long klineAge = ageMs(ws.getLastMessageAt(buildBinanceWsKeyKline(chatId, strategyType, networkType, wsSym, wsTf)), now);
+        long aggAge = ageMs(ws.getLastMessageAt(buildBinanceWsKeyAgg(chatId, strategyType, networkType, wsSym)), now);
+        long bookAge = ageMs(ws.getLastMessageAt(buildBinanceWsKeyBook(chatId, strategyType, networkType, wsSym)), now);
+
+        return buildHealth(klineConnected, aggConnected, bookConnected, klineAge, aggAge, bookAge);
+    }
+
+    private SubscriptionHealth resolveBybitHealth(long chatId,
+                                                  StrategyType strategyType,
+                                                  NetworkType networkType,
+                                                  String sym,
+                                                  String tf) {
+        BybitMarketStreamAdapter ws = bybitWsProvider.getIfAvailable();
+        if (ws == null) {
+            return new SubscriptionHealth(true, false, false, false, -1L, -1L, -1L, true, "ws_client_missing");
+        }
+
+        String wsSym = sym.toUpperCase(Locale.ROOT);
+        String wsTf = tf.toLowerCase(Locale.ROOT);
+
+        boolean klineConnected = ws.isConnected(chatId, strategyType, networkType, wsSym, wsTf, "KLINE");
+        boolean aggConnected = ws.isConnected(chatId, strategyType, networkType, wsSym, wsTf, "AGG_TRADE");
+        boolean bookConnected = ws.isConnected(chatId, strategyType, networkType, wsSym, wsTf, "BOOK_TICKER");
+
+        long now = System.currentTimeMillis();
+        long klineAge = ageMs(ws.getLastMessageAt(buildBybitWsKeyKline(chatId, strategyType, networkType, wsSym, wsTf)), now);
+        long aggAge = ageMs(ws.getLastMessageAt(buildBybitWsKeyAgg(chatId, strategyType, networkType, wsSym)), now);
+        long bookAge = ageMs(ws.getLastMessageAt(buildBybitWsKeyBook(chatId, strategyType, networkType, wsSym)), now);
+
+        return buildHealth(klineConnected, aggConnected, bookConnected, klineAge, aggAge, bookAge);
+    }
+
+    private SubscriptionHealth buildHealth(boolean klineConnected,
+                                           boolean aggConnected,
+                                           boolean bookConnected,
+                                           long klineAge,
+                                           long aggAge,
+                                           long bookAge) {
 
         long silence = Math.max(5_000L, maxSilenceMs);
 
@@ -846,10 +991,11 @@ public class MarketDataStreamService {
 
         if (n <= 0) return -1;
 
-        if (unit == 's') mult = 1000L;
+        if (unit == 's') mult = 1_000L;
         else if (unit == 'm') mult = 60_000L;
         else if (unit == 'h') mult = 3_600_000L;
         else if (unit == 'd') mult = 86_400_000L;
+        else if (unit == 'w') mult = 604_800_000L;
         else return -1;
 
         long ms = n * mult;
@@ -897,28 +1043,6 @@ public class MarketDataStreamService {
     // WS health helpers
     // =====================================================================
 
-    private static String buildWsKeyAgg(long chatId,
-                                        StrategyType strategyType,
-                                        NetworkType net,
-                                        String symLower) {
-        return "BINANCE:" + net + ":" + chatId + ":" + strategyType.name() + ":" + symLower + ":AGG_TRADE";
-    }
-
-    private static String buildWsKeyBook(long chatId,
-                                         StrategyType strategyType,
-                                         NetworkType net,
-                                         String symLower) {
-        return "BINANCE:" + net + ":" + chatId + ":" + strategyType.name() + ":" + symLower + ":BOOK_TICKER";
-    }
-
-    private static String buildWsKeyKline(long chatId,
-                                          StrategyType strategyType,
-                                          NetworkType net,
-                                          String symLower,
-                                          String tfLower) {
-        return "BINANCE:" + net + ":" + chatId + ":" + strategyType.name() + ":" + symLower + ":" + tfLower + ":KLINE";
-    }
-
     private static boolean isFresh(long ageMs, long maxSilenceMs) {
         return ageMs >= 0 && ageMs <= maxSilenceMs;
     }
@@ -927,5 +1051,49 @@ public class MarketDataStreamService {
         if (lastTs == null || lastTs <= 0L) return -1L;
         long age = now - lastTs;
         return Math.max(age, 0L);
+    }
+
+    private static String buildBinanceWsKeyAgg(long chatId,
+                                               StrategyType strategyType,
+                                               NetworkType net,
+                                               String symLower) {
+        return "BINANCE:" + net + ":" + chatId + ":" + strategyType.name() + ":" + symLower + ":AGG_TRADE";
+    }
+
+    private static String buildBinanceWsKeyBook(long chatId,
+                                                StrategyType strategyType,
+                                                NetworkType net,
+                                                String symLower) {
+        return "BINANCE:" + net + ":" + chatId + ":" + strategyType.name() + ":" + symLower + ":BOOK_TICKER";
+    }
+
+    private static String buildBinanceWsKeyKline(long chatId,
+                                                 StrategyType strategyType,
+                                                 NetworkType net,
+                                                 String symLower,
+                                                 String tfLower) {
+        return "BINANCE:" + net + ":" + chatId + ":" + strategyType.name() + ":" + symLower + ":" + tfLower + ":KLINE";
+    }
+
+    private static String buildBybitWsKeyAgg(long chatId,
+                                             StrategyType strategyType,
+                                             NetworkType net,
+                                             String symUpper) {
+        return "BYBIT:" + net + ":" + chatId + ":" + strategyType.name() + ":" + symUpper + ":AGG_TRADE";
+    }
+
+    private static String buildBybitWsKeyBook(long chatId,
+                                              StrategyType strategyType,
+                                              NetworkType net,
+                                              String symUpper) {
+        return "BYBIT:" + net + ":" + chatId + ":" + strategyType.name() + ":" + symUpper + ":BOOK_TICKER";
+    }
+
+    private static String buildBybitWsKeyKline(long chatId,
+                                               StrategyType strategyType,
+                                               NetworkType net,
+                                               String symUpper,
+                                               String tfLower) {
+        return "BYBIT:" + net + ":" + chatId + ":" + strategyType.name() + ":" + symUpper + ":" + tfLower + ":KLINE";
     }
 }

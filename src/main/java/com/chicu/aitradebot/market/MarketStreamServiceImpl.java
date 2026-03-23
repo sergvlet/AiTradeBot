@@ -351,6 +351,46 @@ public class MarketStreamServiceImpl implements MarketStreamService {
         onAggTrade(chatId, type, exchange, networkType, symbol, price, qty, tradeTsMs);
     }
 
+    @Override
+    public void onBookTicker(long chatId,
+                             StrategyType type,
+                             String exchange,
+                             NetworkType networkType,
+                             String symbol,
+                             BigDecimal bid,
+                             BigDecimal ask,
+                             long eventTsMs) {
+
+        final String ex = sanitizeExchange(exchange);
+        final String sym = sanitizeSymbol(symbol);
+
+        if (chatId <= 0 || type == null || ex == null || networkType == null || sym == null || eventTsMs <= 0) {
+            return;
+        }
+
+        boolean hasBid = bid != null && bid.signum() > 0;
+        boolean hasAsk = ask != null && ask.signum() > 0;
+        if (!hasBid && !hasAsk) {
+            return;
+        }
+
+        // ВАЖНО:
+        // BookTicker не должен попадать в onAggTrade(), потому что это не реальные сделки.
+        // Иначе bid/ask midpoint начинает восприниматься как trade price, что отравляет
+        // формирование свечи, входы/выходы стратегии и ML-датасет.
+        if (log.isDebugEnabled()) {
+            log.debug("📘 [MARKET] BOOK_TICKER chatId={} type={} ex={} net={} sym={} bid={} ask={} ts={}",
+                    chatId,
+                    type,
+                    ex,
+                    networkType,
+                    sym,
+                    hasBid ? bid.stripTrailingZeros().toPlainString() : "null",
+                    hasAsk ? ask.stripTrailingZeros().toPlainString() : "null",
+                    eventTsMs);
+        }
+    }
+
     private String resolveTimeframe(long chatId, StrategyType type, String ex, NetworkType net, String sym) {
         try {
             Optional<AiStrategyOrchestrator.RunBinding> b = bindingOf(chatId, type);
@@ -890,3 +930,7 @@ public class MarketStreamServiceImpl implements MarketStreamService {
         }
     }
 }
+
+
+
+

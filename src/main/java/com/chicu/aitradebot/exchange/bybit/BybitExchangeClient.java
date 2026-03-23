@@ -3,6 +3,7 @@ package com.chicu.aitradebot.exchange.bybit;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.domain.ExchangeSettings;
 import com.chicu.aitradebot.exchange.client.ExchangeClient;
+import com.chicu.aitradebot.exchange.client.ExchangeClient.OrderAmountType;
 import com.chicu.aitradebot.exchange.enums.OrderSide;
 import com.chicu.aitradebot.exchange.model.AccountFees;
 import com.chicu.aitradebot.exchange.model.AccountInfo;
@@ -25,6 +26,7 @@ import java.math.RoundingMode;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -32,9 +34,14 @@ import java.util.stream.Collectors;
 public class BybitExchangeClient implements ExchangeClient {
 
     private static final String MAIN = "https://api.bybit.com";
-    private static final String DEMO = "https://api-demo.bybit.com";
+    private static final String TESTNET = "https://api-testnet.bybit.com";
 
     private static final String RECV_WINDOW = "5000";
+    private static final String DEFAULT_BALANCE_COINS = "USDT,USDC,BTC,ETH,BNB,SOL,XRP,ADA,DOGE,MNT";
+    private static final int FALLBACK_QTY_SCALE = 8;
+
+    private final Map<String, BigDecimal> qtyStepCache = new ConcurrentHashMap<>();
+    private final Map<String, BigDecimal> quoteStepCache = new ConcurrentHashMap<>();
 
     private final RestTemplate rest;
     private final ExchangeSettingsService settingsService;
@@ -47,7 +54,7 @@ public class BybitExchangeClient implements ExchangeClient {
         this.rest = rest;
 
         if (log.isDebugEnabled()) {
-            log.debug("BYBIT client initialized. TESTNET is mapped to DEMO endpoint.");
+            log.debug("BYBIT client initialized. TESTNET is mapped to api-testnet.bybit.com.");
         }
     }
 
@@ -61,7 +68,7 @@ public class BybitExchangeClient implements ExchangeClient {
     }
 
     private String baseUrl(NetworkType net) {
-        return net == NetworkType.TESTNET ? DEMO : MAIN;
+        return net == NetworkType.TESTNET ? TESTNET : MAIN;
     }
 
     private ExchangeSettings resolve(long chatId, NetworkType net) {
@@ -77,16 +84,25 @@ public class BybitExchangeClient implements ExchangeClient {
         String sym = normalizeSymbolOrThrow(symbol);
 
         try {
-            // Публичная ручка — MAIN
-            String url = MAIN + "/spot/v3/public/quote/ticker/price?symbol=" + sym;
+            String url = MAIN + "/v5/market/tickers?category=spot&symbol=" + sym;
             String raw = rest.getForObject(url, String.class);
             if (raw == null || raw.isBlank()) return 0;
 
             JSONObject json = new JSONObject(raw);
-            JSONObject result = json.optJSONObject("result");
-            if (result == null) return 0;
+            if (json.optInt("retCode", -1) != 0) {
+                log.warn("⚠️ BYBIT getPrice retCode={} msg={}",
+                        json.optInt("retCode"), json.optString("retMsg"));
+                return 0;
+            }
 
-            return result.optDouble("price", 0);
+            JSONObject result = json.optJSONObject("result");
+            JSONArray list = result != null ? result.optJSONArray("list") : null;
+            if (list == null || list.isEmpty()) return 0;
+
+            JSONObject ticker = list.optJSONObject(0);
+            if (ticker == null) return 0;
+
+            return safeDecimal(ticker.opt("lastPrice")).doubleValue();
 
         } catch (Exception e) {
             log.warn("⚠️ BYBIT getPrice failed symbol={} msg={}", sym, e.getMessage());
@@ -144,9 +160,6 @@ public class BybitExchangeClient implements ExchangeClient {
 
         for (int i = 0; i < list.length(); i++) {
             JSONArray k = list.getJSONArray(i);
-
-            // v5 format:
-            // 0 ts, 1 open, 2 high, 3 low, 4 close, 5 volume, 6 turnover
             out.add(new Kline(
                     k.getLong(0),
                     k.getDouble(1),
@@ -177,7 +190,7 @@ public class BybitExchangeClient implements ExchangeClient {
     }
 
     // =================================================================
-    // ORDERS (NEW INTERFACE)
+    // ORDERS
     // =================================================================
 
     @Override
@@ -201,19 +214,12 @@ public class BybitExchangeClient implements ExchangeClient {
 
         ExchangeSettings s = resolve(chatId, network);
 
-        // ==== Spot order endpoint:
-        // ВАЖНО: у тебя смешаны v3-private order и v5 подпись.
-        // Поэтому делаем строго v5 spot order: /v5/order/create?category=spot
-        // и не используем /spot/v3/private/order
         Map<String, String> p = new LinkedHashMap<>();
         p.put("category", "spot");
         p.put("symbol", sym);
-
-        // Bybit v5: side = Buy/Sell, orderType = Market/Limit
         p.put("side", mapSideV5(sd));
         p.put("orderType", mapTypeV5(tp));
 
-        // qty (только base qty в spot)
         if (quantity == null || quantity.signum() <= 0) {
             throw new IllegalArgumentException("quantity invalid (<=0)");
         }
@@ -224,29 +230,25 @@ public class BybitExchangeClient implements ExchangeClient {
                 throw new IllegalArgumentException("LIMIT требует price > 0");
             }
             p.put("price", strip(price));
-            // v5 timeInForce: GTC / IOC / FOK
             p.put("timeInForce", "GTC");
         }
 
-        // extra params:
-        // - orderLinkId (аналог clientOrderId)
-        // - timeInForce, etc.
         if (extraParams != null && !extraParams.isEmpty()) {
             extraParams.forEach((k, v) -> {
-                if (k == null || k.isBlank()) return;
-                if (v == null) return;
+                if (k == null || k.isBlank() || v == null) return;
 
                 String kk = k.trim();
                 String vv = String.valueOf(v).trim();
                 if (kk.isEmpty() || vv.isEmpty()) return;
 
-                // нормализуем "clientOrderId" -> "orderLinkId" (Bybit)
                 if ("clientOrderId".equalsIgnoreCase(kk)) {
                     kk = "orderLinkId";
                 }
 
-                // чтобы не ломать контракт — не даём затереть критические поля
-                if ("symbol".equalsIgnoreCase(kk) || "side".equalsIgnoreCase(kk) || "orderType".equalsIgnoreCase(kk) || "qty".equalsIgnoreCase(kk)) {
+                if ("symbol".equalsIgnoreCase(kk)
+                    || "side".equalsIgnoreCase(kk)
+                    || "orderType".equalsIgnoreCase(kk)
+                    || "qty".equalsIgnoreCase(kk)) {
                     return;
                 }
 
@@ -267,12 +269,7 @@ public class BybitExchangeClient implements ExchangeClient {
 
         JSONObject result = root.optJSONObject("result");
         String orderId = result != null ? result.optString("orderId", null) : null;
-
-        // Bybit create обычно возвращает только id, статус надо уточнять отдельной ручкой,
-        // но для твоего пайплайна достаточно "NEW" / "FILLED" (MARKET иногда сразу Filled).
         String status = result != null ? result.optString("orderStatus", "NEW") : "NEW";
-
-        // Для MARKET итоговая цена лучше уточняется по истории/деталям — но мы вернём:
         BigDecimal pxOut = (price != null ? price : BigDecimal.ZERO);
 
         return new OrderResult(
@@ -306,31 +303,64 @@ public class BybitExchangeClient implements ExchangeClient {
         if (amount == null || amount.signum() <= 0) throw new IllegalArgumentException("amount invalid (<=0)");
         if (amountType == null) throw new IllegalArgumentException("amountType=null");
 
-        // Bybit spot: qty — base qty.
-        // QUOTE_QTY делаем конвертацией (как было), но теперь:
-        // - если priceHint нет, берём getPrice()
-        // - qty округляем DOWN, чтобы не превысить бюджет
-        BigDecimal qtyBase;
-        BigDecimal usedPrice = null;
+        BigDecimal usedPrice = positiveOrNull(priceHint);
+        if (usedPrice == null) {
+            double pxx = getPrice(sym);
+            if (pxx > 0) {
+                usedPrice = BigDecimal.valueOf(pxx);
+            }
+        }
 
-        if (amountType == OrderAmountType.BASE_QTY) {
-            qtyBase = amount;
-        } else {
+        Map<String, String> extra = new LinkedHashMap<>();
+
+        BigDecimal apiQty;
+        BigDecimal dtoBaseQty;
+
+        if (amountType == OrderAmountType.QUOTE_QTY) {
             if (side == OrderSide.SELL) {
                 throw new IllegalArgumentException("BYBIT SPOT SELL не поддерживает QUOTE_QTY (нужен BASE_QTY)");
             }
 
-            usedPrice = priceHint;
-            if (usedPrice == null || usedPrice.signum() <= 0) {
-                double p = getPrice(sym);
-                if (p <= 0) throw new RuntimeException("BYBIT price unavailable for QUOTE_QTY conversion");
-                usedPrice = BigDecimal.valueOf(p);
+            extra.put("marketUnit", "quoteCoin");
+
+            apiQty = normalizeQuoteQty(amount);
+            if (apiQty == null || apiQty.signum() <= 0) {
+                throw new RuntimeException("BYBIT QUOTE_QTY normalization produced qtyQuote=0");
             }
 
-            qtyBase = amount.divide(usedPrice, 12, RoundingMode.DOWN);
-            if (qtyBase.signum() <= 0) {
+            if (usedPrice == null || usedPrice.signum() <= 0) {
+                throw new RuntimeException("BYBIT price unavailable for QUOTE_QTY conversion");
+            }
+
+            BigDecimal rawBaseQty = apiQty.divide(usedPrice, 16, RoundingMode.DOWN);
+            dtoBaseQty = normalizeBaseQty(sym, network, rawBaseQty);
+
+            if (dtoBaseQty == null || dtoBaseQty.signum() <= 0) {
                 throw new RuntimeException("BYBIT QUOTE_QTY conversion produced qtyBase=0");
             }
+
+            log.info("🔄 BYBIT MARKET BUY quote->quote sym={} quote={} marketQty={} estBaseQty={} priceHint={}",
+                    sym,
+                    strip(amount),
+                    strip(apiQty),
+                    strip(dtoBaseQty),
+                    strip(usedPrice));
+
+        } else {
+            extra.put("marketUnit", "baseCoin");
+
+            dtoBaseQty = normalizeBaseQty(sym, network, amount);
+            if (dtoBaseQty == null || dtoBaseQty.signum() <= 0) {
+                throw new RuntimeException("BYBIT BASE_QTY normalization produced qtyBase=0");
+            }
+
+            apiQty = dtoBaseQty;
+
+            log.info("🔄 BYBIT MARKET {} base->base sym={} baseQty={} marketQty={}",
+                    side.name(),
+                    sym,
+                    strip(amount),
+                    strip(apiQty));
         }
 
         OrderResult r = placeOrder(
@@ -339,29 +369,281 @@ public class BybitExchangeClient implements ExchangeClient {
                 sym,
                 side.name(),
                 "MARKET",
-                qtyBase,
+                apiQty,
                 null,
-                Map.of()
+                extra
         );
 
-        // Если Bybit вернул только id и NEW — это нормально, позже заполнится в ордер-сервисе.
-        // Цена: если у нас есть usedPrice, используем её как hint.
-        BigDecimal px = (r.price() != null && r.price().signum() > 0)
-                ? r.price()
-                : (usedPrice != null ? usedPrice : (priceHint != null ? priceHint : BigDecimal.ZERO));
+        String orderId = (r != null ? r.orderId() : null);
+        FinalMarketState finalState = waitFinalMarketState(chatId, network, sym, orderId, dtoBaseQty, usedPrice);
+
+        BigDecimal finalQty = positiveOrNull(finalState.executedQty()) != null
+                ? finalState.executedQty()
+                : dtoBaseQty;
+
+        BigDecimal finalPrice = positiveOrNull(finalState.avgPrice()) != null
+                ? finalState.avgPrice()
+                : (usedPrice != null ? usedPrice : BigDecimal.ZERO);
+
+        String finalStatus = finalState.status();
+        boolean filled = "FILLED".equalsIgnoreCase(finalStatus);
+
+        log.info("✅ BYBIT MARKET итог sym={} side={} status={} filled={} execQty={} avgPrice={} orderId={}",
+                sym,
+                side.name(),
+                finalStatus,
+                filled,
+                strip(finalQty),
+                strip(finalPrice),
+                orderId);
 
         return Order.builder()
-                .orderId(r.orderId())
+                .orderId(orderId)
                 .chatId(chatId)
-                .symbol(r.symbol())
-                .side(r.side())
-                .type(r.type())
-                .price(px)
-                .quantity(r.qty())
-                .status(r.status())
-                .filled("FILLED".equalsIgnoreCase(r.status()) || "FILLED".equalsIgnoreCase(String.valueOf(r.status())))
-                .time(r.timestamp())
+                .symbol(sym)
+                .side(side.name())
+                .type("MARKET")
+                .price(finalPrice)
+                .quantity(finalQty)
+                .executedQty(finalQty)
+                .avgPrice(finalPrice)
+                .status(finalStatus)
+                .filled(filled)
+                .time(finalState.timeMs())
                 .build();
+    }
+
+    private FinalMarketState waitFinalMarketState(Long chatId,
+                                                  NetworkType network,
+                                                  String symbol,
+                                                  String orderId,
+                                                  BigDecimal fallbackQty,
+                                                  BigDecimal fallbackPrice) {
+        if (orderId == null || orderId.isBlank()) {
+            return new FinalMarketState(
+                    normalizeFinalMarketStatus(null, fallbackQty, BigDecimal.ZERO),
+                    positiveOrNull(fallbackQty) != null ? fallbackQty : BigDecimal.ZERO,
+                    positiveOrNull(fallbackPrice) != null ? fallbackPrice : BigDecimal.ZERO,
+                    System.currentTimeMillis()
+            );
+        }
+
+        FinalMarketState lastSeen = null;
+
+        for (int attempt = 1; attempt <= 8; attempt++) {
+            try {
+                FinalMarketState state = fetchFinalMarketState(chatId, network, symbol, orderId);
+                if (state != null) {
+                    lastSeen = state;
+                    if (isFinalMarketStatus(state.status())) {
+                        return state;
+                    }
+                }
+                Thread.sleep(200L);
+            } catch (Exception e) {
+                log.debug("BYBIT final order poll skipped sym={} orderId={} attempt={} err={}",
+                        symbol, orderId, attempt, e.toString());
+            }
+        }
+
+        if (lastSeen != null) {
+            return lastSeen;
+        }
+
+        return new FinalMarketState(
+                normalizeFinalMarketStatus(null, fallbackQty, BigDecimal.ZERO),
+                positiveOrNull(fallbackQty) != null ? fallbackQty : BigDecimal.ZERO,
+                positiveOrNull(fallbackPrice) != null ? fallbackPrice : BigDecimal.ZERO,
+                System.currentTimeMillis()
+        );
+    }
+
+    private FinalMarketState fetchFinalMarketState(Long chatId,
+                                                   NetworkType network,
+                                                   String symbol,
+                                                   String orderId) throws Exception {
+
+        ExchangeSettings s = resolve(chatId, network);
+
+        Map<String, String> p = new LinkedHashMap<>();
+        p.put("category", "spot");
+        p.put("symbol", normalizeSymbolOrThrow(symbol));
+        p.put("orderId", orderId);
+
+        String raw = signedV5(s, "/v5/order/realtime", p, HttpMethod.GET);
+        if (raw == null || raw.isBlank()) return null;
+
+        JSONObject root = new JSONObject(raw);
+        int rc = root.optInt("retCode", -1);
+        if (rc != 0) {
+            log.debug("BYBIT realtime order retCode={} msg={} sym={} orderId={}",
+                    rc, root.optString("retMsg"), symbol, orderId);
+            return null;
+        }
+
+        JSONObject result = root.optJSONObject("result");
+        JSONArray list = result != null ? result.optJSONArray("list") : null;
+        if (list == null || list.isEmpty()) return null;
+
+        JSONObject item = list.optJSONObject(0);
+        if (item == null) return null;
+
+        BigDecimal execQty = safeDecimal(item.opt("cumExecQty"));
+        BigDecimal avgPrice = safeDecimal(item.opt("avgPrice"));
+        BigDecimal leavesQty = safeDecimal(item.opt("leavesQty"));
+
+        long timeMs = 0L;
+        try {
+            timeMs = item.optLong("updatedTime", 0L);
+        } catch (Exception ignored) {
+            timeMs = 0L;
+        }
+        if (timeMs <= 0) {
+            timeMs = System.currentTimeMillis();
+        }
+
+        String status = normalizeFinalMarketStatus(item.optString("orderStatus", null), execQty, leavesQty);
+
+        return new FinalMarketState(
+                status,
+                execQty,
+                avgPrice,
+                timeMs
+        );
+    }
+
+    private boolean isFinalMarketStatus(String status) {
+        if (status == null || status.isBlank()) return false;
+        String s = status.trim().toUpperCase(Locale.ROOT);
+        return "FILLED".equals(s)
+                || "CANCELED".equals(s)
+                || "CANCELLED".equals(s)
+                || "REJECTED".equals(s)
+                || "PARTIALLY_FILLED_CANCELED".equals(s);
+    }
+
+    private String normalizeFinalMarketStatus(String rawStatus, BigDecimal executedQty, BigDecimal leavesQty) {
+        String s = normalizeUpper(rawStatus);
+
+        if (s == null) {
+            if (positiveOrNull(executedQty) != null && safeDecimal(leavesQty).signum() == 0) {
+                return "FILLED";
+            }
+            if (positiveOrNull(executedQty) != null) {
+                return "PARTIALLY_FILLED";
+            }
+            return "NEW";
+        }
+
+        return switch (s) {
+            case "FILLED" -> "FILLED";
+            case "PARTIALLYFILLED", "PARTIALLY_FILLED" -> "PARTIALLY_FILLED";
+            case "CANCELLED", "CANCELED" -> positiveOrNull(executedQty) != null
+                    ? "PARTIALLY_FILLED_CANCELED"
+                    : "CANCELED";
+            case "REJECTED", "DEACTIVATED" -> "REJECTED";
+            case "NEW", "OPEN", "PENDINGNEW", "PENDING_NEW", "CREATED" -> {
+                if (positiveOrNull(executedQty) != null && safeDecimal(leavesQty).signum() == 0) {
+                    yield "FILLED";
+                }
+                if (positiveOrNull(executedQty) != null) {
+                    yield "PARTIALLY_FILLED";
+                }
+                yield "NEW";
+            }
+            default -> {
+                if (positiveOrNull(executedQty) != null && safeDecimal(leavesQty).signum() == 0) {
+                    yield "FILLED";
+                }
+                if (positiveOrNull(executedQty) != null) {
+                    yield "PARTIALLY_FILLED";
+                }
+                yield s;
+            }
+        };
+    }
+
+    private record FinalMarketState(
+            String status,
+            BigDecimal executedQty,
+            BigDecimal avgPrice,
+            long timeMs
+    ) {}
+
+
+    private BigDecimal normalizeBaseQty(String symbol, NetworkType network, BigDecimal qty) {
+        BigDecimal safeQty = positiveOrNull(qty);
+        if (safeQty == null) return BigDecimal.ZERO;
+
+        BigDecimal step = getQtyStep(symbol, network);
+        if (positiveOrNull(step) != null) {
+            BigDecimal normalized = safeQty.divide(step, 0, RoundingMode.DOWN).multiply(step);
+            return normalized.setScale(Math.max(0, step.stripTrailingZeros().scale()), RoundingMode.DOWN).stripTrailingZeros();
+        }
+
+        return safeQty.setScale(FALLBACK_QTY_SCALE, RoundingMode.DOWN).stripTrailingZeros();
+    }
+
+    private BigDecimal getQtyStep(String symbol, NetworkType network) {
+        String sym = normalizeSymbolOrThrow(symbol);
+        String cacheKey = (network != null ? network.name() : "NA") + ":" + sym;
+        BigDecimal cached = qtyStepCache.get(cacheKey);
+        if (cached != null) return cached;
+
+        try {
+            String url = baseUrl(network) + "/v5/market/instruments-info?category=spot&symbol=" + sym;
+            String raw = rest.getForObject(url, String.class);
+            if (raw == null || raw.isBlank()) return null;
+
+            JSONObject root = new JSONObject(raw);
+            if (root.optInt("retCode", -1) != 0) return null;
+
+            JSONObject result = root.optJSONObject("result");
+            JSONArray list = result != null ? result.optJSONArray("list") : null;
+            if (list == null || list.isEmpty()) return null;
+
+            JSONObject item = list.optJSONObject(0);
+            JSONObject lot = item != null ? item.optJSONObject("lotSizeFilter") : null;
+
+            BigDecimal step = firstPositive(
+                    bdOrNull(lot != null ? lot.optString("qtyStep", null) : null),
+                    bdOrNull(lot != null ? lot.optString("basePrecision", null) : null),
+                    bdOrNull(lot != null ? lot.optString("minOrderQty", null) : null)
+            );
+
+            if (positiveOrNull(step) != null) {
+                qtyStepCache.put(cacheKey, step);
+            }
+            return step;
+
+        } catch (Exception e) {
+            log.debug("BYBIT qtyStep resolve failed sym={} net={} msg={}", sym, network, e.toString());
+            return null;
+        }
+    }
+
+    private static BigDecimal firstPositive(BigDecimal... values) {
+        if (values == null) return null;
+        for (BigDecimal value : values) {
+            if (positiveOrNull(value) != null) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    private String normalizeMarketStatus(String status) {
+        String s = normalizeUpper(status);
+        if (s == null) return "FILLED";
+
+        return switch (s) {
+            case "NEW", "OPEN", "PARTIALLY_FILLED" -> "FILLED";
+            default -> s;
+        };
+    }
+
+    private static BigDecimal positiveOrNull(BigDecimal value) {
+        return value != null && value.signum() > 0 ? value : null;
     }
 
     @Override
@@ -372,7 +654,6 @@ public class BybitExchangeClient implements ExchangeClient {
 
         ExchangeSettings s = resolve(chatId, network);
 
-        // v5 cancel:
         Map<String, String> p = new LinkedHashMap<>();
         p.put("category", "spot");
         p.put("symbol", normalizeSymbolOrThrow(symbol));
@@ -410,46 +691,157 @@ public class BybitExchangeClient implements ExchangeClient {
 
         ExchangeSettings s = resolve(chatId, network);
 
-        // ✅ Bybit: у разных аккаунтов баланс может быть в разных accountType
-        List<String> accountTypes = List.of("UNIFIED", "SPOT", "CONTRACT");
-
         Map<String, Balance> merged = new LinkedHashMap<>();
 
-        for (String accountType : accountTypes) {
-            try {
-                Map<String, Balance> part = loadWalletBalance(s, accountType);
-                if (part == null || part.isEmpty()) continue;
+        // 1) Основной UTA-кошелёк: wallet-balance возвращает только non-zero активы
+        mergeBalances(merged, loadWalletBalanceUnified(s));
 
-                // ✅ merge: суммируем free/locked по активам
-                part.forEach((asset, bal) -> merged.merge(asset, bal, (a, b) ->
-                        new Balance(asset, a.free() + b.free(), a.locked() + b.locked())
-                ));
+        // 2) Funding / дополнительные балансы
+        mergeBalances(merged, loadAllCoinsBalanceV5(s, "FUND", DEFAULT_BALANCE_COINS));
 
-            } catch (Exception e) {
-                // не валим UI целиком
-                log.debug("BYBIT getFullBalance accountType={} failed: {}", accountType, e.toString());
-            }
+        // 3) Если пока пусто — добираем single-coin probes по всем важным accountType
+        if (merged.isEmpty()) {
+            probeCommonCoins(merged, s, "UNIFIED");
+            probeCommonCoins(merged, s, "FUND");
+            probeCommonCoins(merged, s, "SPOT");
+            probeCommonCoins(merged, s, "CONTRACT");
+            probeCommonCoins(merged, s, "OPTION");
+            probeCommonCoins(merged, s, "INVESTMENT");
+        }
+
+        // 4) Если всё ещё пусто — пробуем all-coins для остальных accountType
+        if (merged.isEmpty()) {
+            mergeBalances(merged, loadAllCoinsBalanceV5(s, "SPOT", null));
+            mergeBalances(merged, loadAllCoinsBalanceV5(s, "CONTRACT", null));
+        }
+
+        if (merged.isEmpty()) {
+            log.warn("⚠️ BYBIT balance is empty chatId={} net={}", chatId, network);
+        } else {
+            String preview = merged.entrySet().stream()
+                    .limit(10)
+                    .map(e -> e.getKey() + "[free=" + e.getValue().free() + ", locked=" + e.getValue().locked() + "]")
+                    .collect(Collectors.joining(", "));
+            log.info("💰 BYBIT balances chatId={} net={} -> {}", chatId, network, preview);
         }
 
         return merged;
     }
 
-    private Map<String, Balance> loadWalletBalance(ExchangeSettings s, String accountType) throws Exception {
+    private void probeCommonCoins(Map<String, Balance> merged, ExchangeSettings s, String accountType) {
+        String[] coins = {"USDT", "USDC", "BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE", "MNT"};
+        for (String coin : coins) {
+            try {
+                Balance b = loadSingleCoinBalanceV5(s, accountType, coin);
+                if (b != null && (b.free() > 0.0d || b.locked() > 0.0d)) {
+                    merged.merge(coin, b, (x, y) ->
+                            new Balance(coin, x.free() + y.free(), x.locked() + y.locked()));
+                }
+            } catch (Exception e) {
+                log.debug("BYBIT single-coin probe skipped accountType={} coin={} msg={}",
+                        accountType, coin, e.getMessage());
+            }
+        }
+    }
+
+    private Balance loadSingleCoinBalanceV5(ExchangeSettings s, String accountType, String coin) throws Exception {
+
+        Map<String, String> params = new LinkedHashMap<>();
+        params.put("accountType", accountType);
+        params.put("coin", coin);
+        params.put("withTransferSafeAmount", "1");
+
+        String raw = signedV5(
+                s,
+                "/v5/asset/transfer/query-account-coin-balance",
+                params,
+                HttpMethod.GET
+        );
+
+        if (raw == null || raw.isBlank()) return null;
+
+        JSONObject root = new JSONObject(raw);
+        int retCode = root.optInt("retCode", -1);
+        if (retCode != 0) {
+            log.debug("BYBIT SINGLE_BALANCE accountType={} coin={} retCode={} msg={}",
+                    accountType, coin, retCode, root.optString("retMsg"));
+            return null;
+        }
+
+        JSONObject result = root.optJSONObject("result");
+        if (result == null) return null;
+
+        String asset = normalizeUpper(result.optString("coin", coin));
+        if (asset == null) asset = coin;
+
+        BigDecimal wallet = safeDecimal(result.opt("walletBalance"));
+        BigDecimal transferBalance = safeDecimal(result.opt("transferBalance"));
+        BigDecimal transferSafeAmount = safeDecimal(result.opt("transferSafeAmount"));
+        BigDecimal locked = safeDecimal(result.opt("locked"));
+        BigDecimal bonus = safeDecimal(result.opt("bonus"));
+
+        BigDecimal free = BigDecimal.ZERO;
+
+        if (transferBalance.compareTo(BigDecimal.ZERO) > 0) {
+            free = transferBalance;
+        } else if (transferSafeAmount.compareTo(BigDecimal.ZERO) > 0) {
+            free = transferSafeAmount;
+        } else if (wallet.compareTo(BigDecimal.ZERO) > 0) {
+            free = wallet.subtract(locked).max(BigDecimal.ZERO);
+        }
+
+        BigDecimal finalLocked = locked.max(BigDecimal.ZERO);
+        BigDecimal total = free.add(finalLocked);
+
+        if (total.compareTo(BigDecimal.ZERO) <= 0 && wallet.compareTo(BigDecimal.ZERO) > 0) {
+            total = wallet;
+            free = wallet.subtract(finalLocked).max(BigDecimal.ZERO);
+        }
+
+        if (total.compareTo(BigDecimal.ZERO) <= 0 && bonus.compareTo(BigDecimal.ZERO) > 0) {
+            free = bonus;
+        }
+
+        if (free.compareTo(BigDecimal.ZERO) <= 0 && finalLocked.compareTo(BigDecimal.ZERO) <= 0) {
+            return null;
+        }
+
+        return new Balance(asset, free.doubleValue(), finalLocked.doubleValue());
+    }
+    private void mergeBalances(Map<String, Balance> target, Map<String, Balance> part) {
+        if (part == null || part.isEmpty()) return;
+
+        part.forEach((asset, bal) -> {
+            String a = normalizeUpper(asset);
+            if (a == null || bal == null) return;
+
+            target.merge(a, new Balance(a, bal.free(), bal.locked()),
+                    (x, y) -> new Balance(a, x.free() + y.free(), x.locked() + y.locked()));
+        });
+    }
+
+    /**
+     * Unified wallet: берём все ненулевые активы напрямую.
+     */
+    private Map<String, Balance> loadWalletBalanceUnified(ExchangeSettings s) throws Exception {
+
+        Map<String, String> params = new LinkedHashMap<>();
+        params.put("accountType", "UNIFIED");
 
         String raw = signedV5(
                 s,
                 "/v5/account/wallet-balance",
-                Map.of("accountType", accountType),
+                params,
                 HttpMethod.GET
         );
 
         if (raw == null || raw.isBlank()) return Map.of();
 
         JSONObject root = new JSONObject(raw);
-
-        if (root.optInt("retCode", -1) != 0) {
-            log.debug("BYBIT BALANCE accountType={} retCode={} msg={}",
-                    accountType, root.optInt("retCode"), root.optString("retMsg"));
+        int retCode = root.optInt("retCode", -1);
+        if (retCode != 0) {
+            log.debug("BYBIT WALLET_BALANCE UNIFIED retCode={} msg={}",
+                    retCode, root.optString("retMsg"));
             return Map.of();
         }
 
@@ -461,7 +853,6 @@ public class BybitExchangeClient implements ExchangeClient {
 
         Map<String, Balance> out = new LinkedHashMap<>();
 
-        // ✅ важно: list может быть несколько
         for (int li = 0; li < list.length(); li++) {
             JSONObject acc = list.optJSONObject(li);
             if (acc == null) continue;
@@ -473,28 +864,131 @@ public class BybitExchangeClient implements ExchangeClient {
                 JSONObject c = coins.optJSONObject(i);
                 if (c == null) continue;
 
-                String a = c.optString("coin", "").trim().toUpperCase(Locale.ROOT);
-                if (a.isBlank()) continue;
+                String asset = normalizeUpper(c.optString("coin", null));
+                if (asset == null) continue;
 
                 BigDecimal wallet = safeDecimal(c.opt("walletBalance"));
-                BigDecimal withdraw = safeDecimal(c.opt("availableToWithdraw"));
+                BigDecimal equity = safeDecimal(c.opt("equity"));
+                BigDecimal locked = safeDecimal(c.opt("locked"));
+                BigDecimal borrowAmount = safeDecimal(c.opt("borrowAmount"));
+                BigDecimal spotBorrow = safeDecimal(c.opt("spotBorrow"));
 
-                // ✅ если availableToWithdraw пусто/0, fallback на walletBalance
-                BigDecimal free = (withdraw != null && withdraw.compareTo(BigDecimal.ZERO) > 0)
-                        ? withdraw
-                        : wallet;
+                BigDecimal free = wallet
+                        .subtract(locked)
+                        .subtract(borrowAmount)
+                        .subtract(spotBorrow)
+                        .max(BigDecimal.ZERO);
 
-                if (free == null) free = BigDecimal.ZERO;
-                if (wallet == null) wallet = BigDecimal.ZERO;
-
-                BigDecimal locked = wallet.subtract(free).max(BigDecimal.ZERO);
-
-                // ✅ фильтруем total > 0
-                if (wallet.compareTo(BigDecimal.ZERO) > 0 || free.compareTo(BigDecimal.ZERO) > 0 || locked.compareTo(BigDecimal.ZERO) > 0) {
-                    Balance bal = new Balance(a, free.doubleValue(), locked.doubleValue());
-                    out.merge(a, bal, (x, y) -> new Balance(a, x.free() + y.free(), x.locked() + y.locked()));
+                BigDecimal total = wallet.max(BigDecimal.ZERO);
+                if (total.signum() <= 0 && equity.signum() > 0) {
+                    total = equity;
+                    if (free.signum() <= 0) {
+                        free = equity.max(BigDecimal.ZERO);
+                    }
                 }
+
+                BigDecimal finalLocked = total.subtract(free).max(BigDecimal.ZERO);
+
+                if (total.signum() <= 0 && finalLocked.signum() <= 0 && free.signum() <= 0) {
+                    continue;
+                }
+
+                out.put(asset, new Balance(
+                        asset,
+                        free.doubleValue(),
+                        finalLocked.doubleValue()
+                ));
             }
+        }
+        if (out.isEmpty()) {
+            log.warn("⚠️ BYBIT wallet-balance UNIFIED returned no non-zero coins");
+        } else {
+            log.info("💰 BYBIT wallet-balance UNIFIED coins={}", out.keySet());
+        }
+        return out;
+    }
+
+    /**
+     * Get All Coins Balance:
+     * - UNIFIED/FUND -> coin обязателен/желателен
+     * - SPOT/CONTRACT можно без coin
+     */
+    private Map<String, Balance> loadAllCoinsBalanceV5(
+            ExchangeSettings s,
+            String accountType,
+            String coinCsv
+    ) throws Exception {
+
+        Map<String, String> params = new LinkedHashMap<>();
+        params.put("accountType", accountType);
+
+        if (coinCsv != null && !coinCsv.isBlank()) {
+            params.put("coin", coinCsv);
+        }
+
+        String raw = signedV5(
+                s,
+                "/v5/asset/transfer/query-account-coins-balance",
+                params,
+                HttpMethod.GET
+        );
+
+        if (raw == null || raw.isBlank()) return Map.of();
+
+        JSONObject root = new JSONObject(raw);
+        int retCode = root.optInt("retCode", -1);
+        if (retCode != 0) {
+            log.debug("BYBIT ALL_BALANCE accountType={} retCode={} msg={}",
+                    accountType, retCode, root.optString("retMsg"));
+            return Map.of();
+        }
+
+        JSONObject result = root.optJSONObject("result");
+        if (result == null) return Map.of();
+
+        JSONArray list = result.optJSONArray("balance");
+        if (list == null || list.isEmpty()) {
+            list = result.optJSONArray("coin");
+        }
+        if (list == null || list.isEmpty()) return Map.of();
+
+        Map<String, Balance> out = new LinkedHashMap<>();
+
+        for (int i = 0; i < list.length(); i++) {
+            JSONObject c = list.optJSONObject(i);
+            if (c == null) continue;
+
+            String asset = normalizeUpper(c.optString("coin", null));
+            if (asset == null) continue;
+
+            BigDecimal wallet = safeDecimal(c.opt("walletBalance"));
+            BigDecimal transferBalance = safeDecimal(c.opt("transferBalance"));
+            BigDecimal transferSafeAmount = safeDecimal(c.opt("transferSafeAmount"));
+            BigDecimal locked = safeDecimal(c.opt("locked"));
+            BigDecimal borrowAmount = safeDecimal(c.opt("borrowAmount"));
+
+            BigDecimal free = BigDecimal.ZERO;
+
+            if (transferBalance.compareTo(BigDecimal.ZERO) > 0) {
+                free = transferBalance;
+            } else if (transferSafeAmount.compareTo(BigDecimal.ZERO) > 0) {
+                free = transferSafeAmount;
+            } else if (wallet.compareTo(BigDecimal.ZERO) > 0) {
+                free = wallet.subtract(locked).subtract(borrowAmount).max(BigDecimal.ZERO);
+            }
+
+            BigDecimal total = wallet.max(BigDecimal.ZERO);
+            BigDecimal finalLocked = total.subtract(free).max(BigDecimal.ZERO);
+
+            if (total.signum() <= 0 && free.signum() <= 0 && finalLocked.signum() <= 0) {
+                continue;
+            }
+
+            out.put(asset, new Balance(
+                    asset,
+                    free.doubleValue(),
+                    finalLocked.doubleValue()
+            ));
         }
 
         return out;
@@ -507,21 +1001,25 @@ public class BybitExchangeClient implements ExchangeClient {
     @Override
     public List<String> getAllSymbols() {
         try {
-            String raw = rest.getForObject(MAIN + "/spot/v3/public/symbols", String.class);
+            String raw = rest.getForObject(MAIN + "/v5/market/instruments-info?category=spot", String.class);
             if (raw == null || raw.isBlank()) return List.of();
 
             JSONObject root = new JSONObject(raw);
-            JSONObject result = root.optJSONObject("result");
-            if (result == null) return List.of();
+            if (root.optInt("retCode", -1) != 0) {
+                log.warn("⚠️ BYBIT getAllSymbols retCode={} msg={}",
+                        root.optInt("retCode"), root.optString("retMsg"));
+                return List.of();
+            }
 
-            JSONArray arr = result.optJSONArray("list");
+            JSONObject result = root.optJSONObject("result");
+            JSONArray arr = result != null ? result.optJSONArray("list") : null;
             if (arr == null || arr.isEmpty()) return List.of();
 
             List<String> out = new ArrayList<>();
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject o = arr.getJSONObject(i);
                 if ("Trading".equalsIgnoreCase(o.optString("status"))) {
-                    String name = o.optString("name", "").trim().toUpperCase(Locale.ROOT);
+                    String name = o.optString("symbol", "").trim().toUpperCase(Locale.ROOT);
                     if (!name.isBlank()) out.add(name);
                 }
             }
@@ -547,7 +1045,6 @@ public class BybitExchangeClient implements ExchangeClient {
             BigDecimal makerPct = fees != null ? fees.getMakerPct() : null;
             BigDecimal takerPct = fees != null ? fees.getTakerPct() : null;
 
-            // AccountInfo в твоей модели ожидает double.
             double maker = makerPct != null ? makerPct.doubleValue() : 0.10;
             double taker = takerPct != null ? takerPct.doubleValue() : 0.10;
 
@@ -611,11 +1108,9 @@ public class BybitExchangeClient implements ExchangeClient {
 
             JSONObject fees = list.getJSONObject(0);
 
-            // Bybit даёт долю (0.001 = 0.1%)
             BigDecimal makerRate = parseBd(fees.optString("makerFeeRate", null));
             BigDecimal takerRate = parseBd(fees.optString("takerFeeRate", null));
 
-            // Переводим в проценты
             BigDecimal makerPct = makerRate != null
                     ? makerRate.multiply(BigDecimal.valueOf(100)).setScale(6, RoundingMode.HALF_UP)
                     : null;
@@ -649,7 +1144,7 @@ public class BybitExchangeClient implements ExchangeClient {
     }
 
     // =================================================================
-    // TRADABLE SYMBOLS (V5)
+    // TRADABLE SYMBOLS
     // =================================================================
 
     @Override
@@ -783,18 +1278,9 @@ public class BybitExchangeClient implements ExchangeClient {
     }
 
     // =================================================================
-    // SIGN (Bybit HMAC) — ВАЖНО: stringToSign = ts + apiKey + recvWindow + query/body
+    // SIGN
     // =================================================================
 
-    /**
-     * Bybit v5 подпись:
-     *  stringToSign = timestamp + apiKey + recvWindow + payload
-     *
-     * Для GET payload = queryString (без '?')
-     * Для POST payload = bodyString (для JSON — json; для form — query)
-     *
-     * В нашем варианте мы используем application/x-www-form-urlencoded (query-string) и туда кладём body.
-     */
     private String signedV5(
             ExchangeSettings s,
             String endpoint,
@@ -805,7 +1291,6 @@ public class BybitExchangeClient implements ExchangeClient {
         long ts = System.currentTimeMillis();
 
         String payload = toQuery(params);
-
         String preSign = ts + s.getApiKey() + RECV_WINDOW + payload;
         String signature = sign(preSign, s.getApiSecret());
 
@@ -814,8 +1299,8 @@ public class BybitExchangeClient implements ExchangeClient {
         h.set("X-BAPI-SIGN", signature);
         h.set("X-BAPI-TIMESTAMP", String.valueOf(ts));
         h.set("X-BAPI-RECV-WINDOW", RECV_WINDOW);
+        h.set("X-BAPI-SIGN-TYPE", "2");
 
-        // Bybit допускает form-urlencoded; JSON тоже можно, но тогда payload другой.
         if (method == HttpMethod.POST) {
             h.setContentType(MediaType.APPLICATION_FORM_URLENCODED);
         }
@@ -919,12 +1404,6 @@ public class BybitExchangeClient implements ExchangeClient {
         return s;
     }
 
-    private static String normalizeInterval(String interval) {
-        if (interval == null) return "";
-        String s = interval.trim().toLowerCase(Locale.ROOT);
-        return s.isEmpty() ? "" : s;
-    }
-
     private static String normalizeUpper(String s) {
         if (s == null) return null;
         String v = s.trim().toUpperCase(Locale.ROOT);
@@ -940,20 +1419,22 @@ public class BybitExchangeClient implements ExchangeClient {
         return v.stripTrailingZeros().toPlainString();
     }
 
-    private static BigDecimal bdOrZero(String s) {
-        BigDecimal v = bdOrNull(s);
-        return v != null ? v : BigDecimal.ZERO;
-    }
-
     private static String mapSideV5(String sideUpper) {
-        // вход может быть BUY/SELL
         if ("SELL".equalsIgnoreCase(sideUpper)) return "Sell";
         return "Buy";
     }
 
     private static String mapTypeV5(String typeUpper) {
-        // вход может быть MARKET/LIMIT
         if ("LIMIT".equalsIgnoreCase(typeUpper)) return "Limit";
         return "Market";
     }
+    private BigDecimal normalizeQuoteQty(BigDecimal quoteQty) {
+        BigDecimal safe = positiveOrNull(quoteQty);
+        if (safe == null) return BigDecimal.ZERO;
+
+        // Для spot BUY по quoteCoin держим аккуратную точность и режем вниз,
+        // чтобы не выйти за бюджет.
+        return safe.setScale(4, RoundingMode.DOWN).stripTrailingZeros();
+    }
 }
+

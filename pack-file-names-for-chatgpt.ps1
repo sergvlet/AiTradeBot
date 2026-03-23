@@ -24,16 +24,9 @@ $Manifest    = Join-Path $ExportDir "manifest.txt"
 # =========================================================
 $FileNamesToPack = @(
     "WindowScalpingStrategyV4.java",
-    "WindowScalpingStrategySettings.java",
-    "WindowScalpingStrategySettingsServiceImpl.java",
-    "MlGateway.java",
-    "MlPredictRequest.java",
-    "MlPredictResponse.java",
-    "MlModelBootstrapper.java",
-    "MlSidecarRunner.java",
-    "AiStrategyOrchestrator.java",
+    "TradeExecutionServiceImpl.java",
     "MarketStreamServiceImpl.java",
-    "app.py"
+    "MlTrainingServiceImpl.java"
 )
 
 # =========================================================

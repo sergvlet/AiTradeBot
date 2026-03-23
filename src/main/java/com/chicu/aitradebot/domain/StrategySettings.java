@@ -363,3 +363,4 @@ public class StrategySettings {
         return v.toLowerCase(Locale.ROOT);
     }
 }
+

@@ -11,6 +11,7 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.util.Objects;
 
 @Slf4j
@@ -42,7 +43,6 @@ public class WindowScalpingStrategySettingsServiceImpl implements WindowScalping
             return saved;
 
         } catch (DataIntegrityViolationException dup) {
-            // гонка: кто-то создал параллельно
             return repo.findByChatId(chatId).orElseThrow(() -> dup);
         }
     }
@@ -54,11 +54,6 @@ public class WindowScalpingStrategySettingsServiceImpl implements WindowScalping
         if (incoming == null) throw new IllegalArgumentException("incoming is null");
 
         WindowScalpingStrategySettings cur = getOrCreate(chatId);
-
-        // ✅ ВАЖНО:
-        // patchMode=true => incoming обычно собран через builder() и несёт @Builder.Default.
-        // Чтобы НЕ перетирать существующие значения дефолтами — применяем только то,
-        // что реально отличается от дефолтов.
         boolean patchMode = (incoming.getId() == null);
 
         WindowScalpingStrategySettings defaults = WindowScalpingStrategySettings.builder()
@@ -67,28 +62,20 @@ public class WindowScalpingStrategySettingsServiceImpl implements WindowScalping
 
         boolean changed = false;
 
-        // ✅ TP/SL
-        BigDecimal tp = incoming.getTakeProfitPct();
-        if (tp != null && tp.signum() > 0) {
-            if (!patchMode || !bdEquals(tp, defaults.getTakeProfitPct())) {
-                if (!bdEquals(tp, cur.getTakeProfitPct())) {
-                    cur.setTakeProfitPct(tp);
-                    changed = true;
-                }
-            }
-        }
+        changed |= applyBigDecimal(incoming.getTakeProfitPct(), defaults.getTakeProfitPct(), cur.getTakeProfitPct(), patchMode, cur::setTakeProfitPct);
+        changed |= applyBigDecimal(incoming.getStopLossPct(), defaults.getStopLossPct(), cur.getStopLossPct(), patchMode, cur::setStopLossPct);
 
-        BigDecimal sl = incoming.getStopLossPct();
-        if (sl != null && sl.signum() > 0) {
-            if (!patchMode || !bdEquals(sl, defaults.getStopLossPct())) {
-                if (!bdEquals(sl, cur.getStopLossPct())) {
-                    cur.setStopLossPct(sl);
-                    changed = true;
-                }
-            }
-        }
+        changed |= applyBoolean(incoming.getAutoTpSlEnabled(), defaults.getAutoTpSlEnabled(), cur.getAutoTpSlEnabled(), patchMode, cur::setAutoTpSlEnabled);
+        changed |= applyBigDecimal(incoming.getAutoSlFromRangeFactor(), defaults.getAutoSlFromRangeFactor(), cur.getAutoSlFromRangeFactor(), patchMode, cur::setAutoSlFromRangeFactor);
+        changed |= applyBigDecimal(incoming.getAutoTpFromRangeFactor(), defaults.getAutoTpFromRangeFactor(), cur.getAutoTpFromRangeFactor(), patchMode, cur::setAutoTpFromRangeFactor);
+        changed |= applyBigDecimal(incoming.getAutoMinRiskReward(), defaults.getAutoMinRiskReward(), cur.getAutoMinRiskReward(), patchMode, cur::setAutoMinRiskReward);
+        changed |= applyBigDecimal(incoming.getAutoSlMinPct(), defaults.getAutoSlMinPct(), cur.getAutoSlMinPct(), patchMode, cur::setAutoSlMinPct);
+        changed |= applyBigDecimal(incoming.getAutoSlMaxPct(), defaults.getAutoSlMaxPct(), cur.getAutoSlMaxPct(), patchMode, cur::setAutoSlMaxPct);
+        changed |= applyBigDecimal(incoming.getAutoTpMinPct(), defaults.getAutoTpMinPct(), cur.getAutoTpMinPct(), patchMode, cur::setAutoTpMinPct);
+        changed |= applyBigDecimal(incoming.getAutoTpMaxPct(), defaults.getAutoTpMaxPct(), cur.getAutoTpMaxPct(), patchMode, cur::setAutoTpMaxPct);
+        changed |= applyBigDecimal(incoming.getAutoTpMlBoostFactor(), defaults.getAutoTpMlBoostFactor(), cur.getAutoTpMlBoostFactor(), patchMode, cur::setAutoTpMlBoostFactor);
+        changed |= applyBigDecimal(incoming.getAutoTpWeakSignalFactor(), defaults.getAutoTpWeakSignalFactor(), cur.getAutoTpWeakSignalFactor(), patchMode, cur::setAutoTpWeakSignalFactor);
 
-        // ✅ WINDOW поля
         Integer ws = incoming.getWindowSize();
         if (ws != null && ws >= 5) {
             if (!patchMode || !Objects.equals(ws, defaults.getWindowSize())) {
@@ -99,68 +86,35 @@ public class WindowScalpingStrategySettingsServiceImpl implements WindowScalping
             }
         }
 
-        Double low = incoming.getEntryFromLowPct();
-        if (low != null) {
-            double v = clamp(low, 0.0, 100.0);
-            if (!patchMode || !dblEquals(v, safeD(defaults.getEntryFromLowPct()))) {
-                if (!dblEquals(v, safeD(cur.getEntryFromLowPct()))) {
-                    cur.setEntryFromLowPct(v);
-                    changed = true;
-                }
-            }
-        }
+        changed |= applyDouble(incoming.getEntryFromLowPct(), defaults.getEntryFromLowPct(), cur.getEntryFromLowPct(), patchMode, 0.0, 100.0, cur::setEntryFromLowPct);
+        changed |= applyDouble(incoming.getEntryFromHighPct(), defaults.getEntryFromHighPct(), cur.getEntryFromHighPct(), patchMode, 0.0, 100.0, cur::setEntryFromHighPct);
+        changed |= applyDouble(incoming.getMinRangePct(), defaults.getMinRangePct(), cur.getMinRangePct(), patchMode, 0.0, 100.0, cur::setMinRangePct);
+        changed |= applyDouble(incoming.getMaxSpreadPct(), defaults.getMaxSpreadPct(), cur.getMaxSpreadPct(), patchMode, 0.0, 100.0, cur::setMaxSpreadPct);
 
-        Double high = incoming.getEntryFromHighPct();
-        if (high != null) {
-            double v = clamp(high, 0.0, 100.0);
-            if (!patchMode || !dblEquals(v, safeD(defaults.getEntryFromHighPct()))) {
-                if (!dblEquals(v, safeD(cur.getEntryFromHighPct()))) {
-                    cur.setEntryFromHighPct(v);
-                    changed = true;
-                }
-            }
-        }
-
-        // ✅ minRangePct:
-        //  - допускаем 0.0 (это будем трактовать как AUTO в стратегии)
-        //  - в patchMode НЕ перетираем cur дефолтом из builder()
-        Double minRange = incoming.getMinRangePct();
-        if (minRange != null) {
-            double v = clamp(minRange, 0.0, 100.0);
-            if (!patchMode || !dblEquals(v, safeD(defaults.getMinRangePct()))) {
-                if (!dblEquals(v, safeD(cur.getMinRangePct()))) {
-                    cur.setMinRangePct(v);
-                    changed = true;
-                }
-            }
-        }
-
-        Double maxSpread = incoming.getMaxSpreadPct();
-        if (maxSpread != null) {
-            double v = clamp(maxSpread, 0.0, 100.0);
-            if (!patchMode || !dblEquals(v, safeD(defaults.getMaxSpreadPct()))) {
-                if (!dblEquals(v, safeD(cur.getMaxSpreadPct()))) {
-                    cur.setMaxSpreadPct(v);
-                    changed = true;
-                }
-            }
-        }
+        normalizeAutoBounds(cur);
 
         if (!changed) {
-            // ничего не поменяли — не трогаем БД и не шлём event
             return cur;
         }
 
         WindowScalpingStrategySettings saved = repo.saveAndFlush(cur);
-
-        // ✅ событие строго после коммита, иначе стратегия может прочитать “старое”
         publishAfterCommit(new WindowScalpingSettingsUpdatedEvent(chatId, "update"));
 
-        log.info("✅ WINDOW_SCALPING settings updated (chatId={}, id={}, tpPct={}, slPct={}, windowSize={}, minRangePct={}, entryLowPct={}, entryHighPct={}, maxSpreadPct={})",
+        log.info("✅ WINDOW_SCALPING settings updated (chatId={}, id={}, tpPct={}, slPct={}, autoTpSl={}, slFactor={}, tpFactor={}, minRR={}, slMinPct={}, slMaxPct={}, tpMinPct={}, tpMaxPct={}, tpMlBoost={}, tpWeakFactor={}, windowSize={}, minRangePct={}, entryLowPct={}, entryHighPct={}, maxSpreadPct={})",
                 chatId,
                 saved.getId(),
                 saved.getTakeProfitPct(),
                 saved.getStopLossPct(),
+                saved.getAutoTpSlEnabled(),
+                saved.getAutoSlFromRangeFactor(),
+                saved.getAutoTpFromRangeFactor(),
+                saved.getAutoMinRiskReward(),
+                saved.getAutoSlMinPct(),
+                saved.getAutoSlMaxPct(),
+                saved.getAutoTpMinPct(),
+                saved.getAutoTpMaxPct(),
+                saved.getAutoTpMlBoostFactor(),
+                saved.getAutoTpWeakSignalFactor(),
                 saved.getWindowSize(),
                 saved.getMinRangePct(),
                 saved.getEntryFromLowPct(),
@@ -171,10 +125,6 @@ public class WindowScalpingStrategySettingsServiceImpl implements WindowScalping
         return saved;
     }
 
-    /**
-     * ✅ Для внутренних нужд (например, reflection-fallback в тюнере).
-     * Возвращаем репозиторий напрямую — безопасно, read-only API.
-     */
     public WindowScalpingStrategySettingsRepository getRepository() {
         return repo;
     }
@@ -185,9 +135,29 @@ public class WindowScalpingStrategySettingsServiceImpl implements WindowScalping
         return v != null ? v.longValue() : null;
     }
 
-    // =====================================================
-    // helpers
-    // =====================================================
+    private void normalizeAutoBounds(WindowScalpingStrategySettings cur) {
+        if (cur == null) return;
+
+        BigDecimal slMin = positiveOrDefault(cur.getAutoSlMinPct(), new BigDecimal("0.04"));
+        BigDecimal slMax = positiveOrDefault(cur.getAutoSlMaxPct(), new BigDecimal("0.18"));
+        if (slMax.compareTo(slMin) < 0) slMax = slMin;
+
+        BigDecimal tpMin = positiveOrDefault(cur.getAutoTpMinPct(), new BigDecimal("0.10"));
+        BigDecimal tpMax = positiveOrDefault(cur.getAutoTpMaxPct(), new BigDecimal("0.80"));
+        if (tpMax.compareTo(tpMin) < 0) tpMax = tpMin;
+
+        BigDecimal minRr = positiveOrDefault(cur.getAutoMinRiskReward(), new BigDecimal("2.40"));
+        BigDecimal minTpByRr = slMin.multiply(minRr);
+        if (tpMin.compareTo(minTpByRr) < 0) {
+            tpMin = minTpByRr.setScale(8, RoundingMode.HALF_UP);
+            if (tpMax.compareTo(tpMin) < 0) tpMax = tpMin;
+        }
+
+        cur.setAutoSlMinPct(slMin.setScale(8, RoundingMode.HALF_UP));
+        cur.setAutoSlMaxPct(slMax.setScale(8, RoundingMode.HALF_UP));
+        cur.setAutoTpMinPct(tpMin.setScale(8, RoundingMode.HALF_UP));
+        cur.setAutoTpMaxPct(tpMax.setScale(8, RoundingMode.HALF_UP));
+    }
 
     private void publishAfterCommit(Object event) {
         if (!TransactionSynchronizationManager.isActualTransactionActive()) {
@@ -204,6 +174,49 @@ public class WindowScalpingStrategySettingsServiceImpl implements WindowScalping
                 }
             }
         });
+    }
+
+    private boolean applyBigDecimal(BigDecimal incoming,
+                                    BigDecimal defaultValue,
+                                    BigDecimal currentValue,
+                                    boolean patchMode,
+                                    java.util.function.Consumer<BigDecimal> setter) {
+        if (incoming == null || incoming.signum() <= 0) return false;
+        if (patchMode && bdEquals(incoming, defaultValue)) return false;
+        if (bdEquals(incoming, currentValue)) return false;
+        setter.accept(incoming.setScale(8, RoundingMode.HALF_UP));
+        return true;
+    }
+
+    private boolean applyBoolean(Boolean incoming,
+                                 Boolean defaultValue,
+                                 Boolean currentValue,
+                                 boolean patchMode,
+                                 java.util.function.Consumer<Boolean> setter) {
+        if (incoming == null) return false;
+        if (patchMode && Objects.equals(incoming, defaultValue)) return false;
+        if (Objects.equals(incoming, currentValue)) return false;
+        setter.accept(incoming);
+        return true;
+    }
+
+    private boolean applyDouble(Double incoming,
+                                Double defaultValue,
+                                Double currentValue,
+                                boolean patchMode,
+                                double min,
+                                double max,
+                                java.util.function.Consumer<Double> setter) {
+        if (incoming == null) return false;
+        double v = clamp(incoming, min, max);
+        if (patchMode && dblEquals(v, safeD(defaultValue))) return false;
+        if (dblEquals(v, safeD(currentValue))) return false;
+        setter.accept(v);
+        return true;
+    }
+
+    private static BigDecimal positiveOrDefault(BigDecimal v, BigDecimal def) {
+        return (v != null && v.signum() > 0) ? v : def;
     }
 
     private static double clamp(double v, double min, double max) {

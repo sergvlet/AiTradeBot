@@ -19,6 +19,7 @@ import com.chicu.aitradebot.strategy.core.TradingStrategy;
 import com.chicu.aitradebot.strategy.core.signal.Signal;
 import com.chicu.aitradebot.strategy.live.StrategyLivePublisher;
 import com.chicu.aitradebot.strategy.registry.StrategyBinding;
+import com.chicu.aitradebot.trade.InMemoryPositionStoreImpl;
 import com.chicu.aitradebot.trade.PositionStore;
 import com.chicu.aitradebot.trade.TradeExecutionService;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -58,6 +59,25 @@ public class WindowScalpingStrategyV4 implements
 
     @Value("${strategy.window.entryBlockLogThrottleMs:5000}")
     private long entryBlockLogThrottleMs;
+
+    @Value("${strategy.window.restoreRetryCooldownMs:5000}")
+    private long restoreRetryCooldownMs;
+
+    @Value("${strategy.window.dustRestoreLogThrottleMs:60000}")
+    private long dustRestoreLogThrottleMs;
+
+
+    @Value("${strategy.defaults.exchange:BINANCE}")
+    private String defaultExchange;
+
+    @Value("${strategy.defaults.network:TESTNET}")
+    private String defaultNetwork;
+
+    @Value("${strategy.defaults.symbol:BTCUSDT}")
+    private String defaultSymbol;
+
+    @Value("${strategy.defaults.timeframe:1m}")
+    private String defaultTimeframe;
 
     // =====================================================
     // AUTO MIN-RANGE
@@ -115,11 +135,41 @@ public class WindowScalpingStrategyV4 implements
     @Value("${strategy.window.mlRecheckMinPriceMovePct:0.03}")
     private double mlRecheckMinPriceMovePct;
 
+    @Value("${strategy.window.adaptiveMlGateEnabled:true}")
+    private boolean adaptiveMlGateEnabled;
+
+    @Value("${strategy.window.adaptiveMlGateOnlyHybrid:true}")
+    private boolean adaptiveMlGateOnlyHybrid;
+
+    @Value("${strategy.window.adaptiveMlGateSampleSize:64}")
+    private int adaptiveMlGateSampleSize;
+
+    @Value("${strategy.window.adaptiveMlGateQuantile:0.85}")
+    private double adaptiveMlGateQuantile;
+
+    @Value("${strategy.window.adaptiveMlGateMarginPct:0.03}")
+    private double adaptiveMlGateMarginPct;
+
+    @Value("${strategy.window.adaptiveMlGateFloor:0.18}")
+    private double adaptiveMlGateFloor;
+
+    @Value("${strategy.window.adaptiveMlGateMaxThresholdDrop:0.35}")
+    private double adaptiveMlGateMaxThresholdDrop;
+
+    @Value("${strategy.window.adaptiveMlGateMinStrongScore:55.0}")
+    private double adaptiveMlGateMinStrongScore;
+
+    @Value("${strategy.window.mlAutoTuneOnLowConfidence:false}")
+    private boolean mlAutoTuneOnLowConfidence;
+
+    @Value("${strategy.window.mlAutoTuneLowConfidenceAfter:8}")
+    private int mlAutoTuneLowConfidenceAfter;
+
     // =====================================================
     // AUTO-TUNE ON HOLD
     // =====================================================
 
-    @Value("${strategy.window.autoTuneOnHold:true}")
+    @Value("${strategy.window.autoTuneOnHold:false}")
     private boolean autoTuneOnHold;
 
     @Value("${strategy.window.autoTuneHoldCooldownSeconds:60}")
@@ -167,6 +217,8 @@ public class WindowScalpingStrategyV4 implements
         return orchestratorProvider != null ? orchestratorProvider.getIfAvailable() : null;
     }
 
+    private static final BigDecimal MIN_RESTORABLE_NOTIONAL = new BigDecimal("5.00");
+
     private final Map<Long, LocalState> states = new ConcurrentHashMap<>();
 
     private volatile String cachedHoldReasonsRaw;
@@ -202,6 +254,11 @@ public class WindowScalpingStrategyV4 implements
 
         Instant lastTradeClosedAt;
         Instant lastEntryAt;
+
+        Instant lastRestoreProbeAt;
+        Instant lastRestoreMissAt;
+        Instant lastDustRestoreLogAt;
+        String lastDustRestoreLogKey;
 
         long ticks;
         long warmups;
@@ -240,6 +297,13 @@ public class WindowScalpingStrategyV4 implements
         BigDecimal lastMlBelowThresholdPrice;
         Double lastMlBelowThresholdProba;
         Double lastMlBelowThresholdThreshold;
+        int consecutiveMlBelowThreshold;
+
+        double[] mlProbaSamples;
+        int mlProbaPtr;
+        int mlProbaCount;
+        Double lastAdaptiveMlThreshold;
+        Instant lastAdaptiveMlLogAt;
 
         Instant lastMlWarnAt;
         String lastMlWarnReason;
@@ -262,22 +326,31 @@ public class WindowScalpingStrategyV4 implements
     private static class Prediction {
         final boolean ok;
         final String modelKey;
+        final String modelVersion;
+        final String schemaHash;
         final double proba;
         final String reason;
 
-        private Prediction(boolean ok, String modelKey, double proba, String reason) {
+        private Prediction(boolean ok,
+                           String modelKey,
+                           String modelVersion,
+                           String schemaHash,
+                           double proba,
+                           String reason) {
             this.ok = ok;
             this.modelKey = modelKey;
+            this.modelVersion = modelVersion;
+            this.schemaHash = schemaHash;
             this.proba = proba;
             this.reason = reason;
         }
 
-        static Prediction ok(String modelKey, double proba) {
-            return new Prediction(true, modelKey, proba, null);
+        static Prediction ok(String modelKey, String modelVersion, String schemaHash, double proba) {
+            return new Prediction(true, modelKey, modelVersion, schemaHash, proba, null);
         }
 
         static Prediction fail(String reason) {
-            return new Prediction(false, null, 0.0, reason);
+            return new Prediction(false, null, null, null, 0.0, reason);
         }
     }
 
@@ -318,14 +391,28 @@ public class WindowScalpingStrategyV4 implements
         st.ss = ss;
         st.cfg = cfg;
 
-        st.exchange = normalizeExchangeOrNull(ss != null ? ss.getExchangeName() : hintEx);
-        st.network = ss != null ? ss.getNetworkType() : network;
+        st.exchange = firstNonBlankExchange(
+                hintEx,
+                ss != null ? ss.getExchangeName() : null,
+                defaultExchange
+        );
+        st.network = firstNonNullNetwork(
+                network,
+                ss != null ? ss.getNetworkType() : null,
+                parseNetworkOrNull(defaultNetwork)
+        );
 
-        String sym = ss != null ? normalizeSymbolOrNull(ss.getSymbol()) : null;
-        if (sym == null) sym = normalizeSymbolOrNull(symbolHint);
+        String sym = firstNonBlankSymbol(
+                symbolHint,
+                ss != null ? ss.getSymbol() : null,
+                defaultSymbol
+        );
         st.symbol = sym;
 
-        st.timeframe = normalizeTimeframeOrNull(ss != null ? ss.getTimeframe() : null);
+        st.timeframe = firstNonBlankTimeframe(
+                ss != null ? ss.getTimeframe() : null,
+                defaultTimeframe
+        );
 
         st.lastSettingsLoadAt = Instant.now();
         st.lastFingerprint = buildFingerprint(ss, cfg);
@@ -345,6 +432,10 @@ public class WindowScalpingStrategyV4 implements
 
         st.lastTradeClosedAt = null;
         st.lastEntryAt = null;
+        st.lastRestoreProbeAt = null;
+        st.lastRestoreMissAt = null;
+        st.lastDustRestoreLogAt = null;
+        st.lastDustRestoreLogKey = null;
 
         st.lastHoldReason = null;
         st.lastHoldAt = null;
@@ -373,6 +464,7 @@ public class WindowScalpingStrategyV4 implements
         resetMlCache(st);
         clearPendingMlSample(st);
         clearMlBelowThreshold(st);
+        resetAdaptiveMlGateState(st);
         st.lastMlWarnAt = null;
         st.lastMlWarnReason = null;
         st.lastEntryBlockedAt = null;
@@ -407,6 +499,17 @@ public class WindowScalpingStrategyV4 implements
                 coarseAdjustEnabled,
                 autoMinRangeEnabled
         );
+
+        if (adaptiveMlGateEnabled && gate) {
+            log.info("[WINDOW] 🤖 Adaptive ML gate enabled chatId={} sym={} baseThreshold={} floor={} quantile={} margin={} strongScore>= {}",
+                    chatId,
+                    st.symbol,
+                    (thrBd != null ? thrBd.stripTrailingZeros().toPlainString() : fmt(mlMinProba)),
+                    fmt(adaptiveMlGateFloor),
+                    fmt(adaptiveMlGateQuantile),
+                    fmt(adaptiveMlGateMarginPct),
+                    fmt(adaptiveMlGateMinStrongScore));
+        }
 
         if (st.symbol != null) {
             final String symFinal = st.symbol;
@@ -565,23 +668,61 @@ public class WindowScalpingStrategyV4 implements
                             st.network
                     );
 
+                    String exitReasonCode = safeNullable(exRes.reason());
+
+                    if (!exRes.executed() && (
+                            "dust_position".equals(exitReasonCode)
+                            || "min_notional".equals(exitReasonCode)
+                            || "lot_step".equals(exitReasonCode)
+                            || "balance".equals(exitReasonCode)
+                    )) {
+                        log.warn("[WINDOW] 🧹 Clearing local dust position after failed EXIT chatId={} sym={} reason={} qty={} entry={} tp={} sl={}",
+                                chatId,
+                                sym,
+                                exitReasonCode,
+                                fmtBd(st.entryQty),
+                                fmtBd(st.entryPrice),
+                                fmtBd(st.tp),
+                                fmtBd(st.sl));
+
+                        clearLocalPosition(st);
+                        st.lastTradeClosedAt = time;
+                        st.lastEntryAt = null;
+                        resetMlCache(st);
+
+                        safeLive(() -> live.clearTpSl(chatId, StrategyType.WINDOW_SCALPING, sym));
+                        safeLive(() -> live.clearPriceLines(chatId, StrategyType.WINDOW_SCALPING, sym));
+
+                        pushHoldThrottled(chatId, sym, st, "restored_dust_position", time, holdMs);
+                        return;
+                    }
+
                     if (exRes.executed()) {
                         st.exits++;
+
+                        BigDecimal actualExitPrice = positiveOrNull(exRes.exitPrice());
+                        if (actualExitPrice == null) {
+                            actualExitPrice = price;
+                        }
+
+                        BigDecimal realizedPnlPct = exRes.pnlPct();
 
                         persistClosedTradeSample(
                                 chatId,
                                 st,
                                 sym,
-                                price,
+                                actualExitPrice,
+                                realizedPnlPct,
                                 time
                         );
 
+                        BigDecimal tradePriceForUi = actualExitPrice;
                         safeLive(() -> live.pushTrade(
                                 chatId,
                                 StrategyType.WINDOW_SCALPING,
                                 sym,
                                 "SELL",
-                                price,
+                                tradePriceForUi,
                                 st.entryQty,
                                 time
                         ));
@@ -781,8 +922,6 @@ public class WindowScalpingStrategyV4 implements
             BigDecimal previousMlConfidence = ss.getMlConfidence();
 
             if (isMlGateAllowed(ss)) {
-                double threshold = resolveMlThreshold(ss);
-
                 Map<String, Object> feats = entryFeatures;
 
                 pred = getPredictionThrottled(chatId, sym, st, feats, price, time);
@@ -800,15 +939,21 @@ public class WindowScalpingStrategyV4 implements
                     logMlFailureThrottled(chatId, sym, st, ss, reason, time);
                 } else {
                     maybePersistMlConfidence(st, ss, pred.proba, time);
+                    recordMlProbaSample(st, pred.proba);
+
+                    double threshold = resolveEffectiveMlThreshold(ss, st, score);
 
                     if (pred.proba + 1e-12 < threshold) {
                         rememberMlBelowThreshold(st, price, pred.proba, threshold, time);
-                        logMlBelowThresholdThrottled(chatId, sym, st, pred.proba, threshold, time);
+                        st.consecutiveMlBelowThreshold++;
+                        maybeRequestAutoTuneOnLowConfidence(chatId, sym, st, ss, pred.proba, threshold, time);
+                        logMlBelowThresholdThrottled(chatId, sym, st, pred, threshold, time);
                         pushHoldThrottled(chatId, sym, st, "ml_below_threshold", time, holdMs);
                         return;
                     }
 
                     clearMlBelowThreshold(st);
+                    st.consecutiveMlBelowThreshold = 0;
                 }
             }
 
@@ -896,7 +1041,7 @@ public class WindowScalpingStrategyV4 implements
                         Signal.buy(score, "Вход у нижней границы окна (по тику)")
                 ));
 
-                log.info("[WINDOW] ✅ Вход chatId={} sym={} price={} qty={} tp={} sl={} score={}{}",
+                log.info("[WINDOW] ✅ Вход chatId={} sym={} price={} qty={} tp={} sl={} score={} mlProba={} modelKey={} modelVer={} schemaHash={}{}",
                         chatId,
                         sym,
                         fmtBd(st.entryPrice != null ? st.entryPrice : price),
@@ -904,6 +1049,10 @@ public class WindowScalpingStrategyV4 implements
                         fmtBd(st.tp),
                         fmtBd(st.sl),
                         fmt(score),
+                        (pred != null && pred.ok) ? fmt(pred.proba) : "null",
+                        (pred != null && pred.ok) ? safeNullable(pred.modelKey) : null,
+                        (pred != null && pred.ok) ? safeNullable(pred.modelVersion) : null,
+                        (pred != null && pred.ok) ? safeNullable(pred.schemaHash) : null,
                         (mlBypassForThisEntry ? " mlBypass=true" : "")
                 );
 
@@ -1179,14 +1328,20 @@ public class WindowScalpingStrategyV4 implements
 
             if (loaded != null) {
                 String loadedSymbol = normalizeSymbolOrNull(loaded.getSymbol());
-                if (!st.inPosition && loadedSymbol != null) st.symbol = loadedSymbol;
+                if (!st.inPosition && st.symbol == null && loadedSymbol != null) st.symbol = loadedSymbol;
 
                 String loadedTf = normalizeTimeframeOrNull(loaded.getTimeframe());
-                if (!st.inPosition && loadedTf != null) st.timeframe = loadedTf;
+                if (!st.inPosition && st.timeframe == null && loadedTf != null) st.timeframe = loadedTf;
 
-                if (loaded.getExchangeName() != null) st.exchange = normalizeExchangeOrNull(loaded.getExchangeName());
-                if (loaded.getNetworkType() != null) st.network = loaded.getNetworkType();
+                if (st.exchange == null && loaded.getExchangeName() != null) {
+                    st.exchange = normalizeExchangeOrNull(loaded.getExchangeName());
+                }
+                if (st.network == null && loaded.getNetworkType() != null) {
+                    st.network = loaded.getNetworkType();
+                }
             }
+
+            ensureRuntimeContext(st, loaded);
 
             st.lastSettingsLoadAt = now;
 
@@ -1209,11 +1364,13 @@ public class WindowScalpingStrategyV4 implements
                         st.consecutiveRangeTooSmall = 0;
                         resetRangeSamples(st);
                         resetMlCache(st);
+                        resetAdaptiveMlGateState(st);
 
                         st.lastWindowHigh = null;
                         st.lastWindowLow = null;
                         st.lastBuyZoneTop = null;
                         st.lastZonePublishedAt = null;
+                        resetRestoreThrottleState(st);
 
                         log.info("[WINDOW] 🔄 Контекст изменился {}->{} tf {}->{} (вне позиции) => очищаю окна",
                                 oldSymbol, newSymbol, oldTf, newTf);
@@ -1303,19 +1460,73 @@ public class WindowScalpingStrategyV4 implements
     private void ensureRuntimeContext(LocalState st, StrategySettings ss) {
         if (st == null) return;
 
-        if (st.exchange == null && ss != null && ss.getExchangeName() != null) {
-            st.exchange = normalizeExchangeOrNull(ss.getExchangeName());
-        } else if (st.exchange != null) {
-            st.exchange = normalizeExchangeOrNull(st.exchange);
-        }
+        st.exchange = firstNonBlankExchange(
+                st.exchange,
+                ss != null ? ss.getExchangeName() : null,
+                defaultExchange
+        );
 
-        if (st.network == null && ss != null && ss.getNetworkType() != null) {
-            st.network = ss.getNetworkType();
-        }
+        st.network = firstNonNullNetwork(
+                st.network,
+                ss != null ? ss.getNetworkType() : null,
+                parseNetworkOrNull(defaultNetwork)
+        );
 
-        if (st.timeframe == null && ss != null) {
-            String tf = normalizeTimeframeOrNull(ss.getTimeframe());
-            if (tf != null) st.timeframe = tf;
+        st.symbol = firstNonBlankSymbol(
+                st.symbol,
+                ss != null ? ss.getSymbol() : null,
+                defaultSymbol
+        );
+
+        st.timeframe = firstNonBlankTimeframe(
+                st.timeframe,
+                ss != null ? ss.getTimeframe() : null,
+                defaultTimeframe
+        );
+    }
+
+    private static String firstNonBlankExchange(String... values) {
+        if (values == null) return null;
+        for (String v : values) {
+            String n = normalizeExchangeOrNull(v);
+            if (n != null) return n;
+        }
+        return null;
+    }
+
+    private static String firstNonBlankSymbol(String... values) {
+        if (values == null) return null;
+        for (String v : values) {
+            String n = normalizeSymbolOrNull(v);
+            if (n != null) return n;
+        }
+        return null;
+    }
+
+    private static String firstNonBlankTimeframe(String... values) {
+        if (values == null) return null;
+        for (String v : values) {
+            String n = normalizeTimeframeOrNull(v);
+            if (n != null) return n;
+        }
+        return null;
+    }
+
+    private static NetworkType firstNonNullNetwork(NetworkType... values) {
+        if (values == null) return null;
+        for (NetworkType v : values) {
+            if (v != null) return v;
+        }
+        return null;
+    }
+
+    private static NetworkType parseNetworkOrNull(String value) {
+        String s = normalizeExchangeOrNull(value);
+        if (s == null) return null;
+        try {
+            return NetworkType.valueOf(s);
+        } catch (Exception ignored) {
+            return null;
         }
     }
 
@@ -1600,6 +1811,141 @@ public class WindowScalpingStrategyV4 implements
         return mlMinProba;
     }
 
+    private void resetAdaptiveMlGateState(LocalState st) {
+        if (st == null) return;
+
+        int cap = Math.max(16, adaptiveMlGateSampleSize);
+        st.mlProbaSamples = new double[cap];
+        st.mlProbaPtr = 0;
+        st.mlProbaCount = 0;
+        st.lastAdaptiveMlThreshold = null;
+        st.lastAdaptiveMlLogAt = null;
+        st.consecutiveMlBelowThreshold = 0;
+    }
+
+    private void recordMlProbaSample(LocalState st, double proba) {
+        if (st == null) return;
+        if (!Double.isFinite(proba)) return;
+        if (proba < 0.0 || proba > 1.0) return;
+
+        if (st.mlProbaSamples == null || st.mlProbaSamples.length != Math.max(16, adaptiveMlGateSampleSize)) {
+            resetAdaptiveMlGateState(st);
+        }
+
+        int i = st.mlProbaPtr;
+        st.mlProbaSamples[i] = proba;
+        st.mlProbaPtr = (i + 1) % st.mlProbaSamples.length;
+        if (st.mlProbaCount < st.mlProbaSamples.length) {
+            st.mlProbaCount++;
+        }
+    }
+
+    private double quantileFromMlProbaSamples(LocalState st, double q) {
+        if (st == null || st.mlProbaSamples == null || st.mlProbaCount <= 0) return Double.NaN;
+
+        double qq = q;
+        if (!Double.isFinite(qq)) qq = 0.85;
+        if (qq < 0.0) qq = 0.0;
+        if (qq > 1.0) qq = 1.0;
+
+        int n = st.mlProbaCount;
+        double[] tmp = new double[n];
+
+        int cap = st.mlProbaSamples.length;
+        int start = st.mlProbaPtr - n;
+        while (start < 0) start += cap;
+
+        for (int k = 0; k < n; k++) {
+            int idx = (start + k) % cap;
+            tmp[k] = st.mlProbaSamples[idx];
+        }
+
+        Arrays.sort(tmp);
+        int pos = (int) Math.floor(qq * (n - 1));
+        if (pos < 0) pos = 0;
+        if (pos >= n) pos = n - 1;
+        return tmp[pos];
+    }
+
+    private double resolveEffectiveMlThreshold(StrategySettings ss, LocalState st, double score) {
+        double baseThreshold = resolveMlThreshold(ss);
+
+        if (!adaptiveMlGateEnabled || st == null) {
+            return baseThreshold;
+        }
+
+        if (adaptiveMlGateOnlyHybrid && !isHybridMode(ss)) {
+            return baseThreshold;
+        }
+
+        double strongScore = adaptiveMlGateMinStrongScore;
+        if (!Double.isFinite(strongScore)) strongScore = 55.0;
+        if (score + 1e-12 < strongScore) {
+            return baseThreshold;
+        }
+
+        int minSamples = Math.max(8, Math.min(16, Math.max(16, adaptiveMlGateSampleSize) / 4));
+        if (st.mlProbaCount < minSamples) {
+            return baseThreshold;
+        }
+
+        double q = adaptiveMlGateQuantile;
+        if (!Double.isFinite(q)) q = 0.85;
+        if (q < 0.50) q = 0.50;
+        if (q > 0.98) q = 0.98;
+
+        double qValue = quantileFromMlProbaSamples(st, q);
+        if (!Double.isFinite(qValue)) {
+            return baseThreshold;
+        }
+
+        double margin = adaptiveMlGateMarginPct;
+        if (!Double.isFinite(margin) || margin < 0.0) margin = 0.03;
+
+        double maxDrop = adaptiveMlGateMaxThresholdDrop;
+        if (!Double.isFinite(maxDrop) || maxDrop <= 0.0) maxDrop = 0.35;
+
+        double floor = adaptiveMlGateFloor;
+        if (!Double.isFinite(floor) || floor <= 0.0) floor = 0.18;
+
+        floor = Math.max(floor, baseThreshold - maxDrop);
+        floor = Math.min(floor, baseThreshold);
+
+        double adaptive = qValue + margin;
+        adaptive = Math.max(floor, adaptive);
+        adaptive = Math.min(baseThreshold, adaptive);
+
+        if (!Double.isFinite(adaptive) || adaptive <= 0.0) {
+            return baseThreshold;
+        }
+
+        st.lastAdaptiveMlThreshold = adaptive;
+        return adaptive;
+    }
+
+    private static final class ParsedMlPredictResponse {
+        final boolean ok;
+        final Double proba;
+        final String error;
+        final String modelKey;
+        final String modelVersion;
+        final String schemaHash;
+
+        private ParsedMlPredictResponse(boolean ok,
+                                        Double proba,
+                                        String error,
+                                        String modelKey,
+                                        String modelVersion,
+                                        String schemaHash) {
+            this.ok = ok;
+            this.proba = proba;
+            this.error = error;
+            this.modelKey = modelKey;
+            this.modelVersion = modelVersion;
+            this.schemaHash = schemaHash;
+        }
+    }
+
     private Prediction tryPredict(Long chatId,
                                   String symbol,
                                   Instant now,
@@ -1619,25 +1965,123 @@ public class WindowScalpingStrategyV4 implements
 
             if (r == null) return Prediction.fail("predict_null");
 
-            if (!r.isOk()) {
-                return Prediction.fail(r.getError() != null ? r.getError() : "predict_not_ok");
+            ParsedMlPredictResponse parsed = parsePredictResponse(r);
+
+            if (!parsed.ok) {
+                return Prediction.fail(parsed.error != null ? parsed.error : "predict_not_ok");
             }
 
-            Double p = r.getProba();
-            if (p == null || !Double.isFinite(p)) return Prediction.fail("no_proba");
+            Double p = parsed.proba;
+            if (p == null || !Double.isFinite(p)) {
+                return Prediction.fail("no_proba");
+            }
 
             double proba = Math.max(0.0, Math.min(1.0, p));
-            String mk = (r.getModelKey() != null && !r.getModelKey().isBlank())
-                    ? r.getModelKey()
-                    : (r.getModelVersion() != null && !r.getModelVersion().isBlank()
-                    ? r.getModelVersion()
-                    : "unknown");
+            String mk = firstNonBlank(parsed.modelKey, parsed.modelVersion, "unknown");
+            String mv = blankToNull(parsed.modelVersion);
+            String sh = blankToNull(parsed.schemaHash);
 
-            return Prediction.ok(mk, proba);
+            return Prediction.ok(mk, mv, sh, proba);
 
         } catch (Exception e) {
             return Prediction.fail("predict_exception:" + e.getClass().getSimpleName());
         }
+    }
+
+    private ParsedMlPredictResponse parsePredictResponse(Object raw) {
+        JsonNode node;
+        try {
+            node = objectMapper.valueToTree(raw);
+        } catch (Exception e) {
+            return new ParsedMlPredictResponse(false, null, "predict_response_unreadable", null, null, null);
+        }
+
+        Boolean ok = findBoolean(node, "ok", "success");
+        Double proba = findDouble(node, "proba", "pWin", "pwin", "probability", "confidence", "score", "prob", "p");
+        String error = findString(node, "error", "reason", "message", "detail");
+        String modelKey = findString(node, "modelKey", "model_key", "key", "modelId", "model");
+        String modelVersion = findString(node, "modelVersion", "model_version", "version");
+        String schemaHash = findString(node, "schemaHash", "schema_hash", "featureOrderHash", "feature_order_hash");
+
+        if (ok == null) {
+            ok = (proba != null && (error == null || error.isBlank()));
+        }
+
+        return new ParsedMlPredictResponse(Boolean.TRUE.equals(ok), proba, blankToNull(error), blankToNull(modelKey), blankToNull(modelVersion), blankToNull(schemaHash));
+    }
+
+    private JsonNode findNode(JsonNode root, String... names) {
+        if (root == null || names == null) return null;
+        for (String name : names) {
+            if (name == null || name.isBlank()) continue;
+            JsonNode node = root.findValue(name);
+            if (node != null && !node.isNull() && !node.isMissingNode()) {
+                return node;
+            }
+        }
+        return null;
+    }
+
+    private Boolean findBoolean(JsonNode root, String... names) {
+        JsonNode node = findNode(root, names);
+        if (node == null) return null;
+
+        if (node.isBoolean()) {
+            return node.booleanValue();
+        }
+        if (node.isNumber()) {
+            return node.intValue() != 0;
+        }
+        if (node.isTextual()) {
+            String s = node.asText();
+            if (s == null) return null;
+            s = s.trim().toLowerCase(Locale.ROOT);
+            if (s.isEmpty()) return null;
+            if ("true".equals(s) || "ok".equals(s) || "success".equals(s) || "1".equals(s)) return true;
+            if ("false".equals(s) || "fail".equals(s) || "failed".equals(s) || "0".equals(s)) return false;
+        }
+        return null;
+    }
+
+    private Double findDouble(JsonNode root, String... names) {
+        JsonNode node = findNode(root, names);
+        if (node == null) return null;
+
+        if (node.isNumber()) {
+            double v = node.doubleValue();
+            return Double.isFinite(v) ? v : null;
+        }
+        if (node.isTextual()) {
+            try {
+                double v = Double.parseDouble(node.asText().trim());
+                return Double.isFinite(v) ? v : null;
+            } catch (Exception ignored) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private String findString(JsonNode root, String... names) {
+        JsonNode node = findNode(root, names);
+        if (node == null) return null;
+        if (node.isContainerNode()) return null;
+        return blankToNull(node.asText());
+    }
+
+    private String firstNonBlank(String... values) {
+        if (values == null) return null;
+        for (String v : values) {
+            String s = blankToNull(v);
+            if (s != null) return s;
+        }
+        return null;
+    }
+
+    private String blankToNull(String s) {
+        if (s == null) return null;
+        String t = s.trim();
+        return t.isEmpty() ? null : t;
     }
 
     private Prediction getPredictionThrottled(Long chatId,
@@ -1864,13 +2308,16 @@ public class WindowScalpingStrategyV4 implements
     private void logMlBelowThresholdThrottled(Long chatId,
                                               String sym,
                                               LocalState st,
-                                              double proba,
+                                              Prediction pred,
                                               double threshold,
                                               Instant now) {
         if (st == null || now == null) return;
 
-        long throttle = Math.max(1000L, holdThrottleMs);
-        String key = "LOWPROBA:" + fmt(threshold);
+        long throttle = Math.max(5000L, holdThrottleMs);
+        double proba = (pred != null ? pred.proba : 0.0);
+        String probaBucket = fmt(Math.floor(proba * 100.0) / 100.0);
+        String thresholdBucket = fmt(Math.floor(threshold * 100.0) / 100.0);
+        String key = "LOWPROBA:" + probaBucket + ":" + thresholdBucket;
 
         if (Objects.equals(st.lastMlWarnReason, key) && st.lastMlWarnAt != null) {
             long age = Duration.between(st.lastMlWarnAt, now).toMillis();
@@ -1882,13 +2329,18 @@ public class WindowScalpingStrategyV4 implements
         st.lastMlWarnReason = key;
         st.lastMlWarnAt = now;
 
-        log.info("[WINDOW] 🤖 HOLD: ML ниже порога chatId={} sym={} proba={} threshold={} cooldownMs={} recheckMovePct={}",
+        log.info("[WINDOW] 🤖 HOLD: ML ниже порога chatId={} sym={} proba={} threshold={} adaptiveThreshold={} streak={} cooldownMs={} recheckMovePct={} modelKey={} modelVer={} schemaHash={}",
                 chatId,
                 sym,
                 fmt(proba),
                 fmt(threshold),
+                fmt(st.lastAdaptiveMlThreshold != null ? st.lastAdaptiveMlThreshold : resolveMlThreshold(st.ss)),
+                st.consecutiveMlBelowThreshold,
                 Math.max(300L, mlBelowThresholdCooldownMs),
-                fmt(mlRecheckMinPriceMovePct));
+                fmt(mlRecheckMinPriceMovePct),
+                pred != null ? safeNullable(pred.modelKey) : null,
+                pred != null ? safeNullable(pred.modelVersion) : null,
+                pred != null ? safeNullable(pred.schemaHash) : null);
     }
 
     private void rememberPendingMlSample(LocalState st,
@@ -1935,6 +2387,7 @@ public class WindowScalpingStrategyV4 implements
                                           LocalState st,
                                           String symbol,
                                           BigDecimal exitPrice,
+                                          BigDecimal realizedPnlPct,
                                           Instant exitTime) {
         if (chatId == null || st == null) return;
         if (mlSampleIngestService == null || objectMapper == null) return;
@@ -1956,7 +2409,12 @@ public class WindowScalpingStrategyV4 implements
                 return;
             }
 
-            String label = actualExit.compareTo(entryPrice) >= 0 ? "WIN" : "LOSS";
+            String label;
+            if (realizedPnlPct != null) {
+                label = realizedPnlPct.signum() >= 0 ? "WIN" : "LOSS";
+            } else {
+                label = actualExit.compareTo(entryPrice) >= 0 ? "WIN" : "LOSS";
+            }
 
             Map<String, Object> features = new LinkedHashMap<>(st.pendingMlFeatures);
 
@@ -1965,6 +2423,7 @@ public class WindowScalpingStrategyV4 implements
             meta.put("entryPrice", entryPrice);
             meta.put("exitPrice", actualExit);
             meta.put("label", label);
+            meta.put("realizedPnlPct", realizedPnlPct);
             meta.put("closedAtMs", exitTime != null ? exitTime.toEpochMilli() : Instant.now().toEpochMilli());
             meta.put("mlProba", st.pendingMlProba);
             meta.put("mlModelKey", st.pendingMlModelKey);
@@ -2183,33 +2642,76 @@ public class WindowScalpingStrategyV4 implements
 
     private Set<String> parsedAutoTuneHoldReasons() {
         String raw = (autoTuneHoldReasons == null ? "" : autoTuneHoldReasons.trim());
-        if (raw.equals(cachedHoldReasonsRaw) && cachedHoldReasonsSet != null) {
+        String cacheKey = raw + "|lowConf=" + mlAutoTuneOnLowConfidence;
+        if (cacheKey.equals(cachedHoldReasonsRaw) && cachedHoldReasonsSet != null) {
             return cachedHoldReasonsSet;
         }
 
         try {
-            if (raw.isEmpty()) {
-                cachedHoldReasonsRaw = raw;
-                cachedHoldReasonsSet = Set.of();
-                return cachedHoldReasonsSet;
-            }
-
-            String[] parts = raw.split(",");
             Set<String> out = new HashSet<>();
-            for (String p : parts) {
-                String v = p.trim();
-                if (!v.isEmpty()) out.add(v);
+
+            if (!raw.isEmpty()) {
+                String[] parts = raw.split(",");
+                for (String p : parts) {
+                    String v = p.trim();
+                    if (!v.isEmpty()) out.add(v);
+                }
             }
 
-            cachedHoldReasonsRaw = raw;
+            if (mlAutoTuneOnLowConfidence) {
+                out.add("ml_below_threshold");
+                out.add("predict_failed");
+            }
+
+            cachedHoldReasonsRaw = cacheKey;
             cachedHoldReasonsSet = Set.copyOf(out);
             return cachedHoldReasonsSet;
 
         } catch (Exception ignored) {
-            cachedHoldReasonsRaw = raw;
+            cachedHoldReasonsRaw = cacheKey;
             cachedHoldReasonsSet = Set.of();
             return cachedHoldReasonsSet;
         }
+    }
+
+    private void maybeRequestAutoTuneOnLowConfidence(Long chatId,
+                                                     String symbol,
+                                                     LocalState st,
+                                                     StrategySettings ss,
+                                                     double proba,
+                                                     double threshold,
+                                                     Instant now) {
+        if (!mlAutoTuneOnLowConfidence) return;
+        if (st == null || ss == null || now == null) return;
+        if (st.inPosition) return;
+        if (!isAutoTuneAllowed(ss)) return;
+        if (st.exchange == null || st.network == null) return;
+
+        int after = Math.max(3, mlAutoTuneLowConfidenceAfter);
+        if (st.consecutiveMlBelowThreshold < after) return;
+
+        AiStrategyOrchestrator o = orch();
+        if (o == null) return;
+
+        long cdSec = Math.max(10, autoTuneHoldCooldownSeconds);
+        if (st.lastAutoTuneRequestAt != null) {
+            long passed = Duration.between(st.lastAutoTuneRequestAt, now).getSeconds();
+            if (passed < cdSec) return;
+        }
+
+        st.lastAutoTuneRequestAt = now;
+
+        log.warn("[WINDOW] 🧠 AUTO-TUNE(LOW-CONFIDENCE) chatId={} sym={} proba={} threshold={} streak={} cooldown={}s",
+                chatId, symbol, fmt(proba), fmt(threshold), st.consecutiveMlBelowThreshold, cdSec);
+
+        o.triggerTuneDebounced(
+                chatId,
+                StrategyType.WINDOW_SCALPING,
+                st.exchange,
+                st.network,
+                "low_confidence:proba=" + fmt(proba) + ":thr=" + fmt(threshold),
+                Duration.ofSeconds(cdSec)
+        );
     }
 
     private void maybeRequestAutoTuneOnHold(Long chatId, String symbol, LocalState st, String reason, Instant now) {
@@ -2311,6 +2813,7 @@ public class WindowScalpingStrategyV4 implements
             case "entry_failed" -> "Ошибка при входе в сделку";
             case "in_high_zone_wait_tp" -> "Цена у верхней границы — ждём";
             case "pos_snapshot_missing" -> "Позиция есть, но нет данных в PositionStore";
+            case "restored_dust_position" -> "Позиция слишком мала для выхода (dust, меньше minNotional)";
             case "post_exit_cooldown" -> "Короткий cooldown после выхода";
             case "post_entry_cooldown" -> "Короткий cooldown после входа";
             default -> null;
@@ -2321,10 +2824,134 @@ public class WindowScalpingStrategyV4 implements
     // POSITION RESTORE
     // =====================================================
 
+    private boolean isDustPosition(BigDecimal qty, BigDecimal entryPrice) {
+        if (qty == null || entryPrice == null) return false;
+        if (qty.signum() <= 0 || entryPrice.signum() <= 0) return false;
+
+        BigDecimal notional = qty.multiply(entryPrice);
+        return notional.compareTo(MIN_RESTORABLE_NOTIONAL) < 0;
+    }
+
+    private void clearLocalPosition(LocalState st) {
+        if (st == null) return;
+
+        st.inPosition = false;
+        st.isLong = true;
+        st.entryPrice = null;
+        st.tp = null;
+        st.sl = null;
+        st.entryQty = null;
+        st.entryOrderId = null;
+    }
+
+    private void resetRestoreThrottleState(LocalState st) {
+        if (st == null) return;
+        st.lastRestoreProbeAt = null;
+        st.lastRestoreMissAt = null;
+        st.lastDustRestoreLogAt = null;
+        st.lastDustRestoreLogKey = null;
+    }
+
+    private boolean shouldProbeRestore(LocalState st, Instant now) {
+        if (st == null || now == null) return true;
+        if (st.inPosition) return false;
+
+        if (st.lastRestoreMissAt == null) {
+            return true;
+        }
+
+        long cooldownMs = Math.max(500L, restoreRetryCooldownMs);
+        long ageMs = Duration.between(st.lastRestoreMissAt, now).toMillis();
+        return ageMs < 0 || ageMs >= cooldownMs;
+    }
+
+    private void markRestoreMiss(LocalState st, Instant now) {
+        if (st == null || now == null) return;
+        st.lastRestoreProbeAt = now;
+        st.lastRestoreMissAt = now;
+    }
+
+    private void markRestoreSuccess(LocalState st, Instant now) {
+        if (st == null || now == null) return;
+        st.lastRestoreProbeAt = now;
+        st.lastRestoreMissAt = null;
+    }
+
+    private boolean shouldLogDustRestore(LocalState st, String key, Instant now) {
+        if (st == null || now == null) return true;
+
+        long throttleMs = Math.max(1_000L, dustRestoreLogThrottleMs);
+        if (Objects.equals(st.lastDustRestoreLogKey, key) && st.lastDustRestoreLogAt != null) {
+            long ageMs = Duration.between(st.lastDustRestoreLogAt, now).toMillis();
+            if (ageMs >= 0 && ageMs < throttleMs) {
+                return false;
+            }
+        }
+
+        st.lastDustRestoreLogKey = key;
+        st.lastDustRestoreLogAt = now;
+        return true;
+    }
+
+    private String buildDustRestoreLogKey(Long chatId,
+                                          String symbol,
+                                          String exchange,
+                                          NetworkType network,
+                                          String source) {
+        return chatId + ":" +
+                safeNullable(symbol) + ":" +
+                safeNullable(exchange) + ":" +
+                safeNullable(network != null ? network.name() : null) + ":" +
+                safeNullable(source);
+    }
+
+    private void logDustRestoreSkipThrottled(Long chatId,
+                                             LocalState st,
+                                             String symbol,
+                                             String exchange,
+                                             NetworkType network,
+                                             BigDecimal qty,
+                                             BigDecimal entryPrice,
+                                             BigDecimal notional,
+                                             String source,
+                                             Instant now) {
+        String key = buildDustRestoreLogKey(chatId, symbol, exchange, network, source);
+        if (!shouldLogDustRestore(st, key, now)) {
+            return;
+        }
+
+        if ("history".equalsIgnoreCase(source)) {
+            log.warn("[WINDOW] 🧹 Не восстанавливаю dust-позицию из истории chatId={} sym={} ex={} net={} qty={} notional={} minRestorable={}",
+                    chatId,
+                    symbol,
+                    exchange,
+                    network,
+                    fmtBd(qty),
+                    fmtBd(notional),
+                    fmtBd(MIN_RESTORABLE_NOTIONAL));
+            return;
+        }
+
+        log.warn("[WINDOW] 🧹 Пропускаю восстановление dust-позиции chatId={} sym={} ex={} net={} qty={} entry={} notional={} minRestorable={}",
+                chatId,
+                symbol,
+                exchange,
+                network,
+                fmtBd(qty),
+                fmtBd(entryPrice),
+                fmtBd(notional),
+                fmtBd(MIN_RESTORABLE_NOTIONAL));
+    }
+
     private void maybeRestorePositionFromStore(Long chatId, LocalState st, String symbol, Instant now) {
-        if (chatId == null || st == null) return;
+        if (chatId == null || st == null || now == null) return;
 
         if (st.inPosition && st.entryQty != null && st.tp != null && st.sl != null) {
+            markRestoreSuccess(st, now);
+            return;
+        }
+
+        if (!shouldProbeRestore(st, now)) {
             return;
         }
 
@@ -2335,8 +2962,15 @@ public class WindowScalpingStrategyV4 implements
 
         if (ex == null || net == null || sym == null) return;
 
+        st.lastRestoreProbeAt = now;
+
         if (!positionStore.isInPosition(chatId, StrategyType.WINDOW_SCALPING, ex, net, sym)) {
-            restorePositionFromOrderHistory(chatId, st, ex, net, sym, now);
+            if (restorePositionFromOrderHistory(chatId, st, ex, net, sym, now)) {
+                markRestoreSuccess(st, now);
+                return;
+            }
+
+            markRestoreMiss(st, now);
             return;
         }
 
@@ -2345,30 +2979,125 @@ public class WindowScalpingStrategyV4 implements
 
         if (opt.isEmpty()) {
             if (restorePositionFromOrderHistory(chatId, st, ex, net, sym, now)) {
+                markRestoreSuccess(st, now);
                 return;
             }
 
-            st.inPosition = false;
-            st.isLong = true;
+            clearLocalPosition(st);
 
             try {
                 positionStore.clearPosition(chatId, StrategyType.WINDOW_SCALPING, ex, net, sym);
             } catch (Exception ignored) {
             }
 
+            markRestoreMiss(st, now);
             pushHoldThrottled(chatId, sym, st, "pos_snapshot_missing", now, Math.max(200, holdThrottleMs));
             return;
         }
 
         PositionStore.PositionSnapshot snap = opt.get();
 
+        BigDecimal restoredEntry = snap.entryPrice();
+        BigDecimal restoredQty = snap.qty();
+        BigDecimal restoredTp = snap.tp();
+        BigDecimal restoredSl = snap.sl();
+
+        if (isDustPosition(restoredQty, restoredEntry)) {
+            final String symFinal = sym;
+            BigDecimal notional = null;
+            if (positiveOrNull(snap.qty()) != null && positiveOrNull(snap.entryPrice()) != null) {
+                notional = snap.qty().multiply(snap.entryPrice());
+            }
+
+            logDustRestoreSkipThrottled(
+                    chatId,
+                    st,
+                    symFinal,
+                    ex,
+                    net,
+                    restoredQty,
+                    restoredEntry,
+                    notional,
+                    "store",
+                    now
+            );
+
+            clearLocalPosition(st);
+
+            try {
+                positionStore.clearPosition(chatId, StrategyType.WINDOW_SCALPING, ex, net, symFinal);
+            } catch (Exception ignored) {
+            }
+
+            markRestoreMiss(st, now);
+
+            safeLive(() -> live.clearTpSl(chatId, StrategyType.WINDOW_SCALPING, symFinal));
+            safeLive(() -> live.clearPriceLines(chatId, StrategyType.WINDOW_SCALPING, symFinal));
+
+            pushHoldThrottled(chatId, symFinal, st, "restored_dust_position", now, Math.max(200, holdThrottleMs));
+            return;
+        }
+
+        if (!isValidRestoredLongTp(restoredEntry, restoredTp) || !isValidRestoredLongSl(restoredEntry, restoredSl)) {
+            BigDecimal fixedTp = resolveTpForRestore(st, restoredEntry);
+            BigDecimal fixedSl = resolveSlForRestore(st, restoredEntry);
+
+            if (isValidRestoredLongTp(restoredEntry, fixedTp) && isValidRestoredLongSl(restoredEntry, fixedSl)) {
+                log.warn("[WINDOW] ♻ Исправляю некорректные TP/SL из PositionStore chatId={} sym={} entry={} oldTp={} oldSl={} newTp={} newSl={}",
+                        chatId,
+                        sym,
+                        fmtBd(restoredEntry),
+                        fmtBd(restoredTp),
+                        fmtBd(restoredSl),
+                        fmtBd(fixedTp),
+                        fmtBd(fixedSl));
+
+                restoredTp = fixedTp;
+                restoredSl = fixedSl;
+
+                try {
+                    positionStore.markOpened(
+                            chatId,
+                            StrategyType.WINDOW_SCALPING,
+                            ex,
+                            net,
+                            sym,
+                            restoredEntry,
+                            restoredQty,
+                            restoredTp,
+                            restoredSl,
+                            positiveOrNull(snap.quoteSpent()) != null ? snap.quoteSpent() : (positiveOrNull(restoredEntry) != null && positiveOrNull(restoredQty) != null ? restoredEntry.multiply(restoredQty) : null),
+                            snap.entryOrderId(),
+                            snap.openedAt()
+                    );
+                } catch (Exception ignored) {
+                }
+            } else {
+                log.warn("[WINDOW] ⚠ Некорректные TP/SL у восстановленной позиции и не удалось пересчитать chatId={} sym={} entry={} tp={} sl={}",
+                        chatId,
+                        sym,
+                        fmtBd(restoredEntry),
+                        fmtBd(restoredTp),
+                        fmtBd(restoredSl));
+
+                clearLocalPosition(st);
+                try {
+                    positionStore.clearPosition(chatId, StrategyType.WINDOW_SCALPING, ex, net, sym);
+                } catch (Exception ignored) {
+                }
+                markRestoreMiss(st, now);
+                pushHoldThrottled(chatId, sym, st, "pos_snapshot_missing", now, Math.max(200, holdThrottleMs));
+                return;
+            }
+        }
+
         st.inPosition = true;
         st.isLong = true;
 
-        st.entryPrice = (st.entryPrice != null ? st.entryPrice : snap.entryPrice());
-        st.entryQty = (st.entryQty != null ? st.entryQty : snap.qty());
-        st.tp = (st.tp != null ? st.tp : snap.tp());
-        st.sl = (st.sl != null ? st.sl : snap.sl());
+        st.entryPrice = (st.entryPrice != null ? st.entryPrice : restoredEntry);
+        st.entryQty = (st.entryQty != null ? st.entryQty : restoredQty);
+        st.tp = (st.tp != null ? st.tp : restoredTp);
+        st.sl = (st.sl != null ? st.sl : restoredSl);
         st.entryOrderId = (st.entryOrderId != null ? st.entryOrderId : snap.entryOrderId());
 
         if (st.lastEntryAt == null) {
@@ -2376,10 +3105,35 @@ public class WindowScalpingStrategyV4 implements
         }
 
         if (st.entryPrice == null || st.entryQty == null || st.tp == null || st.sl == null) {
-            restorePositionFromOrderHistory(chatId, st, ex, net, sym, now);
+            if (restorePositionFromOrderHistory(chatId, st, ex, net, sym, now)) {
+                markRestoreSuccess(st, now);
+                return;
+            }
         }
 
+        markRestoreSuccess(st, now);
         publishPositionLines(chatId, sym, st);
+    }
+
+    private boolean isRestoreSuppressedForContext(Long chatId,
+                                                  String exchange,
+                                                  NetworkType network,
+                                                  String symbol) {
+        if (chatId == null || exchange == null || network == null || symbol == null) {
+            return false;
+        }
+
+        if (positionStore instanceof InMemoryPositionStoreImpl store) {
+            return store.isRestoreSuppressed(
+                    chatId,
+                    StrategyType.WINDOW_SCALPING,
+                    exchange,
+                    network,
+                    symbol
+            );
+        }
+
+        return false;
     }
 
     private boolean restorePositionFromOrderHistory(Long chatId,
@@ -2389,6 +3143,10 @@ public class WindowScalpingStrategyV4 implements
                                                     String symbol,
                                                     Instant now) {
         if (chatId == null || st == null || exchange == null || network == null || symbol == null) {
+            return false;
+        }
+
+        if (isRestoreSuppressedForContext(chatId, exchange, network, symbol)) {
             return false;
         }
 
@@ -2481,6 +3239,22 @@ public class WindowScalpingStrategyV4 implements
             return false;
         }
 
+        if (totalCost.compareTo(MIN_RESTORABLE_NOTIONAL) < 0) {
+            logDustRestoreSkipThrottled(
+                    chatId,
+                    st,
+                    symbol,
+                    exchange,
+                    network,
+                    totalQty,
+                    null,
+                    totalCost,
+                    "history",
+                    now
+            );
+            return false;
+        }
+
         BigDecimal entryPrice = totalCost.divide(totalQty, 12, RoundingMode.HALF_UP);
         BigDecimal tp = resolveTpForRestore(st, entryPrice);
         BigDecimal sl = resolveSlForRestore(st, entryPrice);
@@ -2517,6 +3291,7 @@ public class WindowScalpingStrategyV4 implements
 
         publishPositionLines(chatId, symbol, st);
         resetMlCache(st);
+        markRestoreSuccess(st, now);
 
         log.warn("[WINDOW] ♻ Восстановлена позиция из истории ордеров chatId={} sym={} ex={} net={} lots={} qty={} entry={} tp={} sl={} orderId={}",
                 chatId,
@@ -2559,6 +3334,18 @@ public class WindowScalpingStrategyV4 implements
         }
 
         return Objects.equals(orderEx, runtimeEx) && Objects.equals(orderNet, runtimeNet);
+    }
+
+    private boolean isValidRestoredLongTp(BigDecimal entryPrice, BigDecimal tp) {
+        return positiveOrNull(entryPrice) != null
+                && positiveOrNull(tp) != null
+                && tp.compareTo(entryPrice) > 0;
+    }
+
+    private boolean isValidRestoredLongSl(BigDecimal entryPrice, BigDecimal sl) {
+        return positiveOrNull(entryPrice) != null
+                && positiveOrNull(sl) != null
+                && sl.compareTo(entryPrice) < 0;
     }
 
     private BigDecimal resolveTpForRestore(LocalState st, BigDecimal entryPrice) {
@@ -2620,6 +3407,7 @@ public class WindowScalpingStrategyV4 implements
             st.lastSettingsLoadAt = Instant.EPOCH;
             st.lastFingerprint = null;
             resetMlCache(st);
+            resetRestoreThrottleState(st);
         }
     }
 
@@ -2632,6 +3420,7 @@ public class WindowScalpingStrategyV4 implements
             st.lastSettingsLoadAt = Instant.EPOCH;
             st.lastFingerprint = null;
             resetMlCache(st);
+            resetRestoreThrottleState(st);
         }
     }
 
@@ -2650,18 +3439,20 @@ public class WindowScalpingStrategyV4 implements
             return;
         }
 
-        try {
-            ss.setMlConfidence(BigDecimal.valueOf(proba));
-            StrategySettings saved = strategySettingsService.save(ss);
-            if (saved != null) st.ss = saved;
-
-            st.lastMlConfidenceSaveAt = now;
-            st.lastMlConfidenceSaved = proba;
-
-        } catch (Exception ignored) {
-        }
+        /**
+         * ВАЖНО:
+         * mlConfidence — runtime/live значение.
+         * Его нельзя постоянно писать в StrategySettings в БД,
+         * иначе UI save + strategy runtime начинают конфликтовать по optimistic lock.
+         *
+         * Поэтому:
+         * 1. держим значение только в памяти стратегии
+         * 2. в entity кладём только в runtime-объект, без save(...)
+         */
+        st.lastMlConfidenceSaveAt = now;
+        st.lastMlConfidenceSaved = proba;
+        ss.setMlConfidence(BigDecimal.valueOf(proba));
     }
-
     // =====================================================
     // UTILS
     // =====================================================
@@ -2714,6 +3505,4 @@ public class WindowScalpingStrategyV4 implements
         return (v != null && v.signum() > 0) ? v : null;
     }
 }
-
-
 

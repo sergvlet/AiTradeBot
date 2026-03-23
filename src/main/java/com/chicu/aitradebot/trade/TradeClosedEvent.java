@@ -72,3 +72,5 @@ public record TradeClosedEvent(
         return t.isEmpty() ? null : t;
     }
 }
+
+

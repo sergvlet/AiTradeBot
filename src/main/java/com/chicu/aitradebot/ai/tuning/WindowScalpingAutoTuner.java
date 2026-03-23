@@ -32,6 +32,15 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
 
     private static final ZoneId ZONE = ZoneId.of("Europe/Warsaw");
 
+    /**
+     * Не применяем live-тюнинг по 2-3 сделкам — это почти всегда шум.
+     */
+    private static final int MIN_TRADES_FOR_APPLY = 6;
+
+    private static final BigDecimal MIN_TP_PCT = new BigDecimal("0.30");
+    private static final BigDecimal MIN_SL_PCT = new BigDecimal("0.15");
+    private static final BigDecimal MAX_SL_PCT = new BigDecimal("3.00");
+
     private final WindowScalpingTunerProperties props;
     private final MlBacktestRunner backtestRunner;
 
@@ -173,12 +182,20 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         if (bestSc == null) bestSc = BigDecimal.valueOf(-1.0);
 
         BigDecimal delta = bestSc.subtract(base);
-        boolean apply = shouldApply(base, delta);
+        boolean enoughTrades = best.trades != null && best.trades >= MIN_TRADES_FOR_APPLY;
+        boolean apply = enoughTrades && shouldApply(base, delta);
 
         String modelVersion = safe(props.getModelVersion());
 
         if (!apply) {
-            String reason = (best.trades != null && best.trades <= 0) ? "no_trades" : "no_improvement";
+            String reason;
+            if (best.trades == null || best.trades <= 0) {
+                reason = "no_trades";
+            } else if (!enoughTrades) {
+                reason = "too_few_trades:" + best.trades;
+            } else {
+                reason = "no_improvement";
+            }
             logSkip(chatId, ex, net, symbol, tf, base, bestSc, delta, reason);
 
             return TuningResult.builder()
@@ -207,8 +224,10 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
                     .build();
         }
 
+        normalizeRiskCandidate(best.params);
         applyToWindowSettings(cfgToSave, best.params);
         applyToStrategySettings(ssToSave, best.params);
+        normalizeSavedWindowSettings(cfgToSave);
 
         boolean okCfg = persistSafe(windowSettingsService, chatId, cfgToSave);
         boolean okSs = persistSafe(strategySettingsService, chatId, ssToSave);
@@ -489,13 +508,13 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         if (sl == null) sl = new BigDecimal("0.35");
 
         tp = clampBD(tp.add(BigDecimal.valueOf(rndD(rnd, -tpJitter, tpJitter))),
-                new BigDecimal("0.05"), new BigDecimal("10.00"));
+                MIN_TP_PCT, new BigDecimal("10.00"));
 
         sl = clampBD(sl.add(BigDecimal.valueOf(rndD(rnd, -slJitter, slJitter))),
-                new BigDecimal("0.05"), new BigDecimal("10.00"));
+                MIN_SL_PCT, MAX_SL_PCT);
 
         // TP чуть выше SL (чтобы не уходить в странные комбинации)
-        BigDecimal minTp = sl.multiply(new BigDecimal("1.05")).setScale(8, RoundingMode.HALF_UP);
+        BigDecimal minTp = sl.multiply(new BigDecimal("1.10")).max(MIN_TP_PCT).setScale(8, RoundingMode.HALF_UP);
         if (tp.compareTo(minTp) < 0) tp = minTp;
 
         p.put("takeProfitPct", tp.setScale(8, RoundingMode.HALF_UP));
@@ -597,6 +616,38 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
 
         Integer mcl = intObjOf(p.get("maxConsecutiveLosses"));
         if (mcl != null) trySetAssignable(ss, "setMaxConsecutiveLosses", mcl);
+    }
+
+    private void normalizeRiskCandidate(Map<String, Object> p) {
+        if (p == null) return;
+
+        BigDecimal tp = clampBD(bd(p.get("takeProfitPct")), MIN_TP_PCT, new BigDecimal("10.00"));
+        BigDecimal sl = clampBD(bd(p.get("stopLossPct")), MIN_SL_PCT, MAX_SL_PCT);
+
+        if (tp == null) tp = MIN_TP_PCT;
+        if (sl == null) sl = MIN_SL_PCT;
+
+        BigDecimal minTp = sl.multiply(new BigDecimal("1.10")).max(MIN_TP_PCT).setScale(8, RoundingMode.HALF_UP);
+        if (tp.compareTo(minTp) < 0) tp = minTp;
+
+        p.put("takeProfitPct", tp.setScale(8, RoundingMode.HALF_UP));
+        p.put("stopLossPct", sl.setScale(8, RoundingMode.HALF_UP));
+    }
+
+    private void normalizeSavedWindowSettings(WindowScalpingStrategySettings cfg) {
+        if (cfg == null) return;
+
+        BigDecimal tp = clampBD(cfg.getTakeProfitPct(), MIN_TP_PCT, new BigDecimal("10.00"));
+        BigDecimal sl = clampBD(cfg.getStopLossPct(), MIN_SL_PCT, MAX_SL_PCT);
+
+        if (tp == null) tp = MIN_TP_PCT;
+        if (sl == null) sl = MIN_SL_PCT;
+
+        BigDecimal minTp = sl.multiply(new BigDecimal("1.10")).max(MIN_TP_PCT).setScale(8, RoundingMode.HALF_UP);
+        if (tp.compareTo(minTp) < 0) tp = minTp;
+
+        cfg.setTakeProfitPct(tp.setScale(8, RoundingMode.HALF_UP));
+        cfg.setStopLossPct(sl.setScale(8, RoundingMode.HALF_UP));
     }
 
     // =====================================================
@@ -982,3 +1033,4 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         return null;
     }
 }
+

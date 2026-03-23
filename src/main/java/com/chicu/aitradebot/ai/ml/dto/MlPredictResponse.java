@@ -2,110 +2,164 @@ package com.chicu.aitradebot.ai.ml.dto;
 
 import com.fasterxml.jackson.annotation.JsonAlias;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
-import com.fasterxml.jackson.annotation.JsonInclude;
-import lombok.Data;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.Setter;
 
-import java.util.List;
-
-@Data
-@JsonInclude(JsonInclude.Include.NON_NULL)
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class MlPredictResponse {
 
-    /** общий флаг успеха */
-    @JsonAlias({"success"})
-    private boolean ok;
+    /**
+     * Новый основной флаг успешности.
+     */
+    private Boolean ok;
 
-    /** вероятность BUY / win, 0..1 */
-    @JsonAlias({"pWin", "p", "prob", "probability", "confidence", "score"})
-    private Double proba;
+    /**
+     * Каноническое поле вероятности.
+     */
+    @JsonAlias({"pWin", "proba", "probability", "score"})
+    private Double pWin;
 
-    /** ключ модели */
-    @JsonAlias({"model_key", "model", "key", "modelId"})
-    private String modelKey;
+    private String label;
+    private String reason;
 
-    /** версия модели/артефакта */
-    @JsonAlias({"model_version", "version"})
-    private String modelVersion;
-
-    /** hash схемы фичей */
-    @JsonAlias({"schema_hash", "feature_hash", "features_hash", "hash"})
-    private String schemaHash;
-
-    /** если sidecar вернул сам порядок/схему */
-    @JsonAlias({"featureOrder", "schema", "schemaFields", "featureSchema"})
-    private List<String> featureOrder;
-
-    /** backend sidecar */
-    @JsonAlias({"backend"})
-    private String backend;
-
-    /** загружена ли модель */
-    @JsonAlias({"model_loaded", "modelLoaded"})
-    private Boolean modelLoaded;
-
-    /** сообщение об ошибке */
-    @JsonAlias({"error", "message", "reason", "detail"})
+    @JsonAlias({"error", "err"})
     private String error;
 
-    /** опционально — таймстемп */
-    @JsonAlias({"ts", "timestamp"})
+    private String version;
+    private String modelVersion;
+    private String modelKey;
+
+    @JsonAlias({"schemaHash", "featureOrderHash", "feature_order_hash"})
+    private String schemaHash;
+
+    private Double recommendedThreshold;
+    private Double floorThreshold;
+    private Double ceilingThreshold;
+
+    /**
+     * Поля для backward compatibility со старым кодом.
+     */
+    @JsonAlias({"tsMs", "ts", "timestamp"})
     private Long tsMs;
 
+    private Double threshold;
+    private String decision;
+
     // =====================================================
-    // Фабрики
+    // Backward compatibility helpers
     // =====================================================
 
-    /** Backward-compat: старый код мог звать ok(proba, modelVersion) */
-    public static MlPredictResponse ok(Double proba, String modelVersion) {
-        return ok(proba, null, modelVersion, null);
+    /**
+     * Старый код зовёт r.isOk()
+     */
+    public boolean isOk() {
+        if (ok != null) {
+            return ok;
+        }
+        return error == null || error.isBlank();
     }
 
-    public static MlPredictResponse ok(Double proba, String modelKey, String modelVersion, String schemaHash) {
-        MlPredictResponse r = new MlPredictResponse();
-        r.ok = true;
-        r.tsMs = System.currentTimeMillis();
-        r.proba = sanitizeProba(proba);
-        r.modelKey = blankToNull(modelKey);
-        r.modelVersion = blankToNull(modelVersion);
-        r.schemaHash = blankToNull(schemaHash);
-        r.featureOrder = null;
-        r.backend = null;
-        r.modelLoaded = null;
-        r.error = null;
-        return r;
+    /**
+     * Старый код зовёт r.getProba()
+     */
+    public Double getProba() {
+        return pWin;
     }
 
+    /**
+     * На случай старого кода с setProba(...)
+     */
+    public void setProba(Double proba) {
+        this.pWin = proba;
+    }
+
+    /**
+     * Статическая фабрика ошибки для старого MlGateway и других классов.
+     */
     public static MlPredictResponse fail(String error) {
-        MlPredictResponse r = new MlPredictResponse();
-        r.ok = false;
-        r.tsMs = System.currentTimeMillis();
-        r.error = blankToNull(error);
-        r.proba = null;
-        r.modelKey = null;
-        r.modelVersion = null;
-        r.schemaHash = null;
-        r.featureOrder = null;
-        r.backend = null;
-        r.modelLoaded = null;
-        return r;
+        String msg = (error == null || error.isBlank()) ? "predict_failed" : error;
+        return MlPredictResponse.builder()
+                .ok(false)
+                .pWin(null)
+                .label(null)
+                .reason(msg)
+                .error(msg)
+                .version(null)
+                .modelVersion(null)
+                .modelKey(null)
+                .schemaHash(null)
+                .recommendedThreshold(null)
+                .floorThreshold(null)
+                .ceilingThreshold(null)
+                .tsMs(System.currentTimeMillis())
+                .threshold(null)
+                .decision(null)
+                .build();
+    }
+
+    /**
+     * Успешный shortcut.
+     */
+    public static MlPredictResponse ok(double proba) {
+        return MlPredictResponse.builder()
+                .ok(true)
+                .pWin(proba)
+                .tsMs(System.currentTimeMillis())
+                .build();
     }
 
     // =====================================================
-    // helpers
+    // New-style helpers
     // =====================================================
 
-    private static Double sanitizeProba(Double p) {
-        if (p == null) return null;
-        if (!Double.isFinite(p)) return null;
-        if (p < 0.0) return 0.0;
-        if (p > 1.0) return 1.0;
-        return p;
+    public boolean okOrDefault() {
+        return isOk();
     }
 
-    private static String blankToNull(String s) {
-        if (s == null) return null;
-        String t = s.trim();
-        return t.isEmpty() ? null : t;
+    public double probabilityOrZero() {
+        return pWin == null ? 0.0d : pWin;
+    }
+
+    public double recommendedThresholdOr(double fallback) {
+        return recommendedThreshold == null ? fallback : recommendedThreshold;
+    }
+
+    public double floorThresholdOr(double fallback) {
+        return floorThreshold == null ? fallback : floorThreshold;
+    }
+
+    public double ceilingThresholdOr(double fallback) {
+        return ceilingThreshold == null ? fallback : ceilingThreshold;
+    }
+
+    public double thresholdOr(double fallback) {
+        return threshold == null ? fallback : threshold;
+    }
+
+    public boolean hasProbability() {
+        return pWin != null;
+    }
+
+    public boolean isFeatureOrderHashMismatch() {
+        if (error == null) {
+            return false;
+        }
+        return "featureOrder_hash_mismatch".equalsIgnoreCase(error)
+                || "feature_order_hash_mismatch".equalsIgnoreCase(error);
+    }
+
+    public String errorOrReason() {
+        if (error != null && !error.isBlank()) {
+            return error;
+        }
+        return reason;
     }
 }
