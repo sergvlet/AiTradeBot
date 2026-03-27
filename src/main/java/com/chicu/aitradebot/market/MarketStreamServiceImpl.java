@@ -109,6 +109,12 @@ public class MarketStreamServiceImpl implements MarketStreamService {
     /** anti-spam для skip по KLINE */
     private final ConcurrentMap<KlineKey, Long> lastKlineSkipLogAtMs = new ConcurrentHashMap<>();
 
+    /**
+     * Защита от двойного onCandleClosed() для одной и той же свечи.
+     * Ключ — KlineKey, значение — openTime уже диспатченной закрытой свечи.
+     */
+    private final ConcurrentMap<KlineKey, Long> lastClosedCandleOpenTimeMs = new ConcurrentHashMap<>();
+
     /** Диагностический счётчик, если push.seq() == 0 */
     private final AtomicLong diagCounter = new AtomicLong(0);
 
@@ -150,7 +156,8 @@ public class MarketStreamServiceImpl implements MarketStreamService {
             );
 
             try {
-                marketDataStreamService.unsubscribe(prev.exchange, prev.networkType, chatId, type, prev.symbol, prev.timeframe);            } catch (Exception e) {
+                marketDataStreamService.unsubscribe(prev.exchange, prev.networkType, chatId, type, prev.symbol, prev.timeframe);
+            } catch (Exception e) {
                 log.warn("⚠️ [MARKET] Unsubscribe failed chatId={} type={} ex={} net={} {} {} err={}",
                         chatId, type, prev.exchange, prev.networkType, prev.symbol, prev.timeframe, e.getMessage());
             }
@@ -222,10 +229,15 @@ public class MarketStreamServiceImpl implements MarketStreamService {
         final MarketDataStreamService.MarketPushResult push;
         try {
             push = marketDataStreamService.pushAggTrade(
-                    ex, networkType, chatId, type,
+                    ex,
+                    networkType,
+                    chatId,
+                    type,
                     sym,
                     (tf != null ? tf : "na"),
-                    price, qty, tradeTsMs
+                    price,
+                    qty,
+                    tradeTsMs
             );
         } catch (Exception e) {
             log.error("❌ [MARKET] pushAggTrade упал chatId={} type={} ex={} net={} sym={} err={}",
@@ -245,9 +257,16 @@ public class MarketStreamServiceImpl implements MarketStreamService {
         }
 
         if (push != null && push.candleClosed() != null) {
+            UnifiedKline closedCandle = push.candleClosed();
+            ensureKlineMeta(closedCandle, sym, tf);
+
             try {
-                livePublisher.publishCandle(chatId, type, push.candleClosed());
+                livePublisher.publishCandle(chatId, type, closedCandle);
             } catch (Exception ignored) {
+            }
+
+            if (tf != null) {
+                tryDispatchClosedCandle(chatId, type, ex, networkType, sym, tf, closedCandle, nowMs, "agg_trade");
             }
         }
 
@@ -406,8 +425,7 @@ public class MarketStreamServiceImpl implements MarketStreamService {
 
         SubBinding sb = lastSub.get(new SubKey(chatId, type));
         if (sb != null && eq(ex, sb.exchange) && net == sb.networkType && eq(sym, sb.symbol)) {
-            String tf;
-            tf = sanitizeTf(sb.timeframe);
+            String tf = sanitizeTf(sb.timeframe);
             return tf;
         }
 
@@ -462,6 +480,105 @@ public class MarketStreamServiceImpl implements MarketStreamService {
             );
         } catch (Exception ignored) {
         }
+    }
+
+    private void tryDispatchClosedCandle(long chatId,
+                                         StrategyType type,
+                                         String exchange,
+                                         NetworkType networkType,
+                                         String symbol,
+                                         String timeframe,
+                                         UnifiedKline candle,
+                                         long nowMs,
+                                         String source) {
+
+        if (candle == null) return;
+
+        final String ex = sanitizeExchange(exchange);
+        final String sym = sanitizeSymbol(symbol);
+        final String tf = sanitizeTf(timeframe);
+
+        if (type == null || ex == null || networkType == null || sym == null || tf == null) {
+            return;
+        }
+
+        ensureKlineMeta(candle, sym, tf);
+
+        KlineKey key = new KlineKey(chatId, type, ex, networkType, sym, tf);
+
+        Optional<AiStrategyOrchestrator.RunBinding> bindingOpt = bindingOf(chatId, type);
+        if (bindingOpt.isEmpty()) {
+            cleanupKlineKeyIfOld(key, nowMs);
+            return;
+        }
+
+        AiStrategyOrchestrator.RunBinding b = bindingOpt.get();
+
+        boolean match =
+                eq(ex, b.exchange()) &&
+                networkType == b.network() &&
+                eq(sym, b.symbol()) &&
+                eq(tf, b.timeframe());
+
+        if (!match) {
+            cleanupKlineKeyIfOld(key, nowMs);
+            return;
+        }
+
+        if (skipWhenDegraded) {
+            MarketDataStreamService.SubscriptionHealth health = resolveHealth(chatId, type, ex, networkType, sym, tf);
+            if (health != null && health.degraded()) {
+                maybeLogKlineSkip(key, nowMs,
+                        "Пропуск onCandleClosed(" + source + "): market degraded (" + formatHealthReason(health) + ")");
+                return;
+            }
+        }
+
+        long candleOpenTime = extractCandleOpenTimeSafe(candle);
+        if (candleOpenTime > 0) {
+            Long prevOpenTime = lastClosedCandleOpenTimeMs.put(key, candleOpenTime);
+            if (prevOpenTime != null && prevOpenTime == candleOpenTime) {
+                return;
+            }
+        }
+
+        try {
+            AiStrategyOrchestrator o = orch();
+            if (o != null) {
+                o.onCandleClosed(chatId, type, ex, networkType, sym, tf, candle);
+            }
+        } catch (Exception e) {
+            log.error("❌ [MARKET] onCandleClosed({}) упал chatId={} type={} ex={} net={} sym={} tf={} err={}",
+                    source, chatId, type, ex, networkType, sym, tf, e.getMessage(), e);
+        }
+    }
+
+    private void ensureKlineMeta(UnifiedKline kline, String symbol, String timeframe) {
+        if (kline == null) return;
+
+        try {
+            if (kline.getSymbol() == null || kline.getSymbol().isBlank()) {
+                kline.setSymbol(symbol);
+            }
+        } catch (Exception ignored) {
+        }
+
+        try {
+            if (kline.getTimeframe() == null || kline.getTimeframe().isBlank()) {
+                kline.setTimeframe(timeframe);
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private long extractCandleOpenTimeSafe(UnifiedKline candle) {
+        if (candle == null) return -1L;
+
+        long t = candle.getOpenTime();
+        if (t > 0) return t;
+
+        t = candle.getCloseTime();
+        return t > 0 ? t : -1L;
     }
 
     private void maybeLogTickSkip(TickKey key,
@@ -570,11 +687,7 @@ public class MarketStreamServiceImpl implements MarketStreamService {
         final KlineKey key = new KlineKey(chatId, type, ex, networkType, sym, tf);
         lastKlineSeenAtMs.put(key, nowMs);
 
-        try {
-            if (kline.getSymbol() == null || kline.getSymbol().isBlank()) kline.setSymbol(sym);
-            if (kline.getTimeframe() == null || kline.getTimeframe().isBlank()) kline.setTimeframe(tf);
-        } catch (Exception ignored) {
-        }
+        ensureKlineMeta(kline, sym, tf);
 
         // 1) кэш
         try {
@@ -647,40 +760,7 @@ public class MarketStreamServiceImpl implements MarketStreamService {
         // 5) закрытие свечи -> оркестратор
         if (!isKlineClosed(kline)) return;
 
-        Optional<AiStrategyOrchestrator.RunBinding> bindingOpt = bindingOf(chatId, type);
-        if (bindingOpt.isEmpty()) {
-            cleanupKlineKeyIfOld(key, nowMs);
-            return;
-        }
-
-        AiStrategyOrchestrator.RunBinding b = bindingOpt.get();
-
-        boolean match =
-                eq(ex, b.exchange()) &&
-                networkType == b.network() &&
-                eq(sym, b.symbol()) &&
-                eq(tf, b.timeframe());
-
-        if (!match) {
-            cleanupKlineKeyIfOld(key, nowMs);
-            return;
-        }
-
-        if (marketDegraded) {
-            maybeLogKlineSkip(key, nowMs,
-                    "Пропуск onCandleClosed: market degraded (" + formatHealthReason(health) + ")");
-            return;
-        }
-
-        try {
-            AiStrategyOrchestrator o = orch();
-            if (o != null) {
-                o.onCandleClosed(chatId, type, ex, networkType, sym, tf, kline);
-            }
-        } catch (Exception e) {
-            log.error("❌ [MARKET] onCandleClosed упал chatId={} type={} ex={} net={} sym={} tf={} err={}",
-                    chatId, type, ex, networkType, sym, tf, e.getMessage(), e);
-        }
+        tryDispatchClosedCandle(chatId, type, ex, networkType, sym, tf, kline, nowMs, "kline");
     }
 
     private void cleanupKlineKeyIfOld(KlineKey key, long nowMs) {
@@ -692,6 +772,8 @@ public class MarketStreamServiceImpl implements MarketStreamService {
             lastKlineSeenAtMs.remove(key);
             lastKlinePriceDispatchAtMs.remove(key);
             lastKlineSkipLogAtMs.remove(key);
+            lastUiCandleAtMs.remove(key);
+            lastClosedCandleOpenTimeMs.remove(key);
         }
     }
 
@@ -918,8 +1000,3 @@ public class MarketStreamServiceImpl implements MarketStreamService {
         }
     }
 }
-
-
-
-
-

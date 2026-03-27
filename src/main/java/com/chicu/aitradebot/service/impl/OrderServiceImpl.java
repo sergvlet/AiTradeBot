@@ -615,17 +615,7 @@ public class OrderServiceImpl implements OrderService {
         if (!QtyMath.isPositive(qty)) {
             return BigDecimal.ZERO;
         }
-
-        BigDecimal stepSize = descriptor != null ? descriptor.stepSize() : null;
-        if (!QtyMath.isPositive(stepSize)) {
-            return qty.stripTrailingZeros();
-        }
-
-        BigDecimal floored = QtyMath.floorToStepOrZero(qty, stepSize);
-        if ("BUY".equalsIgnoreCase(sideNorm)) {
-            return QtyMath.isPositive(floored) ? floored : qty.stripTrailingZeros();
-        }
-        return QtyMath.isPositive(floored) ? floored : BigDecimal.ZERO;
+        return qty.stripTrailingZeros();
     }
 
     private Order doPlaceLimit(OrderContext ctx,

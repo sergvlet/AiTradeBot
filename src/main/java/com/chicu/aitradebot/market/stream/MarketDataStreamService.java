@@ -56,6 +56,9 @@ public class MarketDataStreamService {
     @Value("${market.stream.health.requireFastChannel:false}")
     private boolean requireFastChannel;
 
+    @Value("${market.stream.health.fastChannelWarmupMs:12000}")
+    private long fastChannelWarmupMs;
+
     /**
      * BOOK_TICKER часто даёт лишний шум для скальпинга.
      * По умолчанию выключаем его и включаем только осознанно через properties.
@@ -227,9 +230,20 @@ public class MarketDataStreamService {
                 if (last == null) {
                     Candle c = new Candle(openTime, p, p, p, p, v, false);
                     deque.addLast(c);
+
                     createdCandle = true;
                     pushedCandle = true;
 
+                    log.info("🕯 [STREAM] NEW CANDLE FROM AGG chatId={} type={} ex={} net={} {} {} openTime={} reason=first_tick price={} qty={}",
+                            chatId,
+                            strategyType,
+                            ex,
+                            networkType,
+                            sym,
+                            tf,
+                            openTime,
+                            price.stripTrailingZeros().toPlainString(),
+                            qty != null ? qty.stripTrailingZeros().toPlainString() : "0");
                 } else if (last.getTime() == openTime) {
                     double open = last.getOpen();
                     double high = Math.max(last.getHigh(), p);
@@ -239,8 +253,8 @@ public class MarketDataStreamService {
                     Candle c = new Candle(openTime, open, high, low, p, vol, false);
                     deque.pollLast();
                     deque.addLast(c);
-                    pushedCandle = true;
 
+                    pushedCandle = true;
                 } else if (last.getTime() < openTime) {
                     Candle prevClosed = new Candle(
                             last.getTime(),
@@ -271,13 +285,56 @@ public class MarketDataStreamService {
 
                     Candle c = new Candle(openTime, p, p, p, p, v, false);
                     deque.addLast(c);
+
                     createdCandle = true;
                     pushedCandle = true;
 
-                    while (deque.size() > MAX_CANDLES) deque.pollFirst();
+                    log.info("🕯 [STREAM] NEW CANDLE FROM AGG chatId={} type={} ex={} net={} {} {} openTime={} prevOpenTime={} reason=rollover price={} qty={}",
+                            chatId,
+                            strategyType,
+                            ex,
+                            networkType,
+                            sym,
+                            tf,
+                            openTime,
+                            prevClosed.getTime(),
+                            price.stripTrailingZeros().toPlainString(),
+                            qty != null ? qty.stripTrailingZeros().toPlainString() : "0");
+
+                    log.info("🕯 [STREAM] CLOSED CANDLE FROM AGG chatId={} type={} ex={} net={} {} {} openTime={} closeTime={} close={} volume={}",
+                            chatId,
+                            strategyType,
+                            ex,
+                            networkType,
+                            sym,
+                            tf,
+                            candleClosed.getOpenTime(),
+                            candleClosed.getCloseTime(),
+                            candleClosed.getClose().stripTrailingZeros().toPlainString(),
+                            candleClosed.getVolume().stripTrailingZeros().toPlainString());
+
+                    while (deque.size() > MAX_CANDLES) {
+                        deque.pollFirst();
+                    }
+                } else {
+                    log.debug("⏭️ [STREAM] LATE AGG_TRADE IGNORED chatId={} type={} ex={} net={} {} {} tickOpenTime={} lastOpenTime={} price={} qty={} tradeTs={}",
+                            chatId,
+                            strategyType,
+                            ex,
+                            networkType,
+                            sym,
+                            tf,
+                            openTime,
+                            last.getTime(),
+                            price.stripTrailingZeros().toPlainString(),
+                            qty != null ? qty.stripTrailingZeros().toPlainString() : "0",
+                            tradeTsMs);
                 }
 
-                while (deque.size() > MAX_CANDLES) deque.pollFirst();
+                while (deque.size() > MAX_CANDLES) {
+                    deque.pollFirst();
+                }
+
                 lastNow = deque.peekLast();
             }
 
@@ -410,8 +467,7 @@ public class MarketDataStreamService {
             throw new IllegalStateException("BINANCE ws client отсутствует");
         }
 
-        boolean enableBookTickerForThisStrategy = bookTickerEnabled
-                && !(strategyType == StrategyType.WINDOW_SCALPING && !windowScalpingBookTickerEnabled);
+        boolean enableBookTickerForThisStrategy = isBookTickerEnabledForStrategy(strategyType);
 
         ws.subscribeKline(networkType, sym, tf, chatId, strategyType);
         ws.subscribeAggTrade(networkType, sym, tf, chatId, strategyType);
@@ -419,16 +475,30 @@ public class MarketDataStreamService {
         if (enableBookTickerForThisStrategy) {
             ws.subscribeBookTicker(networkType, sym, chatId, strategyType);
         } else {
-            try { ws.unsubscribeBookTicker(networkType, sym, chatId, strategyType); } catch (Exception ignored) {}
+            try {
+                ws.unsubscribeBookTicker(networkType, sym, chatId, strategyType);
+            } catch (Exception ignored) {
+            }
         }
 
         if (added) {
             log.info("📡 [STREAM] SUBSCRIBE WS: chatId={} type={} ex={} net={} {} {} ({})",
-                    chatId, strategyType, ex, networkType, sym, tf,
+                    chatId,
+                    strategyType,
+                    ex,
+                    networkType,
+                    sym,
+                    tf,
                     enableBookTickerForThisStrategy ? "KLINE+AGGTRADE+BOOK_TICKER" : "KLINE+AGGTRADE");
         } else {
-            log.debug("⏭ [STREAM] Подписка уже была, подтверждаю каналы: chatId={} type={} ex={} net={} {} {} bookTicker={}",
-                    chatId, strategyType, ex, networkType, sym, tf, enableBookTickerForThisStrategy);
+            log.info("🔁 [STREAM] REUSE WS: chatId={} type={} ex={} net={} {} {} bookTicker={}",
+                    chatId,
+                    strategyType,
+                    ex,
+                    networkType,
+                    sym,
+                    tf,
+                    enableBookTickerForThisStrategy);
         }
     }
 
@@ -445,8 +515,7 @@ public class MarketDataStreamService {
             throw new IllegalStateException("BYBIT ws client отсутствует");
         }
 
-        boolean enableBookTickerForThisStrategy = bookTickerEnabled
-                && !(strategyType == StrategyType.WINDOW_SCALPING && !windowScalpingBookTickerEnabled);
+        boolean enableBookTickerForThisStrategy = isBookTickerEnabledForStrategy(strategyType);
 
         ws.subscribeKline(networkType, sym, tf, chatId, strategyType);
         ws.subscribeAggTrade(networkType, sym, tf, chatId, strategyType);
@@ -454,16 +523,30 @@ public class MarketDataStreamService {
         if (enableBookTickerForThisStrategy) {
             ws.subscribeBookTicker(networkType, sym, chatId, strategyType);
         } else {
-            try { ws.unsubscribeBookTicker(networkType, sym, chatId, strategyType); } catch (Exception ignored) {}
+            try {
+                ws.unsubscribeBookTicker(networkType, sym, chatId, strategyType);
+            } catch (Exception ignored) {
+            }
         }
 
         if (added) {
             log.info("📡 [STREAM] SUBSCRIBE WS: chatId={} type={} ex={} net={} {} {} ({})",
-                    chatId, strategyType, ex, networkType, sym, tf,
+                    chatId,
+                    strategyType,
+                    ex,
+                    networkType,
+                    sym,
+                    tf,
                     enableBookTickerForThisStrategy ? "KLINE+AGGTRADE+BOOK_TICKER" : "KLINE+AGGTRADE");
         } else {
-            log.debug("⏭ [STREAM] Подписка уже была, подтверждаю каналы: chatId={} type={} ex={} net={} {} {} bookTicker={}",
-                    chatId, strategyType, ex, networkType, sym, tf, enableBookTickerForThisStrategy);
+            log.info("🔁 [STREAM] REUSE WS: chatId={} type={} ex={} net={} {} {} bookTicker={}",
+                    chatId,
+                    strategyType,
+                    ex,
+                    networkType,
+                    sym,
+                    tf,
+                    enableBookTickerForThisStrategy);
         }
     }
 
@@ -632,10 +715,18 @@ public class MarketDataStreamService {
         boolean bookFresh = bookConnected && isFresh(bookAge, silence);
 
         boolean fastOk = aggFresh || bookFresh;
-        boolean degraded;
+        boolean fastConnected = aggConnected || bookConnected;
+        boolean fastPendingWarmup = fastConnected
+                                    && !fastOk
+                                    && ((aggConnected && aggAge < 0) || (bookConnected && bookAge < 0));
+        boolean allowWarmup = requireFastChannel
+                              && klineFresh
+                              && fastPendingWarmup
+                              && Math.max(1_000L, fastChannelWarmupMs) > 0;
 
+        boolean degraded;
         if (requireFastChannel) {
-            degraded = !klineFresh || !fastOk;
+            degraded = !klineFresh || (!fastOk && !allowWarmup);
         } else {
             degraded = !klineFresh && !fastOk;
         }
@@ -648,6 +739,9 @@ public class MarketDataStreamService {
             reason = "all_channels_stale";
         } else if (!klineFresh && requireFastChannel) {
             reason = "kline_stale";
+        } else if (!fastOk && allowWarmup) {
+            reason = "fast_channels_warming_up";
+            degraded = false;
         } else if (!fastOk && requireFastChannel) {
             reason = "fast_channels_stale";
         } else if (degraded) {
@@ -694,16 +788,50 @@ public class MarketDataStreamService {
         String sym = normSymbol(symbol);
         String tf = normTf(timeframe);
 
-        if (ex == null || networkType == null || strategyType == null || sym == null || tf == null || candle == null) return;
+        if (ex == null || networkType == null || strategyType == null || sym == null || tf == null || candle == null) {
+            return;
+        }
 
         CandleStoreKey key = new CandleStoreKey(chatId, strategyType, ex, networkType, sym, tf);
         Deque<Candle> deque = candleStorage.computeIfAbsent(key, __ -> new ConcurrentLinkedDeque<>());
 
+        boolean newBucket = false;
+        boolean closedUpdate = false;
+        boolean lateBucket = false;
+        long prevOpenTime = -1L;
+
         synchronized (deque) {
             Candle last = deque.peekLast();
 
-            if (last != null && last.getTime() == candle.getTime()) {
-                deque.pollLast();
+            if (last == null) {
+                newBucket = true;
+            } else {
+                prevOpenTime = last.getTime();
+
+                if (last.getTime() == candle.getTime()) {
+                    deque.pollLast();
+                    if (candle.isClosed()) {
+                        closedUpdate = true;
+                    }
+                } else if (last.getTime() < candle.getTime()) {
+                    newBucket = true;
+                } else {
+                    lateBucket = true;
+                }
+            }
+
+            if (lateBucket) {
+                log.warn("⏭️ [STREAM] LATE KLINE IGNORED chatId={} type={} ex={} net={} {} {} candleOpenTime={} lastOpenTime={} closed={}",
+                        chatId,
+                        strategyType,
+                        ex,
+                        networkType,
+                        sym,
+                        tf,
+                        candle.getTime(),
+                        prevOpenTime,
+                        candle.isClosed());
+                return;
             }
 
             deque.addLast(candle);
@@ -715,9 +843,42 @@ public class MarketDataStreamService {
 
         pushToStreamManager(ex, networkType, sym, tf, candle);
 
-        if (log.isDebugEnabled()) {
-            log.debug("🕯 [STREAM] CANDLE IN chatId={} type={} ex={} net={} {} {} time={}",
-                    chatId, strategyType, ex, networkType, sym, tf, candle.getTime());
+        if (newBucket) {
+            log.info("🕯 [STREAM] NEW CANDLE FROM KLINE chatId={} type={} ex={} net={} {} {} openTime={} closed={} o={} h={} l={} c={} v={}",
+                    chatId,
+                    strategyType,
+                    ex,
+                    networkType,
+                    sym,
+                    tf,
+                    candle.getTime(),
+                    candle.isClosed(),
+                    BigDecimal.valueOf(candle.getOpen()).stripTrailingZeros().toPlainString(),
+                    BigDecimal.valueOf(candle.getHigh()).stripTrailingZeros().toPlainString(),
+                    BigDecimal.valueOf(candle.getLow()).stripTrailingZeros().toPlainString(),
+                    BigDecimal.valueOf(candle.getClose()).stripTrailingZeros().toPlainString(),
+                    BigDecimal.valueOf(candle.getVolume()).stripTrailingZeros().toPlainString());
+        } else if (closedUpdate) {
+            log.info("🕯 [STREAM] KLINE CLOSED UPDATE chatId={} type={} ex={} net={} {} {} openTime={} close={} volume={}",
+                    chatId,
+                    strategyType,
+                    ex,
+                    networkType,
+                    sym,
+                    tf,
+                    candle.getTime(),
+                    BigDecimal.valueOf(candle.getClose()).stripTrailingZeros().toPlainString(),
+                    BigDecimal.valueOf(candle.getVolume()).stripTrailingZeros().toPlainString());
+        } else if (log.isDebugEnabled()) {
+            log.debug("🕯 [STREAM] KLINE UPDATE chatId={} type={} ex={} net={} {} {} openTime={} close={}",
+                    chatId,
+                    strategyType,
+                    ex,
+                    networkType,
+                    sym,
+                    tf,
+                    candle.getTime(),
+                    BigDecimal.valueOf(candle.getClose()).stripTrailingZeros().toPlainString());
         }
     }
 
@@ -847,8 +1008,12 @@ public class MarketDataStreamService {
         synchronized (deque) {
             deque.clear();
             if (candles != null && !candles.isEmpty()) {
+                ArrayList<Candle> ordered = new ArrayList<>(candles.size());
                 for (Candle c : candles) {
                     if (c == null) continue;
+                    upsertOrderedCandle(ordered, c);
+                }
+                for (Candle c : ordered) {
                     deque.addLast(c);
                     while (deque.size() > MAX_CANDLES) deque.pollFirst();
                 }
@@ -931,6 +1096,161 @@ public class MarketDataStreamService {
         } catch (Exception ignored) {
         }
     }
+
+    // =====================================================================
+    // ordered candle helpers
+    // =====================================================================
+
+    private AggTradeApplyResult applyAggTradeOrdered(List<Candle> list,
+                                                     long openTime,
+                                                     long tfMs,
+                                                     double price,
+                                                     double volume,
+                                                     String symbol,
+                                                     String timeframe) {
+
+        if (list.isEmpty()) {
+            Candle created = new Candle(openTime, price, price, price, price, volume, false);
+            list.add(created);
+            trimToMax(list);
+            return new AggTradeApplyResult(true, true, null, created);
+        }
+
+        int existingIdx = indexOfTime(list, openTime);
+        if (existingIdx >= 0) {
+            Candle existing = list.get(existingIdx);
+
+            double open = existing.getOpen();
+            double high = Math.max(existing.getHigh(), price);
+            double low = Math.min(existing.getLow(), price);
+            double close = price;
+            double vol = existing.getVolume() + volume;
+
+            Candle updated = new Candle(
+                    existing.getTime(),
+                    open,
+                    high,
+                    low,
+                    close,
+                    vol,
+                    existing.isClosed()
+            );
+            list.set(existingIdx, updated);
+            trimToMax(list);
+
+            Candle last = list.get(list.size() - 1);
+            return new AggTradeApplyResult(true, false, null, last);
+        }
+
+        Candle tail = list.get(list.size() - 1);
+
+        if (tail.getTime() < openTime) {
+            UnifiedKline closed = null;
+
+            if (!tail.isClosed()) {
+                Candle prevClosed = new Candle(
+                        tail.getTime(),
+                        tail.getOpen(),
+                        tail.getHigh(),
+                        tail.getLow(),
+                        tail.getClose(),
+                        tail.getVolume(),
+                        true
+                );
+                list.set(list.size() - 1, prevClosed);
+
+                closed = UnifiedKline.builder()
+                        .openTime(prevClosed.getTime())
+                        .closeTime(prevClosed.getTime() + tfMs - 1)
+                        .open(BigDecimal.valueOf(prevClosed.getOpen()))
+                        .high(BigDecimal.valueOf(prevClosed.getHigh()))
+                        .low(BigDecimal.valueOf(prevClosed.getLow()))
+                        .close(BigDecimal.valueOf(prevClosed.getClose()))
+                        .volume(BigDecimal.valueOf(prevClosed.getVolume()))
+                        .timeframe(timeframe)
+                        .symbol(symbol)
+                        .closed(true)
+                        .build();
+            }
+
+            Candle created = new Candle(openTime, price, price, price, price, volume, false);
+            list.add(created);
+            trimToMax(list);
+
+            Candle last = list.get(list.size() - 1);
+            return new AggTradeApplyResult(true, true, closed, last);
+        }
+
+        // out-of-order старый тик: вставляем в правильное место
+        Candle created = new Candle(openTime, price, price, price, price, volume, false);
+        int insertPos = insertionIndex(list, openTime);
+        list.add(insertPos, created);
+        trimToMax(list);
+
+        Candle last = list.get(list.size() - 1);
+        return new AggTradeApplyResult(true, true, null, last);
+    }
+
+    private void upsertOrderedCandle(List<Candle> list, Candle candle) {
+        if (candle == null) return;
+
+        if (list.isEmpty()) {
+            list.add(candle);
+            trimToMax(list);
+            return;
+        }
+
+        int idx = indexOfTime(list, candle.getTime());
+        if (idx >= 0) {
+            list.set(idx, candle);
+            trimToMax(list);
+            return;
+        }
+
+        int insertPos = insertionIndex(list, candle.getTime());
+        list.add(insertPos, candle);
+        trimToMax(list);
+    }
+
+    private int indexOfTime(List<Candle> list, long time) {
+        for (int i = 0; i < list.size(); i++) {
+            Candle c = list.get(i);
+            if (c != null && c.getTime() == time) return i;
+        }
+        return -1;
+    }
+
+    private int insertionIndex(List<Candle> list, long time) {
+        for (int i = 0; i < list.size(); i++) {
+            Candle c = list.get(i);
+            if (c != null && c.getTime() > time) {
+                return i;
+            }
+        }
+        return list.size();
+    }
+
+    private void trimToMax(List<Candle> list) {
+        while (list.size() > MAX_CANDLES) {
+            list.remove(0);
+        }
+    }
+
+    private void rewriteDeque(Deque<Candle> deque, List<Candle> list) {
+        deque.clear();
+        for (Candle c : list) {
+            if (c != null) {
+                deque.addLast(c);
+            }
+        }
+    }
+
+    private record AggTradeApplyResult(
+            boolean pushedCandle,
+            boolean createdCandle,
+            UnifiedKline candleClosed,
+            Candle lastCandle
+    ) {}
 
     // =====================================================================
     // keys + нормализация
@@ -1095,5 +1415,12 @@ public class MarketDataStreamService {
                                                String symUpper,
                                                String tfLower) {
         return "BYBIT:" + net + ":" + chatId + ":" + strategyType.name() + ":" + symUpper + ":" + tfLower + ":KLINE";
+    }
+
+    private boolean isBookTickerEnabledForStrategy(StrategyType strategyType) {
+        if (!bookTickerEnabled) {
+            return false;
+        }
+        return strategyType != StrategyType.WINDOW_SCALPING || windowScalpingBookTickerEnabled;
     }
 }

@@ -15,6 +15,9 @@ import com.chicu.aitradebot.service.OrderService;
 import com.chicu.aitradebot.service.StrategySettingsService;
 import com.chicu.aitradebot.strategy.core.TradingStrategy;
 import com.chicu.aitradebot.strategy.registry.StrategyRegistry;
+import com.chicu.aitradebot.trade.ExitResult;
+import com.chicu.aitradebot.trade.PositionStore;
+import com.chicu.aitradebot.trade.TradeExecutionService;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -51,6 +54,8 @@ public class AiStrategyOrchestrator {
     private final StrategyRegistry strategyRegistry;
     private final MarketStreamService marketStreamService;
     private final MarketDataStreamService marketDataStreamService;
+    private final TradeExecutionService tradeExecutionService;
+    private final PositionStore positionStore;
 
     /**
      * ML autotune runtime (оркестратор — главный lifecycle хаб)
@@ -464,6 +469,149 @@ public class AiStrategyOrchestrator {
         }
     }
 
+
+    private record LifecycleCloseResult(
+            boolean ok,
+            boolean attempted,
+            String reason
+    ) {}
+
+    private LifecycleCloseResult closeOpenPositionBeforeLifecycleTransition(Long chatId,
+                                                                            StrategyType type,
+                                                                            RunBinding binding,
+                                                                            StrategySettings settings,
+                                                                            String lifecycleReason) {
+
+        if (chatId == null || type == null || binding == null) {
+            return new LifecycleCloseResult(true, false, "no_binding");
+        }
+
+        String ex = sanitizeExchange(binding.exchange());
+        NetworkType net = binding.network();
+        String sym = sanitizeSymbol(binding.symbol());
+
+        if (ex == null || net == null || sym == null) {
+            return new LifecycleCloseResult(true, false, "binding_incomplete");
+        }
+
+        String phase = sanitizePhase(settings != null ? settings.getRunPhase() : null);
+        if (phaseSkipsProtectiveExit(phase)) {
+            return new LifecycleCloseResult(true, false, "phase=" + phase);
+        }
+
+        Optional<PositionStore.PositionSnapshot> posOpt;
+        try {
+            posOpt = positionStore.getPosition(chatId, type, ex, net, sym);
+        } catch (Exception e) {
+            log.error("🛑 [ORCH] {} aborted: не удалось прочитать позицию | chatId={} type={} ex={} net={} sym={} err={}",
+                    lifecycleReason, chatId, type, ex, net, sym, e.toString());
+            return new LifecycleCloseResult(false, false, "position_lookup_failed");
+        }
+
+        if (posOpt == null || posOpt.isEmpty()) {
+            return new LifecycleCloseResult(true, false, "no_position");
+        }
+
+        PositionStore.PositionSnapshot snap = posOpt.get();
+
+        BigDecimal qty = positiveOrNull(snap.qty());
+        BigDecimal entryPrice = positiveOrNull(snap.entryPrice());
+        BigDecimal tp = positiveOrNull(snap.tp());
+        BigDecimal sl = positiveOrNull(snap.sl());
+
+        if (qty == null) {
+            log.error("🛑 [ORCH] {} aborted: позиция найдена, но qty отсутствует | chatId={} type={} ex={} net={} sym={}",
+                    lifecycleReason, chatId, type, ex, net, sym);
+            return new LifecycleCloseResult(false, true, "position_qty_missing");
+        }
+
+        BigDecimal priceHint = positiveOrNull(sl);
+        if (priceHint == null) priceHint = positiveOrNull(entryPrice);
+        if (priceHint == null) priceHint = BigDecimal.ONE;
+
+        if (sl == null) {
+            sl = priceHint;
+        }
+        if (tp == null) {
+            BigDecimal base = positiveOrNull(entryPrice);
+            if (base == null) base = priceHint;
+            tp = base.multiply(new BigDecimal("2")).setScale(8, RoundingMode.HALF_UP);
+        }
+
+        Instant now = Instant.now();
+
+        log.warn("🛡️ [ORCH] Protective exit before {} | chatId={} type={} ex={} net={} sym={} qty={} entry={} tp={} sl={} priceHint={}",
+                lifecycleReason,
+                chatId,
+                type,
+                ex,
+                net,
+                sym,
+                qty.stripTrailingZeros().toPlainString(),
+                entryPrice != null ? entryPrice.stripTrailingZeros().toPlainString() : "null",
+                tp != null ? tp.stripTrailingZeros().toPlainString() : "null",
+                sl != null ? sl.stripTrailingZeros().toPlainString() : "null",
+                priceHint.stripTrailingZeros().toPlainString()
+        );
+
+        ExitResult exitResult;
+        try {
+            exitResult = tradeExecutionService.executeExitIfHit(
+                    chatId,
+                    type,
+                    sym,
+                    priceHint,
+                    now,
+                    true,
+                    qty,
+                    tp,
+                    sl,
+                    ex,
+                    net
+            );
+        } catch (Exception e) {
+            log.error("🛑 [ORCH] {} aborted: protective SELL threw exception | chatId={} type={} ex={} net={} sym={} err={}",
+                    lifecycleReason, chatId, type, ex, net, sym, e.toString(), e);
+            return new LifecycleCloseResult(false, true, "protective_exit_exception");
+        }
+
+        if (exitResult != null && exitResult.executed()) {
+            log.info("🛡️ [ORCH] Protective exit done before {} | chatId={} type={} ex={} net={} sym={} exitPrice={} pnlPct={}",
+                    lifecycleReason,
+                    chatId,
+                    type,
+                    ex,
+                    net,
+                    sym,
+                    exitResult.exitPrice() != null ? exitResult.exitPrice().stripTrailingZeros().toPlainString() : "null",
+                    exitResult.pnlPct() != null ? exitResult.pnlPct().stripTrailingZeros().toPlainString() : "null"
+            );
+            return new LifecycleCloseResult(true, true, "executed");
+        }
+
+        String reason = (exitResult != null && exitResult.reason() != null && !exitResult.reason().isBlank())
+                ? exitResult.reason()
+                : "protective_exit_failed";
+
+        if ("no_real_position".equalsIgnoreCase(reason)) {
+            log.warn("🛡️ [ORCH] Protective exit skipped before {}: биржа не подтвердила открытую позицию | chatId={} type={} ex={} net={} sym={}",
+                    lifecycleReason, chatId, type, ex, net, sym);
+            return new LifecycleCloseResult(true, true, reason);
+        }
+
+        log.error("🛑 [ORCH] {} aborted: open position was not closed | chatId={} type={} ex={} net={} sym={} reason={}",
+                lifecycleReason, chatId, type, ex, net, sym, reason);
+        return new LifecycleCloseResult(false, true, reason);
+    }
+
+    private static boolean phaseSkipsProtectiveExit(String phase) {
+        return "COLLECT".equalsIgnoreCase(phase) || "BACKTEST".equalsIgnoreCase(phase);
+    }
+
+    private static BigDecimal positiveOrNull(BigDecimal value) {
+        return (value != null && value.signum() > 0) ? value : null;
+    }
+
     // =====================================================================
     // ATOMIC RESTART (главный метод)
     // =====================================================================
@@ -546,6 +694,22 @@ public class AiStrategyOrchestrator {
             TradingStrategy strategy = strategyRegistry.get(type);
             if (strategy == null) {
                 return buildRunInfoFromBinding(s, current, true, "Стратегия не найдена (рестарт пропущен)");
+            }
+
+            LifecycleCloseResult closeResult = closeOpenPositionBeforeLifecycleTransition(
+                    chatId,
+                    type,
+                    current,
+                    s,
+                    "RESTART"
+            );
+            if (!closeResult.ok()) {
+                return buildRunInfoFromBinding(
+                        s,
+                        current,
+                        true,
+                        "Рестарт отменён: не удалось безопасно закрыть позицию (" + closeResult.reason() + ")"
+                );
             }
 
             try {
@@ -693,6 +857,22 @@ public class AiStrategyOrchestrator {
                         existing.exchange(), existing.network(), existing.symbol(), existing.timeframe(),
                         ex, net, sym, tf);
 
+                LifecycleCloseResult closeResult = closeOpenPositionBeforeLifecycleTransition(
+                        chatId,
+                        type,
+                        existing,
+                        s,
+                        "START_CONTEXT_SWITCH"
+                );
+                if (!closeResult.ok()) {
+                    return buildRunInfoFromBinding(
+                            s,
+                            existing,
+                            true,
+                            "Перезапуск отменён: не удалось безопасно закрыть позицию (" + closeResult.reason() + ")"
+                    );
+                }
+
                 try {
                     strategy.stop(chatId, existing.symbol(), existing.exchange(), existing.network());
                 } catch (Exception e) {
@@ -777,6 +957,25 @@ public class AiStrategyOrchestrator {
             }
 
             String sym = sanitizeSymbol(s.getSymbol());
+            RunBinding current = running.get(key);
+
+            LifecycleCloseResult closeResult = closeOpenPositionBeforeLifecycleTransition(
+                    chatId,
+                    type,
+                    current,
+                    s,
+                    "STOP"
+            );
+            if (!closeResult.ok()) {
+                return current != null
+                        ? buildRunInfoFromBinding(
+                                s,
+                                current,
+                                true,
+                                "Остановка отменена: не удалось безопасно закрыть позицию (" + closeResult.reason() + ")"
+                          )
+                        : buildRunInfo(s, true, "Остановка отменена: не удалось безопасно закрыть позицию (" + closeResult.reason() + ")");
+            }
 
             try {
                 marketStreamService.unsubscribe(chatId, type);
@@ -790,10 +989,11 @@ public class AiStrategyOrchestrator {
             lastDegradedLogAtMs.remove(key);
 
             String ex = removed != null ? removed.exchange() : sanitizeExchange(exchange);
+            if (ex == null && current != null) ex = current.exchange();
             if (ex == null) ex = sanitizeExchange(s.getExchangeName());
             if (ex == null) ex = "BINANCE";
 
-            NetworkType net = removed != null ? removed.network() : (network != null ? network : s.getNetworkType());
+            NetworkType net = removed != null ? removed.network() : (current != null ? current.network() : (network != null ? network : s.getNetworkType()));
             if (net == null) net = NetworkType.TESTNET;
 
             TradingStrategy strategy = strategyRegistry.get(type);
@@ -802,6 +1002,8 @@ public class AiStrategyOrchestrator {
                 try {
                     if (removed != null) {
                         strategy.stop(chatId, removed.symbol(), removed.exchange(), removed.network());
+                    } else if (current != null) {
+                        strategy.stop(chatId, current.symbol(), current.exchange(), current.network());
                     } else {
                         strategy.stop(chatId, sym, ex, net);
                     }
@@ -819,7 +1021,11 @@ public class AiStrategyOrchestrator {
 
             safeAutotuneStop(chatId, type, ex, net);
 
-            log.info("⏹ [ORCH] STOP {} chatId={} | bindingRemoved={}", type, chatId, removed != null);
+            log.info("⏹ [ORCH] STOP {} chatId={} | bindingRemoved={} protectiveExitAttempted={}",
+                    type,
+                    chatId,
+                    removed != null,
+                    closeResult.attempted());
             return buildRunInfo(s, false, "Стратегия остановлена");
 
         } finally {

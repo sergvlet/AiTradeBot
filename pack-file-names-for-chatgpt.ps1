@@ -23,13 +23,10 @@ $Manifest    = Join-Path $ExportDir "manifest.txt"
 #    "app.py"
 # =========================================================
 $FileNamesToPack = @(
-    "WindowScalpingStrategyV4.java",
-    "TradeExecutionServiceImpl.java",
+    "MarketStreamServiceImpl.java",
+    "BybitMarketStreamAdapter.java",
     "AiStrategyOrchestrator.java",
-    "StrategyChartApiController.java",
-    "StrategyReplayApiController.java",
-    "WebChartFacadeImpl.java",
-    "application.properties"
+    "WindowScalpingStrategyV4.java"
 )
 
 # =========================================================

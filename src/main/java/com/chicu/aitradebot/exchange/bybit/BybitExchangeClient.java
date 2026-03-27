@@ -644,10 +644,12 @@ public class BybitExchangeClient implements ExchangeClient {
 
     private String normalizeMarketStatus(String status) {
         String s = normalizeUpper(status);
-        if (s == null) return "FILLED";
+        if (s == null) return "NEW";
 
         return switch (s) {
-            case "NEW", "OPEN", "PARTIALLY_FILLED" -> "FILLED";
+            case "NEW", "OPEN", "PENDINGNEW", "PENDING_NEW", "CREATED" -> "NEW";
+            case "PARTIALLYFILLED", "PARTIALLY_FILLED" -> "PARTIALLY_FILLED";
+            case "CANCELLED", "CANCELED" -> "CANCELED";
             default -> s;
         };
     }
@@ -1447,5 +1449,7 @@ public class BybitExchangeClient implements ExchangeClient {
         return safe.setScale(4, RoundingMode.DOWN).stripTrailingZeros();
     }
 }
+
+
 
 

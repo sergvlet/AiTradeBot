@@ -529,19 +529,49 @@ public class ScalpingStrategyV4 implements TradingStrategy {
     }
 
     private void pushHoldThrottled(Long chatId, String symbol, LocalState st, String reason, Instant now) {
-        if (symbol == null) return;
-
-        // если причина та же и прошла меньше 2 секунд — не спамим
-        if (Objects.equals(st.lastHoldReason, reason) && st.lastHoldAt != null) {
-            long ms = Duration.between(st.lastHoldAt, now).toMillis();
-            if (ms < 2000) return;
+        if (chatId == null || st == null || now == null) {
+            return;
         }
 
-        st.lastHoldReason = reason;
-        st.lastHoldAt = now;
-        safeLive(() -> live.pushSignal(chatId, StrategyType.SCALPING, symbol, null, Signal.hold(reason)));
-    }
+        String actualSymbol = (symbol != null && !symbol.isBlank())
+                ? symbol
+                : st.symbol;
 
+        if (actualSymbol == null || actualSymbol.isBlank()) {
+            return;
+        }
+
+        String actualReason = (reason == null || reason.isBlank())
+                ? "unknown_hold_reason"
+                : reason;
+
+        // если причина та же и прошло меньше 2 секунд — не спамим
+        if (Objects.equals(st.lastHoldReason, actualReason) && st.lastHoldAt != null) {
+            long ms = Duration.between(st.lastHoldAt, now).toMillis();
+            if (ms < 2000) {
+                return;
+            }
+        }
+
+        st.lastHoldReason = actualReason;
+        st.lastHoldAt = now;
+
+        log.info("[WINDOW] HOLD chatId={} sym={} reason={} inPosition={} ticks={}",
+                chatId,
+                actualSymbol,
+                actualReason,
+                st.inPosition,
+                st.ticks
+        );
+
+        safeLive(() -> live.pushSignal(
+                chatId,
+                StrategyType.WINDOW_SCALPING,
+                actualSymbol,
+                null,
+                Signal.hold(actualReason)
+        ));
+    }
     // =====================================================
     // UTILS
     // =====================================================

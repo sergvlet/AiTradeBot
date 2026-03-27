@@ -10,10 +10,13 @@ import com.chicu.aitradebot.exchange.model.AccountFees;
 import com.chicu.aitradebot.service.StrategySettingsService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -25,6 +28,13 @@ public class AccountBalanceService {
 
     private final StrategySettingsService strategySettingsService;
     private final ExchangeClientFactory exchangeClientFactory;
+
+    @Value("${trade.balance-cache.ttl-ms:5000}")
+    private long balanceCacheTtlMs;
+
+    private final Map<String, CachedSnapshot> snapshotCache = new ConcurrentHashMap<>();
+
+    private record CachedSnapshot(AccountBalanceSnapshot snapshot, Instant expiresAt) {}
 
     public AccountBalanceSnapshot getSnapshot(
             long chatId,
@@ -46,6 +56,12 @@ public class AccountBalanceService {
         NetworkType net;
         net = networkType;
         String selectedHint = normalize(selectedAssetHint);
+
+        String cacheKey = cacheKey(chatId, type, ex, net, selectedHint);
+        AccountBalanceSnapshot cached = getCachedSnapshot(cacheKey);
+        if (cached != null) {
+            return cached;
+        }
 
         StrategySettings settings = null;
         try {
@@ -137,7 +153,7 @@ public class AccountBalanceService {
                     selectedBalance != null ? selectedBalance.getTotalSafe() : BigDecimal.ZERO,
                     availableAssets);
 
-            return AccountBalanceSnapshot.builder()
+            AccountBalanceSnapshot snapshot = AccountBalanceSnapshot.builder()
                     .availableAssets(availableAssets)
                     .selectedAsset(selected)
                     .selectedBalance(selectedBalance)
@@ -146,6 +162,9 @@ public class AccountBalanceService {
                     .error(null)
                     .build();
 
+            cacheSnapshot(cacheKey, snapshot);
+            return snapshot;
+
         } catch (Exception exx) {
             log.warn("⚠️ Не удалось получить баланс (chatId={}, type={}, ex={}, net={}): {}",
                     chatId, type, ex, net, exx.toString());
@@ -153,8 +172,40 @@ public class AccountBalanceService {
             String msg = exx.getMessage();
             if (msg == null || msg.isBlank()) msg = exx.toString();
 
-            return buildErrorSnapshot(selectedFallback, msg);
+            AccountBalanceSnapshot snapshot = buildErrorSnapshot(selectedFallback, msg);
+            cacheSnapshot(cacheKey, snapshot);
+            return snapshot;
         }
+    }
+
+
+    private String cacheKey(long chatId,
+                            StrategyType type,
+                            String exchangeName,
+                            NetworkType networkType,
+                            String selectedAssetHint) {
+        return chatId + ":"
+                + (type != null ? type.name() : "NA") + ":"
+                + (exchangeName != null ? exchangeName : "NA") + ":"
+                + (networkType != null ? networkType.name() : "NA") + ":"
+                + (selectedAssetHint != null ? selectedAssetHint : "NA");
+    }
+
+    private AccountBalanceSnapshot getCachedSnapshot(String key) {
+        if (key == null) return null;
+        CachedSnapshot cached = snapshotCache.get(key);
+        if (cached == null || cached.snapshot() == null || cached.expiresAt() == null) return null;
+        if (Instant.now().isAfter(cached.expiresAt())) {
+            snapshotCache.remove(key);
+            return null;
+        }
+        return cached.snapshot();
+    }
+
+    private void cacheSnapshot(String key, AccountBalanceSnapshot snapshot) {
+        if (key == null || snapshot == null) return;
+        long ttlMs = Math.max(250L, balanceCacheTtlMs);
+        snapshotCache.put(key, new CachedSnapshot(snapshot, Instant.now().plusMillis(ttlMs)));
     }
 
     public AccountFees getAccountFees(long chatId, String exchangeName, NetworkType networkType) {
@@ -277,3 +328,5 @@ public class AccountBalanceService {
         return BigDecimal.valueOf(v);
     }
 }
+
+
