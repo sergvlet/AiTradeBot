@@ -70,8 +70,6 @@ public class WindowScalpingStrategyV4 implements
     @Value("${strategy.window.positionSyncMinIntervalMs:10000}")
     private long positionSyncMinIntervalMs;
 
-    @Value("${trade.position-restore.min-notional:5.00}")
-    private BigDecimal positionRestoreMinNotional;
 
     @Value("${strategy.defaults.exchange:BINANCE}")
     private String defaultExchange;
@@ -249,6 +247,12 @@ public class WindowScalpingStrategyV4 implements
     @Value("${strategy.window.minProfitAfterFeesPct:0.12}")
     private double minProfitAfterFeesPct;
 
+    @Value("${trade.entry.extra-fee-buffer-pct:0.02}")
+    private double tradeEntryExtraFeeBufferPct;
+
+    @Value("${trade.entry.reject-when-requested-tp-below-roundtrip-fee:true}")
+    private boolean tradeEntryRejectWhenRequestedTpBelowRoundTripFee;
+
     @Value("${strategy.window.breakEvenEnabled:true}")
     private boolean breakEvenEnabled;
 
@@ -282,7 +286,7 @@ public class WindowScalpingStrategyV4 implements
         return (tradeExecutionService instanceof TradeExecutionServiceImpl impl) ? impl : null;
     }
 
-    private static final BigDecimal DEFAULT_RESTORE_MIN_NOTIONAL = new BigDecimal("5.00");
+    private static final BigDecimal MIN_RESTORABLE_NOTIONAL = new BigDecimal("10.50");
 
     private final Map<Long, LocalState> states = new ConcurrentHashMap<>();
 
@@ -389,12 +393,6 @@ public class WindowScalpingStrategyV4 implements
         Double pendingMlProba;
         String pendingMlModelKey;
         boolean pendingMlFailOpen;
-    }
-
-    private BigDecimal restoreMinNotional() {
-        return positiveOrNull(positionRestoreMinNotional) != null
-                ? positionRestoreMinNotional
-                : DEFAULT_RESTORE_MIN_NOTIONAL;
     }
 
     private static class Prediction {
@@ -557,7 +555,7 @@ public class WindowScalpingStrategyV4 implements
         boolean gate = (ss != null && ss.isMlGateEnabled() && mode != AdvancedControlMode.MANUAL);
         BigDecimal thrBd = (ss != null ? ss.getGateMinProb() : null);
 
-        log.info("[WINDOW] ▶ Старт chatId={} ex={} net={} symbol={} tf={} mode={} autoTune={} mlGate={} gateMinProb={} modelVer={} window={} minRange%={} TP%={} SL%={} mlEnabled={} failOpen={} mlMinFallback={} coarseAdjust={} autoMinRange={}",
+        log.info("[WINDOW] ▶ Старт chatId={} ex={} net={} symbol={} tf={} mode={} autoTune={} mlGate={} gateMinProb={} modelVer={} window={} minRange%={} TP={} SL={} mlEnabled={} failOpen={} mlMinFallback={} coarseAdjust={} autoMinRange={}",
                 chatId,
                 fmtEnumOrString(ss != null ? ss.getExchangeName() : st.exchange),
                 fmtEnumOrString(ss != null ? ss.getNetworkType() : st.network),
@@ -570,8 +568,8 @@ public class WindowScalpingStrategyV4 implements
                 (ss != null ? safeNullable(ss.getMlModelVersion()) : "null"),
                 cfg != null ? cfg.getWindowSize() : null,
                 (cfg != null && cfg.getMinRangePct() != null ? fmt(cfg.getMinRangePct()) : "null"),
-                cfg != null ? cfg.getTakeProfitPct() : null,
-                cfg != null ? cfg.getStopLossPct() : null,
+                startupTpLabel(chatId, st, cfg),
+                startupSlLabel(cfg),
                 mlEnabled,
                 mlFailOpen,
                 fmt(mlMinProba),
@@ -1130,7 +1128,7 @@ public class WindowScalpingStrategyV4 implements
                 }
             }
 
-            EntryRisk entryRisk = resolveEntryRisk(st, rangePct, score, pred);
+            EntryRisk entryRisk = resolveEntryRisk(chatId, st, rangePct, score, pred);
             if (entryRisk == null || entryRisk.tpPct() == null || entryRisk.slPct() == null) {
                 pushHoldThrottled(chatId, sym, st, "tp_sl_pct_invalid", time, holdMs);
                 return;
@@ -3030,7 +3028,7 @@ public class WindowScalpingStrategyV4 implements
         if (qty.signum() <= 0 || entryPrice.signum() <= 0) return false;
 
         BigDecimal notional = qty.multiply(entryPrice);
-        return notional.compareTo(restoreMinNotional()) < 0;
+        return notional.compareTo(MIN_RESTORABLE_NOTIONAL) < 0;
     }
 
     private void clearLocalPosition(LocalState st) {
@@ -3133,7 +3131,7 @@ public class WindowScalpingStrategyV4 implements
                     network,
                     fmtBd(qty),
                     fmtBd(notional),
-                    fmtBd(restoreMinNotional()));
+                    fmtBd(MIN_RESTORABLE_NOTIONAL));
             return;
         }
 
@@ -3145,7 +3143,7 @@ public class WindowScalpingStrategyV4 implements
                 fmtBd(qty),
                 fmtBd(entryPrice),
                 fmtBd(notional),
-                fmtBd(restoreMinNotional()));
+                fmtBd(MIN_RESTORABLE_NOTIONAL));
     }
 
     private void maybeRestorePositionFromStore(Long chatId, LocalState st, String symbol, Instant now) {
@@ -3414,7 +3412,7 @@ public class WindowScalpingStrategyV4 implements
         }
 
         BigDecimal notional = entryPrice.multiply(safeAlignedQty).setScale(8, RoundingMode.HALF_UP).stripTrailingZeros();
-        if (notional.compareTo(restoreMinNotional()) < 0) {
+        if (notional.compareTo(MIN_RESTORABLE_NOTIONAL) < 0) {
             logDustRestoreSkipThrottled(chatId, st, symbol, exchange, network, safeAlignedQty, entryPrice, notional, "store", now);
             clearLocalPosition(st);
             try {
@@ -3601,7 +3599,7 @@ public class WindowScalpingStrategyV4 implements
             return false;
         }
 
-        if (totalCost.compareTo(restoreMinNotional()) < 0) {
+        if (totalCost.compareTo(MIN_RESTORABLE_NOTIONAL) < 0) {
             logDustRestoreSkipThrottled(
                     chatId,
                     st,
@@ -3795,6 +3793,87 @@ public class WindowScalpingStrategyV4 implements
                                        double rangePct,
                                        double score,
                                        Prediction pred) {
+        return resolveEntryRisk(null, st, rangePct, score, pred);
+    }
+
+    private double resolveRequestedTpFloorPct(Long chatId, LocalState st) {
+        if (!tradeEntryRejectWhenRequestedTpBelowRoundTripFee) return 0.0;
+        if (chatId == null || st == null) return 0.0;
+
+        TradeExecutionServiceImpl execImpl = tradeExecImpl();
+        if (execImpl == null) return 0.0;
+
+        String ex = normalizeExchangeOrNull(st.exchange);
+        NetworkType net = st.network;
+        if (ex == null || net == null) return 0.0;
+
+        try {
+            BigDecimal roundTripFeePct = execImpl.estimateRoundTripFeePct(chatId, ex, net);
+            double feePct = (roundTripFeePct != null && roundTripFeePct.signum() > 0)
+                    ? roundTripFeePct.doubleValue()
+                    : 0.0;
+            return Math.max(0.0, feePct + Math.max(0.0, tradeEntryExtraFeeBufferPct));
+        } catch (Exception ignored) {
+            return Math.max(0.0, tradeEntryExtraFeeBufferPct);
+        }
+    }
+
+    private boolean isDynamicTpSlActive(WindowScalpingStrategySettings cfg) {
+        return dynamicTpEnabled && isAutoTpSlEnabled(cfg);
+    }
+
+    private boolean isAutoTpSlEnabled(WindowScalpingStrategySettings cfg) {
+        if (cfg == null) return true;
+
+        for (String methodName : new String[]{"getAutoTpSl", "isAutoTpSl", "getAutoTpSlEnabled", "isAutoTpSlEnabled"}) {
+            try {
+                java.lang.reflect.Method m = cfg.getClass().getMethod(methodName);
+                Object value = m.invoke(cfg);
+                if (value instanceof Boolean b) {
+                    return b == null || b;
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        return true;
+    }
+
+    private String startupTpLabel(Long chatId, LocalState st, WindowScalpingStrategySettings cfg) {
+        if (cfg == null) return "null";
+        BigDecimal staticTp = positiveOrNull(cfg.getTakeProfitPct());
+        if (!isDynamicTpSlActive(cfg)) {
+            return staticTp != null ? fmtBd(staticTp) + "%" : "null";
+        }
+
+        double tpCap = clampPct(
+                staticTp != null ? staticTp.doubleValue() : dynamicTpMaxPct,
+                dynamicTpMinPct,
+                dynamicTpMaxPct
+        );
+        double tpFloor = Math.max(dynamicTpMinPct, Math.max(minProfitAfterFeesPct, resolveRequestedTpFloorPct(chatId, st)));
+        return "dynamic[floor>=" + fmt(tpFloor) + "%, cap=" + fmt(tpCap) + "%]";
+    }
+
+    private String startupSlLabel(WindowScalpingStrategySettings cfg) {
+        if (cfg == null) return "null";
+        BigDecimal staticSl = positiveOrNull(cfg.getStopLossPct());
+        if (!isDynamicTpSlActive(cfg)) {
+            return staticSl != null ? fmtBd(staticSl) + "%" : "null";
+        }
+
+        double slCap = clampPct(
+                staticSl != null ? staticSl.doubleValue() : dynamicSlMaxPct,
+                dynamicSlMinPct,
+                dynamicSlMaxPct
+        );
+        return "dynamic[min=" + fmt(dynamicSlMinPct) + "%, cap=" + fmt(slCap) + "%]";
+    }
+
+    private EntryRisk resolveEntryRisk(Long chatId,
+                                       LocalState st,
+                                       double rangePct,
+                                       double score,
+                                       Prediction pred) {
         if (st == null || st.cfg == null) return null;
 
         WindowScalpingStrategySettings cfg = st.cfg;
@@ -3802,7 +3881,7 @@ public class WindowScalpingStrategyV4 implements
         BigDecimal staticTp = positiveOrNull(cfg.getTakeProfitPct());
         BigDecimal staticSl = positiveOrNull(cfg.getStopLossPct());
 
-        if (!dynamicTpEnabled) {
+        if (!isDynamicTpSlActive(cfg)) {
             if (staticTp == null || staticSl == null) return null;
             return new EntryRisk(staticTp, staticSl, "static");
         }
@@ -3827,7 +3906,7 @@ public class WindowScalpingStrategyV4 implements
         );
 
         double dynTp = safeRangePct * dynamicTpFromRangeFactor;
-        double minTp = Math.max(dynamicTpMinPct, minProfitAfterFeesPct);
+        double minTp = Math.max(dynamicTpMinPct, Math.max(minProfitAfterFeesPct, resolveRequestedTpFloorPct(chatId, st)));
         minTp = Math.max(minTp, dynSl * dynamicMinRiskReward);
         minTp = Math.max(minTp, safeRangePct * 0.35);
 

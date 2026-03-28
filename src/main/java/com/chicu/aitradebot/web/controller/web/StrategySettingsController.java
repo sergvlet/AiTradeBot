@@ -528,28 +528,49 @@ public class StrategySettingsController {
             }
 
             case "risk" -> {
-                StrategySettings.CapitalMode mode = parseCapitalModeOrDefault(
-                        params.get("capitalMode"),
-                        (s.getCapitalMode() != null ? s.getCapitalMode() : StrategySettings.CapitalMode.ALL)
-                );
+                String currentAccountAsset = normalizeAsset(s.getAccountAsset());
+                String accountAsset = normalizeAsset(params.get("accountAsset"));
+                if (accountAsset != null) {
+                    s.setAccountAsset(accountAsset);
+                } else {
+                    accountAsset = currentAccountAsset;
+                }
 
-                BigDecimal value = parseBigDecimalOrNull(params.get("capitalValue"));
+                StrategySettings.CapitalMode currentMode =
+                        (s.getCapitalMode() != null ? s.getCapitalMode() : StrategySettings.CapitalMode.ALL);
+                BigDecimal currentValue = s.getCapitalValue();
+
+                boolean hasModeParam = params.containsKey("capitalMode");
+                boolean hasValueParam = params.containsKey("capitalValue");
+
+                StrategySettings.CapitalMode mode = currentMode;
+                if (hasModeParam) {
+                    mode = parseCapitalModeOrDefault(params.get("capitalMode"), currentMode);
+                }
+
+                BigDecimal value = currentValue;
 
                 if (mode == StrategySettings.CapitalMode.ALL) {
                     value = null;
-                } else if (mode == StrategySettings.CapitalMode.FIX) {
-                    value = validateMoneyOrNull(value);
-                    // ✅ режим НЕ откатываем в ALL, даже если значение пока пустое
-                } else if (mode == StrategySettings.CapitalMode.PCT) {
-                    value = validatePctOrNull(value);
-                    // ✅ режим НЕ откатываем в ALL, даже если значение пока пустое
+                } else if (hasValueParam) {
+                    BigDecimal parsed = parseBigDecimalOrNull(params.get("capitalValue"));
+                    if (mode == StrategySettings.CapitalMode.FIX) {
+                        value = validateMoneyOrNull(parsed);
+                    } else if (mode == StrategySettings.CapitalMode.PCT) {
+                        value = validatePctOrNull(parsed);
+                    }
                 }
 
                 s.setCapitalMode(mode);
                 s.setCapitalValue(value);
 
-                log.info("🛡️ [RISK SAVE] chatId={} type={} mode={} value={}",
-                        chatId, strategyType, mode, value);
+                log.info("🛡️ [RISK SAVE] chatId={} type={} accountAsset={} rawMode={} rawValue={} prevMode={} prevValue={} nextMode={} nextValue={}",
+                        chatId, strategyType,
+                        accountAsset,
+                        params.get("capitalMode"),
+                        params.get("capitalValue"),
+                        currentMode, currentValue,
+                        mode, value);
 
                 return saveStrategySettings(chatId, strategyType, s);
             }
@@ -1399,3 +1420,4 @@ public class StrategySettingsController {
         }
     }
 }
+
