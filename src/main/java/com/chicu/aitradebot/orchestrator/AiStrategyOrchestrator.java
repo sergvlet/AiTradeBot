@@ -160,6 +160,9 @@ public class AiStrategyOrchestrator {
     /** Дебаунс ручных триггеров тюнинга. */
     private final ConcurrentMap<RunKey, Long> lastTuneTriggerAtMs = new ConcurrentHashMap<>();
 
+    /** Дебаунс ручных триггеров обучения. */
+    private final ConcurrentMap<RunKey, Long> lastTrainTriggerAtMs = new ConcurrentHashMap<>();
+
     /** Антиспам логов degraded. */
     private final ConcurrentMap<RunKey, Long> lastDegradedLogAtMs = new ConcurrentHashMap<>();
 
@@ -722,6 +725,7 @@ public class AiStrategyOrchestrator {
             running.put(key, desired);
             ignoreCounters.remove(key);
             lastTuneTriggerAtMs.remove(key);
+            lastTrainTriggerAtMs.remove(key);
             lastDegradedLogAtMs.remove(key);
 
             try {
@@ -885,6 +889,7 @@ public class AiStrategyOrchestrator {
             running.put(key, newBinding);
             ignoreCounters.remove(key);
             lastTuneTriggerAtMs.remove(key);
+            lastTrainTriggerAtMs.remove(key);
             lastDegradedLogAtMs.remove(key);
 
             try {
@@ -985,6 +990,7 @@ public class AiStrategyOrchestrator {
             RunBinding removed = running.remove(key);
             ignoreCounters.remove(key);
             lastTuneTriggerAtMs.remove(key);
+            lastTrainTriggerAtMs.remove(key);
             runtimePolicyCache.remove(key);
             lastDegradedLogAtMs.remove(key);
 
@@ -1175,6 +1181,35 @@ public class AiStrategyOrchestrator {
                     reason != null ? reason : "orch-trigger", Duration.ofMillis(d));
         } catch (Exception e) {
             log.warn("🧠 [ORCH] triggerTuneDebounced failed: {}", e.getMessage());
+        }
+    }
+
+    public void triggerTrainDebounced(Long chatId,
+                                      StrategyType type,
+                                      String exchange,
+                                      NetworkType network,
+                                      String reason,
+                                      Duration debounce) {
+
+        MlAutoTuneRuntime rt = ml();
+        if (rt == null) return;
+
+        if (chatId == null || type == null || exchange == null || network == null) return;
+
+        RunKey key = new RunKey(chatId, type);
+        long now = System.currentTimeMillis();
+        long d = Math.max(10_000, debounce != null ? debounce.toMillis() : 60_000);
+
+        Long last = lastTrainTriggerAtMs.get(key);
+        if (last != null && (now - last) < d) return;
+
+        lastTrainTriggerAtMs.put(key, now);
+
+        try {
+            rt.triggerTrainDebounced(chatId, type, exchange, network,
+                    reason != null ? reason : "orch-train-trigger", Duration.ofMillis(d));
+        } catch (Exception e) {
+            log.warn("🧠 [ORCH] triggerTrainDebounced failed: {}", e.getMessage());
         }
     }
 
@@ -1710,3 +1745,4 @@ public class AiStrategyOrchestrator {
         return s.isEmpty() ? null : s;
     }
 }
+

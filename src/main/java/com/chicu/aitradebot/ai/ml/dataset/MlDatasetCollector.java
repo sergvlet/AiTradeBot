@@ -28,7 +28,10 @@ import java.util.concurrent.atomic.AtomicLong;
 @RequiredArgsConstructor
 public class MlDatasetCollector {
 
-    private final MlSampleRepository repo;
+    /**
+     * Сохраняем только через ingest-service, чтобы не обходить auto-train.
+     */
+    private final MlSampleIngestService mlSampleIngestService;
     private final MlFeatureBuilder featureBuilder;
     private final ObjectMapper objectMapper;
 
@@ -54,17 +57,44 @@ public class MlDatasetCollector {
             if (type == null) return;
             if (symbol == null || symbol.isBlank()) return;
 
-            // ✅ label пока простой (потом заменим на TP/SL labeler по H свечам)
+            /**
+             * Для WINDOW_SCALPING sample уже сохраняется в самой стратегии
+             * через persistClosedTradeSample(...) с enrichTrainingMetaWithStrategyParams(...)
+             * и saveAndMaybeTrain(...). Здесь пропускаем, чтобы не делать дубли.
+             */
+            if (type == StrategyType.WINDOW_SCALPING) {
+                if (log.isDebugEnabled()) {
+                    log.debug("🧠 ML dataset: skip generic collector for WINDOW_SCALPING chatId={} sym={} tf={}",
+                            chatId, symbol, tf);
+                }
+                return;
+            }
+
+            if (!e.isTrainable()) {
+                if (log.isDebugEnabled()) {
+                    log.debug("🧠 ML dataset: skip non-trainable close chatId={} type={} sym={} tf={} closureMode={} ignored={} restored={}",
+                            chatId, type, symbol, tf, e.closureMode(), e.ignoredForTraining(), e.restoredPosition());
+                }
+                return;
+            }
+
+            if (Boolean.TRUE.equals(e.restoredPosition())) {
+                if (log.isDebugEnabled()) {
+                    log.debug("🧠 ML dataset: skip restored close chatId={} type={} sym={} tf={} closureMode={}",
+                            chatId, type, symbol, tf, e.closureMode());
+                }
+                return;
+            }
+
+            // Пока простой label
             String label = (e.pnlPct() != null && e.pnlPct().signum() >= 0) ? "1" : "0";
 
-            // ✅ ts: лучше брать время сделки/закрытия если есть в event
             Instant ts = extractInstant(e,
                     "ts", "timestamp", "tradeTs", "closeTs", "closedAt", "executedAt",
                     "getTs", "getTimestamp", "getTradeTs", "getCloseTs", "getClosedAt", "getExecutedAt"
             );
             if (ts == null) ts = Instant.now();
 
-            // ✅ exchange/network должны приходить из TradeClosedEvent
             String exchange = extractString(e,
                     "exchange", "exchangeName", "ex", "exchangeId",
                     "getExchange", "getExchangeName", "getEx", "getExchangeId"
@@ -76,19 +106,13 @@ public class MlDatasetCollector {
                     "getNetwork", "getNetworkType", "getNet", "getNetType"
             );
 
-            // =====================================================
-            // extra/meta: собираем полезные поля по сделке
-            // =====================================================
-
             Map<String, Object> extra = new HashMap<>();
             if (e.pnlPct() != null) extra.put("pnlPct", e.pnlPct());
             if (e.exitReason() != null) extra.put("exitReason", e.exitReason());
 
-            // попробуем вытащить доп. поля, если есть
             Object entryPrice = readAny(e, "entryPrice", "getEntryPrice");
             Object exitPrice = readAny(e, "exitPrice", "getExitPrice", "closePrice", "getClosePrice");
             Object qty = readAny(e, "qty", "quantity", "getQty", "getQuantity");
-
             Object pnlUsd = readAny(e, "pnlUsd", "pnl", "profitUsd", "getPnlUsd", "getPnl", "getProfitUsd");
 
             if (entryPrice != null) extra.put("entryPrice", entryPrice);
@@ -96,7 +120,6 @@ public class MlDatasetCollector {
             if (qty != null) extra.put("qty", qty);
             if (pnlUsd != null) extra.put("pnlUsd", pnlUsd);
 
-            // tp/sl hit (если есть флаги — берём их; иначе пытаемся вывести из exitReason)
             Boolean tpHit = extractBool(e,
                     "tpHit", "takeProfitHit", "isTakeProfitHit", "getTakeProfitHit", "isTpHit", "getTpHit"
             );
@@ -114,16 +137,12 @@ public class MlDatasetCollector {
             if (tpHit != null) extra.put("tpHit", tpHit);
             if (slHit != null) extra.put("slHit", slHit);
 
-            // =====================================================
-            // Контекст для featureBuilder
-            // =====================================================
-
             MlFeatureContext ctx = MlFeatureContext.builder()
                     .chatId(chatId)
                     .strategyType(type)
                     .symbol(symbol)
                     .timeframe(tf)
-                    .action(SignalType.BUY.name()) // обучаем "вход" -> win/lose
+                    .action(SignalType.BUY.name())
                     .extra(extra)
                     .build();
 
@@ -136,32 +155,42 @@ public class MlDatasetCollector {
                 return;
             }
 
-            // ✅ FeatureSpec: сохраняем только фичи стратегии и в стабильном порядке
             List<String> spec = resolveFeatureSpec(featureBuilder, ctx, type);
+            LinkedHashSet<String> schemaKeys = new LinkedHashSet<>();
             ObjectNode featuresNode = objectMapper.createObjectNode();
 
             if (spec != null && !spec.isEmpty()) {
-                for (String k : spec) {
-                    Object v = rawFeatures.get(k);
-                    putJsonValue(featuresNode, k, v);
+                for (String rawKey : spec) {
+                    String key = normalizeKey(rawKey);
+                    if (key == null) continue;
+
+                    putJsonValue(featuresNode, key, rawFeatures.get(key));
+                    schemaKeys.add(key);
                 }
             } else {
-                // fallback: стабильная сортировка ключей (чтобы не ломать обучение)
                 TreeMap<String, Object> sorted = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
                 sorted.putAll(rawFeatures);
+
                 for (Map.Entry<String, Object> en : sorted.entrySet()) {
-                    putJsonValue(featuresNode, en.getKey(), en.getValue());
+                    String key = normalizeKey(en.getKey());
+                    if (key == null) continue;
+
+                    putJsonValue(featuresNode, key, en.getValue());
+                    schemaKeys.add(key);
                 }
+            }
+
+            if (schemaKeys.isEmpty()) {
+                if (log.isDebugEnabled()) {
+                    log.debug("🧠 ML dataset: schemaKeys пустой, пропуск. chatId={} type={} sym={}",
+                            chatId, type, symbol);
+                }
+                return;
             }
 
             JsonNode featuresJson = featuresNode;
 
-            // =====================================================
-            // metaJson (обязательные поля)
-            // =====================================================
-
             ObjectNode meta = objectMapper.createObjectNode();
-
             meta.put("event", "TRADE_CLOSED");
             meta.put("trainAction", SignalType.BUY.name());
             meta.put("label", label);
@@ -179,22 +208,27 @@ public class MlDatasetCollector {
             if (pnlUsd != null) putMetaAny(meta, "pnlUsd", pnlUsd);
 
             if (exitReasonStr != null && !exitReasonStr.isBlank()) meta.put("exitReason", exitReasonStr);
-
-            // ✅ новые поля по чек-листу
             if (entryPrice != null) putMetaAny(meta, "entryPrice", entryPrice);
             if (exitPrice != null) putMetaAny(meta, "exitPrice", exitPrice);
             if (qty != null) putMetaAny(meta, "qty", qty);
 
             if (tpHit != null) meta.put("tpHit", tpHit);
             if (slHit != null) meta.put("slHit", slHit);
+            if (e.closureMode() != null) meta.put("closureMode", e.closureMode());
+            if (e.requestedQty() != null) meta.put("requestedQty", e.requestedQty().doubleValue());
+            if (e.executedQty() != null) meta.put("executedQty", e.executedQty().doubleValue());
+            if (e.dustRemainderQty() != null) meta.put("dustRemainderQty", e.dustRemainderQty().doubleValue());
+            if (e.dustRemainderNotional() != null) meta.put("dustRemainderNotional", e.dustRemainderNotional().doubleValue());
+            if (e.restoredPosition() != null) meta.put("restoredPosition", e.restoredPosition());
+            if (e.ignoredForTraining() != null) meta.put("ignoredForTraining", e.ignoredForTraining());
 
-            if (spec != null && !spec.isEmpty()) {
-                ArrayNode a = meta.putArray("featureSpec");
-                for (String k : spec) a.add(k);
+            ArrayNode a = meta.putArray("featureSpec");
+            for (String key : schemaKeys) {
+                a.add(key);
             }
 
             meta.put("featureCount", featuresNode.size());
-            meta.put("schemaHash", sha256Hex(featuresNode.toString()));
+            meta.put("schemaHash", schemaHashForKeys(schemaKeys));
 
             MlSampleEntity sample = MlSampleEntity.builder()
                     .chatId(chatId)
@@ -212,14 +246,14 @@ public class MlDatasetCollector {
                     .createdAt(Instant.now())
                     .build();
 
-            repo.save(sample);
+            mlSampleIngestService.saveAndMaybeTrain(sample);
 
             long c = savedCount.incrementAndGet();
             maybeInfoLog(chatId, type, exchange, network, symbol, tf, c);
 
         } catch (Exception ex) {
             log.warn("🧠 ML sample save failed: chatId={} type={} sym={} tf={} err={}",
-                    chatId, type, symbol, tf, ex.toString());
+                    chatId, type, symbol, tf, ex.toString(), ex);
         }
     }
 
@@ -234,8 +268,8 @@ public class MlDatasetCollector {
         long now = System.currentTimeMillis();
         long last = lastInfoLogMs.get();
 
-        boolean timeOk = (now - last) >= 60_000L; // раз в минуту
-        boolean countOk = (saved % 50L) == 0L;    // или каждые 50 записей
+        boolean timeOk = (now - last) >= 60_000L;
+        boolean countOk = (saved % 50L) == 0L;
 
         if (timeOk || countOk) {
             if (lastInfoLogMs.compareAndSet(last, now)) {
@@ -247,10 +281,6 @@ public class MlDatasetCollector {
             }
         }
     }
-
-    // =====================================================
-    // FeatureSpec resolve (reflection-safe)
-    // =====================================================
 
     @SuppressWarnings("unchecked")
     private List<String> resolveFeatureSpec(MlFeatureBuilder builder, MlFeatureContext ctx, StrategyType type) {
@@ -272,9 +302,8 @@ public class MlDatasetCollector {
         if (v instanceof List<?> list) {
             List<String> out = new ArrayList<>();
             for (Object o : list) {
-                if (o == null) continue;
-                String s = String.valueOf(o).trim();
-                if (!s.isEmpty()) out.add(s);
+                String k = normalizeKey(o != null ? String.valueOf(o) : null);
+                if (k != null) out.add(k);
             }
             return out.isEmpty() ? null : out;
         }
@@ -282,9 +311,8 @@ public class MlDatasetCollector {
         if (v instanceof String[] arr) {
             List<String> out = new ArrayList<>();
             for (String s : arr) {
-                if (s == null) continue;
-                String x = s.trim();
-                if (!x.isEmpty()) out.add(x);
+                String k = normalizeKey(s);
+                if (k != null) out.add(k);
             }
             return out.isEmpty() ? null : out;
         }
@@ -292,9 +320,8 @@ public class MlDatasetCollector {
         if (v instanceof Set<?> set) {
             List<String> out = new ArrayList<>();
             for (Object o : set) {
-                if (o == null) continue;
-                String s = String.valueOf(o).trim();
-                if (!s.isEmpty()) out.add(s);
+                String k = normalizeKey(o != null ? String.valueOf(o) : null);
+                if (k != null) out.add(k);
             }
             out.sort(String.CASE_INSENSITIVE_ORDER);
             return out.isEmpty() ? null : out;
@@ -311,10 +338,6 @@ public class MlDatasetCollector {
             return null;
         }
     }
-
-    // =====================================================
-    // JSON helpers
-    // =====================================================
 
     private void putJsonValue(ObjectNode node, String key, Object v) {
         if (node == null || key == null) return;
@@ -358,6 +381,15 @@ public class MlDatasetCollector {
         }
     }
 
+    private static String schemaHashForKeys(Collection<String> keys) {
+        if (keys == null || keys.isEmpty()) {
+            return "sha256_empty_schema";
+        }
+
+        String joined = String.join("|", keys);
+        return sha256Hex(joined);
+    }
+
     private static String sha256Hex(String s) {
         try {
             MessageDigest md = MessageDigest.getInstance("SHA-256");
@@ -370,23 +402,17 @@ public class MlDatasetCollector {
         }
     }
 
-    // =====================================================
-    // Reflection helpers (event fields)
-    // =====================================================
-
     private static Object readAny(Object target, String... names) {
         if (target == null || names == null) return null;
 
         for (String n : names) {
             if (n == null || n.isBlank()) continue;
 
-            // method
             try {
                 Method m = target.getClass().getMethod(n);
                 if (m.getParameterCount() == 0) return m.invoke(target);
             } catch (Exception ignored) {}
 
-            // field
             try {
                 Field f = target.getClass().getDeclaredField(n);
                 f.setAccessible(true);
@@ -458,10 +484,6 @@ public class MlDatasetCollector {
         return null;
     }
 
-    // =====================================================
-    // Small utils
-    // =====================================================
-
     private static String safeSym(String s) {
         if (s == null) return null;
         String x = s.trim().toUpperCase(Locale.ROOT);
@@ -477,6 +499,12 @@ public class MlDatasetCollector {
     private static String normUpper(String s) {
         if (s == null) return null;
         String x = s.trim().toUpperCase(Locale.ROOT);
+        return x.isEmpty() ? null : x;
+    }
+
+    private static String normalizeKey(String s) {
+        if (s == null) return null;
+        String x = s.trim();
         return x.isEmpty() ? null : x;
     }
 

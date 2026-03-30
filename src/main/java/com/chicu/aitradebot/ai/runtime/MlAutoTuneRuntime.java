@@ -83,6 +83,16 @@ public class MlAutoTuneRuntime {
     @Value("${ai.autotune.reactiveReasonPrefixes:hold:,low_confidence:}")
     private String reactiveReasonPrefixes;
 
+    /**
+     * Разрешить реактивный тюнинг при голодании по сделкам даже когда autoTuneEnabled=false,
+     * если режим не MANUAL и фаза не заблокирована.
+     */
+    @Value("${ai.autotune.allowStarvationBypassAutoTuneDisabled:true}")
+    private boolean allowStarvationBypassAutoTuneDisabled;
+
+    @Value("${ai.autotune.starvationReasonPrefixes:starvation:,no_trade:}")
+    private String starvationReasonPrefixes;
+
     // =====================================================
     // CONFIG (TRAIN)
     // =====================================================
@@ -465,7 +475,8 @@ public class MlAutoTuneRuntime {
         if (!env.ok) return;
 
         StrategySettings ss = loadSettingsSoft(chatId, type);
-        if (!tuningGate(ss).allowed) return;
+        boolean starvationBypass = isStarvationReason(reason);
+        if (!tuningGate(ss, starvationBypass).allowed) return;
 
         String k = key(chatId, type, env.exchange, env.network);
 
@@ -503,6 +514,10 @@ public class MlAutoTuneRuntime {
     private record Gate(boolean allowed, AdvancedControlMode mode, boolean autoTuneEnabled, String phase, String reason) {}
 
     private Gate tuningGate(StrategySettings ss) {
+        return tuningGate(ss, false);
+    }
+
+    private Gate tuningGate(StrategySettings ss, boolean starvationBypassAutoTuneDisabled) {
         if (ss == null) {
             return new Gate(false, AdvancedControlMode.MANUAL, false, null, "no_settings");
         }
@@ -512,19 +527,22 @@ public class MlAutoTuneRuntime {
                 : AdvancedControlMode.MANUAL;
 
         String phase = normalizeUpperNullable(ss.getRunPhase());
-
         boolean autoTuneEnabled = ss.isAutoTuneEnabled();
 
         if (mode == AdvancedControlMode.MANUAL) {
             return new Gate(false, mode, autoTuneEnabled, phase, "manual_mode");
         }
 
-        if (!autoTuneEnabled) {
+        if (phase != null && parsedSkipPhases().contains(phase)) {
+            return new Gate(false, mode, autoTuneEnabled, phase, "skipPhase:" + phase);
+        }
+
+        if (!autoTuneEnabled && !starvationBypassAutoTuneDisabled) {
             return new Gate(false, mode, false, phase, "autoTuneDisabled");
         }
 
-        if (phase != null && parsedSkipPhases().contains(phase)) {
-            return new Gate(false, mode, true, phase, "skipPhase:" + phase);
+        if (!autoTuneEnabled) {
+            return new Gate(true, mode, false, phase, "starvation_bypass_autoTuneDisabled");
         }
 
         return new Gate(true, mode, true, phase, "ok");
@@ -571,7 +589,8 @@ public class MlAutoTuneRuntime {
 
         try {
             StrategySettings ss = loadSettingsSoft(chatId, type);
-            Gate gate = tuningGate(ss);
+            boolean starvationBypass = isStarvationReason(reason);
+            Gate gate = tuningGate(ss, starvationBypass);
             if (!gate.allowed) {
                 if (log.isDebugEnabled()) {
                     log.debug("🧠 AUTO-TUNE skip chatId={} type={} ex={} net={} gate={}",
@@ -667,6 +686,25 @@ public class MlAutoTuneRuntime {
             return Set.of("hold:", "low_confidence:");
         }
         return out;
+    }
+
+    private boolean isStarvationReason(String reason) {
+        if (!allowStarvationBypassAutoTuneDisabled) return false;
+        if (reason == null || reason.isBlank()) return false;
+
+        String normalized = reason.trim().toLowerCase(Locale.ROOT);
+        String raw = starvationReasonPrefixes == null ? "" : starvationReasonPrefixes.trim();
+        if (raw.isEmpty()) {
+            return normalized.startsWith("starvation:") || normalized.startsWith("no_trade:");
+        }
+
+        for (String part : raw.split(",")) {
+            String prefix = part == null ? "" : part.trim().toLowerCase(Locale.ROOT);
+            if (!prefix.isEmpty() && normalized.startsWith(prefix)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // =====================================================
@@ -828,3 +866,4 @@ public class MlAutoTuneRuntime {
         return s;
     }
 }
+

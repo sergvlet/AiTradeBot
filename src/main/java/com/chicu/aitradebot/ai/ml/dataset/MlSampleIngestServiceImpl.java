@@ -26,18 +26,20 @@ public class MlSampleIngestServiceImpl implements MlSampleIngestService {
     private final MlTrainProperties trainProperties;
 
     /**
-     * Защита от параллельного train по одному и тому же контексту.
+     * Защита от параллельного train по одному и тому же КОНТЕКСТУ модели.
+     * Важно: ключ без chatId, потому что модель cohort-уровня и должна быть общей
+     * для одного контекста (strategy + exchange + network + symbol + timeframe).
      */
     private final Map<String, AtomicBoolean> trainingNow = new ConcurrentHashMap<>();
 
     /**
-     * Локальный soft-cooldown, чтобы не дёргать train слишком часто.
+     * Локальный soft-cooldown по контексту модели.
      */
     private final Map<String, Instant> lastAttemptAt = new ConcurrentHashMap<>();
 
     /**
-     * Сколько trainable samples было при последней успешной/осмысленной попытке.
-     * Нужен, чтобы запускать retrain по приросту данных, а не только на точных кратных.
+     * Сколько trainable samples было при последней осмысленной попытке retrain
+     * по конкретному контексту модели.
      */
     private final Map<String, Long> lastTriggeredTrainableCount = new ConcurrentHashMap<>();
 
@@ -64,9 +66,11 @@ public class MlSampleIngestServiceImpl implements MlSampleIngestService {
         try {
             maybeTriggerTraining(saved);
         } catch (Exception e) {
-            log.warn("🧠 SAMPLE save ok, but maybeTrain failed: chatId={} type={} symbol={} tf={} err={}",
+            log.warn("🧠 SAMPLE save ok, but maybeTrain failed: chatId={} type={} ex={} net={} symbol={} tf={} err={}",
                     saved.getChatId(),
                     saved.getStrategyType(),
+                    saved.getExchange(),
+                    saved.getNetwork(),
                     saved.getSymbol(),
                     saved.getTimeframe(),
                     e.toString(),
@@ -82,6 +86,8 @@ public class MlSampleIngestServiceImpl implements MlSampleIngestService {
 
         Long chatId = sample.getChatId();
         StrategyType type = sample.getStrategyType();
+        String exchange = normUpper(sample.getExchange());
+        String network = normUpper(sample.getNetwork());
         String symbol = normUpper(sample.getSymbol());
         String timeframe = normLower(sample.getTimeframe());
         String label = normTrim(sample.getLabel());
@@ -89,14 +95,14 @@ public class MlSampleIngestServiceImpl implements MlSampleIngestService {
         if (chatId == null || chatId <= 0 || type == null) return;
         if (symbol == null || timeframe == null) return;
 
-        // нет label = нет trainable sample
+        // Нет label -> нет trainable sample
         if (label == null) {
             return;
         }
 
-        String key = buildKey(chatId, type, symbol, timeframe);
+        String contextKey = buildContextKey(type, exchange, network, symbol, timeframe);
 
-        AtomicBoolean lock = trainingNow.computeIfAbsent(key, k -> new AtomicBoolean(false));
+        AtomicBoolean lock = trainingNow.computeIfAbsent(contextKey, k -> new AtomicBoolean(false));
         if (lock.get()) {
             return;
         }
@@ -104,7 +110,7 @@ public class MlSampleIngestServiceImpl implements MlSampleIngestService {
         Instant now = Instant.now();
 
         long cooldownMinutes = Math.max(1, trainProperties.getCooldownMinutes());
-        Instant lastAttempt = lastAttemptAt.get(key);
+        Instant lastAttempt = lastAttemptAt.get(contextKey);
         if (lastAttempt != null && lastAttempt.plus(cooldownMinutes, ChronoUnit.MINUTES).isAfter(now)) {
             return;
         }
@@ -113,29 +119,36 @@ public class MlSampleIngestServiceImpl implements MlSampleIngestService {
 
         List<MlSampleEntity> trainable;
         try {
-            trainable = sampleRepository.findForTraining(chatId, type, symbol, timeframe, from, now);
+            trainable = sampleRepository.findForTrainingByContext(
+                    type,
+                    symbol,
+                    timeframe,
+                    exchange,
+                    network,
+                    from
+            );
         } catch (Exception e) {
-            log.warn("🧠 SAMPLE findForTraining failed chatId={} type={} symbol={} tf={} from={} to={} err={}",
-                    chatId, type, symbol, timeframe, from, now, e.toString(), e);
+            log.warn("🧠 SAMPLE findForTrainingByContext failed chatId={} type={} ex={} net={} symbol={} tf={} from={} err={}",
+                    chatId, type, exchange, network, symbol, timeframe, from, e.toString(), e);
             return;
         }
 
         long trainableCount = trainable != null ? trainable.size() : 0L;
         int minSamples = Math.max(10, trainProperties.getMinSamples());
-        long prevTriggeredCount = lastTriggeredTrainableCount.getOrDefault(key, 0L);
+        long prevTriggeredCount = lastTriggeredTrainableCount.getOrDefault(contextKey, 0L);
         long retrainStep = resolveRetrainStep(minSamples);
 
         if (trainableCount < minSamples) {
             if (trainableCount == 1 || trainableCount % 5 == 0) {
-                log.info("🧠 TRAIN WAIT chatId={} type={} symbol={} tf={} trainableSamples={}/{}",
-                        chatId, type, symbol, timeframe, trainableCount, minSamples);
+                log.info("🧠 TRAIN WAIT chatId={} type={} ex={} net={} symbol={} tf={} trainableSamples={}/{}",
+                        chatId, type, exchange, network, symbol, timeframe, trainableCount, minSamples);
             }
             return;
         }
 
         if (!hasAtLeastTwoClasses(trainable)) {
-            log.info("🧠 TRAIN WAIT (need_2_classes) chatId={} type={} symbol={} tf={} trainableSamples={}",
-                    chatId, type, symbol, timeframe, trainableCount);
+            log.info("🧠 TRAIN WAIT (need_2_classes) chatId={} type={} ex={} net={} symbol={} tf={} trainableSamples={}",
+                    chatId, type, exchange, network, symbol, timeframe, trainableCount);
             return;
         }
 
@@ -150,25 +163,31 @@ public class MlSampleIngestServiceImpl implements MlSampleIngestService {
             return;
         }
 
-        lastAttemptAt.put(key, now);
+        lastAttemptAt.put(contextKey, now);
 
         try {
-            log.info("🧠 AUTO-TRAIN TRIGGER chatId={} type={} symbol={} tf={} trainableSamples={} minSamples={} prevTriggered={} retrainStep={}",
-                    chatId, type, symbol, timeframe, trainableCount, minSamples, prevTriggeredCount, retrainStep);
+            log.info("🧠 AUTO-TRAIN TRIGGER chatId={} type={} ex={} net={} symbol={} tf={} trainableSamples={} minSamples={} prevTriggered={} retrainStep={}",
+                    chatId, type, exchange, network, symbol, timeframe, trainableCount, minSamples, prevTriggeredCount, retrainStep);
 
-            MlTrainingResult result = mlTrainingService.trainNow(chatId, type, firstTrain ? "bootstrap_after_samples" : "auto_after_samples");
+            MlTrainingResult result = mlTrainingService.trainNow(
+                    chatId,
+                    type,
+                    firstTrain ? "bootstrap_after_samples" : "auto_after_samples"
+            );
 
             if (result == null) {
-                log.warn("🧠 AUTO-TRAIN NULL chatId={} type={} symbol={} tf={}",
-                        chatId, type, symbol, timeframe);
+                log.warn("🧠 AUTO-TRAIN NULL chatId={} type={} ex={} net={} symbol={} tf={}",
+                        chatId, type, exchange, network, symbol, timeframe);
                 return;
             }
 
             if (result.ok()) {
-                lastTriggeredTrainableCount.put(key, trainableCount);
-                log.info("🧠 AUTO-TRAIN DONE chatId={} type={} symbol={} tf={} applied={} modelKey={} version={} schemaHash={}",
+                lastTriggeredTrainableCount.put(contextKey, trainableCount);
+                log.info("🧠 AUTO-TRAIN DONE chatId={} type={} ex={} net={} symbol={} tf={} applied={} modelKey={} version={} schemaHash={}",
                         chatId,
                         type,
+                        exchange,
+                        network,
                         symbol,
                         timeframe,
                         result.applied(),
@@ -176,17 +195,19 @@ public class MlSampleIngestServiceImpl implements MlSampleIngestService {
                         result.modelVersion(),
                         result.schemaHash());
             } else {
-                log.warn("🧠 AUTO-TRAIN SKIP/FAIL chatId={} type={} symbol={} tf={} error={}",
+                log.warn("🧠 AUTO-TRAIN SKIP/FAIL chatId={} type={} ex={} net={} symbol={} tf={} error={}",
                         chatId,
                         type,
+                        exchange,
+                        network,
                         symbol,
                         timeframe,
                         result.error());
             }
 
         } catch (Exception e) {
-            log.warn("🧠 AUTO-TRAIN ERROR chatId={} type={} symbol={} tf={} err={}",
-                    chatId, type, symbol, timeframe, e.toString(), e);
+            log.warn("🧠 AUTO-TRAIN ERROR chatId={} type={} ex={} net={} symbol={} tf={} err={}",
+                    chatId, type, exchange, network, symbol, timeframe, e.toString(), e);
         } finally {
             lock.set(false);
         }
@@ -252,8 +273,20 @@ public class MlSampleIngestServiceImpl implements MlSampleIngestService {
         }
     }
 
-    private static String buildKey(Long chatId, StrategyType type, String symbol, String timeframe) {
-        return chatId + ":" + type.name() + ":" + symbol + ":" + timeframe;
+    private static String buildContextKey(StrategyType type,
+                                          String exchange,
+                                          String network,
+                                          String symbol,
+                                          String timeframe) {
+        return safePart(type != null ? type.name() : null) + ":" +
+                safePart(exchange) + ":" +
+                safePart(network) + ":" +
+                safePart(symbol) + ":" +
+                safePart(timeframe);
+    }
+
+    private static String safePart(String s) {
+        return s == null || s.isBlank() ? "NA" : s;
     }
 
     private static String normTrim(String s) {
@@ -272,7 +305,3 @@ public class MlSampleIngestServiceImpl implements MlSampleIngestService {
         return v == null ? null : v.toLowerCase(Locale.ROOT);
     }
 }
-
-
-
-

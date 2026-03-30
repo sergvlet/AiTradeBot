@@ -54,12 +54,6 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
     /** Мини-буфер сверх комиссий, чтобы TP не был в ноль после комиссий. */
     private static final BigDecimal TP_FEE_BUFFER_PCT = new BigDecimal("0.02");
 
-    /** Минимальная желаемая чистая прибыль в котируемой валюте после round-trip fee. */
-    private static final BigDecimal DEFAULT_MIN_NET_PROFIT_QUOTE = new BigDecimal("0.10");
-
-    /** Верхняя граница авто-поднятого TP (%), чтобы защита не делала нереалистичный TP. */
-    private static final BigDecimal DEFAULT_MAX_AUTO_BUMPED_TP_PCT = new BigDecimal("5.00");
-
     /**
      * Минимальный notional, ниже которого локальную позицию не восстанавливаем,
      * потому что биржа уже не даст корректно закрыть такую dust-позицию MARKET-ордером.
@@ -122,37 +116,6 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
 
     @Value("${trade.position-restore.dust-suppress-ms:21600000}")
     private long dustRestoreSuppressMs;
-
-    /**
-     * Legacy-флаг. В текущей схеме StrategySettings режим ALL штатно хранится с capitalValue=null,
-     * поэтому жёстко блокировать ALL по отсутствию capitalValue нельзя.
-     * Оставлен только для мягкого диагностического лога, без фактической блокировки входа.
-     */
-    @Value("${trade.entry.block-all-mode-without-explicit-capital-value:true}")
-    private boolean blockAllModeWithoutExplicitCapitalValue;
-
-    /** Минимальная чистая прибыль в quote-валюте после учёта round-trip fee. */
-    @Value("${trade.entry.min-net-profit-quote:0.10}")
-    private BigDecimal minNetProfitQuote;
-
-    /** Дополнительный буфер к round-trip fee floor при проверке TP. */
-    @Value("${trade.entry.extra-fee-buffer-pct:0.02}")
-    private BigDecimal entryExtraFeeBufferPct;
-
-    /** Абсолютный потолок для auto-bumped TP в процентах. */
-    @Value("${trade.entry.max-auto-bumped-tp-pct:5.00}")
-    private BigDecimal maxAutoBumpedTpPct;
-
-    /** Максимум, во сколько раз разрешено автоматически поднять requested TP. */
-    @Value("${trade.entry.max-auto-bumped-tp-multiple:2.50}")
-    private BigDecimal maxAutoBumpedTpMultiple;
-
-    /**
-     * Если исходный requested TP уже ниже round-trip fee floor,
-     * вход блокируется сразу, а не пытается молча исправляться.
-     */
-    @Value("${trade.entry.reject-when-requested-tp-below-roundtrip-fee:true}")
-    private boolean rejectWhenRequestedTpBelowRoundTripFee;
 
     @PostConstruct
     public void onStart() {
@@ -467,48 +430,21 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             failCooldown.recordFailure(key, "min_notional", reason);
             return EntryResult.fail("min_notional");
         }
-        TpProfitDecision tpProfitDecision = evaluateTpProfitDecision(
-                chatId,
-                strategyType,
-                sym,
-                effectiveNotional,
-                tpPct,
-                commissionPct
-        );
-
-        if (!tpProfitDecision.allowed()) {
-            String rejectDetails = "requestedTpPct=" + QtyMath.strip(tpProfitDecision.requestedTpPct())
-                    + ", requiredTpPct=" + QtyMath.strip(tpProfitDecision.requiredTpPct())
-                    + ", effectiveTpPct=" + QtyMath.strip(tpProfitDecision.effectiveTpPct())
-                    + ", expectedNetQuote=" + QtyMath.strip(tpProfitDecision.expectedNetQuote())
-                    + ", minNetProfitQuote=" + QtyMath.strip(resolveMinNetProfitQuote())
-                    + ", feePct=" + QtyMath.strip(safeNonNegative(commissionPct))
-                    + ", extraFeeBufferPct=" + QtyMath.strip(resolveEntryExtraFeeBufferPct())
-                    + ", notionalQuote=" + QtyMath.strip(tpProfitDecision.notionalQuote());
-
-            failCooldown.recordFailure(key, tpProfitDecision.reason(), rejectDetails);
-            return EntryResult.fail(tpProfitDecision.reason());
+        if (commissionPct != null && commissionPct.signum() > 0) {
+            BigDecimal minTpToNotLose = commissionPct.multiply(BigDecimal.valueOf(2)).add(TP_FEE_BUFFER_PCT);
+            if (tpPct.compareTo(minTpToNotLose) < 0) {
+                log.warn("⛔ [Вход] TP слишком маленький относительно комиссий | tpPct={} < minTp={} (feePct={} x2 + buffer={}) | chatId={} {} {}",
+                        tpPct.stripTrailingZeros().toPlainString(),
+                        minTpToNotLose.stripTrailingZeros().toPlainString(),
+                        commissionPct.stripTrailingZeros().toPlainString(),
+                        TP_FEE_BUFFER_PCT.stripTrailingZeros().toPlainString(),
+                        chatId, strategyType, sym
+                );
+                return EntryResult.fail("tp_too_small_for_fees");
+            }
         }
 
-        BigDecimal effectiveTpPct = tpProfitDecision.effectiveTpPct();
-
-        if (effectiveTpPct.compareTo(tpPct) > 0) {
-            log.info("📈 [Вход] TP автоматически поднят для минимальной чистой прибыли | requestedTpPct={} effectiveTpPct={} requiredTpPct={} expectedNetQuote={} minNetProfitQuote={} feePct={} extraFeeBufferPct={} notionalQuote={} | chatId={} {} {}",
-                    QtyMath.strip(tpPct),
-                    QtyMath.strip(effectiveTpPct),
-                    QtyMath.strip(tpProfitDecision.requiredTpPct()),
-                    QtyMath.strip(tpProfitDecision.expectedNetQuote()),
-                    QtyMath.strip(resolveMinNetProfitQuote()),
-                    QtyMath.strip(safeNonNegative(commissionPct)),
-                    QtyMath.strip(resolveEntryExtraFeeBufferPct()),
-                    QtyMath.strip(tpProfitDecision.notionalQuote()),
-                    chatId,
-                    strategyType,
-                    sym
-            );
-        }
-
-        BigDecimal tp = calcTp(price, effectiveTpPct);
+        BigDecimal tp = calcTp(price, tpPct);
         BigDecimal sl = calcSl(price, slPct);
 
         if (tp.compareTo(price) <= 0) return EntryResult.fail("tp_le_entry");
@@ -753,6 +689,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         BigDecimal entryPriceFromStore = null;
 
         Optional<PositionStore.PositionSnapshot> posOpt = Optional.empty();
+        boolean restoredBeforeExit = false;
         try {
             posOpt = positionStore.getPosition(chatId, strategyType, ex, net, sym);
             if (posOpt.isPresent()) {
@@ -810,6 +747,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                             rp.openedAt()
                     );
 
+                    restoredBeforeExit = true;
                     posOpt = positionStore.getPosition(chatId, strategyType, ex, net, sym);
                     if (posOpt.isPresent()) {
                         PositionStore.PositionSnapshot snap = posOpt.get();
@@ -875,7 +813,14 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                     effTp,
                     effSl,
                     tpHit,
-                    slHit
+                    slHit,
+                    effQty,
+                    effQty,
+                    null,
+                    null,
+                    TradeClosedEvent.CLOSURE_MODE_PAPER,
+                    restoredBeforeExit,
+                    false
             );
 
             try { positionStore.clearPosition(chatId, strategyType, ex, net, sym); } catch (Exception ignored) {}
@@ -972,7 +917,8 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                     posOpt,
                     order,
                     price,
-                    exitKey
+                    exitKey,
+                    restoredBeforeExit
             );
 
         } catch (Exception e) {
@@ -1020,7 +966,8 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                                                  Optional<PositionStore.PositionSnapshot> posOpt,
                                                  Order order,
                                                  BigDecimal fallbackTickPrice,
-                                                 String exitKey) {
+                                                 String exitKey,
+                                                 boolean restoredBeforeExit) {
 
         String sym = normalizeSymbol(symbol);
         String ex = safeExchange(exchange);
@@ -1052,6 +999,11 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             remainingQty = BigDecimal.ZERO;
         }
         remainingQty = normalizeRuntimeQty(remainingQty, ex, net, sym);
+
+        BigDecimal dustRemainderQty = null;
+        BigDecimal dustRemainderNotional = null;
+        String closureMode = TradeClosedEvent.CLOSURE_MODE_FULL;
+        boolean ignoredForTraining = false;
 
         BigDecimal effectiveEntryPrice = positiveOrNull(entryPrice);
         if (effectiveEntryPrice == null && posOpt != null && posOpt.isPresent()) {
@@ -1098,6 +1050,10 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                                 + ", remainingNotional=" + QtyMath.strip(remainingNotional)
                 );
 
+                dustRemainderQty = remainingQty;
+                dustRemainderNotional = remainingNotional;
+                closureMode = TradeClosedEvent.CLOSURE_MODE_DUST_CLOSE;
+                ignoredForTraining = true;
                 remainingQty = BigDecimal.ZERO;
             }
         }
@@ -1172,7 +1128,14 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                 tpPrice,
                 slPrice,
                 tpHit,
-                slHit
+                slHit,
+                requestedQty,
+                executedQty,
+                dustRemainderQty,
+                dustRemainderNotional,
+                closureMode,
+                restoredBeforeExit,
+                ignoredForTraining
         );
 
         try {
@@ -1472,7 +1435,14 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                                          BigDecimal tpPrice,
                                          BigDecimal slPrice,
                                          Boolean tpHit,
-                                         Boolean slHit) {
+                                         Boolean slHit,
+                                         BigDecimal requestedQty,
+                                         BigDecimal executedQty,
+                                         BigDecimal dustRemainderQty,
+                                         BigDecimal dustRemainderNotional,
+                                         String closureMode,
+                                         Boolean restoredPosition,
+                                         Boolean ignoredForTraining) {
         if (eventPublisher == null) return;
         try {
             eventPublisher.publishEvent(new TradeClosedEvent(
@@ -1491,7 +1461,14 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                     tpPrice,
                     slPrice,
                     tpHit,
-                    slHit
+                    slHit,
+                    requestedQty,
+                    executedQty,
+                    dustRemainderQty,
+                    dustRemainderNotional,
+                    closureMode,
+                    restoredPosition,
+                    ignoredForTraining
             ));
         } catch (Exception e) {
             log.warn("⚠️ [Трейд] Не удалось отправить TradeClosedEvent chatId={} type={} sym={} err={}",
@@ -1594,31 +1571,9 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         }
 
         StrategySettings.CapitalMode mode = ss.getCapitalMode();
+        if (mode == null) mode = StrategySettings.CapitalMode.ALL;
+
         BigDecimal value = ss.getCapitalValue();
-
-        if (mode == null) {
-            return new QuoteBudget(BigDecimal.ZERO, null, value, free, "capital_mode_missing");
-        }
-
-        /*
-         * В текущей модели данных режим ALL по определению хранится с capitalValue = null.
-         * Поэтому блокировка "ALL без explicit value" делала невозможным любой легальный ALL.
-         * FIX/PCT защищаются тем, что их mode/value должны корректно сохраниться из UI/контроллера.
-         */
-        if (mode == StrategySettings.CapitalMode.ALL
-                && blockAllModeWithoutExplicitCapitalValue
-                && !QtyMath.isPositive(value)) {
-
-            String logKey = "capital_all:" + entryKey(chatId, strategyType, ex, net, ss.getSymbol());
-            if (shouldLogNow(logKey, 30_000L)) {
-                log.info("ℹ️ [Вход] CapitalMode=ALL: использую весь свободный баланс, потому что для ALL capitalValue по схеме хранится null | free={} | chatId={} {} ex={} net={}",
-                        QtyMath.strip(free),
-                        chatId,
-                        strategyType,
-                        ex,
-                        net);
-            }
-        }
 
         BigDecimal quote;
         switch (mode) {
@@ -2719,17 +2674,6 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                                                  BigDecimal price,
                                                  StrategySettings ss,
                                                  Instant now) {
-        return precheckEntryFast(chatId, strategyType, symbol, price, ss, null, null, now);
-    }
-
-    public EntryPrecheckResult precheckEntryFast(Long chatId,
-                                                 StrategyType strategyType,
-                                                 String symbol,
-                                                 BigDecimal price,
-                                                 StrategySettings ss,
-                                                 BigDecimal requestedTpPct,
-                                                 BigDecimal requestedSlPct,
-                                                 Instant now) {
 
         if (chatId == null) {
             return EntryPrecheckResult.block("chatId_null", "chatId=null");
@@ -2748,13 +2692,6 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
 
         if (!QtyMath.isPositive(price)) {
             return EntryPrecheckResult.block("price_invalid", "price<=0");
-        }
-
-        if (requestedTpPct != null && !isValidPct(requestedTpPct)) {
-            return EntryPrecheckResult.block("takeProfitPct_invalid", "tpPct=" + QtyMath.strip(requestedTpPct));
-        }
-        if (requestedSlPct != null && !isValidPct(requestedSlPct)) {
-            return EntryPrecheckResult.block("stopLossPct_invalid", "slPct=" + QtyMath.strip(requestedSlPct));
         }
 
         String ex = resolveExchange(ss);
@@ -2781,8 +2718,8 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                 sym,
                 ex,
                 net,
-                requestedTpPct,
-                requestedSlPct,
+                null,
+                null,
                 effectiveNow
         );
 
@@ -2934,242 +2871,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             return EntryPrecheckResult.block("min_notional", details);
         }
 
-        if (QtyMath.isPositive(requestedTpPct)) {
-            TpProfitDecision tpProfitDecision = evaluateTpProfitDecision(
-                    chatId,
-                    strategyType,
-                    sym,
-                    effectiveNotional,
-                    requestedTpPct,
-                    commissionPct
-            );
-
-            if (!tpProfitDecision.allowed()) {
-                String details = "requestedTpPct=" + QtyMath.strip(tpProfitDecision.requestedTpPct())
-                        + ", requiredTpPct=" + QtyMath.strip(tpProfitDecision.requiredTpPct())
-                        + ", effectiveTpPct=" + QtyMath.strip(tpProfitDecision.effectiveTpPct())
-                        + ", expectedNetQuote=" + QtyMath.strip(tpProfitDecision.expectedNetQuote())
-                        + ", minNetProfitQuote=" + QtyMath.strip(resolveMinNetProfitQuote())
-                        + ", feePct=" + QtyMath.strip(safeNonNegative(commissionPct))
-                        + ", extraFeeBufferPct=" + QtyMath.strip(resolveEntryExtraFeeBufferPct())
-                        + ", notionalQuote=" + QtyMath.strip(tpProfitDecision.notionalQuote());
-                return EntryPrecheckResult.block(tpProfitDecision.reason(), details);
-            }
-        }
-
         return EntryPrecheckResult.allow();
-    }
-
-    private BigDecimal calcRequiredTpPctForMinNetProfit(BigDecimal notionalQuote,
-                                                  BigDecimal commissionPct,
-                                                  BigDecimal minNetProfitQuote,
-                                                  BigDecimal extraFeeBufferPct) {
-        if (!QtyMath.isPositive(notionalQuote)) {
-            return BigDecimal.ZERO;
-        }
-
-        BigDecimal feeComponentPct = calcRoundTripFeeFloorPct(commissionPct, extraFeeBufferPct);
-        BigDecimal netTargetPct = safeNonNegative(minNetProfitQuote)
-                .multiply(BigDecimal.valueOf(100))
-                .divide(notionalQuote, 8, RoundingMode.UP);
-
-        return feeComponentPct.add(netTargetPct).setScale(8, RoundingMode.UP).stripTrailingZeros();
-    }
-
-    private BigDecimal calcExpectedNetProfitQuote(BigDecimal notionalQuote,
-                                                  BigDecimal tpPct,
-                                                  BigDecimal commissionPct,
-                                                  BigDecimal extraFeeBufferPct) {
-        if (!QtyMath.isPositive(notionalQuote) || tpPct == null) {
-            return BigDecimal.ZERO;
-        }
-
-        BigDecimal grossProfitQuote = notionalQuote
-                .multiply(safeNonNegative(tpPct))
-                .divide(BigDecimal.valueOf(100), 8, RoundingMode.HALF_UP);
-
-        BigDecimal feeQuote = notionalQuote
-                .multiply(calcRoundTripFeeFloorPct(commissionPct, extraFeeBufferPct))
-                .divide(BigDecimal.valueOf(100), 8, RoundingMode.HALF_UP);
-
-        return grossProfitQuote.subtract(feeQuote).setScale(8, RoundingMode.HALF_UP).stripTrailingZeros();
-    }
-
-    private BigDecimal calcRoundTripFeeFloorPct(BigDecimal commissionPct,
-                                                BigDecimal extraFeeBufferPct) {
-        return safeNonNegative(commissionPct)
-                .multiply(BigDecimal.valueOf(2))
-                .add(safeNonNegative(extraFeeBufferPct))
-                .setScale(8, RoundingMode.HALF_UP)
-                .stripTrailingZeros();
-    }
-
-    private BigDecimal resolveMinNetProfitQuote() {
-        return safePositive(minNetProfitQuote, DEFAULT_MIN_NET_PROFIT_QUOTE);
-    }
-
-    private BigDecimal resolveEntryExtraFeeBufferPct() {
-        return safeNonNegative(entryExtraFeeBufferPct, TP_FEE_BUFFER_PCT);
-    }
-
-    private BigDecimal resolveMaxAutoBumpedTpPct() {
-        return safePositive(maxAutoBumpedTpPct, DEFAULT_MAX_AUTO_BUMPED_TP_PCT);
-    }
-
-    private BigDecimal resolveMaxAutoBumpedTpMultiple() {
-        return safePositive(maxAutoBumpedTpMultiple, new BigDecimal("2.50"));
-    }
-
-    private BigDecimal safeNonNegative(BigDecimal value) {
-        return safeNonNegative(value, BigDecimal.ZERO);
-    }
-
-    private BigDecimal safeNonNegative(BigDecimal value, BigDecimal fallback) {
-        if (value == null) return fallback;
-        if (value.signum() < 0) return fallback;
-        return value;
-    }
-
-    private BigDecimal safePositive(BigDecimal value, BigDecimal fallback) {
-        if (value == null || value.signum() <= 0) return fallback;
-        return value;
-    }
-
-    private TpProfitDecision evaluateTpProfitDecision(Long chatId,
-                                                      StrategyType strategyType,
-                                                      String symbol,
-                                                      BigDecimal notionalQuote,
-                                                      BigDecimal requestedTpPct,
-                                                      BigDecimal commissionPct) {
-        BigDecimal safeNotional = safeNonNegative(notionalQuote);
-        BigDecimal safeRequestedTpPct = safeNonNegative(requestedTpPct);
-        BigDecimal safeCommissionPct = safeNonNegative(commissionPct);
-        BigDecimal minNetProfit = resolveMinNetProfitQuote();
-        BigDecimal extraFeeBufferPct = resolveEntryExtraFeeBufferPct();
-        BigDecimal maxAutoTpPct = resolveMaxAutoBumpedTpPct();
-        BigDecimal maxAutoTpMultiple = resolveMaxAutoBumpedTpMultiple();
-        BigDecimal roundTripFeeFloorPct = calcRoundTripFeeFloorPct(safeCommissionPct, extraFeeBufferPct);
-
-        if (!QtyMath.isPositive(safeNotional)) {
-            return TpProfitDecision.reject(
-                    safeRequestedTpPct,
-                    safeRequestedTpPct,
-                    BigDecimal.ZERO,
-                    BigDecimal.ZERO,
-                    safeNotional,
-                    "tp_net_profit_too_small"
-            );
-        }
-
-        BigDecimal requiredTpPct = calcRequiredTpPctForMinNetProfit(safeNotional, safeCommissionPct, minNetProfit, extraFeeBufferPct);
-        if (rejectWhenRequestedTpBelowRoundTripFee
-                && QtyMath.isPositive(safeRequestedTpPct)
-                && safeRequestedTpPct.compareTo(roundTripFeeFloorPct) < 0
-                && requiredTpPct.compareTo(roundTripFeeFloorPct) <= 0) {
-            BigDecimal expectedAtRequested = calcExpectedNetProfitQuote(safeNotional, safeRequestedTpPct, safeCommissionPct, extraFeeBufferPct);
-
-            log.warn("⛔ [Вход] Запрошенный TP ниже round-trip fee floor | requestedTpPct={} roundTripFeeFloorPct={} expectedNetQuote={} minNetProfitQuote={} feePct={} extraFeeBufferPct={} notionalQuote={} | chatId={} {} {}",
-                    QtyMath.strip(safeRequestedTpPct),
-                    QtyMath.strip(roundTripFeeFloorPct),
-                    QtyMath.strip(expectedAtRequested),
-                    QtyMath.strip(minNetProfit),
-                    QtyMath.strip(safeCommissionPct),
-                    QtyMath.strip(extraFeeBufferPct),
-                    QtyMath.strip(safeNotional),
-                    chatId,
-                    strategyType,
-                    symbol);
-
-            return TpProfitDecision.reject(
-                    safeRequestedTpPct,
-                    safeRequestedTpPct,
-                    roundTripFeeFloorPct,
-                    expectedAtRequested,
-                    safeNotional,
-                    "tp_below_roundtrip_fee_floor"
-            );
-        }
-        BigDecimal effectiveTpPct = safeRequestedTpPct;
-
-        if (safeRequestedTpPct.compareTo(requiredTpPct) < 0) {
-            effectiveTpPct = requiredTpPct;
-        }
-
-        boolean autoBumpedTp = effectiveTpPct.compareTo(safeRequestedTpPct) > 0;
-
-        if (autoBumpedTp
-                && QtyMath.isPositive(maxAutoTpMultiple)
-                && QtyMath.isPositive(safeRequestedTpPct)) {
-            BigDecimal maxAllowedByMultiple = safeRequestedTpPct.multiply(maxAutoTpMultiple).setScale(8, RoundingMode.HALF_UP);
-            if (effectiveTpPct.compareTo(maxAllowedByMultiple) > 0) {
-                BigDecimal expectedAtRequested = calcExpectedNetProfitQuote(safeNotional, safeRequestedTpPct, safeCommissionPct, extraFeeBufferPct);
-                return TpProfitDecision.reject(
-                        safeRequestedTpPct,
-                        effectiveTpPct,
-                        requiredTpPct,
-                        expectedAtRequested,
-                        safeNotional,
-                        "tp_net_profit_unreachable"
-                );
-            }
-        }
-
-        if (autoBumpedTp && QtyMath.isPositive(maxAutoTpPct) && effectiveTpPct.compareTo(maxAutoTpPct) > 0) {
-            BigDecimal expectedAtCap = calcExpectedNetProfitQuote(safeNotional, maxAutoTpPct, safeCommissionPct, extraFeeBufferPct);
-            return TpProfitDecision.reject(
-                    safeRequestedTpPct,
-                    effectiveTpPct,
-                    requiredTpPct,
-                    expectedAtCap,
-                    safeNotional,
-                    "tp_net_profit_unreachable"
-            );
-        }
-
-        BigDecimal expectedAtEffective = calcExpectedNetProfitQuote(safeNotional, effectiveTpPct, safeCommissionPct, extraFeeBufferPct);
-        if (expectedAtEffective.compareTo(minNetProfit) < 0) {
-            return TpProfitDecision.reject(
-                    safeRequestedTpPct,
-                    effectiveTpPct,
-                    requiredTpPct,
-                    expectedAtEffective,
-                    safeNotional,
-                    "tp_net_profit_too_small"
-            );
-        }
-
-        return TpProfitDecision.allow(
-                safeRequestedTpPct,
-                effectiveTpPct,
-                requiredTpPct,
-                expectedAtEffective,
-                safeNotional
-        );
-    }
-
-    private record TpProfitDecision(boolean allowed,
-                                    BigDecimal requestedTpPct,
-                                    BigDecimal effectiveTpPct,
-                                    BigDecimal requiredTpPct,
-                                    BigDecimal expectedNetQuote,
-                                    BigDecimal notionalQuote,
-                                    String reason) {
-        private static TpProfitDecision allow(BigDecimal requestedTpPct,
-                                              BigDecimal effectiveTpPct,
-                                              BigDecimal requiredTpPct,
-                                              BigDecimal expectedNetQuote,
-                                              BigDecimal notionalQuote) {
-            return new TpProfitDecision(true, requestedTpPct, effectiveTpPct, requiredTpPct, expectedNetQuote, notionalQuote, "ok");
-        }
-
-        private static TpProfitDecision reject(BigDecimal requestedTpPct,
-                                               BigDecimal effectiveTpPct,
-                                               BigDecimal requiredTpPct,
-                                               BigDecimal expectedNetQuote,
-                                               BigDecimal notionalQuote,
-                                               String reason) {
-            return new TpProfitDecision(false, requestedTpPct, effectiveTpPct, requiredTpPct, expectedNetQuote, notionalQuote, reason);
-        }
     }
 
     public record EntryPrecheckResult(

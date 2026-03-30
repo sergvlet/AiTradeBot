@@ -17,8 +17,8 @@ import java.util.Locale;
                 @Index(name = "ix_ml_samples_chat_strategy_time", columnList = "chat_id,strategy_type,created_at"),
                 @Index(name = "ix_ml_samples_symbol_time", columnList = "symbol,created_at"),
                 @Index(name = "ix_ml_samples_ts", columnList = "ts"),
-                // ✅ ускоряет findForTraining (chatId + type + symbol + tf + time)
-                @Index(name = "ix_ml_samples_train", columnList = "chat_id,strategy_type,symbol,timeframe,created_at")
+                @Index(name = "ix_ml_samples_train_chat", columnList = "chat_id,strategy_type,symbol,timeframe,created_at"),
+                @Index(name = "ix_ml_samples_train_ctx", columnList = "strategy_type,exchange,network,symbol,timeframe,created_at")
         }
 )
 @Getter
@@ -32,7 +32,6 @@ public class MlSampleEntity {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    // routing
     @Column(name = "chat_id", nullable = false)
     private Long chatId;
 
@@ -46,7 +45,6 @@ public class MlSampleEntity {
     @Column(name = "network", length = 32)
     private String network;
 
-    // market identity
     @Column(name = "symbol", nullable = false, length = 32)
     private String symbol;
 
@@ -56,7 +54,6 @@ public class MlSampleEntity {
     @Column(name = "ts")
     private Instant ts;
 
-    // ML data
     @Column(name = "label", length = 32)
     private String label;
 
@@ -74,7 +71,6 @@ public class MlSampleEntity {
     @Column(name = "meta_json", columnDefinition = "jsonb")
     private JsonNode metaJson;
 
-    // audit
     @Column(name = "created_at", nullable = false)
     private Instant createdAt;
 
@@ -96,7 +92,6 @@ public class MlSampleEntity {
         this.network = normalizeUpperNullable(this.network);
         this.symbol = normalizeUpperNullable(this.symbol);
         this.timeframe = normalizeLowerNullable(this.timeframe);
-
         this.label = normalizeTrimNullable(this.label);
         this.target = normalizeTrimNullable(this.target);
     }

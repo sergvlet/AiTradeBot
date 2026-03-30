@@ -3,6 +3,7 @@ package com.chicu.aitradebot.ai.ml;
 import com.chicu.aitradebot.ai.ml.dto.MlHealthResponse;
 import com.chicu.aitradebot.ai.ml.dto.MlPredictRequest;
 import com.chicu.aitradebot.ai.ml.dto.MlPredictResponse;
+import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
 import com.chicu.aitradebot.service.StrategySettingsService;
@@ -24,6 +25,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -68,7 +70,23 @@ public class MlGateway {
                     "retWindowPct",
                     "momentum1",
                     "smaFastRel",
-                    "smaSlowRel"
+                    "smaSlowRel",
+                    "entryFromLowPct",
+                    "entryFromHighPct",
+                    "minRangePct",
+                    "takeProfitPct",
+                    "stopLossPct",
+                    "autoTpSlEnabled",
+                    "autoSlFromRangeFactor",
+                    "autoTpFromRangeFactor",
+                    "autoMinRiskReward",
+                    "autoSlMinPct",
+                    "autoSlMaxPct",
+                    "autoTpMinPct",
+                    "autoTpMaxPct",
+                    "autoTpMlBoostFactor",
+                    "autoTpWeakSignalFactor",
+                    "maxSpreadPct"
             ),
             List.of(
                     "momentum1",
@@ -84,20 +102,8 @@ public class MlGateway {
     );
 
     private final MlProperties props;
-
-    /**
-     * MlClient создаётся только при ml.enabled=true.
-     */
     private final ObjectProvider<MlClient> clientProvider;
-
-    /**
-     * Нужен для modelKey/schemaHash/timeframe из StrategySettings.
-     */
     private final StrategySettingsService strategySettingsService;
-
-    /**
-     * Анти-спам по предупреждениям.
-     */
     private final Map<String, Long> warnThrottle = new ConcurrentHashMap<>();
 
     private static final class StrategyFeatureSpec {
@@ -133,19 +139,15 @@ public class MlGateway {
         }
     }
 
-    // =====================================================
-    // Predict API
-    // =====================================================
-
     public MlPredictResponse predict(Map<String, Object> features) {
-        return predictInternal(null, null, null, null, null, null, features, null);
+        return predictInternal(null, null, null, null, null, null, null, features, null);
     }
 
     public MlPredictResponse predictWindowScalping(Long chatId,
                                                    String symbol,
                                                    Map<String, Object> features,
                                                    Instant ts) {
-        return predictInternal(StrategyType.WINDOW_SCALPING, chatId, symbol, null, null, null, features, ts);
+        return predictInternal(StrategyType.WINDOW_SCALPING, chatId, symbol, null, null, null, null, features, ts);
     }
 
     public MlPredictResponse predict(StrategyType type,
@@ -153,19 +155,16 @@ public class MlGateway {
                                      String symbol,
                                      Map<String, Object> features,
                                      Instant ts) {
-        return predictInternal(type, chatId, symbol, null, null, null, features, ts);
+        return predictInternal(type, chatId, symbol, null, null, null, null, features, ts);
     }
-
-    // =====================================================
-    // Internal
-    // =====================================================
 
     private MlPredictResponse predictInternal(StrategyType type,
                                               Long chatId,
                                               String symbol,
                                               String timeframe,
+                                              String exchange,
+                                              String network,
                                               String modelKey,
-                                              String schemaHash,
                                               Map<String, Object> features,
                                               Instant ts) {
 
@@ -183,32 +182,28 @@ public class MlGateway {
         if (chatId == null) {
             chatId = extractLong(raw.get("chatId"));
         }
-
         if (type == null) {
             type = parseStrategyType(raw.get("strategyType"));
-            if (type == null) {
-                type = parseStrategyType(raw.get("strategy"));
-            }
+            if (type == null) type = parseStrategyType(raw.get("strategy"));
         }
-
         if (symbol == null || symbol.isBlank()) {
             symbol = extractString(raw.get("symbol"));
         }
-
         if (timeframe == null || timeframe.isBlank()) {
             timeframe = extractString(raw.get("timeframe"));
         }
-
+        if (exchange == null || exchange.isBlank()) {
+            exchange = extractString(raw.get("exchange"));
+        }
+        if (network == null || network.isBlank()) {
+            network = extractString(raw.get("network"));
+        }
         if (modelKey == null || modelKey.isBlank()) {
             modelKey = extractString(raw.get("modelKey"));
         }
 
-        if (schemaHash == null || schemaHash.isBlank()) {
-            schemaHash = extractString(raw.get("schemaHash"));
-        }
-
         StrategySettings ss = resolveStrategySettings(chatId, type);
-
+        String storedModelKey = null;
         if (ss != null) {
             if ((symbol == null || symbol.isBlank()) && ss.getSymbol() != null) {
                 symbol = ss.getSymbol();
@@ -216,33 +211,36 @@ public class MlGateway {
             if ((timeframe == null || timeframe.isBlank()) && ss.getTimeframe() != null) {
                 timeframe = ss.getTimeframe();
             }
-            if ((modelKey == null || modelKey.isBlank()) && ss.getMlModelKey() != null) {
-                modelKey = ss.getMlModelKey();
+            if ((exchange == null || exchange.isBlank()) && ss.getExchangeName() != null) {
+                exchange = String.valueOf(ss.getExchangeName());
             }
-            if ((schemaHash == null || schemaHash.isBlank()) && ss.getMlSchemaHash() != null) {
-                schemaHash = ss.getMlSchemaHash();
+            if ((network == null || network.isBlank()) && ss.getNetworkType() != null) {
+                network = String.valueOf(ss.getNetworkType());
             }
+            storedModelKey = blankToNull(ss.getMlModelKey());
         }
 
         String symbolNorm = normUpper(symbol);
         String timeframeNorm = normLower(timeframe);
-        String modelKeyNorm = blankToNull(modelKey);
-        String schemaHashNorm = blankToNull(schemaHash);
-
+        String exchangeNorm = normUpper(exchange);
+        String networkNorm = normUpper(network);
+        String contextModelKey = buildContextModelKey(type, exchangeNorm, networkNorm, symbolNorm, timeframeNorm);
+        if ((modelKey == null || modelKey.isBlank()) && storedModelKey != null) {
+            if (isCompatibleModelKey(storedModelKey, type, exchangeNorm, networkNorm, symbolNorm, timeframeNorm)) {
+                modelKey = storedModelKey;
+            } else {
+                warnOnce(buildWarnKey(type, chatId, symbolNorm, "stale_model_key"), 60_000,
+                        "🧠 ML ignore stale settings modelKey | type={} chatId={} symbol={} storedModelKey={} contextModelKey={}",
+                        type, chatId, symbolNorm, storedModelKey, contextModelKey);
+            }
+        }
         long tsMs = (ts != null ? ts.toEpochMilli() : System.currentTimeMillis());
 
-        // -----------------------------------------------------
-        // 1) Нормализуем и очищаем features
-        // -----------------------------------------------------
         LinkedHashMap<String, Object> normalizedFeatures = normalizeFeatures(type, raw);
-
         if (normalizedFeatures.isEmpty()) {
             return MlPredictResponse.fail("no_features");
         }
 
-        // -----------------------------------------------------
-        // 2) Ранняя проверка обязательных фич
-        // -----------------------------------------------------
         List<String> missing = validateRequiredFeatures(type, normalizedFeatures);
         if (!missing.isEmpty()) {
             String reason = "missing_features:" + String.join(",", missing);
@@ -252,106 +250,172 @@ public class MlGateway {
             return MlPredictResponse.fail(reason);
         }
 
-        // -----------------------------------------------------
-        // 3) Строим стабильный feature order
-        // -----------------------------------------------------
         List<String> incomingOrder = extractFeatureOrder(raw);
         List<String> finalFeatureOrder = buildStableFeatureOrder(type, normalizedFeatures, incomingOrder);
-
         if (finalFeatureOrder.isEmpty()) {
             return MlPredictResponse.fail("feature_order_empty");
         }
 
-        // -----------------------------------------------------
-        // 4) Упорядочиваем map строго в order
-        // -----------------------------------------------------
         LinkedHashMap<String, Object> orderedFeatures = reorderFeatures(normalizedFeatures, finalFeatureOrder);
-
-        // -----------------------------------------------------
-        // 5) Считаем hash порядка фич и валидируем
-        // -----------------------------------------------------
         String computedFeatureOrderHash = computeFeatureOrderHash(finalFeatureOrder);
 
-        if (schemaHashNorm != null && !schemaHashNorm.equalsIgnoreCase(computedFeatureOrderHash)) {
-            String reason = "featureOrder_hash_mismatch"
-                            + " provided=" + schemaHashNorm
-                            + " req=" + computedFeatureOrderHash;
-
-            warnOnce(buildWarnKey(type, chatId, symbolNorm, "featureOrder_hash_mismatch"), 15_000,
-                    "🧠 ML feature order mismatch до sidecar | type={} chatId={} symbol={} modelKey={} provided={} req={} order={}",
-                    type, chatId, symbolNorm, modelKeyNorm, schemaHashNorm, computedFeatureOrderHash, String.join(",", finalFeatureOrder));
-
-            return MlPredictResponse.fail(reason);
+        String schemaHashNorm = extractString(raw.get("schemaHash"));
+        if (schemaHashNorm == null && ss != null && ss.getMlSchemaHash() != null) {
+            schemaHashNorm = ss.getMlSchemaHash();
         }
 
+        if (schemaHashNorm != null && !schemaHashNorm.equalsIgnoreCase(computedFeatureOrderHash)) {
+            String reason = "featureOrder_hash_mismatch provided=" + schemaHashNorm + " req=" + computedFeatureOrderHash;
+            warnOnce(buildWarnKey(type, chatId, symbolNorm, "featureOrder_hash_mismatch"), 15_000,
+                    "🧠 ML feature order mismatch до sidecar | type={} chatId={} symbol={} modelKey={} provided={} req={} order={}",
+                    type, chatId, symbolNorm, modelKey, schemaHashNorm, computedFeatureOrderHash, String.join(",", finalFeatureOrder));
+            return MlPredictResponse.fail(reason);
+        }
         schemaHashNorm = computedFeatureOrderHash;
 
-        // -----------------------------------------------------
-        // 6) Собираем request
-        // -----------------------------------------------------
+        String modelKeyNorm = blankToNull(modelKey);
+        if (modelKeyNorm == null) {
+            modelKeyNorm = contextModelKey;
+        }
+
+        MlPredictRequest req = buildPredictRequest(
+                chatId,
+                type,
+                symbolNorm,
+                timeframeNorm,
+                modelKeyNorm,
+                schemaHashNorm,
+                tsMs,
+                finalFeatureOrder,
+                orderedFeatures
+        );
+
+        MlPredictResponse primary = executePredict(c, req, type, chatId, symbolNorm, modelKeyNorm, schemaHashNorm);
+        if (shouldRetryWithoutSpecificModelKey(primary, modelKeyNorm)) {
+            warnOnce(buildWarnKey(type, chatId, symbolNorm, "predict_retry_default_model"), 15_000,
+                    "🧠 ML retry without fixed modelKey | type={} chatId={} symbol={} failedModelKey={} err={}",
+                    type, chatId, symbolNorm, modelKeyNorm, safeStr(primary != null ? primary.getError() : null));
+
+            MlPredictRequest retryReq = buildPredictRequest(
+                    chatId,
+                    type,
+                    symbolNorm,
+                    timeframeNorm,
+                    null,
+                    schemaHashNorm,
+                    tsMs,
+                    finalFeatureOrder,
+                    orderedFeatures
+            );
+
+            MlPredictResponse retry = executePredict(c, retryReq, type, chatId, symbolNorm, null, schemaHashNorm);
+            if (retry != null && retry.isOk()) {
+                log.info("🧠 ML fallback predict OK | type={} chatId={} symbol={} contextModelKey={} fallbackModelKey={} proba={}",
+                        type, chatId, symbolNorm, modelKeyNorm, blankToNull(retry.getModelKey()), retry.getProba());
+                return retry;
+            }
+            return retry != null ? retry : primary;
+        }
+        return primary;
+    }
+
+    private MlPredictRequest buildPredictRequest(Long chatId,
+                                                StrategyType type,
+                                                String symbolNorm,
+                                                String timeframeNorm,
+                                                String modelKey,
+                                                String schemaHash,
+                                                long tsMs,
+                                                List<String> featureOrder,
+                                                LinkedHashMap<String, Object> orderedFeatures) {
         MlPredictRequest req = new MlPredictRequest();
         req.setChatId(chatId);
         req.setStrategyType(type != null ? type.name() : null);
         req.setSymbol(symbolNorm);
         req.setTimeframe(timeframeNorm);
-        req.setModelKey(modelKeyNorm);
-        req.setSchemaHash(schemaHashNorm);
+        req.setModelKey(blankToNull(modelKey));
+        req.setSchemaHash(schemaHash);
         req.setTsMs(tsMs);
-        req.setFeatureOrder(finalFeatureOrder);
+        req.setFeatureOrder(featureOrder);
         req.setFeatures(orderedFeatures);
+        return req;
+    }
 
+    private MlPredictResponse executePredict(MlClient client,
+                                             MlPredictRequest req,
+                                             StrategyType type,
+                                             Long chatId,
+                                             String symbolNorm,
+                                             String logModelKey,
+                                             String schemaHashNorm) {
         try {
-            MlPredictResponse r = c.predict(req);
+            MlPredictResponse r = client.predict(req);
             if (r == null) return MlPredictResponse.fail("predict_null");
-
             if (r.isOk() && (r.getProba() == null || !Double.isFinite(r.getProba()))) {
                 return MlPredictResponse.fail("predict_no_proba");
             }
-
             if (!r.isOk()) {
-                String err = safeStr(r.getError());
-
-                if (isMissingFeaturesError(err)) {
-                    warnOnce(buildWarnKey(type, chatId, symbolNorm, "missing_features"), 15_000,
-                            "🧠 ML sidecar отклонил predict: missing_features | type={} chatId={} symbol={} modelKey={} err={}",
-                            type, chatId, symbolNorm, modelKeyNorm, err);
-                } else if (isFeatureOrderHashMismatchError(err)) {
-                    warnOnce(buildWarnKey(type, chatId, symbolNorm, "featureOrder_hash_mismatch"), 15_000,
-                            "🧠 ML sidecar отклонил predict: feature order hash mismatch | type={} chatId={} symbol={} modelKey={} err={} reqHash={} order={}",
-                            type, chatId, symbolNorm, modelKeyNorm, err, schemaHashNorm, String.join(",", finalFeatureOrder));
-                } else if (isSchemaMismatchError(err)) {
-                    warnOnce(buildWarnKey(type, chatId, symbolNorm, "schema_mismatch"), 15_000,
-                            "🧠 ML sidecar отклонил predict: schema mismatch | type={} chatId={} symbol={} modelKey={} err={} reqHash={}",
-                            type, chatId, symbolNorm, modelKeyNorm, err, schemaHashNorm);
-                } else if (isModelFormatError(err)) {
-                    warnOnce(buildWarnKey(type, chatId, symbolNorm, "model_format"), 30_000,
-                            "🧠 ML sidecar: проблема формата модели | type={} chatId={} symbol={} modelKey={} err={}",
-                            type, chatId, symbolNorm, modelKeyNorm, err);
-                } else if (isNeutralStreakError(err)) {
-                    warnOnce(buildWarnKey(type, chatId, symbolNorm, "neutral_streak"), 30_000,
-                            "🧠 ML sidecar: neutral-streak | type={} chatId={} symbol={} modelKey={} err={}",
-                            type, chatId, symbolNorm, modelKeyNorm, err);
-                } else {
-                    warnOnce(buildWarnKey(type, chatId, symbolNorm, "predict_not_ok"), 15_000,
-                            "🧠 ML predict вернул not_ok | type={} chatId={} symbol={} modelKey={} err={} reqHash={}",
-                            type, chatId, symbolNorm, modelKeyNorm, err, schemaHashNorm);
-                }
+                warnOnce(buildWarnKey(type, chatId, symbolNorm, safeStr(r.getError())), 15_000,
+                        "🧠 ML predict вернул not_ok | type={} chatId={} symbol={} modelKey={} err={} reqHash={}",
+                        type, chatId, symbolNorm, blankToNull(logModelKey), safeStr(r.getError()), schemaHashNorm);
             }
-
             return r;
-
         } catch (Exception e) {
             String msg = "predict_failed: " + safeMsg(e);
             warnOnce(buildWarnKey(type, chatId, symbolNorm, "predict_exception"), 15_000,
                     "🧠 ML predict exception | type={} chatId={} symbol={} modelKey={} err={}",
-                    type, chatId, symbolNorm, modelKeyNorm, msg);
+                    type, chatId, symbolNorm, blankToNull(logModelKey), msg);
             return MlPredictResponse.fail(msg);
         }
     }
 
-    // =====================================================
-    // Settings
-    // =====================================================
+    private static boolean shouldRetryWithoutSpecificModelKey(MlPredictResponse response, String modelKey) {
+        if (blankToNull(modelKey) == null || response == null || response.isOk()) {
+            return false;
+        }
+        String err = normLower(response.getError());
+        if (err == null) {
+            return false;
+        }
+        return err.contains("no_model")
+                || err.contains("model_not_found")
+                || err.contains("missing_model")
+                || err.contains("load_error");
+    }
+
+    private static boolean isCompatibleModelKey(String modelKey,
+                                                StrategyType type,
+                                                String exchange,
+                                                String network,
+                                                String symbol,
+                                                String timeframe) {
+        String value = blankToNull(modelKey);
+        if (value == null) return false;
+
+        String[] parts = value.split(":");
+        if (parts.length >= 5) {
+            return equalsIgnoreCase(parts[0], type != null ? type.name() : null)
+                    && equalsIgnoreCase(parts[1], exchange)
+                    && equalsIgnoreCase(parts[2], network)
+                    && equalsIgnoreCase(parts[3], symbol)
+                    && equalsIgnoreCase(parts[4], timeframe);
+        }
+        if (parts.length == 3) {
+            return equalsIgnoreCase(parts[0], type != null ? type.name() : null)
+                    && equalsIgnoreCase(parts[1], symbol)
+                    && equalsIgnoreCase(parts[2], timeframe);
+        }
+        return false;
+    }
+
+    private static boolean equalsIgnoreCase(String a, String b) {
+        String left = blankToNull(a);
+        String right = blankToNull(b);
+        if (left == null || right == null) {
+            return Objects.equals(left, right);
+        }
+        return left.equalsIgnoreCase(right);
+    }
 
     private StrategySettings resolveStrategySettings(Long chatId, StrategyType type) {
         if (chatId == null || chatId <= 0 || type == null || strategySettingsService == null) {
@@ -365,76 +429,64 @@ public class MlGateway {
         }
     }
 
-    // =====================================================
-    // Feature order / schema
-    // =====================================================
+    public static String buildContextModelKey(StrategyType type,
+                                              String exchange,
+                                              String network,
+                                              String symbol,
+                                              String timeframe) {
+        String st = type != null ? type.name() : "GLOBAL";
+        String ex = blankToDefault(normUpper(exchange), "NA");
+        String net = blankToDefault(normUpper(network), "NA");
+        String sym = blankToDefault(normUpper(symbol), "NA");
+        String tf = blankToDefault(normLower(timeframe), "na");
+        return st + ":" + ex + ":" + net + ":" + sym + ":" + tf;
+    }
 
     private static List<String> extractFeatureOrder(Map<String, Object> features) {
         if (features == null || features.isEmpty()) return null;
-
         Object v = features.get("featureOrder");
         if (v == null) v = features.get("featureSchema");
         if (v == null) v = features.get("schema");
         if (v == null) v = features.get("schemaFields");
-
         if (v == null) return null;
 
         List<String> out = new ArrayList<>();
-
         if (v instanceof Iterable<?> iterable) {
             for (Object o : iterable) {
                 String s = normalizeFeatureName(extractString(o));
-                if (s != null && !META_KEYS.contains(s)) {
-                    out.add(s);
-                }
+                if (s != null && !META_KEYS.contains(s)) out.add(s);
             }
         } else {
             String raw = extractString(v);
             if (raw != null) {
                 String prepared = raw.replace(';', ',').replace('|', ',');
-                String[] parts = prepared.split(",");
-                for (String part : parts) {
+                for (String part : prepared.split(",")) {
                     String s = normalizeFeatureName(part);
-                    if (s != null && !META_KEYS.contains(s)) {
-                        out.add(s);
-                    }
+                    if (s != null && !META_KEYS.contains(s)) out.add(s);
                 }
             }
         }
-
         return out.isEmpty() ? null : out;
     }
 
     private static List<String> buildStableFeatureOrder(StrategyType type,
                                                         Map<String, Object> normalizedFeatures,
                                                         List<String> incomingOrder) {
-
         LinkedHashSet<String> ordered = new LinkedHashSet<>();
-
         if (incomingOrder != null) {
             for (String name : incomingOrder) {
-                if (name != null && normalizedFeatures.containsKey(name)) {
-                    ordered.add(name);
-                }
+                if (name != null && normalizedFeatures.containsKey(name)) ordered.add(name);
             }
         }
-
         StrategyFeatureSpec spec = FEATURE_SPECS.get(type);
         if (spec != null) {
             for (String name : spec.canonicalOrder) {
-                if (normalizedFeatures.containsKey(name)) {
-                    ordered.add(name);
-                }
+                if (normalizedFeatures.containsKey(name)) ordered.add(name);
             }
         }
-
         List<String> rest = new ArrayList<>(normalizedFeatures.keySet());
         rest.sort(Comparator.naturalOrder());
-
-        for (String name : rest) {
-            ordered.add(name);
-        }
-
+        ordered.addAll(rest);
         return new ArrayList<>(ordered);
     }
 
@@ -442,9 +494,7 @@ public class MlGateway {
                                                                  List<String> featureOrder) {
         LinkedHashMap<String, Object> out = new LinkedHashMap<>();
         for (String key : featureOrder) {
-            if (features.containsKey(key)) {
-                out.put(key, features.get(key));
-            }
+            if (features.containsKey(key)) out.put(key, features.get(key));
         }
         return out;
     }
@@ -454,7 +504,6 @@ public class MlGateway {
             String payload = String.join("|", featureOrder);
             MessageDigest md = MessageDigest.getInstance("SHA-256");
             byte[] digest = md.digest(payload.getBytes(StandardCharsets.UTF_8));
-
             StringBuilder sb = new StringBuilder(digest.length * 2);
             for (byte b : digest) {
                 sb.append(Character.forDigit((b >> 4) & 0xF, 16));
@@ -466,22 +515,13 @@ public class MlGateway {
         }
     }
 
-    // =====================================================
-    // Feature validation / normalization
-    // =====================================================
-
     private static List<String> validateRequiredFeatures(StrategyType type,
                                                          Map<String, Object> features) {
         StrategyFeatureSpec spec = FEATURE_SPECS.get(type);
-        if (spec == null || spec.requiredFeatures.isEmpty()) {
-            return Collections.emptyList();
-        }
-
+        if (spec == null || spec.requiredFeatures.isEmpty()) return Collections.emptyList();
         List<String> missing = new ArrayList<>();
         for (String req : spec.requiredFeatures) {
-            if (!features.containsKey(req) || features.get(req) == null) {
-                missing.add(req);
-            }
+            if (!features.containsKey(req) || features.get(req) == null) missing.add(req);
         }
         return missing;
     }
@@ -489,53 +529,30 @@ public class MlGateway {
     private static LinkedHashMap<String, Object> normalizeFeatures(StrategyType type, Map<String, Object> in) {
         LinkedHashMap<String, Object> out = new LinkedHashMap<>();
         if (in == null || in.isEmpty()) return out;
-
         for (Map.Entry<String, Object> e : in.entrySet()) {
             String k = normalizeFeatureName(e.getKey());
-            Object v = e.getValue();
-
-            if (k == null) continue;
-            if (META_KEYS.contains(k)) continue;
-
-            Object nv = normalizeValue(v);
-            out.put(k, nv);
+            if (k == null || META_KEYS.contains(k)) continue;
+            out.put(k, normalizeValue(e.getValue()));
         }
-
         applyStrategyAliases(type, out);
         return out;
     }
 
     private static void applyStrategyAliases(StrategyType type, LinkedHashMap<String, Object> out) {
         if (out == null || out.isEmpty()) return;
-
         if (type == StrategyType.WINDOW_SCALPING) {
-            if (!out.containsKey("lastPrice") && out.containsKey("price")) {
-                out.put("lastPrice", out.get("price"));
-            }
-            if (!out.containsKey("price") && out.containsKey("lastPrice")) {
-                out.put("price", out.get("lastPrice"));
-            }
+            if (!out.containsKey("lastPrice") && out.containsKey("price")) out.put("lastPrice", out.get("price"));
+            if (!out.containsKey("price") && out.containsKey("lastPrice")) out.put("price", out.get("lastPrice"));
         }
     }
 
     private static Object normalizeValue(Object v) {
         if (v == null) return null;
-
         if (v instanceof Enum<?> en) return en.name();
         if (v instanceof Instant inst) return inst.toEpochMilli();
-
-        if (v instanceof Double d) {
-            if (!Double.isFinite(d)) return null;
-            return d;
-        }
-        if (v instanceof Float f) {
-            if (!Float.isFinite(f)) return null;
-            return (double) f;
-        }
-        if (v instanceof BigDecimal bd) {
-            return bd.stripTrailingZeros();
-        }
-
+        if (v instanceof Double d) return Double.isFinite(d) ? d : null;
+        if (v instanceof Float f) return Float.isFinite(f) ? (double) f : null;
+        if (v instanceof BigDecimal bd) return bd.stripTrailingZeros();
         return v;
     }
 
@@ -544,10 +561,6 @@ public class MlGateway {
         String s = key.trim();
         return s.isEmpty() ? null : s;
     }
-
-    // =====================================================
-    // Parsing helpers
-    // =====================================================
 
     private static StrategyType parseStrategyType(Object v) {
         String s = extractString(v);
@@ -593,73 +606,22 @@ public class MlGateway {
         return t.isEmpty() ? null : t;
     }
 
-    // =====================================================
-    // Error classifiers
-    // =====================================================
-
-    private static boolean isModelFormatError(String err) {
-        if (err == null) return false;
-        String s = err.toLowerCase(Locale.ROOT);
-
-        if (s.contains("predict_proba") && s.contains("dict")) return true;
-        if (s.contains("xgboost") && (s.contains("save_model") || s.contains("serialized model"))) return true;
-
-        return s.contains("model") && (s.contains("load") || s.contains("deserialize") || s.contains("pickle"));
+    private static String blankToDefault(String s, String fallback) {
+        String v = blankToNull(s);
+        return v != null ? v : fallback;
     }
-
-    private static boolean isNeutralStreakError(String err) {
-        if (err == null) return false;
-        String s = err.toLowerCase(Locale.ROOT);
-        return s.contains("neutral_streak");
-    }
-
-    private static boolean isMissingFeaturesError(String err) {
-        if (err == null) return false;
-        return err.toLowerCase(Locale.ROOT).contains("missing_features");
-    }
-
-    private static boolean isFeatureOrderHashMismatchError(String err) {
-        if (err == null) return false;
-        String s = err.toLowerCase(Locale.ROOT);
-        return s.contains("featureorder_hash_mismatch")
-               || s.contains("feature_order_hash_mismatch")
-               || s.contains("feature hash mismatch");
-    }
-
-    private static boolean isSchemaMismatchError(String err) {
-        if (err == null) return false;
-        String s = err.toLowerCase(Locale.ROOT);
-        return s.contains("schema_hash_mismatch")
-               || s.contains("schema mismatch")
-               || s.contains("schema_mismatch");
-    }
-
-    // =====================================================
-    // Warn throttle
-    // =====================================================
 
     private void warnOnce(String key, long throttleMs, String template, Object... args) {
         long now = System.currentTimeMillis();
         Long prev = warnThrottle.get(key);
-
-        if (prev != null && now - prev < throttleMs) {
-            return;
-        }
-
+        if (prev != null && now - prev < throttleMs) return;
         warnThrottle.put(key, now);
         log.warn(template, args);
     }
 
-    private static String buildWarnKey(StrategyType type,
-                                       Long chatId,
-                                       String symbol,
-                                       String suffix) {
+    private static String buildWarnKey(StrategyType type, Long chatId, String symbol, String suffix) {
         return String.valueOf(type) + "|" + chatId + "|" + symbol + "|" + suffix;
     }
-
-    // =====================================================
-    // Misc
-    // =====================================================
 
     private static String safeMsg(Throwable e) {
         if (e == null) return "null";
@@ -672,4 +634,3 @@ public class MlGateway {
         return s == null ? "null" : s;
     }
 }
-

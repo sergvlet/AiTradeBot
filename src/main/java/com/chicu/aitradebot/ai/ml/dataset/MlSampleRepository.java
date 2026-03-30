@@ -1,102 +1,63 @@
 package com.chicu.aitradebot.ai.ml.dataset;
 
 import com.chicu.aitradebot.common.enums.StrategyType;
-import jakarta.persistence.criteria.Predicate;
-import org.springframework.data.domain.Sort;
 import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 
 @Repository
-public interface MlSampleRepository
-        extends JpaRepository<MlSampleEntity, Long>, JpaSpecificationExecutor<MlSampleEntity> {
+public interface MlSampleRepository extends JpaRepository<MlSampleEntity, Long> {
+
+    @Query("""
+            select s
+            from MlSampleEntity s
+            where s.chatId = :chatId
+              and s.strategyType = :type
+              and s.createdAt >= :from
+            order by coalesce(s.ts, s.createdAt) desc
+            """)
+    List<MlSampleEntity> findRecent(@Param("chatId") Long chatId,
+                                    @Param("type") StrategyType type,
+                                    @Param("from") Instant from);
 
     /**
-     * Последние сэмплы по chatId + strategyType начиная с указанного времени.
-     * Нужен для MlTrainingServiceImpl.findRecent(...)
+     * Новый продовый метод: обучение по контексту стратегии,
+     * чтобы не смешивать пользователей / биржи / сети / пары.
      */
-    default List<MlSampleEntity> findRecent(Long chatId,
-                                            StrategyType strategyType,
-                                            Instant from) {
-        if (chatId == null || strategyType == null || from == null) {
-            return List.of();
-        }
-
-        return findAll((root, query, cb) -> {
-            List<Predicate> predicates = new ArrayList<>();
-            predicates.add(cb.equal(root.get("chatId"), chatId));
-            predicates.add(cb.equal(root.get("strategyType"), strategyType));
-            predicates.add(cb.greaterThanOrEqualTo(root.get("createdAt"), from));
-            return cb.and(predicates.toArray(new Predicate[0]));
-        }, Sort.by(Sort.Direction.ASC, "createdAt"));
-    }
+    @Query("""
+            select s
+            from MlSampleEntity s
+            where s.strategyType = :type
+              and upper(s.symbol) = upper(:symbol)
+              and lower(coalesce(s.timeframe, '')) = lower(:timeframe)
+              and s.createdAt >= :from
+              and (:exchange is null or upper(coalesce(s.exchange, '')) = upper(:exchange))
+              and (:network is null or upper(coalesce(s.network, '')) = upper(:network))
+            order by coalesce(s.ts, s.createdAt) desc
+            """)
+    List<MlSampleEntity> findForTrainingByContext(@Param("type") StrategyType type,
+                                                  @Param("symbol") String symbol,
+                                                  @Param("timeframe") String timeframe,
+                                                  @Param("exchange") String exchange,
+                                                  @Param("network") String network,
+                                                  @Param("from") Instant from);
 
     /**
-     * Безопасная выборка для обучения.
-     * Здесь нет конструкции (? is null or ...), из-за которой PostgreSQL
-     * у тебя выбрасывал ошибку "не удалось определить тип данных параметра $7".
+     * Обратная совместимость со старым кодом.
+     * Старый сервис ожидал метод findForTraining(chatId, type, symbol, timeframe, from, to).
+     * chatId и to здесь больше не используются для cohort-train,
+     * поэтому делаем безопасный мост на новый метод.
      */
     default List<MlSampleEntity> findForTraining(Long chatId,
-                                                 StrategyType strategyType,
+                                                 StrategyType type,
                                                  String symbol,
                                                  String timeframe,
                                                  Instant from,
                                                  Instant to) {
-        if (chatId == null || strategyType == null) {
-            return List.of();
-        }
-
-        final String normalizedSymbol = normalizeSymbol(symbol);
-        final String normalizedTimeframe = normalizeTimeframe(timeframe);
-
-        return findAll((root, query, cb) -> {
-            List<Predicate> predicates = new ArrayList<>();
-
-            predicates.add(cb.equal(root.get("chatId"), chatId));
-            predicates.add(cb.equal(root.get("strategyType"), strategyType));
-
-            if (normalizedSymbol != null) {
-                predicates.add(cb.equal(root.get("symbol"), normalizedSymbol));
-            }
-
-            if (normalizedTimeframe != null) {
-                predicates.add(cb.equal(root.get("timeframe"), normalizedTimeframe));
-            }
-
-            if (from != null) {
-                predicates.add(cb.greaterThanOrEqualTo(root.get("createdAt"), from));
-            }
-
-            if (to != null) {
-                predicates.add(cb.lessThanOrEqualTo(root.get("createdAt"), to));
-            }
-
-            predicates.add(cb.isNotNull(root.get("label")));
-            predicates.add(cb.notEqual(root.get("label"), ""));
-
-            return cb.and(predicates.toArray(new Predicate[0]));
-        }, Sort.by(Sort.Direction.ASC, "createdAt"));
-    }
-
-    private static String normalizeSymbol(String symbol) {
-        if (symbol == null) {
-            return null;
-        }
-        String s = symbol.trim().toUpperCase(Locale.ROOT);
-        return s.isEmpty() ? null : s;
-    }
-
-    private static String normalizeTimeframe(String timeframe) {
-        if (timeframe == null) {
-            return null;
-        }
-        String s = timeframe.trim().toLowerCase(Locale.ROOT);
-        return s.isEmpty() ? null : s;
+        return findForTrainingByContext(type, symbol, timeframe, null, null, from);
     }
 }
-
