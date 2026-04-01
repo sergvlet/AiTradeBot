@@ -219,6 +219,10 @@ public interface ExchangeClient {
 
     AccountInfo getAccountInfo(long chatId, NetworkType network);
 
+    /**
+     * Комиссии аккаунта ВСЕГДА возвращаются в процентах: 0.1 = 0.1%, 0.06 = 0.06%, 0.18 = 0.18%.
+     * Не rate/double fraction. Для перевода в долю используйте pct / 100.
+     */
     AccountFees getAccountFees(long chatId, NetworkType network);
 
     List<SymbolDescriptor> getTradableSymbols(String quoteAsset);
@@ -312,4 +316,5 @@ public interface ExchangeClient {
         QUOTE_QTY
     }
 }
+
 

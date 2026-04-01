@@ -1124,11 +1124,11 @@ public class BybitExchangeClient implements ExchangeClient {
             BigDecimal takerRate = parseBd(fees.optString("takerFeeRate", null));
 
             BigDecimal makerPct = makerRate != null
-                    ? makerRate.multiply(BigDecimal.valueOf(100)).setScale(6, RoundingMode.HALF_UP)
+                    ? AccountFees.normalizePct(makerRate.multiply(BigDecimal.valueOf(100)))
                     : null;
 
             BigDecimal takerPct = takerRate != null
-                    ? takerRate.multiply(BigDecimal.valueOf(100)).setScale(6, RoundingMode.HALF_UP)
+                    ? AccountFees.normalizePct(takerRate.multiply(BigDecimal.valueOf(100)))
                     : null;
 
             return AccountFees.builder()
@@ -1449,6 +1449,7 @@ public class BybitExchangeClient implements ExchangeClient {
         return safe.setScale(4, RoundingMode.DOWN).stripTrailingZeros();
     }
 }
+
 
 
 

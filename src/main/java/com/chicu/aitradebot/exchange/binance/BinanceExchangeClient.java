@@ -1013,10 +1013,12 @@ public class BinanceExchangeClient implements ExchangeClient {
             JSONObject json = new JSONObject(body);
 
             BigDecimal makerPct = BigDecimal.valueOf(json.optInt("makerCommission", 10))
-                    .divide(BigDecimal.valueOf(10000), 8, RoundingMode.HALF_UP);
+                    .divide(BigDecimal.valueOf(100), 6, RoundingMode.HALF_UP)
+                    .stripTrailingZeros();
 
             BigDecimal takerPct = BigDecimal.valueOf(json.optInt("takerCommission", 10))
-                    .divide(BigDecimal.valueOf(10000), 8, RoundingMode.HALF_UP);
+                    .divide(BigDecimal.valueOf(100), 6, RoundingMode.HALF_UP)
+                    .stripTrailingZeros();
 
             int vip = json.optInt("feeTier", 0);
 
@@ -1054,10 +1056,10 @@ public class BinanceExchangeClient implements ExchangeClient {
             if (log.isDebugEnabled()) log.debug("Stacktrace getAccountInfo", e);
 
             return AccountInfo.builder()
-                    .makerFee(0.001)
-                    .takerFee(0.001)
-                    .makerFeeWithDiscount(0.001)
-                    .takerFeeWithDiscount(0.001)
+                    .makerFee(0.10)
+                    .takerFee(0.10)
+                    .makerFeeWithDiscount(0.10)
+                    .takerFeeWithDiscount(0.10)
                     .vipLevel(0)
                     .usingBnbDiscount(false)
                     .build();
@@ -1083,11 +1085,13 @@ public class BinanceExchangeClient implements ExchangeClient {
 
             BigDecimal makerPct = BigDecimal
                     .valueOf(json.getInt("makerCommission"))
-                    .divide(BigDecimal.valueOf(10000), 8, RoundingMode.HALF_UP);
+                    .divide(BigDecimal.valueOf(100), 6, RoundingMode.HALF_UP)
+                    .stripTrailingZeros();
 
             BigDecimal takerPct = BigDecimal
                     .valueOf(json.getInt("takerCommission"))
-                    .divide(BigDecimal.valueOf(10000), 8, RoundingMode.HALF_UP);
+                    .divide(BigDecimal.valueOf(100), 6, RoundingMode.HALF_UP)
+                    .stripTrailingZeros();
 
             return AccountFees.builder()
                     .makerPct(makerPct)
@@ -1413,6 +1417,7 @@ public class BinanceExchangeClient implements ExchangeClient {
         return v.stripTrailingZeros().toPlainString();
     }
 }
+
 
 
 

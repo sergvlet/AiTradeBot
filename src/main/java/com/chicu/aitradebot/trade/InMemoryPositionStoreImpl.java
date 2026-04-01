@@ -664,7 +664,18 @@ public class InMemoryPositionStoreImpl implements PositionStore {
     }
 
     private boolean shouldCountSellForRestore(OrderEntity order) {
-        return isFilledOrder(order);
+        if (order == null) return false;
+        if (Boolean.TRUE.equals(order.getFilled())) return true;
+
+        String status = normUpper(order.getStatus());
+        if (status == null) return false;
+
+        return switch (status) {
+            case "FILLED", "PARTIALLY_FILLED", "PARTIALLYFILLED", "PARTIALLY_FILLED_CANCELED", "PARTIALLYFILLEDCANCELED" -> true;
+            case "NEW", "OPEN", "PENDING_NEW", "PENDINGNEW", "CREATED", "ACCEPTED", "ACTIVE", "UNTRIGGERED", "TRIGGERED",
+                 "CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "FAILED" -> false;
+            default -> false;
+        };
     }
 
     private Instant resolveOrderInstant(OrderEntity order) {
@@ -800,4 +811,6 @@ public class InMemoryPositionStoreImpl implements PositionStore {
         return v == null ? "null" : v.stripTrailingZeros().toPlainString();
     }
 }
+
+
 

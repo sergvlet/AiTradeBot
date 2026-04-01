@@ -24,15 +24,34 @@ $Manifest    = Join-Path $ExportDir "manifest.txt"
 # =========================================================
 $FileNamesToPack = @(
     "WindowScalpingStrategyV4.java",
-    "MlAutoTuneRuntime.java",
-    "TradeExecutionServiceImpl.java",
-    "InMemoryPositionStoreImpl.java",
-    "MlDatasetCollector.java",
-    "TradeClosedEvent.java",
     "AiStrategyOrchestrator.java",
-    "StrategySettings.java"
+    "AutoTunerOrchestrator.java",
+    "MlAutoTuneRuntime.java",
+    "WindowScalpingAutoTuner.java",
+    "MlTrainingService.java",
+    "MlTrainingServiceImpl.java",
+    "MlGateway.java",
+    "MlClient.java",
+    "MlTrainResponse.java",
+    "MlProperties.java",
+    "MlTrainProperties.java",
+    "MlSampleEntity.java",
+    "MlSampleIngestService.java",
+    "MlSampleIngestServiceImpl.java",
+    "MlDatasetCollector.java",
+    "StrategySettings.java",
+    "StrategySettingsService.java",
+    "StrategySettingsServiceImpl.java",
+    "WindowScalpingStrategySettings.java",
+    "WindowScalpingStrategySettingsService.java",
+    "WindowScalpingStrategySettingsServiceImpl.java",
+    "MlBacktestRunner.java",
+    "RealMlBacktestRunner.java",
+    "SchedulerService.java",
+    "SchedulerServiceImpl.java",
+    "TradeExecutionServiceImpl.java",
+    "app.py"
 )
-
 # =========================================================
 # 3) ПОДГОТОВКА ПАПКИ РЕЗУЛЬТАТА
 # =========================================================
