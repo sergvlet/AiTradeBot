@@ -1,78 +1,66 @@
 "use strict";
 
-/**
- * LayerRenderer
- * =============
- */
-
 export class LayerRenderer {
 
     constructor(chart, candleSeries) {
-        this.chart   = chart;
+        this.chart = chart;
         this.candles = candleSeries;
 
-        // === LEVELS ===
         this.levelLines = [];
         this.activeLevelPrice = null;
-
-        // === GENERIC ZONE ===
         this.zoneLines = [];
-
-        // === BUY / SELL ZONE ===
         this.tradeZoneLines = [];
-
-        // === TP / SL (legacy) ===
         this.tpLine = null;
         this.slLine = null;
-
-        // === NAMED PRICE LINES (ENTRY / TP / SL) ===
         this.priceLines = new Map();
 
-        // === WINDOW ZONE (SCALPING) ===
         this.windowHighLine = null;
-        this.windowLowLine  = null;
+        this.windowLowLine = null;
         this.windowZoneBackground = null;
-
-        // ✅ sticky state (чтобы после refresh восстановить)
         this._lastWindowZone = null;
 
-        // === ATR / VOLATILITY (INFO ONLY) ===
+        this.emaFastSeries = null;
+        this.emaSlowSeries = null;
+        this._lastEmaSeries = null;
+
         this.lastAtr = null;
         this.lastVolatilityPct = null;
 
-        // === ORDERS ===
         this.orderLines = new Map();
-
-        // === TRADES (MARKERS) ===
         this.markers = [];
+        this._lastMarkers = [];
 
-        // === LEGACY / INTERNAL ===
         this.magnetTarget = null;
         this.magnetStrength = 0;
-
         this.currentPrice = null;
     }
 
-    // =====================================================
-    // BIND / REBIND (ВАЖНО для refresh)
-    // =====================================================
     bind(chart, candleSeries) {
-        this.chart   = chart;
+        this.chart = chart;
         this.candles = candleSeries;
-
-        // после пересоздания series/graph — восстанавливаем зону
         this.restoreWindowZone();
+        this.restoreEmaSeries();
+        this.restoreMarkers();
     }
 
     restoreWindowZone() {
         if (!this._lastWindowZone) return;
-        // перерисует на текущих this.chart/this.candles
         this.renderWindowZone(this._lastWindowZone);
     }
 
-    // =====================================================
-    // HELPERS
-    // =====================================================
+    restoreEmaSeries() {
+        if (!this._lastEmaSeries) return;
+        this.renderEmaSeries(this._lastEmaSeries);
+    }
+
+    restoreMarkers() {
+        if (!Array.isArray(this._lastMarkers) || !this._lastMarkers.length) return;
+        this.markers = [...this._lastMarkers];
+        try {
+            this.candles?.setMarkers?.(this.markers);
+        } catch {}
+    }
+
     _parsePrice(v) {
         if (v == null) return NaN;
         if (typeof v === "number") return v;
@@ -86,39 +74,40 @@ export class LayerRenderer {
 
     _safeRemovePriceLine(line) {
         if (!line) return;
-        try {
-            this.candles?.removePriceLine?.(line);
-        } catch {}
+        try { this.candles?.removePriceLine?.(line); } catch {}
     }
 
     _safeRemoveSeries(series) {
         if (!series) return;
-        try {
-            this.chart?.removeSeries?.(series);
-        } catch {}
+        try { this.chart?.removeSeries?.(series); } catch {}
     }
 
-    // ✅ приводим время к UTCTimestamp (секунды)
     _normalizeTime(t) {
         if (t == null) return NaN;
-
-        // LightweightCharts иногда может вернуть объект businessDay
         if (typeof t === "object") return NaN;
-
         const n = Number(t);
         if (!Number.isFinite(n)) return NaN;
-
-        // если миллисекунды (типично 13 цифр)
         if (n > 1e11) return Math.floor(n / 1000);
         return Math.floor(n);
     }
 
-    // =====================================================
-    // LEVELS
-    // =====================================================
+    _createLineSeries(color) {
+        if (typeof this.chart?.addLineSeries !== "function") return null;
+        try {
+            return this.chart.addLineSeries({
+                color,
+                lineWidth: 2,
+                priceLineVisible: false,
+                lastValueVisible: false,
+                crosshairMarkerVisible: false
+            });
+        } catch {
+            return null;
+        }
+    }
+
     renderLevels(levels) {
         if (!Array.isArray(levels)) return;
-
         this.clearLevels();
 
         levels.forEach(lvl => {
@@ -144,9 +133,6 @@ export class LayerRenderer {
         this.levelLines = [];
     }
 
-    // =====================================================
-    // ACTIVE LEVEL (LEGACY)
-    // =====================================================
     onActiveLevel(payload) {
         if (!payload) return;
         this.activeLevelPrice = Number(payload.price);
@@ -163,17 +149,11 @@ export class LayerRenderer {
         });
     }
 
-    // =====================================================
-    // PRICE
-    // =====================================================
     onPriceUpdate(price) {
         if (!Number.isFinite(price)) return;
         this.currentPrice = price;
     }
 
-    // =====================================================
-    // GENERIC ZONE
-    // =====================================================
     renderZone(zone) {
         if (!zone) return;
         this.clearZone();
@@ -184,7 +164,6 @@ export class LayerRenderer {
 
         const hi = Math.max(top, bottom);
         const lo = Math.min(top, bottom);
-
         const color = zone.color || "rgba(59,130,246,0.15)";
 
         this.zoneLines = [
@@ -210,9 +189,6 @@ export class LayerRenderer {
         this.zoneLines = [];
     }
 
-    // =====================================================
-    // BUY / SELL ZONE
-    // =====================================================
     renderTradeZone(zone) {
         if (!zone) return;
         this.clearTradeZone();
@@ -224,10 +200,9 @@ export class LayerRenderer {
         const hi = Math.max(top, bottom);
         const lo = Math.min(top, bottom);
 
-        const color =
-            zone.side === "BUY"
-                ? "rgba(34,197,94,0.25)"
-                : "rgba(239,68,68,0.25)";
+        const color = zone.side === "BUY"
+            ? "rgba(34,197,94,0.25)"
+            : "rgba(239,68,68,0.25)";
 
         this.tradeZoneLines = [
             this.candles.createPriceLine({
@@ -252,9 +227,6 @@ export class LayerRenderer {
         this.tradeZoneLines = [];
     }
 
-    // =====================================================
-    // TP / SL (LEGACY)
-    // =====================================================
     renderTpSl(tpSl) {
         if (!tpSl) return;
         this.clearTpSl();
@@ -293,9 +265,6 @@ export class LayerRenderer {
         this.slLine = null;
     }
 
-    // =====================================================
-    // NAMED PRICE LINES
-    // =====================================================
     renderPriceLine(pl) {
         if (!pl || !pl.name || pl.price == null) return;
 
@@ -307,11 +276,10 @@ export class LayerRenderer {
             this._safeRemovePriceLine(this.priceLines.get(name));
         }
 
-        const color =
-            pl.color ||
+        const color = pl.color ||
             (name === "ENTRY" ? "#eab308" :
-                name === "TP"    ? "#22c55e" :
-                    name === "SL"    ? "#ef4444" :
+                name === "TP" ? "#22c55e" :
+                    name === "SL" ? "#ef4444" :
                         "#94a3b8");
 
         const line = this.candles.createPriceLine({
@@ -330,32 +298,26 @@ export class LayerRenderer {
         this.priceLines.clear();
     }
 
-    // =====================================================
-    // WINDOW ZONE  ✅ FIXED
-    // =====================================================
     renderWindowZone(zone) {
         if (!zone) return;
 
         const high = Number(zone.high);
-        const low  = Number(zone.low);
+        const low = Number(zone.low);
         if (!Number.isFinite(high) || !Number.isFinite(low)) return;
 
         const hi = Math.max(high, low);
         const lo = Math.min(high, low);
 
-        // ✅ сохраняем последнюю валидную зону (для restore после refresh)
         this._lastWindowZone = {
             high: hi,
             low: lo,
             candlesData: Array.isArray(zone.candlesData) ? zone.candlesData : null
         };
 
-        // перерисовка
         this.clearWindowZone();
 
         const color = "#64748b";
 
-        // ✅ Линии рисуем ВСЕГДА
         this.windowHighLine = this.candles.createPriceLine({
             price: hi,
             color,
@@ -372,37 +334,32 @@ export class LayerRenderer {
             title: "WINDOW LOW"
         });
 
-        // ---- ФОН (опционально) ----
         if (typeof this.chart?.addBaselineSeries !== "function") return;
 
         let fromTime = NaN;
-        let toTime   = NaN;
-
+        let toTime = NaN;
         const candles = Array.isArray(zone.candlesData) ? zone.candlesData : null;
 
         if (candles && candles.length) {
             fromTime = this._normalizeTime(candles[0]?.time);
-            toTime   = this._normalizeTime(candles.at(-1)?.time);
+            toTime = this._normalizeTime(candles.at(-1)?.time);
         }
 
-        // fallback: видимый диапазон (если candlesData нет/битый)
         if (!Number.isFinite(fromTime) || !Number.isFinite(toTime)) {
             const vr = this.chart?.timeScale?.().getVisibleRange?.();
             if (vr && vr.from != null && vr.to != null) {
                 fromTime = this._normalizeTime(vr.from);
-                toTime   = this._normalizeTime(vr.to);
+                toTime = this._normalizeTime(vr.to);
             }
         }
 
         if (!Number.isFinite(fromTime) || !Number.isFinite(toTime)) return;
-
         if (toTime < fromTime) {
             const tmp = fromTime;
             fromTime = toTime;
             toTime = tmp;
         }
 
-        // шаг по времени
         let step = 60;
         if (candles && candles.length >= 2) {
             const t1 = this._normalizeTime(candles.at(-1)?.time);
@@ -411,7 +368,6 @@ export class LayerRenderer {
             if (Number.isFinite(dt) && dt > 0) step = dt;
         }
 
-        // ограничим размер массива
         const maxPoints = 600;
         const range = toTime - fromTime;
         const approx = Math.floor(range / step);
@@ -419,17 +375,13 @@ export class LayerRenderer {
 
         const bg = this.chart.addBaselineSeries({
             baseValue: { type: "price", price: lo },
-
             topFillColor1: "rgba(100, 116, 139, 0.12)",
             topFillColor2: "rgba(100, 116, 139, 0.12)",
             bottomFillColor1: "rgba(100, 116, 139, 0.12)",
             bottomFillColor2: "rgba(100, 116, 139, 0.12)",
-
             lineVisible: false,
             priceLineVisible: false,
             lastValueVisible: false,
-
-            // ✅ чтобы фон НЕ влиял на autoscale свечей
             autoscaleInfoProvider: () => null
         });
 
@@ -450,17 +402,40 @@ export class LayerRenderer {
     clearWindowZone() {
         this._safeRemovePriceLine(this.windowHighLine);
         this._safeRemovePriceLine(this.windowLowLine);
-
         this.windowHighLine = null;
         this.windowLowLine = null;
-
         this._safeRemoveSeries(this.windowZoneBackground);
         this.windowZoneBackground = null;
     }
 
-    // =====================================================
-    // ATR / VOLATILITY (INFO)
-    // =====================================================
+    renderEmaSeries(payload) {
+        if (!payload) return;
+        const fastData = Array.isArray(payload.fastData) ? payload.fastData : [];
+        const slowData = Array.isArray(payload.slowData) ? payload.slowData : [];
+
+        this._lastEmaSeries = {
+            fastData: fastData.map(p => ({ ...p })),
+            slowData: slowData.map(p => ({ ...p }))
+        };
+
+        this.clearEmaSeries();
+
+        if (!fastData.length && !slowData.length) return;
+
+        this.emaFastSeries = this._createLineSeries("#f59e0b");
+        this.emaSlowSeries = this._createLineSeries("#60a5fa");
+
+        try { this.emaFastSeries?.setData?.(fastData); } catch {}
+        try { this.emaSlowSeries?.setData?.(slowData); } catch {}
+    }
+
+    clearEmaSeries() {
+        this._safeRemoveSeries(this.emaFastSeries);
+        this._safeRemoveSeries(this.emaSlowSeries);
+        this.emaFastSeries = null;
+        this.emaSlowSeries = null;
+    }
+
     renderAtr(atr) {
         if (!atr) return;
         this.lastAtr = atr.atr;
@@ -472,14 +447,10 @@ export class LayerRenderer {
         this.lastVolatilityPct = null;
     }
 
-    // =====================================================
-    // ORDERS
-    // =====================================================
     renderOrder(order) {
         if (!order || !order.orderId) return;
 
         const orderId = String(order.orderId);
-
         if (this.orderLines.has(orderId)) {
             this._safeRemovePriceLine(this.orderLines.get(orderId));
         }
@@ -498,18 +469,12 @@ export class LayerRenderer {
         this.orderLines.set(orderId, line);
     }
 
-    // =====================================================
-    // MAGNET (LEGACY)
-    // =====================================================
     onMagnet(magnet) {
         if (!magnet) return;
         this.magnetTarget = Number(magnet.target);
         this.magnetStrength = magnet.strength;
     }
 
-    // =====================================================
-    // TRADES (MARKERS)
-    // =====================================================
     renderTrade(trade, timeSec) {
         if (!trade || !Number.isFinite(timeSec)) return;
 
@@ -528,6 +493,15 @@ export class LayerRenderer {
             this.markers = this.markers.slice(-300);
         }
 
+        this._lastMarkers = [...this.markers];
         this.candles.setMarkers(this.markers);
+    }
+
+    clearTrades() {
+        this.markers = [];
+        this._lastMarkers = [];
+        try {
+            this.candles?.setMarkers?.([]);
+        } catch {}
     }
 }

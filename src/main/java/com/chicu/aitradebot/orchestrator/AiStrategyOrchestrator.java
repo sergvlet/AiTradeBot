@@ -1,7 +1,12 @@
 package com.chicu.aitradebot.orchestrator;
 
 import com.chicu.aitradebot.ai.ml.MlGateway;
+import com.chicu.aitradebot.ai.ml.training.MlTrainingResult;
+import com.chicu.aitradebot.ai.ml.training.MlTrainingServiceImpl;
 import com.chicu.aitradebot.ai.runtime.MlAutoTuneRuntime;
+import com.chicu.aitradebot.ai.tuning.AutoTunerOrchestrator;
+import com.chicu.aitradebot.ai.tuning.TuningRequest;
+import com.chicu.aitradebot.ai.tuning.TuningResult;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
@@ -12,6 +17,7 @@ import com.chicu.aitradebot.market.model.UnifiedKline;
 import com.chicu.aitradebot.market.stream.MarketDataStreamService;
 import com.chicu.aitradebot.orchestrator.dto.StrategyRunInfo;
 import com.chicu.aitradebot.service.OrderService;
+import com.chicu.aitradebot.service.StrategySettingsCommandService;
 import com.chicu.aitradebot.service.StrategySettingsService;
 import com.chicu.aitradebot.strategy.core.TradingStrategy;
 import com.chicu.aitradebot.strategy.registry.StrategyRegistry;
@@ -35,6 +41,7 @@ import java.time.ZoneId;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -50,6 +57,7 @@ public class AiStrategyOrchestrator {
     private static final BigDecimal DEFAULT_GATE_MIN_PROB = new BigDecimal("0.550000");
 
     private final OrderService orderService;
+    private final StrategySettingsCommandService strategySettingsCommandService;
     private final StrategySettingsService settingsService;
     private final StrategyRegistry strategyRegistry;
     private final MarketStreamService marketStreamService;
@@ -63,6 +71,8 @@ public class AiStrategyOrchestrator {
      */
     private final ObjectProvider<MlAutoTuneRuntime> mlAutoTuneRuntime;
     private final ObjectProvider<MlGateway> mlGatewayProvider;
+    private final ObjectProvider<MlTrainingServiceImpl> mlTrainingServiceProvider;
+    private final ObjectProvider<AutoTunerOrchestrator> autoTunerProvider;
 
     @Value("${orch.market-events.listener-enabled:false}")
     private boolean eventBridgeEnabled;
@@ -79,6 +89,14 @@ public class AiStrategyOrchestrator {
 
     private MlGateway mlGateway() {
         return mlGatewayProvider != null ? mlGatewayProvider.getIfAvailable() : null;
+    }
+
+    private MlTrainingServiceImpl trainer() {
+        return mlTrainingServiceProvider != null ? mlTrainingServiceProvider.getIfAvailable() : null;
+    }
+
+    private AutoTunerOrchestrator autoTuner() {
+        return autoTunerProvider != null ? autoTunerProvider.getIfAvailable() : null;
     }
 
     private static String blankToNull(String s) {
@@ -393,7 +411,7 @@ public class AiStrategyOrchestrator {
 
         if (changed) {
             try {
-                settingsService.save(s);
+                s = saveSettingsWithRetry(s, "applyRuntimePolicy");
             } catch (Exception e) {
                 log.warn("⚠️ [ORCH] applyRuntimePolicy save failed chatId={} type={} : {}", chatId, type, e.getMessage());
             }
@@ -699,6 +717,46 @@ public class AiStrategyOrchestrator {
                 return buildRunInfoFromBinding(s, current, true, "Стратегия не найдена (рестарт пропущен)");
             }
 
+            String prepareError = runPrepareBeforeStart(
+                    chatId,
+                    type,
+                    desired.exchange(),
+                    desired.network(),
+                    desired.symbol(),
+                    desired.timeframe(),
+                    s
+            );
+            if (prepareError != null) {
+                boolean softPrepareError = isSoftPrepareError(prepareError);
+                if (softPrepareError) {
+                    clearStaleMlContextOnSoftPrepareFailure(
+                            s,
+                            type,
+                            desired.exchange(),
+                            desired.network(),
+                            desired.symbol(),
+                            desired.timeframe()
+                    );
+                }
+
+                if (softPrepareError && allowStartWithoutPreparedModel(s)) {
+                    log.warn("⚠️ [ORCH] SOFT_PREPARE_MISS chatId={} type={} ex={} net={} sym={} tf={} reason={} | продолжу переключение контекста без подготовленной модели",
+                            chatId, type, desired.exchange(), desired.network(), desired.symbol(), desired.timeframe(), prepareError);
+                } else {
+                    return buildRunInfoFromBinding(
+                            s,
+                            current,
+                            true,
+                            "Рестарт отменён: подготовка нового контекста не пройдена (" + prepareError + ")"
+                    );
+                }
+            }
+
+            StrategySettings preparedSettings = loadSettingsStrict(chatId, type, desired.exchange(), desired.network());
+            if (preparedSettings != null) {
+                s = preparedSettings;
+            }
+
             LifecycleCloseResult closeResult = closeOpenPositionBeforeLifecycleTransition(
                     chatId,
                     type,
@@ -765,7 +823,7 @@ public class AiStrategyOrchestrator {
                 s.setActive(true);
                 s.setStartedAt(LocalDateTime.now());
                 s.setStoppedAt(null);
-                settingsService.save(s);
+                s = saveSettingsWithRetry(s, "restart_active_state");
             }
 
             applyRuntimePolicy(chatId, type, desired.exchange(), desired.network(), s);
@@ -780,7 +838,233 @@ public class AiStrategyOrchestrator {
         }
     }
 
-    // =====================================================================
+    
+
+    private boolean isSoftPrepareError(String prepareError) {
+        if (prepareError == null || prepareError.isBlank()) {
+            return false;
+        }
+
+        String normalized = prepareError.trim().toLowerCase(Locale.ROOT);
+        return normalized.contains("no_selected_candles")
+                || normalized.contains("no_samples")
+                || normalized.contains("no_context_samples")
+                || normalized.contains("not_enough_candle_rows")
+                || normalized.contains("not_enough_samples");
+    }
+
+    private boolean allowStartWithoutPreparedModel(StrategySettings settings) {
+        return safeMode(settings) == AdvancedControlMode.HYBRID;
+    }
+
+    private void clearStaleMlContextOnSoftPrepareFailure(StrategySettings settings,
+                                                         StrategyType type,
+                                                         String exchange,
+                                                         NetworkType network,
+                                                         String symbol,
+                                                         String timeframe) {
+        if (settings == null || type == null) {
+            return;
+        }
+
+        Long chatId = settings.getChatId();
+        if (chatId == null || chatId <= 0) {
+            return;
+        }
+
+        try {
+            StrategySettings target = settings;
+            try {
+                StrategySettings fresh = settingsService.getOrCreate(chatId, type);
+                if (fresh != null) {
+                    target = fresh;
+                }
+            } catch (Exception ignored) {
+            }
+
+            String contextualModelKey = MlGateway.buildContextModelKey(type, exchange, network != null ? network.name() : null, symbol, timeframe);
+            String livePhase = resolvePhaseAfterPrepare(network != null ? network : target.getNetworkType());
+
+            boolean changed = false;
+
+            if (!Objects.equals(blankToNull(target.getMlModelKey()), blankToNull(contextualModelKey))) {
+                target.setMlModelKey(contextualModelKey);
+                changed = true;
+            }
+            if (blankToNull(target.getMlModelVersion()) != null) {
+                target.setMlModelVersion(null);
+                changed = true;
+            }
+            if (blankToNull(target.getMlSchemaHash()) != null) {
+                target.setMlSchemaHash(null);
+                changed = true;
+            }
+            if (!livePhase.equalsIgnoreCase(sanitizePhase(target.getRunPhase()))) {
+                target.setRunPhase(livePhase);
+                changed = true;
+            }
+
+            if (changed) {
+                settingsService.save(target);
+            }
+
+            if (target != settings) {
+                settings.setMlModelKey(target.getMlModelKey());
+                settings.setMlModelVersion(target.getMlModelVersion());
+                settings.setMlSchemaHash(target.getMlSchemaHash());
+                settings.setRunPhase(target.getRunPhase());
+            }
+        } catch (Exception e) {
+            log.warn("⚠️ [ORCH] clearStaleMlContextOnSoftPrepareFailure failed chatId={} type={} ex={} net={} sym={} tf={} err={}",
+                    chatId, type, exchange, network, symbol, timeframe, e.toString());
+        }
+    }
+
+    private boolean requiresPrepareBeforeStart(StrategyType type, StrategySettings settings) {
+        if (type == null) return false;
+        if (type != StrategyType.WINDOW_SCALPING && type != StrategyType.EMA_CROSSOVER) return false;
+        AdvancedControlMode mode = safeMode(settings);
+        return mode == AdvancedControlMode.AI || mode == AdvancedControlMode.HYBRID;
+    }
+
+    private String resolvePhaseAfterPrepare(NetworkType network) {
+        return network == NetworkType.TESTNET ? "PAPER" : "LIVE";
+    }
+
+    private String runPrepareBeforeStart(Long chatId,
+                                         StrategyType type,
+                                         String exchange,
+                                         NetworkType network,
+                                         String symbol,
+                                         String timeframe,
+                                         StrategySettings settings) {
+        if (!requiresPrepareBeforeStart(type, settings)) {
+            return null;
+        }
+
+        Integer candlesLimit = settings != null ? settings.getCachedCandlesLimit() : null;
+        if (candlesLimit == null || candlesLimit <= 0) {
+            candlesLimit = 1000;
+        }
+
+        try {
+            settings.setRunPhase("PREPARE");
+            settingsService.save(settings);
+        } catch (Exception e) {
+            log.warn("⚠️ [ORCH] prepare phase save failed chatId={} type={} err={}", chatId, type, e.toString());
+        }
+
+        TradingStrategy strategy = strategyRegistry.get(type);
+        if (strategy instanceof PrepareStartAware aware) {
+            PreparationResult preparationResult;
+            try {
+                preparationResult = aware.prepareStart(chatId, type, symbol, timeframe, exchange, network);
+            } catch (Exception e) {
+                log.error("❌ [ORCH] prepareStart exception chatId={} type={} ex={} net={} sym={} tf={}",
+                        chatId, type, exchange, network, symbol, timeframe, e);
+                return "prepare_failed:train_exception";
+            }
+
+            if (preparationResult == null || !preparationResult.ok()) {
+                String reason = preparationResult != null ? blankToNull(preparationResult.message()) : null;
+                if (reason == null) {
+                    reason = "train_failed";
+                }
+                log.warn("🧠 [ORCH] PREPARE TRAIN SKIP/BLOCK chatId={} type={} ex={} net={} sym={} tf={} reason={}",
+                        chatId, type, exchange, network, symbol, timeframe, reason);
+                return "prepare_failed:" + reason;
+            }
+
+            try {
+                StrategySettings reloaded = loadSettingsStrict(chatId, type, exchange, network);
+                if (reloaded != null) {
+                    reloaded.setRunPhase(resolvePhaseAfterPrepare(network));
+                    settingsService.save(reloaded);
+                } else {
+                    settings.setRunPhase(resolvePhaseAfterPrepare(network));
+                    settingsService.save(settings);
+                }
+            } catch (Exception e) {
+                log.warn("⚠️ [ORCH] prepare final phase save failed chatId={} type={} err={}", chatId, type, e.toString());
+            }
+
+            return null;
+        }
+
+        MlTrainingServiceImpl trainer = trainer();
+        if (trainer == null) {
+            return "prepare_failed:trainer_missing";
+        }
+
+        MlTrainingResult trainRes;
+        try {
+            trainRes = trainer.trainOnSelectedCandles(
+                    chatId,
+                    type,
+                    exchange,
+                    network,
+                    symbol,
+                    timeframe,
+                    candlesLimit,
+                    "prepare_start_train"
+            );
+        } catch (Exception e) {
+            log.error("❌ [ORCH] prepare train exception chatId={} type={} ex={} net={} sym={} tf={}",
+                    chatId, type, exchange, network, symbol, timeframe, e);
+            return "prepare_failed:train_exception";
+        }
+
+        if (trainRes == null || !trainRes.ok() || !trainRes.applied()) {
+            String reason = (trainRes != null && trainRes.error() != null && !trainRes.error().isBlank())
+                    ? trainRes.error()
+                    : "train_failed";
+            log.warn("🧠 [ORCH] PREPARE TRAIN SKIP/BLOCK chatId={} type={} ex={} net={} sym={} tf={} reason={}",
+                    chatId, type, exchange, network, symbol, timeframe, reason);
+            return "prepare_failed:" + reason;
+        }
+
+        AutoTunerOrchestrator tuner = autoTuner();
+        if (tuner != null) {
+            try {
+                TuningRequest req = TuningRequest.builder()
+                        .chatId(chatId)
+                        .strategyType(type)
+                        .exchange(exchange)
+                        .network(network)
+                        .symbol(symbol)
+                        .timeframe(timeframe)
+                        .candlesLimit(candlesLimit)
+                        .reason("prepare_start_validate")
+                        .build();
+
+                TuningResult tuneRes = tuner.tune(req);
+                if (tuneRes != null) {
+                    log.info("🧠 [ORCH] PREPARE TUNE result chatId={} type={} ex={} net={} sym={} tf={} applied={} reason={}",
+                            chatId, type, exchange, network, symbol, timeframe, tuneRes.applied(), tuneRes.reason());
+                }
+            } catch (Exception e) {
+                log.warn("⚠️ [ORCH] prepare tune failed chatId={} type={} ex={} net={} sym={} tf={} err={}",
+                        chatId, type, exchange, network, symbol, timeframe, e.toString());
+            }
+        }
+
+        try {
+            StrategySettings reloaded = loadSettingsStrict(chatId, type, exchange, network);
+            if (reloaded != null) {
+                reloaded.setRunPhase(resolvePhaseAfterPrepare(network));
+                settingsService.save(reloaded);
+            } else {
+                settings.setRunPhase(resolvePhaseAfterPrepare(network));
+                settingsService.save(settings);
+            }
+        } catch (Exception e) {
+            log.warn("⚠️ [ORCH] prepare final phase save failed chatId={} type={} err={}", chatId, type, e.toString());
+        }
+
+        return null;
+    }
+
+// =====================================================================
     // START
     // =====================================================================
     public StrategyRunInfo startStrategy(Long chatId, StrategyType type, String exchange, NetworkType network) {
@@ -826,6 +1110,29 @@ public class AiStrategyOrchestrator {
 
             if (sym == null) return buildRunInfo(s, false, "Ошибка: не выбран символ");
 
+            String prepareError = runPrepareBeforeStart(chatId, type, ex, net, sym, tf, s);
+            if (prepareError != null) {
+                boolean softPrepareError = isSoftPrepareError(prepareError);
+                if (softPrepareError) {
+                    clearStaleMlContextOnSoftPrepareFailure(s, type, ex, net, sym, tf);
+                }
+
+                if (softPrepareError && allowStartWithoutPreparedModel(s)) {
+                    log.warn("⚠️ [ORCH] SOFT_PREPARE_MISS chatId={} type={} ex={} net={} sym={} tf={} reason={} | запускаю стратегию без подготовленной модели",
+                            chatId, type, ex, net, sym, tf, prepareError);
+                } else {
+                    return buildRunInfo(s, false, "Подготовка перед стартом не пройдена (" + prepareError + ")");
+                }
+            }
+
+            StrategySettings preparedSettings = loadSettingsStrict(chatId, type, ex, net);
+            if (preparedSettings != null) {
+                s = preparedSettings;
+                sym = sanitizeSymbol(s.getSymbol());
+                tf = sanitizeTf(s.getTimeframe());
+                if (sym == null) return buildRunInfo(s, false, "Ошибка: не выбран символ");
+            }
+
             TradingStrategy strategy = strategyRegistry.get(type);
             if (strategy == null) return buildRunInfo(s, false, "Стратегия не найдена");
 
@@ -846,7 +1153,7 @@ public class AiStrategyOrchestrator {
                     s.setActive(true);
                     s.setStartedAt(LocalDateTime.now());
                     s.setStoppedAt(null);
-                    settingsService.save(s);
+                    s = saveSettingsWithRetry(s, "start_already_running_active_state");
                 }
 
                 applyRuntimePolicy(chatId, type, ex, net, s);
@@ -909,12 +1216,20 @@ public class AiStrategyOrchestrator {
                 return buildRunInfo(s, false, "Ошибка запуска стратегии");
             }
 
+            StrategySettings freshSettings = loadSettingsStrict(chatId, type, ex, net);
+            if (freshSettings != null) {
+                s = freshSettings;
+                sym = sanitizeSymbol(s.getSymbol());
+                tf = sanitizeTf(s.getTimeframe());
+                if (sym == null) return buildRunInfo(s, false, "Ошибка: не выбран символ");
+            }
+
             syncSettingsContextIfNeeded(s, ex, net);
 
             s.setActive(true);
             s.setStartedAt(LocalDateTime.now());
             s.setStoppedAt(null);
-            settingsService.save(s);
+            s = saveSettingsWithRetry(s, "start_active_state");
 
             log.info("▶️ [ORCH] START {} chatId={} ex={} net={} symbol={} tf={} mode={}",
                     type, chatId, ex, net, sym, tf, safeMode(s));
@@ -1019,11 +1334,16 @@ public class AiStrategyOrchestrator {
                 }
             }
 
+            StrategySettings freshSettings = loadSettingsStrict(chatId, type, ex, net);
+            if (freshSettings != null) {
+                s = freshSettings;
+            }
+
             syncSettingsContextIfNeeded(s, ex, net);
 
             s.setActive(false);
             s.setStoppedAt(LocalDateTime.now());
-            settingsService.save(s);
+            s = saveSettingsWithRetry(s, "stop_inactive_state");
 
             safeAutotuneStop(chatId, type, ex, net);
 
@@ -1121,6 +1441,20 @@ public class AiStrategyOrchestrator {
     // =====================================================================
     // ML AUTO-TUNE HOOKS
     // =====================================================================
+
+    private StrategySettings saveSettingsWithRetry(StrategySettings s, String source) {
+        if (s == null || s.getChatId() == null || s.getType() == null) return s;
+
+        try {
+            StrategySettings saved = strategySettingsCommandService.savePatchWithRetry(s.getChatId(), s.getType(), s);
+            return saved != null ? saved : s;
+        } catch (Exception patchEx) {
+            log.warn("⚠️ [ORCH] {} savePatchWithRetry failed chatId={} type={} err={}",
+                    source, s.getChatId(), s.getType(), patchEx.toString());
+            StrategySettings saved = settingsService.save(s);
+            return saved != null ? saved : s;
+        }
+    }
 
     private void safeAutotuneStart(Long chatId, StrategyType type, String exchange, NetworkType network) {
         try {
@@ -1458,6 +1792,26 @@ public class AiStrategyOrchestrator {
                 health.lastBookTickerAgeMs());
     }
 
+
+    public record PreparationResult(boolean ok, String message) {
+        public static PreparationResult ok(String message) {
+            return new PreparationResult(true, message);
+        }
+
+        public static PreparationResult fail(String message) {
+            return new PreparationResult(false, message);
+        }
+    }
+
+    public interface PrepareStartAware {
+        PreparationResult prepareStart(long chatId,
+                                       StrategyType type,
+                                       String symbol,
+                                       String timeframe,
+                                       String exchange,
+                                       NetworkType network);
+    }
+
     // =====================================================================
     // GLOBAL DASHBOARD
     // =====================================================================
@@ -1553,7 +1907,7 @@ public class AiStrategyOrchestrator {
 
         if (changed) {
             try {
-                settingsService.save(s);
+                saveSettingsWithRetry(s, "syncSettingsContextIfNeeded");
             } catch (Exception e) {
                 log.debug("⚠ [ORCH] syncSettingsContextIfNeeded failed: {}", e.getMessage());
             }
@@ -1745,4 +2099,9 @@ public class AiStrategyOrchestrator {
         return s.isEmpty() ? null : s;
     }
 }
+
+
+
+
+
 

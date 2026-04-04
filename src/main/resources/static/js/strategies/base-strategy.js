@@ -1,37 +1,16 @@
 "use strict";
 
-/**
- * BaseStrategy (ШАГ 11)
- * -------------------
- * Адаптер между:
- *   - источником событий (WS / REST / replay)
- *   - набором feature
- *
- * ДОПОЛНИТЕЛЬНО:
- * ✔ хранит read-only runtime-состояния (cooldown и т.п.)
- */
 export class BaseStrategy {
 
     constructor({ ctx } = {}) {
-
         this.ctx = ctx || {};
-
-        /** @type {Array<Object>} */
         this.features = [];
-
         this.debug = false;
         this.name = this.constructor?.name || "Strategy";
 
-        // =============================
-        // RUNTIME STATE (READ-ONLY)
-        // =============================
         this.cooldownSeconds = null;
         this.cooldownUpdatedAt = null;
     }
-
-    // =====================================================
-    // FEATURE REGISTRATION
-    // =====================================================
 
     registerFeatures(features = []) {
         if (!Array.isArray(features)) return;
@@ -46,37 +25,25 @@ export class BaseStrategy {
         }
     }
 
-    // =====================================================
-    // EVENT PIPELINE
-    // =====================================================
+    setInfo(info = {}) {
+        this.ctx = this.ctx || {};
+        this.ctx.info = (info && typeof info === "object") ? info : {};
+    }
 
-    /**
-     * Главная точка входа событий.
-     */
     onEvent(ev) {
         if (!ev) return;
 
-        // -----------------------------
-        // SNAPSHOT / REPLAY LAYERS (INIT)
-        // -----------------------------
-        // StrategyDashboard.js отправляет это после REST snapshot:
-        //   strategy.onEvent({ type: "layers", layers: {...} })
-        // Раньше это игнорировалось feature-слоями, поэтому при refresh
-        // линии/зоны могли пропадать до следующего live-события.
         if (ev.type === "layers" && ev.layers && typeof ev.layers === "object") {
             const L = ev.layers || {};
 
-            // levels: [{price:...}, ...]
             if (Array.isArray(L.levels)) {
                 this.onEvent({ type: "levels", levels: L.levels });
             }
 
-            // zone: {top,bottom,color?}
             if (L.zone && typeof L.zone === "object") {
                 this.onEvent({ type: "zone", zone: L.zone });
             }
 
-            // tpSl: {tp?, sl?}
             const tpSl = (L.tpSl && typeof L.tpSl === "object") ? L.tpSl
                 : (L.tp_sl && typeof L.tp_sl === "object") ? L.tp_sl
                     : null;
@@ -84,19 +51,32 @@ export class BaseStrategy {
                 this.onEvent({ type: "tp_sl", tpSl });
             }
 
-            return; // исходный "layers" дальше не прокидываем
+            const windowZone = (L.windowZone && typeof L.windowZone === "object") ? L.windowZone
+                : (L.window_zone && typeof L.window_zone === "object") ? L.window_zone
+                    : null;
+            if (windowZone) {
+                this.onEvent({ type: "window_zone", windowZone });
+            }
+
+            if (Array.isArray(L.priceLines)) {
+                for (const pl of L.priceLines) {
+                    this.onEvent({ type: "price_line", priceLine: pl });
+                }
+            }
+
+            if (Array.isArray(L.trades)) {
+                for (const tr of L.trades) {
+                    this.onEvent({ type: "trade", trade: tr, time: tr?.time });
+                }
+            }
+
+            return;
         }
 
-        // -----------------------------
-        // SIGNAL PARSING (SYSTEM)
-        // -----------------------------
         if (ev.type === "signal" && ev.action === "hold") {
             this._handleHoldSignal(ev);
         }
 
-        // -----------------------------
-        // FORWARD TO FEATURES
-        // -----------------------------
         for (const f of this.features) {
             try {
                 f.onEvent(ev);
@@ -106,14 +86,8 @@ export class BaseStrategy {
         }
     }
 
-    // =====================================================
-    // SIGNAL HANDLERS
-    // =====================================================
-
     _handleHoldSignal(ev) {
         if (typeof ev.reason !== "string") return;
-
-        // ожидаемый формат: "cooldown 12s"
         const m = ev.reason.match(/^cooldown\s+(\d+)s$/i);
         if (!m) return;
 
@@ -125,20 +99,9 @@ export class BaseStrategy {
         }
     }
 
-    // =====================================================
-    // READ-ONLY API (для UI)
-    // =====================================================
-
-    /**
-     * @returns {number|null}
-     */
     getCooldownSeconds() {
         return this.cooldownSeconds;
     }
-
-    // =====================================================
-    // LIFECYCLE
-    // =====================================================
 
     clear() {
         for (const f of this.features) {
@@ -149,7 +112,6 @@ export class BaseStrategy {
             }
         }
 
-        // сбрасываем runtime-индикаторы
         this.cooldownSeconds = null;
         this.cooldownUpdatedAt = null;
 
@@ -158,7 +120,6 @@ export class BaseStrategy {
         }
     }
 
-    // OPTIONAL HOOKS
     onStart() {}
     onStop() {}
 }

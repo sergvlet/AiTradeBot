@@ -33,9 +33,14 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
     private static final ZoneId ZONE = ZoneId.of("Europe/Warsaw");
 
     /**
-     * Не применяем live-тюнинг по 2-3 сделкам — это почти всегда шум.
+     * Базовый минимум для live-тюнинга.
+     * Для prepare-валидации будет использоваться отдельный динамический порог.
      */
-    private static final int MIN_TRADES_FOR_APPLY = 6;
+    private static final int DEFAULT_MIN_TRADES_FOR_APPLY = 6;
+    private static final int PREPARE_MIN_TRADES_FOR_APPLY = 4;
+    private static final int ABSOLUTE_MIN_TRADES_FOR_APPLY = 3;
+    private static final int MAX_REASONABLE_MIN_TRADES_FOR_APPLY = 8;
+    private static final int MAX_TUNE_CANDLES_LIMIT = 20_000;
 
     private static final BigDecimal MIN_TP_PCT = new BigDecimal("0.30");
     private static final BigDecimal MIN_SL_PCT = new BigDecimal("0.15");
@@ -89,25 +94,34 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         }
 
         StrategySettings ss = strategySettingsService.getOrCreate(chatId, StrategyType.WINDOW_SCALPING);
-        WindowScalpingStrategySettings cfg = windowSettingsService.getOrCreate(chatId);
-        if (ss == null || cfg == null) {
+        if (ss == null) {
             return TuningResult.builder().applied(false).reason("no_settings").build();
         }
 
         String symbol = safeSym(firstNonBlank(request.symbol(), ss.getSymbol()));
         String tf = safeTf(firstNonBlank(request.timeframe(), ss.getTimeframe()));
 
-        Integer candlesLimit = request.candlesLimit() != null ? request.candlesLimit() : ss.getCachedCandlesLimit();
-        int minCL = Math.max(50, props.getMinCandlesLimit());
-        int defCL = Math.max(minCL, props.getDefaultCandlesLimit());
-        int cl = (candlesLimit == null || candlesLimit < minCL) ? defCL : candlesLimit;
+        WindowScalpingStrategySettings cfg = resolveWindowSettings(chatId, ex, net, symbol, tf);
+        if (cfg == null) {
+            return TuningResult.builder().applied(false).reason("no_settings").build();
+        }
 
-        int days = Math.max(3, props.getDefaultPeriodDays());
-        LocalDate endDate = LocalDate.now(ZONE);
-        LocalDate startDate = endDate.minusDays(days);
+        Instant requestedStart = request.startAt();
+        Instant requestedEnd = request.endAt();
+        int cl = resolveCandlesLimit(request, ss, tf, requestedStart, requestedEnd);
 
-        Instant start = startDate.atStartOfDay(ZONE).toInstant();
-        Instant end = endDate.plusDays(1).atStartOfDay(ZONE).toInstant();
+        Instant start;
+        Instant end;
+        if (requestedStart != null && requestedEnd != null && requestedEnd.isAfter(requestedStart)) {
+            start = requestedStart;
+            end = requestedEnd;
+        } else {
+            int days = Math.max(3, props.getDefaultPeriodDays());
+            LocalDate endDate = LocalDate.now(ZONE);
+            LocalDate startDate = endDate.minusDays(days);
+            start = startDate.atStartOfDay(ZONE).toInstant();
+            end = endDate.plusDays(1).atStartOfDay(ZONE).toInstant();
+        }
 
         // baseline
         Map<String, Object> baselineParams = buildParamsFromCurrent(ss, cfg);
@@ -122,38 +136,46 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
 
         Integer baseTrades = (baseMetrics != null ? baseMetrics.trades() : null);
 
-        // если базово сделок нет — разжимаем грубые фильтры 1 раз (меняем ТОЛЬКО cfg)
+        // если базово сделок нет — разжимаем грубые фильтры только ВРЕМЕННО,
+        // без записи в БД, чтобы не загрязнять live-настройки
         if (baseTrades != null && baseTrades <= 0) {
-            log.warn("[WS-TUNER] baseline NO_TRADES chatId={} ex={} net={} sym={} tf={} cl={} -> coarse adjust",
+            log.warn("[WS-TUNER] baseline NO_TRADES chatId={} ex={} net={} sym={} tf={} cl={} -> coarse adjust (temp only)",
                     chatId, ex, net, symbol, tf, cl);
 
-            boolean changedCfg = adjustCoarseFiltersInternal(chatId, ex, net, symbol, tf, cfg, "baseline_no_trades");
-            if (changedCfg) {
-                persistSafe(windowSettingsService, chatId, cfg); // ✅ только cfg
+            Map<String, Object> coarseBaselineParams = new HashMap<>(baselineParams);
+            boolean changed = adjustCoarseFiltersCandidate(coarseBaselineParams, "baseline_no_trades");
+
+            if (changed) {
+                coarseBaselineParams.put("candlesLimit", cl);
+                coarseBaselineParams.put("cachedCandlesLimit", cl);
+
+                BacktestMetrics coarseMetrics = safeRunBacktest(chatId, ex, net, symbol, tf, coarseBaselineParams, start, end);
+
+                double coarseScore = (coarseMetrics != null && coarseMetrics.score() != null)
+                        ? coarseMetrics.score().doubleValue()
+                        : -1.0;
+
+                Integer coarseTrades = (coarseMetrics != null ? coarseMetrics.trades() : null);
+
+                if (isBetter(coarseScore, coarseTrades, baseScore, baseTrades)) {
+                    baselineParams = coarseBaselineParams;
+                    baseMetrics = coarseMetrics;
+                    baseScore = coarseScore;
+                    baseTrades = coarseTrades;
+
+                    log.info("[WS-TUNER] baseline improved by TEMP coarse-adjust chatId={} ex={} net={} sym={} tf={} score {} -> {} trades {} -> {}",
+                            chatId, ex, net, symbol, tf,
+                            fmt(baseScore), fmt(coarseScore),
+                            baseTrades, coarseTrades);
+                }
             }
-
-            // пересчёт baseline после coarse
-            ss = strategySettingsService.getOrCreate(chatId, StrategyType.WINDOW_SCALPING);
-            cfg = windowSettingsService.getOrCreate(chatId);
-
-            baselineParams = buildParamsFromCurrent(ss, cfg);
-            baselineParams.put("candlesLimit", cl);
-            baselineParams.put("cachedCandlesLimit", cl);
-
-            baseMetrics = safeRunBacktest(chatId, ex, net, symbol, tf, baselineParams, start, end);
-
-            baseScore = (baseMetrics != null && baseMetrics.score() != null)
-                    ? baseMetrics.score().doubleValue()
-                    : -1.0;
-
-            baseTrades = (baseMetrics != null ? baseMetrics.trades() : null);
         }
 
         int candidates = Math.max(5, props.getCandidates());
         long seed = Optional.ofNullable(request.seed()).orElse(System.nanoTime());
         Random rnd = new Random(seed);
 
-        Candidate best = new Candidate(baselineParams, baseScore, baseTrades, "baseline");
+        Candidate best = new Candidate(new HashMap<>(baselineParams), baseScore, baseTrades, "baseline");
 
         for (int i = 0; i < candidates; i++) {
             Map<String, Object> cand = new HashMap<>(baselineParams);
@@ -182,7 +204,8 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         if (bestSc == null) bestSc = BigDecimal.valueOf(-1.0);
 
         BigDecimal delta = bestSc.subtract(base);
-        boolean enoughTrades = best.trades != null && best.trades >= MIN_TRADES_FOR_APPLY;
+        int requiredTrades = resolveRequiredTrades(request, tf, cl, start, end);
+        boolean enoughTrades = best.trades != null && best.trades >= requiredTrades;
         boolean apply = enoughTrades && shouldApply(base, delta);
 
         String modelVersion = safe(props.getModelVersion());
@@ -192,7 +215,7 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
             if (best.trades == null || best.trades <= 0) {
                 reason = "no_trades";
             } else if (!enoughTrades) {
-                reason = "too_few_trades:" + best.trades;
+                reason = "too_few_trades:" + best.trades + "/need:" + requiredTrades;
             } else {
                 reason = "no_improvement";
             }
@@ -268,7 +291,7 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
     // =====================================================
 
     public boolean onNoTrades(TuningRequest request) {
-        return adjustCoarseFilters(request);
+        return adjustCoarseFilters(request, "no_trades");
     }
 
     public boolean adjustCoarseFilters(TuningRequest request) {
@@ -283,22 +306,14 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         if (request == null || request.chatId() == null || request.chatId() <= 0) return false;
 
         Long chatId = request.chatId();
-
         String ex = normalizeExchangeOrNull(request.exchange());
         NetworkType net = request.network();
-        if (ex == null || net == null) return false;
-
-        WindowScalpingStrategySettings cfg = windowSettingsService.getOrCreate(chatId);
-        if (cfg == null) return false;
-
         String symbol = safeSym(request.symbol());
         String tf = safeTf(request.timeframe());
 
-        boolean applied = adjustCoarseFiltersInternal(chatId, ex, net, symbol, tf, cfg, reason);
-        if (applied) {
-            persistSafe(windowSettingsService, chatId, cfg); // ✅ только cfg
-        }
-        return applied;
+        log.warn("[WS-TUNER] NO_TRADES coarse-adjust persistence disabled chatId={} ex={} net={} sym={} tf={} reason={}",
+                chatId, ex, net, symbol, tf, String.valueOf(reason));
+        return false;
     }
 
     // =====================================================
@@ -404,6 +419,83 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
             );
         }
 
+        return changed;
+    }
+
+    private WindowScalpingStrategySettings resolveWindowSettings(Long chatId,
+                                                               String exchange,
+                                                               NetworkType network,
+                                                               String symbol,
+                                                               String timeframe) {
+        try {
+            WindowScalpingStrategySettings byContext = windowSettingsService.getOrCreate(chatId, exchange, network, symbol, timeframe);
+            if (byContext != null) {
+                return byContext;
+            }
+        } catch (Exception e) {
+            log.warn("[WS-TUNER] resolveWindowSettings(context) failed chatId={} ex={} net={} sym={} tf={} err={}",
+                    chatId, exchange, network, symbol, timeframe, e.toString());
+        }
+        try {
+            return windowSettingsService.getOrCreate(chatId);
+        } catch (Exception e) {
+            log.warn("[WS-TUNER] resolveWindowSettings(default) failed chatId={} err={}", chatId, e.toString());
+            return null;
+        }
+    }
+
+    private boolean adjustCoarseFiltersCandidate(Map<String, Object> params, String reason) {
+        if (params == null) return false;
+
+        boolean changed = false;
+
+        double oldMinRange = dblOf(params.get("minRangePct"), 0.35);
+        double newMinRange = clampD(Math.max(0.0, oldMinRange * 0.45), 0.0, 10.0);
+        if (Math.abs(newMinRange - oldMinRange) > 1e-9) {
+            params.put("minRangePct", newMinRange);
+            changed = true;
+        }
+
+        double oldLow = dblOf(params.get("entryFromLowPct"), 20.0);
+        double oldHigh = dblOf(params.get("entryFromHighPct"), 20.0);
+
+        double newLow = clampD(Math.max(oldLow * 1.35, oldLow + 5.0), 0.5, 60.0);
+        double newHigh = clampD(Math.max(oldHigh * 1.35, oldHigh + 5.0), 0.5, 60.0);
+        double sum = newLow + newHigh;
+        if (sum > 90.0) {
+            double k = 90.0 / sum;
+            newLow *= k;
+            newHigh *= k;
+        }
+
+        if (Math.abs(newLow - oldLow) > 1e-9) {
+            params.put("entryFromLowPct", newLow);
+            changed = true;
+        }
+        if (Math.abs(newHigh - oldHigh) > 1e-9) {
+            params.put("entryFromHighPct", newHigh);
+            changed = true;
+        }
+
+        double oldSpread = dblOf(params.get("maxSpreadPct"), 0.08);
+        double newSpread = clampD(Math.max(oldSpread + 0.30, oldSpread * 2.0), 0.0, 5.0);
+        if (Math.abs(newSpread - oldSpread) > 1e-9) {
+            params.put("maxSpreadPct", newSpread);
+            changed = true;
+        }
+
+        Integer w = intObjOf(params.get("windowSize"));
+        if (w != null && w > 25) {
+            int newW = clampInt((int) Math.round(w * 0.85), 5, 250);
+            if (newW != w) {
+                params.put("windowSize", newW);
+                changed = true;
+            }
+        }
+
+        if (changed) {
+            normalizeRiskCandidate(params);
+        }
         return changed;
     }
 
@@ -653,6 +745,98 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
     // =====================================================
     // backtest
     // =====================================================
+
+    private int resolveCandlesLimit(TuningRequest request,
+                                    StrategySettings ss,
+                                    String timeframe,
+                                    Instant start,
+                                    Instant end) {
+        Integer requested = request != null ? request.candlesLimit() : null;
+
+        int minCL = Math.max(50, props.getMinCandlesLimit());
+        int defCL = Math.max(minCL, props.getDefaultCandlesLimit());
+
+        Integer resolved = requested != null ? requested : (ss != null ? ss.getCachedCandlesLimit() : null);
+        if (resolved == null || resolved <= 0) {
+            resolved = defCL;
+        }
+
+        long tfMs = timeframeToMillis(timeframe);
+        if (tfMs > 0L && start != null && end != null && end.isAfter(start)) {
+            long spanMs = end.toEpochMilli() - start.toEpochMilli();
+            long spanCandles = (long) Math.ceil((double) spanMs / (double) tfMs);
+            if (spanCandles > 0L && spanCandles < Integer.MAX_VALUE) {
+                resolved = Math.max(resolved, (int) spanCandles);
+            }
+        }
+
+        if (resolved < minCL) resolved = minCL;
+        if (resolved > MAX_TUNE_CANDLES_LIMIT) resolved = MAX_TUNE_CANDLES_LIMIT;
+        return resolved;
+    }
+
+    private int resolveRequiredTrades(TuningRequest request,
+                                      String timeframe,
+                                      int candlesLimit,
+                                      Instant start,
+                                      Instant end) {
+        boolean prepareValidation = request != null
+                && safe(request.reason()) != null
+                && request.reason().toLowerCase(Locale.ROOT).contains("prepare");
+
+        int required = prepareValidation ? PREPARE_MIN_TRADES_FOR_APPLY : DEFAULT_MIN_TRADES_FOR_APPLY;
+
+        long tfMs = timeframeToMillis(timeframe);
+        if (tfMs > 0L) {
+            long spanCandles = candlesLimit;
+            if (start != null && end != null && end.isAfter(start)) {
+                long spanMs = end.toEpochMilli() - start.toEpochMilli();
+                long derived = (long) Math.ceil((double) spanMs / (double) tfMs);
+                if (derived > 0L) {
+                    spanCandles = derived;
+                }
+            }
+
+            if (spanCandles <= 300L) {
+                required = prepareValidation ? 2 : 3;
+            } else if (spanCandles <= 1200L) {
+                required = prepareValidation ? 2 : 4;
+            } else if (spanCandles >= 5000L) {
+                required = prepareValidation ? 4 : 6;
+            }
+        }
+
+        if (prepareValidation && required < 2) required = 2;
+        if (required < ABSOLUTE_MIN_TRADES_FOR_APPLY) required = ABSOLUTE_MIN_TRADES_FOR_APPLY;
+        if (required > MAX_REASONABLE_MIN_TRADES_FOR_APPLY) required = MAX_REASONABLE_MIN_TRADES_FOR_APPLY;
+        return required;
+    }
+
+    private long timeframeToMillis(String timeframe) {
+        if (timeframe == null) return -1L;
+        String tf = timeframe.trim().toLowerCase(Locale.ROOT);
+        if (tf.isEmpty()) return -1L;
+        if (tf.length() < 2) return -1L;
+
+        String numberPart = tf.substring(0, tf.length() - 1);
+        char unit = tf.charAt(tf.length() - 1);
+        long num;
+        try {
+            num = Long.parseLong(numberPart);
+        } catch (Exception e) {
+            return -1L;
+        }
+        if (num <= 0L) return -1L;
+
+        return switch (unit) {
+            case 's' -> num * 1_000L;
+            case 'm' -> num * 60_000L;
+            case 'h' -> num * 3_600_000L;
+            case 'd' -> num * 86_400_000L;
+            case 'w' -> num * 604_800_000L;
+            default -> -1L;
+        };
+    }
 
     private BacktestMetrics safeRunBacktest(Long chatId,
                                             String exchange,
@@ -1033,4 +1217,5 @@ public class WindowScalpingAutoTuner implements StrategyAutoTuner {
         return null;
     }
 }
+
 

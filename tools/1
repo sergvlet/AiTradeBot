@@ -4,7 +4,7 @@ powershell -ExecutionPolicy Bypass -File .\tools\project-snapshot\make_report.ps
 
 Как запускать (примеры)
 1) По пакету (самый удобный)
-.\tools\project-snapshot\make_report_package.ps1 -Path src\main\java\com\chicu\aitradebot
+.\tools\project-snapshot\make_report_package.ps1 -Path src/main/resources
 
 2) По пути в проекте
 .\tools\project-snapshot\make_report_package.ps1 -Path src\main\java\com\chicu\aitradebot\strategy\windowscalping

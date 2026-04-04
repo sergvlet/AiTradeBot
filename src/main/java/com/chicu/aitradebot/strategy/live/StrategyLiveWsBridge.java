@@ -146,7 +146,6 @@ public class StrategyLiveWsBridge {
                 uiLayers.saveTpSl(ev.getChatId(), ev.getStrategyType(), ev.getSymbol(), time, tp, sl);
             }
 
-            // ✅ ВАЖНО: это твоя “зона окна” — без этого после refresh всё пропадает
             case "window_zone" -> {
                 if (ev.getWindowZone() == null || ev.getWindowZone().getHigh() == null || ev.getWindowZone().getLow() == null) {
                     uiLayers.clearWindowZone(ev.getChatId(), ev.getStrategyType(), ev.getSymbol());
@@ -163,7 +162,42 @@ public class StrategyLiveWsBridge {
                 );
             }
 
-            default -> { }
+            case "price_line" -> {
+                if (ev.getPriceLine() == null || ev.getPriceLine().getName() == null || ev.getPriceLine().getPrice() == null) {
+                    uiLayers.clearPriceLines(ev.getChatId(), ev.getStrategyType(), ev.getSymbol());
+                    return;
+                }
+
+                uiLayers.upsertPriceLine(
+                        ev.getChatId(),
+                        ev.getStrategyType(),
+                        ev.getSymbol(),
+                        time,
+                        ev.getPriceLine().getName(),
+                        ev.getPriceLine().getPrice().doubleValue(),
+                        ev.getPriceLine().getColor()
+                );
+            }
+
+            case "trade" -> {
+                if (ev.getTrade() == null || ev.getTrade().getSide() == null || ev.getTrade().getPrice() == null) {
+                    return;
+                }
+
+                Double qty = ev.getTrade().getQty() != null ? ev.getTrade().getQty().doubleValue() : null;
+                uiLayers.appendTrade(
+                        ev.getChatId(),
+                        ev.getStrategyType(),
+                        ev.getSymbol(),
+                        time,
+                        ev.getTrade().getSide(),
+                        ev.getTrade().getPrice().doubleValue(),
+                        qty
+                );
+            }
+
+            default -> {
+            }
         }
     }
 

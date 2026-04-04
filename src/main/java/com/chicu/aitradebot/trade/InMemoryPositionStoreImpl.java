@@ -96,6 +96,13 @@ public class InMemoryPositionStoreImpl implements PositionStore {
     @Value("${trade.position-restore.dust-suppress-ms:21600000}")
     private long dustSuppressRestoreMs;
 
+    /**
+     * PROD: lazy-restore из истории ордеров выключен по умолчанию.
+     * Иначе после рестарта легко поднять фантомную позицию, которой уже нет на бирже.
+     */
+    @Value("${trade.position-restore.from-order-history.enabled:false}")
+    private boolean restoreFromOrderHistoryEnabled;
+
     private static final class OpenLot {
         private BigDecimal qty;
         private final BigDecimal price;
@@ -414,6 +421,10 @@ public class InMemoryPositionStoreImpl implements PositionStore {
                                                           String symbol) {
 
         if (chatId == null || type == null || symbol == null || orderRepository == null) {
+            return Optional.empty();
+        }
+
+        if (!restoreFromOrderHistoryEnabled) {
             return Optional.empty();
         }
 
@@ -811,6 +822,8 @@ public class InMemoryPositionStoreImpl implements PositionStore {
         return v == null ? "null" : v.stripTrailingZeros().toPlainString();
     }
 }
+
+
 
 
 

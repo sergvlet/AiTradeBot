@@ -5,6 +5,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.*;
 
 import java.util.List;
+import java.util.Map;
 
 @Getter
 @Setter
@@ -21,9 +22,8 @@ public class StrategyChartDto {
     @Builder.Default
     private Layers layers = Layers.empty();
 
-    // =====================================================
-    // DTOs
-    // =====================================================
+    @Builder.Default
+    private Map<String, Object> info = Map.of();
 
     @Getter
     @Setter
@@ -38,16 +38,44 @@ public class StrategyChartDto {
         @Builder.Default
         private Zone zone = null;
 
-        // ✅ ДОБАВЛЕНО: SCALPING window zone (high/low)
         @Builder.Default
-        private WindowZone windowZone = null;
+        private TpSl tpSl = null;
+
+        @Builder.Default
+        private StrategyChartDto.WindowZone windowZone = null;
+
+        @Builder.Default
+        private List<PriceLine> priceLines = List.of();
+
+        @Builder.Default
+        private List<TradeMarker> trades = List.of();
 
         public static Layers empty() {
             return Layers.builder()
                     .levels(List.of())
                     .zone(null)
+                    .tpSl(null)
                     .windowZone(null)
+                    .priceLines(List.of())
+                    .trades(List.of())
                     .build();
+        }
+
+        @Getter
+        @Setter
+        @NoArgsConstructor
+        @AllArgsConstructor
+        @Builder
+        public static class WindowZone {
+            private double high;
+            private double low;
+
+            public StrategyChartDto.WindowZone toOuter() {
+                return StrategyChartDto.WindowZone.builder()
+                        .high(high)
+                        .low(low)
+                        .build();
+            }
         }
     }
 
@@ -62,7 +90,16 @@ public class StrategyChartDto {
         private String color;
     }
 
-    // ✅ ДОБАВЛЕНО
+    @Getter
+    @Setter
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class TpSl {
+        private Double tp;
+        private Double sl;
+    }
+
     @Getter
     @Setter
     @Builder
@@ -71,6 +108,30 @@ public class StrategyChartDto {
     public static class WindowZone {
         private double high;
         private double low;
+    }
+
+    @Getter
+    @Setter
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class PriceLine {
+        private String name;
+        private Double price;
+        private String color;
+    }
+
+    @Getter
+    @Setter
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class TradeMarker {
+        private String side;
+        private Double price;
+        private Double qty;
+        private Long time;
+        private String source;
     }
 
     @Getter

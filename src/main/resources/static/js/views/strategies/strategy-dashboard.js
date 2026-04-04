@@ -1,11 +1,12 @@
 "use strict";
 
 import { ChartController } from "../../chart/chart-controller.js";
-import { LayerRenderer }   from "../../chart/layer-renderer.js";
+import { LayerRenderer } from "../../chart/layer-renderer.js";
 
-import { ScalpingStrategy }    from "../../strategies/scalping.strategy.js";
-import { FibonacciStrategy }   from "../../strategies/fibonacci.strategy.js";
+import { ScalpingStrategy } from "../../strategies/scalping.strategy.js";
+import { FibonacciStrategy } from "../../strategies/fibonacci.strategy.js";
 import { SmartFusionStrategy } from "../../strategies/smartfusion.strategy.js";
+import { EmaStrategy } from "../../strategies/ema.strategy.js";
 
 class GenericStrategy {
     constructor({ layers, ctx }) {
@@ -14,6 +15,7 @@ class GenericStrategy {
     }
     onEvent(_) {}
     onCandleHistory(_) {}
+    setInfo(_) {}
 }
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -27,11 +29,11 @@ document.addEventListener("DOMContentLoaded", () => {
         return;
     }
 
-    const chatId    = String(root.dataset.chatId || "").trim();
-    const type      = String(root.dataset.type || "").trim();
-    const symbol    = String(root.dataset.symbol || "").trim().toUpperCase();
-    const exchange  = String(root.dataset.exchange || "").trim().toUpperCase();
-    const network   = String(root.dataset.network || "").trim().toUpperCase();
+    const chatId = String(root.dataset.chatId || "").trim();
+    const type = String(root.dataset.type || "").trim();
+    const symbol = String(root.dataset.symbol || "").trim().toUpperCase();
+    const exchange = String(root.dataset.exchange || "").trim().toUpperCase();
+    const network = String(root.dataset.network || "").trim().toUpperCase();
     const timeframe = String(root.dataset.timeframe || "1m").trim().toLowerCase();
 
     console.log("🧩 Context:", { chatId, type, symbol, exchange, network, timeframe });
@@ -60,7 +62,8 @@ document.addEventListener("DOMContentLoaded", () => {
         symbol,
         exchange,
         network,
-        timeframe: chartCtrl.timeframe
+        timeframe: chartCtrl.timeframe,
+        info: {}
     };
 
     let strategy;
@@ -79,6 +82,10 @@ document.addEventListener("DOMContentLoaded", () => {
         case "SMART_FUSION":
         case "HYBRID":
             strategy = new SmartFusionStrategy({ layers, ctx });
+            break;
+
+        case "EMA_CROSSOVER":
+            strategy = new EmaStrategy({ layers, ctx });
             break;
 
         default:
@@ -109,6 +116,9 @@ document.addEventListener("DOMContentLoaded", () => {
         if ("windowZone" in L) out.windowZone = L.windowZone ?? null;
         else if ("window_zone" in L) out.windowZone = L.window_zone ?? null;
 
+        if (Array.isArray(L.priceLines)) out.priceLines = L.priceLines;
+        if (Array.isArray(L.trades)) out.trades = L.trades;
+
         return out;
     }
 
@@ -127,6 +137,16 @@ document.addEventListener("DOMContentLoaded", () => {
         }
         if ("windowZone" in state) {
             strategy.onEvent?.({ type: "window_zone", windowZone: state.windowZone });
+        }
+        if (Array.isArray(state.priceLines)) {
+            for (const pl of state.priceLines) {
+                strategy.onEvent?.({ type: "price_line", priceLine: pl });
+            }
+        }
+        if (Array.isArray(state.trades)) {
+            for (const tr of state.trades) {
+                strategy.onEvent?.({ type: "trade", trade: tr, time: tr?.time });
+            }
         }
     }
 
@@ -149,7 +169,6 @@ document.addEventListener("DOMContentLoaded", () => {
                 if (!_layerState) return;
                 localStorage.setItem(layerCacheKey, JSON.stringify({ v: 1, ts: Date.now(), ..._layerState }));
             } catch (_) {
-                // ignore
             }
         }, 250);
     }
@@ -183,6 +202,31 @@ document.addEventListener("DOMContentLoaded", () => {
                 schedulePersistLayerState();
                 break;
 
+            case "price_line": {
+                const pl = ev.priceLine || ev;
+                if (!_layerState.priceLines) _layerState.priceLines = [];
+                if (!pl?.name || pl?.price == null) {
+                    _layerState.priceLines = [];
+                } else {
+                    const name = String(pl.name).toUpperCase();
+                    _layerState.priceLines = (_layerState.priceLines || []).filter(x => String(x?.name || "").toUpperCase() !== name);
+                    _layerState.priceLines.push(pl);
+                }
+                schedulePersistLayerState();
+                break;
+            }
+
+            case "trade": {
+                const tr = ev.trade || ev;
+                if (!_layerState.trades) _layerState.trades = [];
+                _layerState.trades.push({ ...tr, time: ev.time ?? tr?.time ?? Date.now() });
+                if (_layerState.trades.length > 300) {
+                    _layerState.trades = _layerState.trades.slice(-300);
+                }
+                schedulePersistLayerState();
+                break;
+            }
+
             default:
                 break;
         }
@@ -214,6 +258,11 @@ document.addEventListener("DOMContentLoaded", () => {
                 }
             }
 
+            if (data?.info && typeof data.info === "object") {
+                ctx.info = data.info;
+                strategy.setInfo?.(data.info);
+            }
+
             if (Array.isArray(data?.candles)) {
                 chartCtrl.setHistory(data.candles);
                 strategy.onCandleHistory?.(chartCtrl.candlesData);
@@ -221,7 +270,6 @@ document.addEventListener("DOMContentLoaded", () => {
 
             if (data?.layers) {
                 strategy.onEvent?.({ type: "layers", layers: data.layers });
-
                 const st = normalizeLayerState(data.layers);
                 if (st) {
                     _layerState = st;
@@ -239,12 +287,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function isCandleEvent(ev) {
-        return (
-            ev?.type === "candle" ||
-            !!ev?.kline ||
-            !!ev?.k ||
-            !!ev?.data?.k
-        );
+        return ev?.type === "candle" || !!ev?.kline || !!ev?.k || !!ev?.data?.k;
     }
 
     function isPriceEvent(ev) {
@@ -274,15 +317,15 @@ document.addEventListener("DOMContentLoaded", () => {
     function candleDedupKey(ev) {
         const k = getNestedKline(ev) || {};
         const sym = eventSymbolUpper(ev);
-        const tf  = normValue(ev?.timeframe || k?.timeframe || k?.i || "");
-        const st  = normValue(ev?.strategyType || type || "");
-        const ex  = normValue(ev?.exchange || exchange || "");
+        const tf = normValue(ev?.timeframe || k?.timeframe || k?.i || "");
+        const st = normValue(ev?.strategyType || type || "");
+        const ex = normValue(ev?.exchange || exchange || "");
         const net = normValue(ev?.network || network || "");
-        const t   = normValue(eventTimeValue(ev));
+        const t = normValue(eventTimeValue(ev));
 
         const o = normValue(k.open ?? k.o ?? ev?.open);
         const h = normValue(k.high ?? k.h ?? ev?.high);
-        const l = normValue(k.low  ?? k.l ?? ev?.low);
+        const l = normValue(k.low ?? k.l ?? ev?.low);
         const c = normValue(k.close ?? k.c ?? ev?.close);
 
         return `candle|${st}|${ex}|${net}|${sym}|${tf}|${t}|${o}|${h}|${l}|${c}`;
@@ -290,12 +333,12 @@ document.addEventListener("DOMContentLoaded", () => {
 
     function priceDedupKey(ev) {
         const sym = eventSymbolUpper(ev);
-        const tf  = normValue(ev?.timeframe || "");
-        const st  = normValue(ev?.strategyType || type || "");
-        const ex  = normValue(ev?.exchange || exchange || "");
+        const tf = normValue(ev?.timeframe || "");
+        const st = normValue(ev?.strategyType || type || "");
+        const ex = normValue(ev?.exchange || exchange || "");
         const net = normValue(ev?.network || network || "");
-        const t   = normValue(eventTimeValue(ev));
-        const p   = normValue(ev?.price);
+        const t = normValue(eventTimeValue(ev));
+        const p = normValue(ev?.price);
         return `price|${st}|${ex}|${net}|${sym}|${tf}|${t}|${p}`;
     }
 
@@ -303,11 +346,11 @@ document.addEventListener("DOMContentLoaded", () => {
         const k = getNestedKline(ev);
         const t = normValue(eventTimeValue(ev));
         const sym = eventSymbolUpper(ev);
-        const tf  = normValue(ev?.timeframe || "");
-        const st  = normValue(ev?.strategyType || type || "");
-        const ex  = normValue(ev?.exchange || exchange || "");
+        const tf = normValue(ev?.timeframe || "");
+        const st = normValue(ev?.strategyType || type || "");
+        const ex = normValue(ev?.exchange || exchange || "");
         const net = normValue(ev?.network || network || "");
-        const et  = normValue(ev?.type || "");
+        const et = normValue(ev?.type || "");
 
         const extra =
             normValue(ev?.state) ||
@@ -452,7 +495,7 @@ document.addEventListener("DOMContentLoaded", () => {
                         strategy.onEvent?.(ev);
                         updateLayerStateFromEvent(ev);
 
-                        if ((type === "SCALPING" || type === "WINDOW_SCALPING") && isCandleEvent(ev)) {
+                        if (isCandleEvent(ev)) {
                             strategy.onCandleHistory?.(chartCtrl.candlesData);
                         }
                     });

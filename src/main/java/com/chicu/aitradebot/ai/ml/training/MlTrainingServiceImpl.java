@@ -12,6 +12,7 @@ import com.chicu.aitradebot.ai.ml.dto.MlTrainResponse;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
+import com.chicu.aitradebot.strategy.windowscalping.WindowScalpingStrategySettingsService;
 import com.chicu.aitradebot.domain.enums.AdvancedControlMode;
 import com.chicu.aitradebot.events.StrategySettingsUpdatedEvent;
 import com.chicu.aitradebot.service.StrategySettingsService;
@@ -20,11 +21,13 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.context.ApplicationContext;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Instant;
@@ -78,6 +81,7 @@ public class MlTrainingServiceImpl implements MlTrainingService {
     private final ObjectMapper objectMapper;
     private final ObjectProvider<MlClient> mlClientProvider;
     private final ApplicationEventPublisher eventPublisher;
+    private final ApplicationContext applicationContext;
 
     private final Map<String, Instant> lastTrainAt = new ConcurrentHashMap<>();
 
@@ -100,9 +104,12 @@ public class MlTrainingServiceImpl implements MlTrainingService {
 
         StrategySettings ss;
         try {
-            ss = strategySettingsService.getOrCreate(chatId, type);
+            ss = strategySettingsService.getSettings(chatId, type);
+            if (ss == null) {
+                ss = strategySettingsService.getOrCreate(chatId, type);
+            }
         } catch (Exception e) {
-            log.warn("🧠 TRAIN getOrCreate settings failed chatId={} type={} err={}", chatId, type, e.toString());
+            log.warn("🧠 TRAIN settings load failed chatId={} type={} err={}", chatId, type, e.toString());
             return new MlTrainingResult(false, false, null, null, null, "strategy_settings_missing");
         }
         if (ss == null) {
@@ -130,11 +137,10 @@ public class MlTrainingServiceImpl implements MlTrainingService {
 
         if (symbol == null) return new MlTrainingResult(false, false, null, null, null, "symbol_missing");
         if (timeframe == null) return new MlTrainingResult(false, false, null, null, null, "timeframe_missing");
+        if (exchange == null) return new MlTrainingResult(false, false, null, null, null, "exchange_missing");
+        if (network == null) return new MlTrainingResult(false, false, null, null, null, "network_missing");
 
-        String modelKey = normTrim(ss.getMlModelKey());
-        if (modelKey == null) {
-            modelKey = MlGateway.buildContextModelKey(type, exchange, network, symbol, timeframe);
-        }
+        String modelKey = MlGateway.buildContextModelKey(type, exchange, network, symbol, timeframe);
 
         String cooldownKey = cooldownKey(modelKey);
         Instant last = lastTrainAt.get(cooldownKey);
@@ -263,8 +269,7 @@ public class MlTrainingServiceImpl implements MlTrainingService {
             return new MlTrainingResult(false, false, modelKey, null, computedSchemaHash, error);
         }
 
-        String responseModelKey = normTrim(resp.getModelKey());
-        if (responseModelKey == null) responseModelKey = modelKey;
+        String responseModelKey = modelKey;
         String responseModelVersion = normTrim(resp.getModelVersion());
         String responseSchemaHash = normTrim(resp.getSchemaHash());
         String finalSchemaHash = responseSchemaHash != null ? responseSchemaHash : computedSchemaHash;
@@ -299,6 +304,803 @@ public class MlTrainingServiceImpl implements MlTrainingService {
         return new MlTrainingResult(true, applied, responseModelKey, responseModelVersion, finalSchemaHash, null);
     }
 
+
+
+    /**
+     * Первый запуск: обучаемся не по ml_samples, а прямо по выбранным свечам.
+     * Используется только для WINDOW_SCALPING.
+     */
+    public MlTrainingResult trainOnSelectedCandles(Long chatId,
+                                                   StrategyType type,
+                                                   String exchangeOverride,
+                                                   NetworkType networkOverride,
+                                                   String symbolOverride,
+                                                   String timeframeOverride,
+                                                   Integer candlesLimitOverride,
+                                                   String reason) {
+        if (type != StrategyType.WINDOW_SCALPING) {
+            return trainNow(chatId, type, reason);
+        }
+        if (props == null || !props.isEnabled()) {
+            log.warn("🧠 TRAIN SKIP: training disabled");
+            return new MlTrainingResult(false, false, null, null, null, "training_disabled");
+        }
+        if (chatId == null || chatId <= 0 || type == null) {
+            log.warn("🧠 TRAIN SKIP: bad args chatId={} type={}", chatId, type);
+            return new MlTrainingResult(false, false, null, null, null, "bad_args");
+        }
+
+        MlClient mlClient = mlClientProvider != null ? mlClientProvider.getIfAvailable() : null;
+        if (mlClient == null) {
+            log.warn("🧠 TRAIN SKIP: MlClient missing");
+            return new MlTrainingResult(false, false, null, null, null, "ml_client_missing");
+        }
+
+        StrategySettings ss;
+        try {
+            ss = strategySettingsService.getSettings(chatId, type);
+            if (ss == null) {
+                ss = strategySettingsService.getOrCreate(chatId, type);
+            }
+        } catch (Exception e) {
+            log.warn("🧠 TRAIN settings load failed chatId={} type={} err={}", chatId, type, e.toString());
+            return new MlTrainingResult(false, false, null, null, null, "strategy_settings_missing");
+        }
+        if (ss == null) {
+            return new MlTrainingResult(false, false, null, null, null, "strategy_settings_missing");
+        }
+
+        String reasonNorm = normTrim(reason);
+        if (reasonNorm == null) reasonNorm = "prepare_start_train";
+
+        String symbol = normUpper(symbolOverride);
+        if (symbol == null) symbol = normUpper(ss.getSymbol());
+
+        String timeframe = normLower(timeframeOverride);
+        if (timeframe == null) timeframe = normLower(ss.getTimeframe());
+
+        String exchange = normUpper(exchangeOverride);
+        if (exchange == null) exchange = normUpper(stringOf(ss.getExchangeName()));
+
+        NetworkType network = networkOverride != null ? networkOverride : ss.getNetworkType();
+        String networkName = normUpper(network != null ? network.name() : stringOf(ss.getNetworkType()));
+
+        if (symbol == null) return new MlTrainingResult(false, false, null, null, null, "symbol_missing");
+        if (timeframe == null) return new MlTrainingResult(false, false, null, null, null, "timeframe_missing");
+        if (exchange == null) return new MlTrainingResult(false, false, null, null, null, "exchange_missing");
+        if (networkName == null) return new MlTrainingResult(false, false, null, null, null, "network_missing");
+
+        String modelKey = MlGateway.buildContextModelKey(type, exchange, networkName, symbol, timeframe);
+
+        Instant now = Instant.now();
+        boolean bypassCooldown = reasonNorm.toLowerCase(Locale.ROOT).contains("prepare_start");
+        String cooldownKey = cooldownKey(modelKey);
+        Instant last = lastTrainAt.get(cooldownKey);
+        long cooldownMinutes = Math.max(0, props.getCooldownMinutes());
+        if (!bypassCooldown && last != null && cooldownMinutes > 0) {
+            long passed = ChronoUnit.MINUTES.between(last, now);
+            if (passed < cooldownMinutes) {
+                log.info("🧠 TRAIN SKIP: cooldown modelKey={} passed={}m need={}m", modelKey, passed, cooldownMinutes);
+                return new MlTrainingResult(false, false, modelKey, null, normTrim(ss.getMlSchemaHash()), "cooldown");
+            }
+        }
+
+        int candlesLimit = candlesLimitOverride != null && candlesLimitOverride > 0
+                ? candlesLimitOverride
+                : (ss.getCachedCandlesLimit() != null && ss.getCachedCandlesLimit() > 0 ? ss.getCachedCandlesLimit() : Math.max(300, props.getRowsLimit() * 3));
+
+        List<Object> candles = loadSelectedCandles(chatId, type, exchange, network, symbol, timeframe, candlesLimit);
+        if (candles.isEmpty()) {
+            log.warn("🧠 TRAIN SKIP: no selected candles type={} ex={} net={} sym={} tf={} limit={}",
+                    type, exchange, networkName, symbol, timeframe, candlesLimit);
+            return new MlTrainingResult(false, false, modelKey, null, normTrim(ss.getMlSchemaHash()), "no_selected_candles");
+        }
+
+        WindowTrainingConfig cfg = resolveWindowTrainingConfig(chatId, exchange, network, symbol, timeframe);
+        List<String> featureSchema = List.of(
+                "windowSize",
+                "lastPrice",
+                "price",
+                "low",
+                "high",
+                "range",
+                "rangePct",
+                "volatilityPct",
+                "pos01",
+                "posPct",
+                "lowZone01",
+                "highZone01",
+                "diffPctForEntry",
+                "retWindowPct",
+                "momentum1",
+                "smaFastRel",
+                "smaSlowRel"
+        );
+        String computedSchemaHash = computeSchemaHash(featureSchema);
+
+        List<Map<String, Object>> rows = buildWindowRowsFromCandles(candles, cfg, candlesLimit, chatId, symbol, exchange, networkName, timeframe);
+        if (rows.size() < props.getMinSamples()) {
+            log.warn("🧠 TRAIN SKIP: not enough candle rows modelKey={} rows={} minSamples={} schemaHash={} candles={}",
+                    modelKey, rows.size(), props.getMinSamples(), computedSchemaHash, candles.size());
+            return new MlTrainingResult(false, false, modelKey, null, computedSchemaHash, "not_enough_candle_rows=" + rows.size());
+        }
+
+        boolean settingsChangedBeforeTrain = false;
+        if (!Objects.equals(normTrim(ss.getMlModelKey()), modelKey)) {
+            ss.setMlModelKey(modelKey);
+            settingsChangedBeforeTrain = true;
+        }
+        if (!Objects.equals(normTrim(ss.getMlSchemaHash()), computedSchemaHash)) {
+            ss.setMlSchemaHash(computedSchemaHash);
+            settingsChangedBeforeTrain = true;
+        }
+        if (settingsChangedBeforeTrain) {
+            try {
+                ss = strategySettingsService.save(ss);
+            } catch (Exception e) {
+                log.warn("🧠 TRAIN pre-save settings failed chatId={} type={} err={}", chatId, type, e.toString());
+            }
+        }
+
+        MlTrainRequest req = new MlTrainRequest();
+        req.setChatId(chatId);
+        req.setStrategyType(type.name());
+        req.setSymbol(symbol);
+        req.setTimeframe(timeframe);
+        req.setModelKey(modelKey);
+        req.setSchemaHash(computedSchemaHash);
+        req.setFeatureSchema(featureSchema);
+        req.setRows(rows);
+
+        Map<String, Object> params = new LinkedHashMap<>();
+        params.put("reason", reasonNorm);
+        params.put("rows", rows.size());
+        params.put("candles", candles.size());
+        params.put("modelKey", modelKey);
+        params.put("schemaHash", computedSchemaHash);
+        params.put("exchange", exchange);
+        params.put("network", networkName);
+        params.put("datasetSource", "selected_candles");
+        params.put("windowSize", cfg.windowSize);
+        params.put("tpPct", cfg.takeProfitPct);
+        params.put("slPct", cfg.stopLossPct);
+        req.setParams(params);
+
+        log.info("🧠 TRAIN START type={} ex={} net={} sym={} tf={} rows={} candles={} schemaSize={} schemaHash={} modelKey={} reason={} source=selected_candles",
+                type, exchange, networkName, symbol, timeframe, rows.size(), candles.size(), featureSchema.size(), computedSchemaHash, modelKey, reasonNorm);
+
+        MlTrainResponse resp;
+        try {
+            resp = mlClient.train(req);
+        } catch (Exception e) {
+            log.warn("🧠 TRAIN exception type={} ex={} net={} sym={} tf={} err={}",
+                    type, exchange, networkName, symbol, timeframe, e.toString(), e);
+            return new MlTrainingResult(false, false, modelKey, null, computedSchemaHash, "train_exception");
+        }
+
+        if (resp == null) {
+            return new MlTrainingResult(false, false, modelKey, null, computedSchemaHash, "train_null");
+        }
+        if (!resp.isOk()) {
+            String error = normTrim(resp.getError()) != null ? resp.getError() : "train_not_ok";
+            return new MlTrainingResult(false, false, modelKey, null, computedSchemaHash, error);
+        }
+
+        String responseModelKey = modelKey;
+        String responseModelVersion = normTrim(resp.getModelVersion());
+        String responseSchemaHash = normTrim(resp.getSchemaHash());
+        String finalSchemaHash = responseSchemaHash != null ? responseSchemaHash : computedSchemaHash;
+
+        saveArtifactSafe(chatId, type, symbol, timeframe, responseModelKey, responseModelVersion, finalSchemaHash, resp.getMetricsJson(), now);
+
+        boolean applied = false;
+        try {
+            AdvancedControlMode mode = ss.getAdvancedControlMode() != null ? ss.getAdvancedControlMode() : AdvancedControlMode.MANUAL;
+            ss.setMlModelKey(responseModelKey);
+            ss.setMlModelVersion(responseModelVersion);
+            ss.setMlSchemaHash(finalSchemaHash);
+            BigDecimal minProb = ss.getGateMinProb();
+            if ((minProb == null || minProb.signum() <= 0) && props.getThresholdAutoEnable() > 0) {
+                ss.setGateMinProb(BigDecimal.valueOf(props.getThresholdAutoEnable()).setScale(6, RoundingMode.HALF_UP));
+            }
+            if (mode == AdvancedControlMode.AI || mode == AdvancedControlMode.HYBRID) {
+                ss.setMlGateEnabled(true);
+            }
+            strategySettingsService.save(ss);
+            applied = true;
+        } catch (Exception e) {
+            log.warn("🧠 TRAIN apply settings failed chatId={} type={} err={}", chatId, type, e.toString(), e);
+        }
+
+        publishSettingsUpdated(chatId, type, "ml_train:" + reasonNorm);
+        lastTrainAt.put(cooldownKey, now);
+
+        log.info("🧠 TRAIN DONE type={} ex={} net={} sym={} tf={} applied={} modelKey={} ver={} schemaHash={} rows={} source=selected_candles",
+                type, exchange, networkName, symbol, timeframe, applied, responseModelKey, responseModelVersion, finalSchemaHash, rows.size());
+
+        return new MlTrainingResult(true, applied, responseModelKey, responseModelVersion, finalSchemaHash, null);
+    }
+
+    private List<Object> loadSelectedCandles(Long chatId,
+                                             StrategyType type,
+                                             String exchange,
+                                             NetworkType network,
+                                             String symbol,
+                                             String timeframe,
+                                             int candlesLimit) {
+        List<Object> out = new ArrayList<>();
+        tryWarmupHistory(chatId, type, exchange, network, symbol, timeframe, candlesLimit);
+
+        Object service = getBeanByName("marketDataStreamService");
+        if (service == null) {
+            service = getBeanByName("marketStreamService");
+        }
+        if (service == null) {
+            return out;
+        }
+
+        Object res = tryInvokeCandleLoader(service, chatId, type, exchange, network, symbol, timeframe, candlesLimit);
+        return normalizeCandleResult(res, candlesLimit);
+    }
+
+    private Object tryInvokeCandleLoader(Object service,
+                                         Long chatId,
+                                         StrategyType type,
+                                         String exchange,
+                                         NetworkType network,
+                                         String symbol,
+                                         String timeframe,
+                                         int candlesLimit) {
+        if (service == null) return null;
+
+        List<Object[]> candidates = List.of(
+                new Object[]{chatId, type, exchange, network, symbol, timeframe, candlesLimit},
+                new Object[]{chatId, type, exchange, network, symbol, timeframe, Integer.valueOf(candlesLimit)},
+                new Object[]{chatId, type, symbol, timeframe, exchange, network, candlesLimit},
+                new Object[]{chatId, type, symbol, timeframe, candlesLimit, exchange, network},
+                new Object[]{chatId, type, symbol, timeframe, candlesLimit},
+                new Object[]{chatId, type, exchange, network, symbol, timeframe},
+                new Object[]{chatId, type, symbol, timeframe},
+                new Object[]{chatId, symbol, timeframe, candlesLimit},
+                new Object[]{symbol, timeframe, candlesLimit}
+        );
+
+        List<String> methodNames = List.of(
+                "getCachedCandles",
+                "getRecentCandles",
+                "getCandles",
+                "loadCandles",
+                "getCandlesSnapshot",
+                "snapshotCandles",
+                "findCandles",
+                "readCandles"
+        );
+
+        for (String methodName : methodNames) {
+            for (Object[] args : candidates) {
+                Object value = invokeCompatible(service, methodName, args);
+                if (value != null) {
+                    return value;
+                }
+            }
+        }
+        return null;
+    }
+
+    private List<Object> normalizeCandleResult(Object value, int limit) {
+        if (value == null) return List.of();
+        List<Object> out = new ArrayList<>();
+
+        if (value instanceof Collection<?> collection) {
+            for (Object item : collection) {
+                if (item != null) out.add(item);
+            }
+        } else if (value.getClass().isArray()) {
+            int n = java.lang.reflect.Array.getLength(value);
+            for (int i = 0; i < n; i++) {
+                Object item = java.lang.reflect.Array.get(value, i);
+                if (item != null) out.add(item);
+            }
+        } else {
+            Object nested = invokeCompatible(value, "getCandles");
+            if (nested == null) nested = invokeCompatible(value, "candles");
+            if (nested == null) nested = invokeCompatible(value, "items");
+            if (nested != null && nested != value) {
+                return normalizeCandleResult(nested, limit);
+            }
+        }
+
+        out.sort(Comparator.comparingLong(this::candleOpenTimeMsSafe));
+        if (out.size() > limit) {
+            return new ArrayList<>(out.subList(out.size() - limit, out.size()));
+        }
+        return out;
+    }
+
+    private void tryWarmupHistory(Long chatId,
+                                  StrategyType type,
+                                  String exchange,
+                                  NetworkType network,
+                                  String symbol,
+                                  String timeframe,
+                                  int candlesLimit) {
+        Object warmupService = getBeanByName("historyWarmupService");
+        if (warmupService == null) return;
+
+        List<Object[]> candidates = List.of(
+                new Object[]{chatId, type, exchange, network, symbol, timeframe, candlesLimit},
+                new Object[]{chatId, type, exchange, network, symbol, timeframe, Integer.valueOf(candlesLimit)},
+                new Object[]{chatId, type, exchange, network, symbol, timeframe},
+                new Object[]{exchange, network, symbol, timeframe, candlesLimit}
+        );
+
+        for (String methodName : List.of("warmup", "ensureWarmup", "warmupIfNeeded", "ensureHistory")) {
+            for (Object[] args : candidates) {
+                Object ignored = invokeCompatible(warmupService, methodName, args);
+                if (ignored != null || hasCompatibleMethod(warmupService, methodName, args)) {
+                    return;
+                }
+            }
+        }
+    }
+
+    private WindowTrainingConfig resolveWindowTrainingConfig(Long chatId,
+                                                            String exchange,
+                                                            NetworkType network,
+                                                            String symbol,
+                                                            String timeframe) {
+        int windowSize = 14;
+        double entryFromLowPct = 35.0;
+        double entryFromHighPct = 35.0;
+        double takeProfitPct = 0.35;
+        double stopLossPct = 0.18;
+        double minRangePct = 0.05;
+
+        try {
+            Object svc = getBeanByName("windowScalpingStrategySettingsService");
+            if (svc != null) {
+                Object cfg = invokeCompatible(
+                        svc,
+                        "getOrCreate",
+                        chatId,
+                        exchange,
+                        network,
+                        symbol,
+                        timeframe
+                );
+                if (cfg == null) {
+                    cfg = invokeCompatible(svc, "getOrCreate", chatId);
+                }
+                if (cfg != null) {
+                    Integer w = toInt(readBeanValue(cfg, "getWindowSize", "windowSize"));
+                    Double low = toDouble(readBeanValue(cfg, "getEntryFromLowPct", "entryFromLowPct"));
+                    Double high = toDouble(readBeanValue(cfg, "getEntryFromHighPct", "entryFromHighPct"));
+                    Double tp = toDouble(readBeanValue(cfg, "getTakeProfitPct", "takeProfitPct"));
+                    Double sl = toDouble(readBeanValue(cfg, "getStopLossPct", "stopLossPct"));
+                    Double mr = toDouble(readBeanValue(cfg, "getMinRangePct", "minRangePct"));
+
+                    if (w != null && w >= 5) windowSize = w;
+                    if (low != null && low > 0) entryFromLowPct = low;
+                    if (high != null && high > 0) entryFromHighPct = high;
+                    if (tp != null && tp > 0) takeProfitPct = tp;
+                    if (sl != null && sl > 0) stopLossPct = sl;
+                    if (mr != null && mr > 0) minRangePct = mr;
+                }
+            }
+        } catch (Exception e) {
+            log.debug("🧠 TRAIN candle-config fallback chatId={} ex={} net={} sym={} tf={} err={}",
+                    chatId, exchange, network, symbol, timeframe, e.toString());
+        }
+
+        return new WindowTrainingConfig(
+                Math.max(5, windowSize),
+                clampPct01(entryFromLowPct / 100.0d),
+                clampPct01(1.0d - (entryFromHighPct / 100.0d)),
+                takeProfitPct,
+                stopLossPct,
+                minRangePct
+        );
+    }
+
+    private List<Map<String, Object>> buildWindowRowsFromCandles(List<Object> candles,
+                                                                 WindowTrainingConfig cfg,
+                                                                 int candlesLimit,
+                                                                 Long chatId,
+                                                                 String symbol,
+                                                                 String exchange,
+                                                                 String network,
+                                                                 String timeframe) {
+        List<Map<String, Object>> rows = new ArrayList<>();
+        if (candles == null || candles.isEmpty() || cfg == null) return rows;
+
+        List<CandlePoint> points = new ArrayList<>(candles.size());
+        for (Object candle : candles) {
+            CandlePoint p = toCandlePoint(candle);
+            if (p != null) points.add(p);
+        }
+        points.sort(Comparator.comparingLong(CandlePoint::openTimeMs));
+
+        int windowSize = Math.max(5, cfg.windowSize);
+        int horizon = Math.max(8, Math.min(48, windowSize * 3));
+
+        for (int i = windowSize - 1; i < points.size() - 2; i++) {
+            List<CandlePoint> window = points.subList(i - windowSize + 1, i + 1);
+
+            double low = window.stream().mapToDouble(CandlePoint::low).min().orElse(Double.NaN);
+            double high = window.stream().mapToDouble(CandlePoint::high).max().orElse(Double.NaN);
+            double lastPrice = points.get(i).close();
+
+            if (!Double.isFinite(low) || !Double.isFinite(high) || !Double.isFinite(lastPrice) || low <= 0.0 || high <= low) {
+                continue;
+            }
+
+            double range = high - low;
+            double rangePct = (range / low) * 100.0d;
+            if (!Double.isFinite(rangePct) || rangePct <= 0.0 || rangePct + 1e-12 < cfg.minRangePct) {
+                continue;
+            }
+
+            double clampedPrice = Math.max(low, Math.min(high, lastPrice));
+            double pos01 = (clampedPrice - low) / range;
+            if (!Double.isFinite(pos01)) {
+                continue;
+            }
+
+            if (pos01 > cfg.lowZone01) {
+                continue;
+            }
+
+            double diffPctForEntry = Math.max(0.000001d, (cfg.lowZone01 - pos01) * 100.0d);
+            double retWindowPct = calcWindowReturnPct(window);
+            double momentum1 = calcMomentum1Pct(window);
+            double volatilityPct = calcVolatilityPct(window);
+            double smaFast = calcSma(window, Math.max(3, Math.min(5, windowSize)));
+            double smaSlow = calcSma(window, Math.max(5, Math.min(10, windowSize)));
+
+            Integer label = simulateTpSlLabel(points, i, horizon, cfg.takeProfitPct, cfg.stopLossPct);
+            if (label == null) {
+                continue;
+            }
+
+            LinkedHashMap<String, Object> row = new LinkedHashMap<>();
+            row.put("windowSize", windowSize);
+            row.put("lastPrice", lastPrice);
+            row.put("price", lastPrice);
+            row.put("low", low);
+            row.put("high", high);
+            row.put("range", range);
+            row.put("rangePct", rangePct);
+            row.put("volatilityPct", volatilityPct);
+            row.put("pos01", pos01);
+            row.put("posPct", pos01 * 100.0d);
+            row.put("lowZone01", cfg.lowZone01);
+            row.put("highZone01", cfg.highZone01);
+            row.put("diffPctForEntry", diffPctForEntry);
+            row.put("retWindowPct", retWindowPct);
+            row.put("momentum1", momentum1);
+            row.put("smaFastRel", relPct(lastPrice, smaFast));
+            row.put("smaSlowRel", relPct(lastPrice, smaSlow));
+            row.put("label", label);
+            row.put("chatId", chatId);
+            row.put("strategyType", StrategyType.WINDOW_SCALPING.name());
+            row.put("symbol", symbol);
+            row.put("exchange", exchange);
+            row.put("network", network);
+            row.put("timeframe", timeframe);
+            row.put("ts", points.get(i).closeTimeMs());
+
+            rows.add(row);
+        }
+
+        int rowsLimit = Math.max(100, props.getRowsLimit());
+        if (rows.size() > rowsLimit) {
+            rows = new ArrayList<>(rows.subList(rows.size() - rowsLimit, rows.size()));
+        }
+        return rows;
+    }
+
+    private Integer simulateTpSlLabel(List<CandlePoint> points,
+                                      int entryIndex,
+                                      int horizon,
+                                      double tpPct,
+                                      double slPct) {
+        if (points == null || entryIndex < 0 || entryIndex >= points.size()) return null;
+
+        double entry = points.get(entryIndex).close();
+        if (!Double.isFinite(entry) || entry <= 0.0d) return null;
+
+        double tp = entry * (1.0d + Math.max(0.0001d, tpPct) / 100.0d);
+        double sl = entry * (1.0d - Math.max(0.0001d, slPct) / 100.0d);
+
+        int end = Math.min(points.size() - 1, entryIndex + Math.max(2, horizon));
+        for (int i = entryIndex + 1; i <= end; i++) {
+            CandlePoint p = points.get(i);
+            if (p.low() <= sl) return 0;
+            if (p.high() >= tp) return 1;
+        }
+
+        double finalClose = points.get(end).close();
+        if (!Double.isFinite(finalClose)) return null;
+        return finalClose >= entry ? 1 : 0;
+    }
+
+    private CandlePoint toCandlePoint(Object candle) {
+        if (candle == null) return null;
+
+        Double open = toDouble(readBeanValue(candle, "getOpen", "open"));
+        Double high = toDouble(readBeanValue(candle, "getHigh", "high"));
+        Double low = toDouble(readBeanValue(candle, "getLow", "low"));
+        Double close = toDouble(readBeanValue(candle, "getClose", "close"));
+
+        Long openTime = toLong(readBeanValue(candle, "getOpenTime", "openTime", "getTimestamp", "timestamp", "getOpenTimeMs", "openTimeMs"));
+        Long closeTime = toLong(readBeanValue(candle, "getCloseTime", "closeTime", "getCloseTimeMs", "closeTimeMs"));
+
+        if (open == null || high == null || low == null || close == null) return null;
+        if (!Double.isFinite(open) || !Double.isFinite(high) || !Double.isFinite(low) || !Double.isFinite(close)) return null;
+        if (low <= 0.0d || high < low) return null;
+
+        if (openTime == null) openTime = 0L;
+        if (closeTime == null || closeTime <= 0L) closeTime = openTime;
+
+        return new CandlePoint(open, high, low, close, openTime, closeTime);
+    }
+
+    private long candleOpenTimeMsSafe(Object candle) {
+        CandlePoint p = toCandlePoint(candle);
+        return p != null ? p.openTimeMs() : Long.MIN_VALUE;
+    }
+
+    private double calcWindowReturnPct(List<CandlePoint> window) {
+        if (window == null || window.isEmpty()) return 0.0d;
+        double first = window.get(0).close();
+        double last = window.get(window.size() - 1).close();
+        if (!Double.isFinite(first) || !Double.isFinite(last) || first <= 0.0d) return 0.0d;
+        return ((last - first) / first) * 100.0d;
+    }
+
+    private double calcMomentum1Pct(List<CandlePoint> window) {
+        if (window == null || window.size() < 2) return 0.0d;
+        double prev = window.get(window.size() - 2).close();
+        double last = window.get(window.size() - 1).close();
+        if (!Double.isFinite(prev) || !Double.isFinite(last) || prev <= 0.0d) return 0.0d;
+        return ((last - prev) / prev) * 100.0d;
+    }
+
+    private double calcVolatilityPct(List<CandlePoint> window) {
+        if (window == null || window.size() < 3) return 0.0d;
+        double mean = 0.0d;
+        int count = 0;
+        for (CandlePoint p : window) {
+            if (p == null || !Double.isFinite(p.close()) || p.close() <= 0.0d) continue;
+            mean += p.close();
+            count++;
+        }
+        if (count < 3) return 0.0d;
+        mean /= count;
+        if (!Double.isFinite(mean) || mean <= 0.0d) return 0.0d;
+
+        double var = 0.0d;
+        for (CandlePoint p : window) {
+            if (p == null || !Double.isFinite(p.close()) || p.close() <= 0.0d) continue;
+            double d = p.close() - mean;
+            var += d * d;
+        }
+        var /= count;
+
+        double std = Math.sqrt(var);
+        if (!Double.isFinite(std)) return 0.0d;
+        return (std / mean) * 100.0d;
+    }
+
+    private double calcSma(List<CandlePoint> window, int period) {
+        if (window == null || window.isEmpty() || period <= 0) return 0.0d;
+        int from = Math.max(0, window.size() - period);
+        double sum = 0.0d;
+        int count = 0;
+        for (int i = from; i < window.size(); i++) {
+            CandlePoint p = window.get(i);
+            if (p == null || !Double.isFinite(p.close()) || p.close() <= 0.0d) continue;
+            sum += p.close();
+            count++;
+        }
+        return count <= 0 ? 0.0d : sum / count;
+    }
+
+    private double relPct(double price, double avg) {
+        if (!Double.isFinite(price) || !Double.isFinite(avg) || avg <= 0.0d) return 0.0d;
+        return ((price - avg) / avg) * 100.0d;
+    }
+
+    private double clampPct01(double v) {
+        if (!Double.isFinite(v)) return 0.0d;
+        if (v < 0.0d) return 0.0d;
+        if (v > 1.0d) return 1.0d;
+        return v;
+    }
+
+    private Object getBeanByName(String name) {
+        try {
+            return applicationContext != null && applicationContext.containsBean(name)
+                    ? applicationContext.getBean(name)
+                    : null;
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private boolean hasCompatibleMethod(Object target, String methodName, Object[] args) {
+        if (target == null || methodName == null) return false;
+        for (Method m : target.getClass().getMethods()) {
+            if (!m.getName().equals(methodName)) continue;
+            Class<?>[] pt = m.getParameterTypes();
+            if (pt.length != (args != null ? args.length : 0)) continue;
+            if (areArgumentsCompatible(pt, args)) return true;
+        }
+        return false;
+    }
+
+    private Object invokeCompatible(Object target, String methodName, Object... args) {
+        if (target == null || methodName == null) return null;
+        for (Method m : target.getClass().getMethods()) {
+            if (!m.getName().equals(methodName)) continue;
+            Class<?>[] pt = m.getParameterTypes();
+            if (pt.length != (args != null ? args.length : 0)) continue;
+            if (!areArgumentsCompatible(pt, args)) continue;
+            try {
+                return m.invoke(target, coerceArgs(pt, args));
+            } catch (Exception ignored) {
+            }
+        }
+        return null;
+    }
+
+    private boolean areArgumentsCompatible(Class<?>[] types, Object[] args) {
+        if (types == null) return args == null || args.length == 0;
+        if (args == null) return types.length == 0;
+        if (types.length != args.length) return false;
+
+        for (int i = 0; i < types.length; i++) {
+            Class<?> t = wrap(types[i]);
+            Object a = args[i];
+
+            if (a == null) {
+                if (types[i].isPrimitive()) return false;
+                continue;
+            }
+
+            if (t.isInstance(a)) continue;
+
+            if (Number.class.isAssignableFrom(t) && a instanceof Number) continue;
+            if (t == String.class) continue;
+            if (t == Boolean.class && (a instanceof Boolean || a instanceof Number || a instanceof String)) continue;
+            if (Enum.class.isAssignableFrom(t) && (a instanceof Enum<?> || a instanceof String)) continue;
+            if ((t == Long.class || t == Integer.class || t == Double.class || t == Float.class) && a instanceof String) continue;
+            return false;
+        }
+        return true;
+    }
+
+    private Object[] coerceArgs(Class<?>[] types, Object[] args) {
+        Object[] out = new Object[types.length];
+        for (int i = 0; i < types.length; i++) {
+            out[i] = coerceArg(types[i], args[i]);
+        }
+        return out;
+    }
+
+    private Object coerceArg(Class<?> type, Object arg) {
+        if (arg == null) return null;
+        Class<?> t = wrap(type);
+        if (t.isInstance(arg)) return arg;
+        if (t == String.class) return String.valueOf(arg);
+        if (Enum.class.isAssignableFrom(t)) {
+            try {
+                String name = (arg instanceof Enum<?> e) ? e.name() : String.valueOf(arg);
+                @SuppressWarnings({"rawtypes","unchecked"})
+                Object en = Enum.valueOf((Class<? extends Enum>) t.asSubclass(Enum.class), name);
+                return en;
+            } catch (Exception ignored) {
+                return null;
+            }
+        }
+        if (Number.class.isAssignableFrom(t)) {
+            if (arg instanceof Number n) {
+                if (t == Integer.class) return n.intValue();
+                if (t == Long.class) return n.longValue();
+                if (t == Double.class) return n.doubleValue();
+                if (t == Float.class) return n.floatValue();
+                if (t == BigDecimal.class) return BigDecimal.valueOf(n.doubleValue());
+            }
+            try {
+                String s = String.valueOf(arg).trim();
+                if (t == Integer.class) return Integer.parseInt(s);
+                if (t == Long.class) return Long.parseLong(s);
+                if (t == Double.class) return Double.parseDouble(s);
+                if (t == Float.class) return Float.parseFloat(s);
+                if (t == BigDecimal.class) return new BigDecimal(s);
+            } catch (Exception ignored) {
+                return null;
+            }
+        }
+        if (t == Boolean.class) {
+            if (arg instanceof Boolean b) return b;
+            if (arg instanceof Number n) return n.intValue() != 0;
+            return Boolean.parseBoolean(String.valueOf(arg));
+        }
+        return arg;
+    }
+
+    private Class<?> wrap(Class<?> type) {
+        if (type == null) return Object.class;
+        if (!type.isPrimitive()) return type;
+        if (type == int.class) return Integer.class;
+        if (type == long.class) return Long.class;
+        if (type == double.class) return Double.class;
+        if (type == float.class) return Float.class;
+        if (type == boolean.class) return Boolean.class;
+        if (type == short.class) return Short.class;
+        if (type == byte.class) return Byte.class;
+        if (type == char.class) return Character.class;
+        return type;
+    }
+
+    private Object readBeanValue(Object target, String... methodNames) {
+        if (target == null || methodNames == null) return null;
+        for (String methodName : methodNames) {
+            if (methodName == null || methodName.isBlank()) continue;
+            try {
+                Method m = target.getClass().getMethod(methodName);
+                return m.invoke(target);
+            } catch (Exception ignored) {
+            }
+        }
+        return null;
+    }
+
+    private Integer toInt(Object value) {
+        if (value == null) return null;
+        if (value instanceof Number n) return n.intValue();
+        try {
+            return Integer.parseInt(String.valueOf(value).trim());
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private Long toLong(Object value) {
+        if (value == null) return null;
+        if (value instanceof Number n) return n.longValue();
+        try {
+            return Long.parseLong(String.valueOf(value).trim());
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private Double toDouble(Object value) {
+        if (value == null) return null;
+        if (value instanceof BigDecimal bd) return bd.doubleValue();
+        if (value instanceof Number n) return n.doubleValue();
+        try {
+            return Double.parseDouble(String.valueOf(value).trim());
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private record WindowTrainingConfig(int windowSize,
+                                        double lowZone01,
+                                        double highZone01,
+                                        double takeProfitPct,
+                                        double stopLossPct,
+                                        double minRangePct) {}
+
+    private record CandlePoint(double open,
+                               double high,
+                               double low,
+                               double close,
+                               long openTimeMs,
+                               long closeTimeMs) {}
     private List<MlSampleEntity> safeFindRecent(Long chatId, StrategyType type, Instant from) {
         try {
             List<MlSampleEntity> r = sampleRepo.findRecent(chatId, type, from);
@@ -616,3 +1418,5 @@ public class MlTrainingServiceImpl implements MlTrainingService {
 
     private record Context(String symbol, String timeframe, String exchange, String network) {}
 }
+
+

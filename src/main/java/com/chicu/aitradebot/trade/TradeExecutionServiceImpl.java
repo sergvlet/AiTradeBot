@@ -120,15 +120,15 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
     @Value("${trade.position-restore.dust-suppress-ms:21600000}")
     private long dustRestoreSuppressMs;
 
-    @Value("${trade.entry.wallet-base-sync-grace-ms:6000}")
+    @Value("${trade.entry.wallet-base-sync-grace-ms:12000}")
     private long walletBaseSyncGraceMs;
 
     /** Минимальный запас прибыли сверх комиссий, иначе market-entry не имеет смысла. */
-    @Value("${trade.entry.min-net-edge-pct:0.24}")
+    @Value("${trade.entry.min-net-edge-pct:0.08}")
     private BigDecimal minNetEdgePct;
 
     /** Минимальное net reward/risk для market-entry с учётом round-trip fee. */
-    @Value("${trade.entry.min-net-reward-risk:1.35}")
+    @Value("${trade.entry.min-net-reward-risk:1.02}")
     private BigDecimal minNetRewardRisk;
 
     @PostConstruct
@@ -342,7 +342,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             return EntryResult.fail(entryOrderBlock.code());
         }
 
-        QuoteBudget budget = resolveQuoteBudget(chatId, strategyType, ss, ex, net);
+        QuoteBudget budget = resolveQuoteBudget(chatId, strategyType, ss, ex, net, sym);
         if (!QtyMath.isPositive(budget.quoteAmount())) {
             log.warn("⛔ [Вход] Нет бюджета для сделки | reason={} | mode={} value={} free={} | chatId={} {} {} ex={} net={}",
                     budget.reason(),
@@ -1578,7 +1578,8 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                                            StrategyType strategyType,
                                            StrategySettings ss,
                                            String ex,
-                                           NetworkType net) {
+                                           NetworkType net,
+                                           String symbol) {
 
         if (chatId == null || strategyType == null || ss == null) {
             return new QuoteBudget(BigDecimal.ZERO, null, null, null, "bad_args");
@@ -1595,10 +1596,12 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             return new QuoteBudget(BigDecimal.ZERO, ss.getCapitalMode(), ss.getCapitalValue(), null, "exchange_connection_bad");
         }
 
-        AccountBalanceSnapshot.AssetBalance bal = snap.getSelectedBalance();
-        BigDecimal free = (bal != null) ? bal.getFree() : null;
+        String quoteAsset = guessQuoteAsset(symbol);
+        AccountBalanceSnapshot.AssetBalance bal = resolveQuoteBalanceFromSnapshot(snap, quoteAsset);
+        BigDecimal free = (bal != null) ? bal.getFreeSafe() : null;
         if (!QtyMath.isPositive(free)) {
-            return new QuoteBudget(BigDecimal.ZERO, ss.getCapitalMode(), ss.getCapitalValue(), free, "no_free_balance");
+            return new QuoteBudget(BigDecimal.ZERO, ss.getCapitalMode(), ss.getCapitalValue(), free,
+                    quoteAsset != null ? "no_free_quote_balance:" + quoteAsset : "no_free_balance");
         }
 
         StrategySettings.CapitalMode mode = ss.getCapitalMode();
@@ -2286,6 +2289,39 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
     }
 
 
+    private AccountBalanceSnapshot.AssetBalance resolveQuoteBalanceFromSnapshot(AccountBalanceSnapshot snap,
+                                                                               String quoteAsset) {
+        if (snap == null) return null;
+
+        if (quoteAsset != null && !quoteAsset.isBlank()) {
+            AccountBalanceSnapshot.AssetBalance exact = snap.getBalance(quoteAsset);
+            if (exact == null && snap.getBalances() != null) {
+                exact = snap.getBalances().get(quoteAsset.toUpperCase(Locale.ROOT));
+            }
+            if (exact == null && snap.getFullBalance() != null) {
+                exact = snap.getFullBalance().get(quoteAsset.toUpperCase(Locale.ROOT));
+            }
+            if (exact != null) {
+                return exact;
+            }
+        }
+
+        return snap.getSelectedBalance();
+    }
+
+    private String guessQuoteAsset(String symbol) {
+        String s = normalizeSymbol(symbol);
+        if (s == null) return null;
+
+        String[] quotes = new String[]{"USDT","USDC","BUSD","FDUSD","TUSD","BTC","ETH","EUR","TRY","BRL","GBP","UAH","PLN"};
+        for (String q : quotes) {
+            if (s.endsWith(q) && s.length() > q.length()) {
+                return q;
+            }
+        }
+        return null;
+    }
+
     private String guessBaseAsset(String symbol) {
         String s = normalizeSymbol(symbol);
         if (s == null) return null;
@@ -2870,7 +2906,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             }
         }
 
-        QuoteBudget budget = resolveQuoteBudget(chatId, strategyType, ss, ex, net);
+        QuoteBudget budget = resolveQuoteBudget(chatId, strategyType, ss, ex, net, sym);
         if (!QtyMath.isPositive(budget.quoteAmount())) {
             return EntryPrecheckResult.block(
                     safe(budget.reason()) != null ? budget.reason() : "no_budget",
@@ -2987,6 +3023,8 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         }
     }
 }
+
+
 
 
 
