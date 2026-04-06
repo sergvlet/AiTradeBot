@@ -6,6 +6,7 @@ import com.chicu.aitradebot.ai.ml.dataset.MlSampleIngestService;
 import com.chicu.aitradebot.ai.ml.dto.MlPredictResponse;
 import com.chicu.aitradebot.ai.ml.training.MlTrainingResult;
 import com.chicu.aitradebot.ai.ml.training.MlTrainingService;
+import com.chicu.aitradebot.ai.ml.training.MlTrainingServiceImpl;
 import com.chicu.aitradebot.ai.tuning.AutoTunerOrchestrator;
 import com.chicu.aitradebot.ai.tuning.TuningRequest;
 import com.chicu.aitradebot.ai.tuning.TuningResult;
@@ -393,6 +394,33 @@ public class WindowScalpingStrategyV4 implements
         return mlTrainingServiceProvider != null ? mlTrainingServiceProvider.getIfAvailable() : null;
     }
 
+    private MlTrainingResult trainPrepareOnSelectedCandles(long chatId,
+                                                           String exchange,
+                                                           NetworkType network,
+                                                           String symbol,
+                                                           String timeframe,
+                                                           int candlesLimit) {
+        MlTrainingService trainingService = trainingService();
+        if (trainingService == null) {
+            return null;
+        }
+
+        if (trainingService instanceof MlTrainingServiceImpl impl) {
+            return impl.trainOnSelectedCandles(
+                    chatId,
+                    StrategyType.WINDOW_SCALPING,
+                    exchange,
+                    network,
+                    symbol,
+                    timeframe,
+                    candlesLimit,
+                    "prepare_start_train"
+            );
+        }
+
+        return trainingService.trainNow(chatId, StrategyType.WINDOW_SCALPING, "prepare_start_train");
+    }
+
     private AutoTunerOrchestrator autoTuner() {
         return autoTunerProvider != null ? autoTunerProvider.getIfAvailable() : null;
     }
@@ -631,10 +659,14 @@ public class WindowScalpingStrategyV4 implements
         MlTrainingResult trainRes = null;
         TuningResult tuneRes = null;
         try {
-            MlTrainingService trainingService = trainingService();
-            if (trainingService != null) {
-                trainRes = trainingService.trainNow(chatId, StrategyType.WINDOW_SCALPING, "prepare_start");
-            }
+            trainRes = trainPrepareOnSelectedCandles(
+                    chatId,
+                    ex,
+                    net,
+                    sym,
+                    tf,
+                    range.candlesLimit()
+            );
 
             AutoTunerOrchestrator tuner = autoTuner();
             if (tuner != null) {
@@ -1095,7 +1127,7 @@ public class WindowScalpingStrategyV4 implements
                 fmt(effectiveGateThreshold),
                 (ss != null ? safeNullable(ss.getMlModelVersion()) : "null"),
                 st.cfg != null ? st.cfg.getWindowSize() : null,
-                (st.cfg != null && st.cfg.getMinRangePct() != null ? fmt(st.cfg.getMinRangePct()) : "null"),
+                (effectiveMinRangePct(st, st.cfg) > 0.0 ? fmt(effectiveMinRangePct(st, st.cfg)) : "null"),
                 st.cfg != null ? st.cfg.getTakeProfitPct() : null,
                 st.cfg != null ? st.cfg.getStopLossPct() : null,
                 mlEnabled,
@@ -1652,7 +1684,7 @@ public class WindowScalpingStrategyV4 implements
 
         cfg = st.cfg != null ? st.cfg : cfg;
 
-        double minRangePct = (cfg.getMinRangePct() != null ? cfg.getMinRangePct() : 0.0);
+        double minRangePct = effectiveMinRangePct(st, cfg);
         boolean rangeTooSmallBypass = false;
         if (rangePct + 1e-12 < minRangePct) {
             double bypassFactor = Double.isFinite(rangeTooSmallBypassFactor) ? rangeTooSmallBypassFactor : 0.72;
@@ -2137,6 +2169,27 @@ public class WindowScalpingStrategyV4 implements
         long logEvery = Math.max(1, tickLogEveryTicks);
         long holdMs = Math.max(200, holdThrottleMs);
 
+        if (shouldRunCandleClosePriceFallback(st, time, timeframe)) {
+            try {
+                onPriceUpdate(
+                        chatId,
+                        StrategyType.WINDOW_SCALPING,
+                        symbol,
+                        timeframe,
+                        close,
+                        tsMs,
+                        exchange,
+                        network
+                );
+            } catch (Exception e) {
+                log.warn("[WINDOW] ⚠ Ошибка candle-close fallback chatId={} sym={} tf={} err={}",
+                        chatId,
+                        normalizeSymbolOrNull(symbol),
+                        normalizeTimeframeOrNull(timeframe),
+                        e.getMessage());
+            }
+        }
+
         String ex = normalizeExchangeOrNull(exchange);
         if (ex != null) st.exchange = ex;
         if (network != null) st.network = network;
@@ -2238,7 +2291,7 @@ public class WindowScalpingStrategyV4 implements
                         st.window.size(),
                         st.tickWindow != null ? st.tickWindow.size() : 0,
                         fmt(rangePct),
-                        fmt(cfg.getMinRangePct() != null ? cfg.getMinRangePct() : 0.0));
+                        fmt(effectiveMinRangePct(st, cfg)));
             }
         }
     }
@@ -2261,6 +2314,60 @@ public class WindowScalpingStrategyV4 implements
         }
 
         st.lastTickAt = Instant.now();
+    }
+
+    private boolean shouldRunCandleClosePriceFallback(LocalState st, Instant now, String timeframe) {
+        if (st == null || now == null) {
+            return false;
+        }
+
+        Instant lastTick = st.lastTickAt;
+        if (lastTick == null) {
+            return true;
+        }
+
+        long ageMs;
+        try {
+            ageMs = Math.max(0L, Duration.between(lastTick, Instant.now()).toMillis());
+        } catch (Exception e) {
+            ageMs = Long.MAX_VALUE;
+        }
+
+        return ageMs >= resolveCandleCloseFallbackThresholdMs(timeframe != null ? timeframe : st.timeframe);
+    }
+
+    private long resolveCandleCloseFallbackThresholdMs(String timeframe) {
+        long tfMs = parseTimeframeToMs(normalizeTimeframeOrNull(timeframe));
+        if (tfMs <= 0L) {
+            return 2_500L;
+        }
+        return Math.max(1_500L, Math.min(10_000L, tfMs / 8L));
+    }
+
+    private long parseTimeframeToMs(String timeframe) {
+        if (timeframe == null || timeframe.isBlank()) {
+            return -1L;
+        }
+
+        String tf = timeframe.trim().toLowerCase(Locale.ROOT);
+        if (tf.isEmpty()) {
+            return -1L;
+        }
+
+        try {
+            long value = Long.parseLong(tf.substring(0, tf.length() - 1));
+            char unit = tf.charAt(tf.length() - 1);
+            return switch (unit) {
+                case 's' -> value * 1_000L;
+                case 'm' -> value * 60_000L;
+                case 'h' -> value * 3_600_000L;
+                case 'd' -> value * 86_400_000L;
+                case 'w' -> value * 604_800_000L;
+                default -> -1L;
+            };
+        } catch (Exception e) {
+            return -1L;
+        }
     }
 
     private record ZoneExitDecision(boolean shouldExit,
@@ -5602,6 +5709,16 @@ public class WindowScalpingStrategyV4 implements
         return s.isEmpty() ? null : s;
     }
 
+    private double effectiveMinRangePct(LocalState st, WindowScalpingStrategySettings cfg) {
+        if (st != null && st.lastAutoMinRangeApplied != null && Double.isFinite(st.lastAutoMinRangeApplied) && st.lastAutoMinRangeApplied > 0.0) {
+            return st.lastAutoMinRangeApplied;
+        }
+        if (cfg != null && cfg.getMinRangePct() != null && Double.isFinite(cfg.getMinRangePct()) && cfg.getMinRangePct() > 0.0) {
+            return cfg.getMinRangePct();
+        }
+        return 0.0;
+    }
+
     private static double clamp01(double v) {
         if (v < 0) return 0;
         if (v > 1) return 1;
@@ -5625,4 +5742,5 @@ public class WindowScalpingStrategyV4 implements
         return (v != null && v.signum() > 0) ? v : null;
     }
 }
+
 

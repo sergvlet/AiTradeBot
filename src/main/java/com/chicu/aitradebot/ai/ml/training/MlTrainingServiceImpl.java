@@ -318,7 +318,7 @@ public class MlTrainingServiceImpl implements MlTrainingService {
                                                    String timeframeOverride,
                                                    Integer candlesLimitOverride,
                                                    String reason) {
-        if (type != StrategyType.WINDOW_SCALPING) {
+        if (type != StrategyType.WINDOW_SCALPING && type != StrategyType.FIBONACCI_GRID) {
             return trainNow(chatId, type, reason);
         }
         if (props == null || !props.isEnabled()) {
@@ -396,32 +396,68 @@ public class MlTrainingServiceImpl implements MlTrainingService {
             return new MlTrainingResult(false, false, modelKey, null, normTrim(ss.getMlSchemaHash()), "no_selected_candles");
         }
 
-        WindowTrainingConfig cfg = resolveWindowTrainingConfig(chatId, exchange, network, symbol, timeframe);
-        List<String> featureSchema = List.of(
-                "windowSize",
-                "lastPrice",
-                "price",
-                "low",
-                "high",
-                "range",
-                "rangePct",
-                "volatilityPct",
-                "pos01",
-                "posPct",
-                "lowZone01",
-                "highZone01",
-                "diffPctForEntry",
-                "retWindowPct",
-                "momentum1",
-                "smaFastRel",
-                "smaSlowRel"
-        );
-        String computedSchemaHash = computeSchemaHash(featureSchema);
+        List<String> featureSchema;
+        List<Map<String, Object>> rows;
+        Map<String, Object> params = new LinkedHashMap<>();
 
-        List<Map<String, Object>> rows = buildWindowRowsFromCandles(candles, cfg, candlesLimit, chatId, symbol, exchange, networkName, timeframe);
+        if (type == StrategyType.FIBONACCI_GRID) {
+            FiboTrainingConfig cfg = resolveFiboTrainingConfig(chatId);
+            featureSchema = List.of(
+                    "gridLevels",
+                    "distancePct",
+                    "takeProfitPct",
+                    "stopLossPct",
+                    "levelHitIndex",
+                    "levelDistancePct",
+                    "anchorPrice",
+                    "price",
+                    "rangePct",
+                    "ret1Pct",
+                    "ret3Pct",
+                    "ret5Pct",
+                    "volatilityPct",
+                    "drawdownFromAnchorPct",
+                    "bounceFromLowPct",
+                    "positionInRange01"
+            );
+            rows = buildFiboRowsFromCandles(candles, cfg, candlesLimit, chatId, symbol, exchange, networkName, timeframe);
+            params.put("datasetSource", "selected_candles");
+            params.put("gridLevels", cfg.gridLevels);
+            params.put("distancePct", cfg.distancePct);
+            params.put("tpPct", cfg.takeProfitPct);
+            params.put("slPct", cfg.stopLossPct);
+        } else {
+            WindowTrainingConfig cfg = resolveWindowTrainingConfig(chatId, exchange, network, symbol, timeframe);
+            featureSchema = List.of(
+                    "windowSize",
+                    "lastPrice",
+                    "price",
+                    "low",
+                    "high",
+                    "range",
+                    "rangePct",
+                    "volatilityPct",
+                    "pos01",
+                    "posPct",
+                    "lowZone01",
+                    "highZone01",
+                    "diffPctForEntry",
+                    "retWindowPct",
+                    "momentum1",
+                    "smaFastRel",
+                    "smaSlowRel"
+            );
+            rows = buildWindowRowsFromCandles(candles, cfg, candlesLimit, chatId, symbol, exchange, networkName, timeframe);
+            params.put("datasetSource", "selected_candles");
+            params.put("windowSize", cfg.windowSize);
+            params.put("tpPct", cfg.takeProfitPct);
+            params.put("slPct", cfg.stopLossPct);
+        }
+
+        String computedSchemaHash = computeSchemaHash(featureSchema);
         if (rows.size() < props.getMinSamples()) {
-            log.warn("🧠 TRAIN SKIP: not enough candle rows modelKey={} rows={} minSamples={} schemaHash={} candles={}",
-                    modelKey, rows.size(), props.getMinSamples(), computedSchemaHash, candles.size());
+            log.warn("🧠 TRAIN SKIP: not enough candle rows modelKey={} rows={} minSamples={} schemaHash={} candles={} type={}",
+                    modelKey, rows.size(), props.getMinSamples(), computedSchemaHash, candles.size(), type);
             return new MlTrainingResult(false, false, modelKey, null, computedSchemaHash, "not_enough_candle_rows=" + rows.size());
         }
 
@@ -452,7 +488,6 @@ public class MlTrainingServiceImpl implements MlTrainingService {
         req.setFeatureSchema(featureSchema);
         req.setRows(rows);
 
-        Map<String, Object> params = new LinkedHashMap<>();
         params.put("reason", reasonNorm);
         params.put("rows", rows.size());
         params.put("candles", candles.size());
@@ -460,10 +495,6 @@ public class MlTrainingServiceImpl implements MlTrainingService {
         params.put("schemaHash", computedSchemaHash);
         params.put("exchange", exchange);
         params.put("network", networkName);
-        params.put("datasetSource", "selected_candles");
-        params.put("windowSize", cfg.windowSize);
-        params.put("tpPct", cfg.takeProfitPct);
-        params.put("slPct", cfg.stopLossPct);
         req.setParams(params);
 
         log.info("🧠 TRAIN START type={} ex={} net={} sym={} tf={} rows={} candles={} schemaSize={} schemaHash={} modelKey={} reason={} source=selected_candles",
@@ -634,13 +665,26 @@ public class MlTrainingServiceImpl implements MlTrainingService {
                 new Object[]{exchange, network, symbol, timeframe, candlesLimit}
         );
 
+        boolean invoked = false;
         for (String methodName : List.of("warmup", "ensureWarmup", "warmupIfNeeded", "ensureHistory")) {
             for (Object[] args : candidates) {
-                Object ignored = invokeCompatible(warmupService, methodName, args);
-                if (ignored != null || hasCompatibleMethod(warmupService, methodName, args)) {
-                    return;
+                try {
+                    Object ignored = invokeCompatible(warmupService, methodName, args);
+                    if (ignored != null) {
+                        invoked = true;
+                    } else if (hasCompatibleMethod(warmupService, methodName, args)) {
+                        // Метод может быть void — всё равно считаем попытку валидной и пробуем остальные сигнатуры без раннего выхода.
+                        invoked = true;
+                    }
+                } catch (Exception ignore) {
+                    // идём дальше по другим сигнатурам
                 }
             }
+        }
+
+        if (!invoked) {
+            log.debug("🧠 TRAIN warmup skipped: no compatible warmup method type={} ex={} net={} sym={} tf={} limit={}",
+                    type, exchange, network, symbol, timeframe, candlesLimit);
         }
     }
 
@@ -1088,6 +1132,171 @@ public class MlTrainingServiceImpl implements MlTrainingService {
         }
     }
 
+
+    private FiboTrainingConfig resolveFiboTrainingConfig(Long chatId) {
+        int gridLevels = 6;
+        double distancePct = 0.50d;
+        double takeProfitPct = 0.80d;
+        double stopLossPct = 1.20d;
+
+        try {
+            Object svc = getBeanByName("fibonacciGridStrategySettingsService");
+            if (svc == null) {
+                svc = getBeanByName("fibonacciGridStrategySettingsServiceImpl");
+            }
+            if (svc != null) {
+                Object cfg = invokeCompatible(svc, "getOrCreate", chatId);
+                if (cfg != null) {
+                    Integer levels = toInt(readBeanValue(cfg, "getGridLevels", "gridLevels"));
+                    Double distance = toDouble(readBeanValue(cfg, "getDistancePct", "distancePct"));
+                    Double tp = toDouble(readBeanValue(cfg, "getTakeProfitPct", "takeProfitPct"));
+                    Double sl = toDouble(readBeanValue(cfg, "getStopLossPct", "stopLossPct"));
+
+                    if (levels != null && levels > 0) gridLevels = levels;
+                    if (distance != null && distance > 0) distancePct = distance;
+                    if (tp != null && tp > 0) takeProfitPct = tp;
+                    if (sl != null && sl > 0) stopLossPct = sl;
+                }
+            }
+        } catch (Exception e) {
+            log.debug("🧠 TRAIN fibo-config fallback chatId={} err={}", chatId, e.toString());
+        }
+
+        return new FiboTrainingConfig(
+                Math.max(1, gridLevels),
+                Math.max(0.05d, distancePct),
+                Math.max(0.05d, takeProfitPct),
+                Math.max(0.05d, stopLossPct)
+        );
+    }
+
+
+private List<Map<String, Object>> buildFiboRowsFromCandles(List<Object> candles,
+                                                           FiboTrainingConfig cfg,
+                                                           int candlesLimit,
+                                                           Long chatId,
+                                                           String symbol,
+                                                           String exchange,
+                                                           String network,
+                                                           String timeframe) {
+    List<Map<String, Object>> rows = new ArrayList<>();
+    if (candles == null || candles.isEmpty() || cfg == null) return rows;
+
+    List<CandlePoint> points = new ArrayList<>(candles.size());
+    for (Object candle : candles) {
+        CandlePoint p = toCandlePoint(candle);
+        if (p != null) points.add(p);
+    }
+    points.sort(Comparator.comparingLong(CandlePoint::openTimeMs));
+
+    int minWarmup = Math.max(20, cfg.gridLevels + 8);
+    if (points.size() < minWarmup + 8) {
+        return rows;
+    }
+
+    int anchorWindow = Math.max(12, Math.min(60, cfg.gridLevels * 5));
+    int horizon = Math.max(8, Math.min(64, cfg.gridLevels * 6));
+    double gridStepPct = Math.max(0.05d, cfg.distancePct);
+
+    for (int i = anchorWindow; i < points.size() - Math.max(3, Math.min(6, horizon / 2)); i++) {
+        CandlePoint point = points.get(i);
+        List<CandlePoint> anchorSlice = points.subList(i - anchorWindow, i);
+
+        double anchor = anchorSlice.stream().mapToDouble(CandlePoint::high).max().orElse(Double.NaN);
+        double rollingLow = anchorSlice.stream().mapToDouble(CandlePoint::low).min().orElse(Double.NaN);
+        double price = point.close();
+
+        if (!Double.isFinite(anchor) || !Double.isFinite(price) || !Double.isFinite(rollingLow)
+                || anchor <= 0.0d || rollingLow <= 0.0d) {
+            continue;
+        }
+
+        double rawRange = anchor - rollingLow;
+        if (!Double.isFinite(rawRange) || rawRange <= 0.0d) {
+            continue;
+        }
+
+        double rangePct = ((anchor - rollingLow) / rollingLow) * 100.0d;
+        if (!Double.isFinite(rangePct) || rangePct <= 0.0d) {
+            continue;
+        }
+
+        double drawdownFromAnchorPct = Math.max(0.0d, ((anchor - price) / anchor) * 100.0d);
+        double bounceFromLowPct = Math.max(0.0d, ((price - rollingLow) / rollingLow) * 100.0d);
+        double positionInRange01 = clampPct01((price - rollingLow) / rawRange);
+
+        int derivedLevelIdx = (int) Math.floor(drawdownFromAnchorPct / gridStepPct);
+        if (derivedLevelIdx < 0) derivedLevelIdx = 0;
+        if (derivedLevelIdx >= cfg.gridLevels) derivedLevelIdx = cfg.gridLevels - 1;
+
+        double levelHitIndex = derivedLevelIdx;
+        double levelDistancePct = Math.min(drawdownFromAnchorPct, gridStepPct * Math.max(1, cfg.gridLevels));
+
+        Integer label = simulateTpSlLabel(points, i, horizon, cfg.takeProfitPct, cfg.stopLossPct);
+        if (label == null) {
+            continue;
+        }
+
+        LinkedHashMap<String, Object> row = new LinkedHashMap<>();
+        row.put("gridLevels", cfg.gridLevels);
+        row.put("distancePct", cfg.distancePct);
+        row.put("takeProfitPct", cfg.takeProfitPct);
+        row.put("stopLossPct", cfg.stopLossPct);
+        row.put("levelHitIndex", levelHitIndex);
+        row.put("levelDistancePct", levelDistancePct);
+        row.put("anchorPrice", anchor);
+        row.put("price", price);
+        row.put("rangePct", rangePct);
+        row.put("ret1Pct", calcCloseReturnPct(points, i, 1));
+        row.put("ret3Pct", calcCloseReturnPct(points, i, 3));
+        row.put("ret5Pct", calcCloseReturnPct(points, i, 5));
+        row.put("volatilityPct", calcVolatilityPct(anchorSlice));
+        row.put("drawdownFromAnchorPct", drawdownFromAnchorPct);
+        row.put("bounceFromLowPct", bounceFromLowPct);
+        row.put("positionInRange01", positionInRange01);
+        row.put("label", label);
+        row.put("chatId", chatId);
+        row.put("strategyType", StrategyType.FIBONACCI_GRID.name());
+        row.put("symbol", symbol);
+        row.put("exchange", exchange);
+        row.put("network", network);
+        row.put("timeframe", timeframe);
+        row.put("ts", point.closeTimeMs());
+        rows.add(row);
+    }
+
+    int rowsLimit = Math.max(100, props.getRowsLimit());
+    if (rows.size() > rowsLimit) {
+        rows = new ArrayList<>(rows.subList(rows.size() - rowsLimit, rows.size()));
+    }
+
+    log.info("🧠 TRAIN FIBO rows built chatId={} sym={} ex={} net={} tf={} candles={} rows={} levels={} stepPct={} horizon={}",
+            chatId,
+            symbol,
+            exchange,
+            network,
+            timeframe,
+            points.size(),
+            rows.size(),
+            cfg.gridLevels,
+            cfg.distancePct,
+            horizon);
+
+    return rows;
+}
+
+private double calcCloseReturnPct(List<CandlePoint> points, int index, int back) {
+        if (points == null || index < 0 || back <= 0 || index - back < 0 || index >= points.size()) return 0.0d;
+        double prev = points.get(index - back).close();
+        double cur = points.get(index).close();
+        if (!Double.isFinite(prev) || !Double.isFinite(cur) || prev <= 0.0d) return 0.0d;
+        return ((cur - prev) / prev) * 100.0d;
+    }
+    private record FiboTrainingConfig(int gridLevels,
+                                      double distancePct,
+                                      double takeProfitPct,
+                                      double stopLossPct) {}
+
     private record WindowTrainingConfig(int windowSize,
                                         double lowZone01,
                                         double highZone01,
@@ -1418,5 +1627,6 @@ public class MlTrainingServiceImpl implements MlTrainingService {
 
     private record Context(String symbol, String timeframe, String exchange, String network) {}
 }
+
 
 

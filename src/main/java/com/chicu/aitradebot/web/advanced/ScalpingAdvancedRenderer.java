@@ -23,24 +23,17 @@ public class ScalpingAdvancedRenderer implements StrategyAdvancedRenderer {
         return StrategyType.SCALPING;
     }
 
-    // =====================================================
-    // RENDER
-    // =====================================================
     @Override
     public String render(AdvancedRenderContext ctx) {
-
-        ScalpingStrategySettings s =
-                scalpingSettingsService.getOrCreate(ctx.getChatId());
+        ScalpingStrategySettings s = scalpingSettingsService.getOrCreate(ctx.getChatId());
 
         boolean readOnly = ctx.isReadOnly();
-
-        String dis    = readOnly ? " disabled" : "";
+        String dis = readOnly ? " disabled" : "";
         String roAttr = readOnly ? " readonly" : "";
 
         return "<div class='card card-theme p-3 mb-3'>"
-
                + "  <div class='d-flex align-items-center justify-content-between mb-2'>"
-               + "    <div class='fw-bold'>SCALPING — параметры стратегии</div>"
+               + "    <div class='fw-bold'>SCALPING V4 — параметры стратегии</div>"
                +      badge(readOnly)
                + "  </div>"
 
@@ -48,18 +41,18 @@ public class ScalpingAdvancedRenderer implements StrategyAdvancedRenderer {
 
                + fieldNumber(
                 "windowSize",
-                "Окно анализа",
+                "Окно",
                 valInt(s.getWindowSize()),
-                "min='1' step='1'",
+                "min='5' step='1'",
                 dis,
                 roAttr,
-                "Количество последних свечей для анализа."
+                "Размер рабочего окна для core-расчётов стратегии."
         )
 
                + fieldNumber(
-                "priceChangeThreshold",
-                "Порог движения (%)",
-                valDouble(s.getPriceChangeThreshold()),
+                "minImpulsePct",
+                "Мин. импульс (%)",
+                valDouble(s.getMinImpulsePct()),
                 "min='0' step='0.01'",
                 dis,
                 roAttr,
@@ -67,13 +60,121 @@ public class ScalpingAdvancedRenderer implements StrategyAdvancedRenderer {
         )
 
                + fieldNumber(
-                "spreadThreshold",
-                "Максимальный спред (%)",
-                valDouble(s.getSpreadThreshold()),
+                "emaDiffThreshold",
+                "Сила тренда EMA (%)",
+                valDouble(s.getEmaDiffThreshold()),
+                "min='0' step='0.01'",
+                dis,
+                roAttr,
+                "Минимальный разрыв между EMA fast и EMA slow."
+        )
+
+               + fieldNumber(
+                "volumeRatio",
+                "Отношение объёма",
+                valDouble(s.getVolumeRatio()),
+                "min='0' step='0.01'",
+                dis,
+                roAttr,
+                "Минимальное отношение текущей активности к средней."
+        )
+
+               + fieldNumber(
+                "spreadLimitPct",
+                "Макс. спред (%)",
+                valDouble(s.getSpreadLimitPct()),
                 "min='0' step='0.01'",
                 dis,
                 roAttr,
                 "Если спред выше — вход запрещён."
+        )
+
+               + fieldNumber(
+                "atrPctRange",
+                "ATR диапазон (%)",
+                valDouble(s.getAtrPctRange()),
+                "min='0' step='0.01'",
+                dis,
+                roAttr,
+                "Максимально допустимая краткосрочная волатильность."
+        )
+
+               + fieldNumber(
+                "rsiFilter",
+                "RSI фильтр",
+                valDouble(s.getRsiFilter()),
+                "min='1' max='99' step='0.1'",
+                dis,
+                roAttr,
+                "Минимальное значение RSI для long-входа."
+        )
+
+               + fieldNumber(
+                "riskRewardMin",
+                "Мин. R/R",
+                valDouble(s.getRiskRewardMin()),
+                "min='0.1' step='0.01'",
+                dis,
+                roAttr,
+                "Минимально допустимое отношение reward/risk."
+        )
+
+               + fieldNumber(
+                "orderVolume",
+                "Объём ордера",
+                valDouble(s.getOrderVolume()),
+                "min='0.0001' step='0.01'",
+                dis,
+                roAttr,
+                "Размер входа для исполнения сделки."
+        )
+
+               + fieldNumber(
+                "takeProfitPct",
+                "Take Profit (%)",
+                valDouble(s.getTakeProfitPct()),
+                "min='0.01' step='0.01'",
+                dis,
+                roAttr,
+                "Целевой take profit."
+        )
+
+               + fieldNumber(
+                "stopLossPct",
+                "Stop Loss (%)",
+                valDouble(s.getStopLossPct()),
+                "min='0.01' step='0.01'",
+                dis,
+                roAttr,
+                "Защитный stop loss."
+        )
+
+               + fieldText(
+                "symbol",
+                "Символ",
+                valText(s.getSymbol()),
+                dis,
+                roAttr,
+                "Торговый символ, например BTCUSDT."
+        )
+
+               + fieldText(
+                "timeframe",
+                "Таймфрейм",
+                valText(s.getTimeframe()),
+                dis,
+                roAttr,
+                "Таймфрейм стратегии, например 1m, 5m, 15m."
+        )
+
+               + fieldNumber(
+                "cachedCandlesLimit",
+                "Свечей в кэше",
+                valInt(s.getCachedCandlesLimit()),
+                "min='50' step='10'",
+                dis,
+                roAttr,
+                "Количество свечей для истории и обучения."
         )
 
                + "  </div>"
@@ -83,20 +184,15 @@ public class ScalpingAdvancedRenderer implements StrategyAdvancedRenderer {
                   + "Режим <b>AI</b>: параметры управляются автоматически."
                   + "</div>"
                 : "<div class='alert alert-secondary small mt-3 mb-0'>"
-                  + "Режим <b>MANUAL / HYBRID</b>: параметры можно редактировать."
+                  + "Режим <b>MANUAL / HYBRID</b>: можно менять core-параметры нового скальпинга."
                   + "</div>"
                )
 
                + "</div>";
     }
 
-    // =====================================================
-    // SUBMIT (🔥 ВАЖНО)
-    // =====================================================
     @Override
     public void handleSubmit(AdvancedRenderContext ctx) {
-
-        // если AI — не трогаем ручные параметры
         if (ctx.getControlMode() == AdvancedControlMode.AI) {
             log.info("🔒 SCALPING advanced ignored (AI mode)");
             return;
@@ -107,18 +203,25 @@ public class ScalpingAdvancedRenderer implements StrategyAdvancedRenderer {
         ScalpingStrategySettings incoming = ScalpingStrategySettings.builder()
                 .chatId(ctx.getChatId())
                 .windowSize(parseInt(p.get("windowSize")))
-                .priceChangeThreshold(parseDouble(p.get("priceChangeThreshold")))
-                .spreadThreshold(parseDouble(p.get("spreadThreshold")))
+                .minImpulsePct(parseDouble(p.get("minImpulsePct")))
+                .emaDiffThreshold(parseDouble(p.get("emaDiffThreshold")))
+                .volumeRatio(parseDouble(p.get("volumeRatio")))
+                .spreadLimitPct(parseDouble(p.get("spreadLimitPct")))
+                .atrPctRange(parseDouble(p.get("atrPctRange")))
+                .rsiFilter(parseDouble(p.get("rsiFilter")))
+                .riskRewardMin(parseDouble(p.get("riskRewardMin")))
+                .orderVolume(parseDouble(p.get("orderVolume")))
+                .takeProfitPct(parseDouble(p.get("takeProfitPct")))
+                .stopLossPct(parseDouble(p.get("stopLossPct")))
+                .symbol(parseText(p.get("symbol")))
+                .timeframe(parseText(p.get("timeframe")))
+                .cachedCandlesLimit(parseInt(p.get("cachedCandlesLimit")))
                 .build();
 
         scalpingSettingsService.update(ctx.getChatId(), incoming);
 
-        log.info("✅ SCALPING advanced settings saved (chatId={})", ctx.getChatId());
+        log.info("✅ SCALPING V4 advanced settings saved (chatId={})", ctx.getChatId());
     }
-
-    // =====================================================
-    // HELPERS
-    // =====================================================
 
     private static String badge(boolean ro) {
         return ro
@@ -145,12 +248,34 @@ public class ScalpingAdvancedRenderer implements StrategyAdvancedRenderer {
                + "</div>";
     }
 
+    private static String fieldText(
+            String name,
+            String label,
+            String value,
+            String dis,
+            String roAttr,
+            String help
+    ) {
+        String safe = value == null ? "" : HtmlUtils.htmlEscape(value);
+
+        return "<div class='col-md-3'>"
+               + "  <label class='form-label'>" + HtmlUtils.htmlEscape(label) + "</label>"
+               + "  <input type='text' class='form-control' name='" + HtmlUtils.htmlEscape(name) + "'"
+               + "         value='" + safe + "'" + dis + roAttr + ">"
+               + "  <div class='form-text'>" + HtmlUtils.htmlEscape(help) + "</div>"
+               + "</div>";
+    }
+
     private static String valInt(Integer v) {
         return v == null ? "" : String.valueOf(v);
     }
 
     private static String valDouble(Double v) {
         return v == null ? "" : String.valueOf(v);
+    }
+
+    private static String valText(String v) {
+        return v == null ? "" : v;
     }
 
     private static Integer parseInt(String v) {
@@ -163,9 +288,16 @@ public class ScalpingAdvancedRenderer implements StrategyAdvancedRenderer {
 
     private static Double parseDouble(String v) {
         try {
-            return v == null || v.isBlank() ? null : Double.parseDouble(v.trim());
+            return v == null || v.isBlank() ? null : Double.parseDouble(v.trim().replace(',', '.'));
         } catch (Exception e) {
             return null;
         }
+    }
+
+    private static String parseText(String v) {
+        if (v == null || v.isBlank()) {
+            return null;
+        }
+        return v.trim();
     }
 }

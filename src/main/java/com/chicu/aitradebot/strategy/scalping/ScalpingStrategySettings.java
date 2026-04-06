@@ -8,6 +8,9 @@ import java.time.Instant;
 @Entity
 @Table(
         name = "scalping_strategy_settings",
+        uniqueConstraints = {
+                @UniqueConstraint(name = "uk_scalping_settings_chat", columnNames = "chat_id")
+        },
         indexes = {
                 @Index(name = "ix_scalping_settings_chat", columnList = "chat_id")
         }
@@ -16,54 +19,170 @@ import java.time.Instant;
 @Setter
 @NoArgsConstructor
 @AllArgsConstructor
-@Builder
+@Builder(toBuilder = true)
 public class ScalpingStrategySettings {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    @Column(nullable = false)
+    @Version
+    private Long version;
+
+    @Column(name = "chat_id", nullable = false)
     private Long chatId;
 
-    // =========================
-    // LOGIC PARAMS
-    // =========================
+    @Builder.Default
+    @Column(nullable = false)
+    private Integer windowSize = 60;
+
+    /**
+     * Минимальный импульс в процентах.
+     * Пример: 0.08 = 0.08%
+     */
+    @Builder.Default
+    @Column(nullable = false)
+    private Double minImpulsePct = 0.08d;
+
+    /**
+     * emaDiff = (emaFast - emaSlow) / price * 100
+     */
+    @Builder.Default
+    @Column(nullable = false)
+    private Double emaDiffThreshold = 0.05d;
 
     @Builder.Default
     @Column(nullable = false)
-    private Integer windowSize = 20;
+    private Double volumeRatio = 1.00d;
 
     @Builder.Default
     @Column(nullable = false)
-    private Double priceChangeThreshold = 0.3;
+    private Double spreadLimitPct = 0.35d;
 
     @Builder.Default
     @Column(nullable = false)
-    private Double spreadThreshold = 0.1;
+    private Double atrPctRange = 0.90d;
 
-    // =========================
-    // AUDIT
-    // =========================
+    /**
+     * Базовый нижний RSI-фильтр.
+     * Должен быть мягким для частых входов.
+     */
+    @Builder.Default
+    @Column(nullable = false)
+    private Double rsiFilter = 38.0d;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Double riskRewardMin = 1.10d;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Double orderVolume = 20.0d;
+
+    /**
+     * Для скальпинга TP должен быть маленьким.
+     */
+    @Builder.Default
+    @Column(nullable = false)
+    private Double takeProfitPct = 0.28d;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Double stopLossPct = 0.18d;
+
+    @Builder.Default
+    @Column(nullable = false, length = 32)
+    private String symbol = "BTCUSDT";
+
+    @Builder.Default
+    @Column(nullable = false, length = 16)
+    private String timeframe = "1m";
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Integer cachedCandlesLimit = 1000;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Boolean active = false;
 
     @Builder.Default
     @Column(nullable = false, updatable = false)
     private Instant createdAt = Instant.now();
 
-    @Column(nullable = true)
+    @Column(nullable = false)
     private Instant updatedAt;
 
     @PrePersist
     public void prePersist() {
         Instant now = Instant.now();
-        if (createdAt == null) createdAt = now;
-
-        // ✅ чтобы не было null на свежесозданной записи
-        if (updatedAt == null) updatedAt = createdAt;
+        if (createdAt == null) {
+            createdAt = now;
+        }
+        if (updatedAt == null) {
+            updatedAt = now;
+        }
+        normalize();
     }
 
     @PreUpdate
     public void preUpdate() {
         updatedAt = Instant.now();
+        normalize();
+    }
+
+    public void normalize() {
+        if (windowSize == null || windowSize < 6) {
+            windowSize = 60;
+        } else if (windowSize > 120) {
+            windowSize = 120;
+        }
+
+        if (minImpulsePct == null || minImpulsePct <= 0) {
+            minImpulsePct = 0.08d;
+        }
+        if (emaDiffThreshold == null || emaDiffThreshold < 0) {
+            emaDiffThreshold = 0.05d;
+        }
+        if (volumeRatio == null || volumeRatio <= 0) {
+            volumeRatio = 1.00d;
+        }
+        if (spreadLimitPct == null || spreadLimitPct <= 0) {
+            spreadLimitPct = 0.35d;
+        }
+        if (atrPctRange == null || atrPctRange <= 0) {
+            atrPctRange = 0.90d;
+        }
+        if (rsiFilter == null || rsiFilter < 1 || rsiFilter > 99) {
+            rsiFilter = 38.0d;
+        }
+        if (riskRewardMin == null || riskRewardMin <= 0) {
+            riskRewardMin = 1.10d;
+        }
+        if (orderVolume == null || orderVolume <= 0) {
+            orderVolume = 20.0d;
+        }
+        if (takeProfitPct == null || takeProfitPct <= 0) {
+            takeProfitPct = 0.28d;
+        }
+        if (stopLossPct == null || stopLossPct <= 0) {
+            stopLossPct = 0.18d;
+        }
+        if (symbol == null || symbol.isBlank()) {
+            symbol = "BTCUSDT";
+        } else {
+            symbol = symbol.trim().toUpperCase();
+        }
+        if (timeframe == null || timeframe.isBlank()) {
+            timeframe = "1m";
+        } else {
+            timeframe = timeframe.trim().toLowerCase();
+        }
+        if (cachedCandlesLimit == null || cachedCandlesLimit < 50) {
+            cachedCandlesLimit = 1000;
+        }
+        if (active == null) {
+            active = false;
+        }
     }
 }

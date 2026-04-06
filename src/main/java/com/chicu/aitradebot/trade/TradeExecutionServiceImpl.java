@@ -1982,6 +1982,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             return MlGateDecision.pass(confidence, minProb);
         }
 
+        boolean failOpen = isMlFailOpenEnabled(ss);
         boolean mlConfidenceMissing = (confidenceRaw == null);
 
         if (mlConfidenceMissing && mode == AdvancedControlMode.HYBRID) {
@@ -1993,6 +1994,13 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         }
 
         if (mlConfidenceMissing && mode == AdvancedControlMode.AI) {
+            if (failOpen) {
+                return MlGateDecision.bypass(
+                        BigDecimal.ZERO,
+                        minProb,
+                        "ai_fail_open_no_ml_confidence"
+                );
+            }
             return MlGateDecision.reject(
                     BigDecimal.ZERO,
                     minProb,
@@ -2001,10 +2009,57 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         }
 
         if (confidence.compareTo(minProb) < 0) {
+            if (failOpen) {
+                return MlGateDecision.bypass(confidence, minProb, "ai_fail_open_confidence_below_threshold");
+            }
             return MlGateDecision.reject(confidence, minProb, "confidence_below_threshold");
         }
 
         return MlGateDecision.pass(confidence, minProb);
+    }
+
+    private boolean isMlFailOpenEnabled(StrategySettings ss) {
+        Boolean flag = readBooleanReflective(
+                ss,
+                "isMlFailOpenEnabled",
+                "getMlFailOpenEnabled",
+                "isMlFailOpen",
+                "getMlFailOpen",
+                "isFailOpen",
+                "getFailOpen"
+        );
+        return Boolean.TRUE.equals(flag);
+    }
+
+    private Boolean readBooleanReflective(Object target, String... methodNames) {
+        if (target == null || methodNames == null) {
+            return null;
+        }
+
+        for (String methodName : methodNames) {
+            if (methodName == null || methodName.isBlank()) {
+                continue;
+            }
+            try {
+                java.lang.reflect.Method method = target.getClass().getMethod(methodName);
+                Object value = method.invoke(target);
+                if (value instanceof Boolean b) {
+                    return b;
+                }
+                if (value != null) {
+                    String s = String.valueOf(value).trim();
+                    if ("true".equalsIgnoreCase(s) || "1".equals(s)) {
+                        return true;
+                    }
+                    if ("false".equalsIgnoreCase(s) || "0".equals(s)) {
+                        return false;
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+        }
+
+        return null;
     }
 
     private BigDecimal normalizeProb(BigDecimal value) {
@@ -3023,6 +3078,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         }
     }
 }
+
 
 
 

@@ -117,9 +117,10 @@ public class AutoTunerOrchestrator {
             LastRun last = lastRunByKey.get(key);
             long now = System.currentTimeMillis();
 
+            boolean adaptiveReason = isAdaptiveReason(normalized.reason());
             boolean sameSignature = (last != null && signature.equals(last.signature()));
             boolean withinCooldown = (last != null && (now - last.atMs()) < COOLDOWN_MS);
-            boolean cooldownApplies = (last != null && (last.outcome() == TuneOutcome.APPLIED || last.outcome() == TuneOutcome.NO_IMPROVEMENT));
+            boolean cooldownApplies = (last != null && (last.outcome() == TuneOutcome.APPLIED || (last.outcome() == TuneOutcome.NO_IMPROVEMENT && !adaptiveReason)));
 
             if (sameSignature && withinCooldown && cooldownApplies) {
                 log.info("🧠 TUNE SKIP (cooldown) chatId={} type={} ex={} net={} signature={} ageMs={} lastOutcome={}",
@@ -177,6 +178,10 @@ public class AutoTunerOrchestrator {
                     tookMs,
                     safe(res.reason())
             );
+
+            if (!res.applied() && adaptiveReason && shouldForceRelaxAfterNoImprovement(res)) {
+                tryAdjustCoarseFilters(tuner, normalized);
+            }
 
             TuneOutcome outcome = res.applied() ? TuneOutcome.APPLIED : TuneOutcome.NO_IMPROVEMENT;
             lastRunByKey.put(key, new LastRun(signature, System.currentTimeMillis(), safe(res.modelVersion()), outcome));
@@ -237,6 +242,23 @@ public class AutoTunerOrchestrator {
 
     private static TuningResult reject(String reason) {
         return TuningResult.builder().applied(false).reason(reason).build();
+    }
+
+
+    private static boolean isAdaptiveReason(String reason) {
+        String normalized = safe(reason).toLowerCase(Locale.ROOT);
+        return normalized.startsWith("starvation:")
+                || normalized.startsWith("regime_shift:")
+                || normalized.startsWith("loss_recovery:")
+                || normalized.startsWith("profit_expand:");
+    }
+
+    private static boolean shouldForceRelaxAfterNoImprovement(TuningResult res) {
+        if (res == null || res.applied()) {
+            return false;
+        }
+        String reason = safe(res.reason()).toLowerCase(Locale.ROOT);
+        return reason.contains("no_improvement") || reason.contains("no_change_needed") || reason.contains("no_trades");
     }
 
     private static String normalizeExchangeOrNull(String exchange) {
@@ -325,9 +347,10 @@ public class AutoTunerOrchestrator {
     private static void tryAdjustCoarseFilters(StrategyAutoTuner tuner, TuningRequest req) {
         if (tuner == null || req == null) return;
 
-        boolean invoked = false;
-        invoked |= invokeOptional(tuner, "adjustCoarseFilters", req);
-        invoked |= invokeOptional(tuner, "onNoTrades", req);
+        boolean invoked = invokeOptional(tuner, "adjustCoarseFilters", req);
+        if (!invoked) {
+            invoked = invokeOptional(tuner, "onNoTrades", req);
+        }
 
         if (invoked) {
             log.warn("🧠 NO_TRADES → coarse filters updated by tuner: type={} ex={} net={} sym={} tf={}",
@@ -381,3 +404,4 @@ public class AutoTunerOrchestrator {
             TuneOutcome outcome
     ) {}
 }
+

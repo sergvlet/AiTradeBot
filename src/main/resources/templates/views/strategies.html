@@ -38,8 +38,8 @@
                 descriptionSafe=${s.description != null and !#strings.isEmpty(#strings.trim(s.description)) ? #strings.trim(s.description) : 'Описание пока не задано'},
                 symbolSafe=${s.symbol != null ? #strings.trim(s.symbol) : ''},
                 tfSafe=${s.timeframe != null ? #strings.trim(s.timeframe) : ''},
-                exSafe=${s.exchangeName != null and !#strings.isEmpty(#strings.trim(s.exchangeName)) ? #strings.trim(s.exchangeName) : 'BINANCE'},
-                netSafe=${s.networkType != null ? s.networkType.name() : 'MAINNET'},
+                exSafe=${s.exchangeName != null and !#strings.isEmpty(#strings.trim(s.exchangeName)) ? #strings.trim(s.exchangeName) : ''},
+                netSafe=${s.networkType != null ? s.networkType.name() : ''},
                 modeSafe=${s.advancedControlMode != null ? s.advancedControlMode : 'MANUAL'},
                 phaseSafe=${s.runPhase != null ? s.runPhase : '—'},
                 hasChatId=${s.chatId != null},
@@ -108,11 +108,11 @@
                         </div>
                         <div class="mb-1">
                             <strong>Биржа:</strong>
-                            <span th:text="${exSafe}">BINANCE</span>
+                            <span th:text="${!#strings.isEmpty(exSafe) ? exSafe : '— не выбрано —'}">BYBIT</span>
                         </div>
                         <div class="mb-1">
                             <strong>Сеть:</strong>
-                            <span th:text="${netSafe}">MAINNET</span>
+                            <span th:text="${!#strings.isEmpty(netSafe) ? netSafe : '— не выбрано —'}">MAINNET</span>
                         </div>
                         <div class="mb-1">
                             <strong>Пара:</strong>
@@ -145,11 +145,6 @@
                         <form method="post" th:action="@{/strategies/toggle}">
                             <input type="hidden" name="chatId" th:value="${s.chatId}">
                             <input type="hidden" name="type" th:value="${s.type}">
-                            <input type="hidden" name="exchange" th:value="${exSafe}">
-                            <input type="hidden" name="network" th:value="${netSafe}">
-                            <input type="hidden" name="symbol" th:value="${symbolSafe}">
-                            <input type="hidden" name="timeframe" th:value="${tfSafe}">
-
                             <input type="hidden"
                                    th:if="${_csrf != null}"
                                    th:name="${_csrf.parameterName}"
@@ -178,7 +173,7 @@
 
                         <a class="btn btn-outline-primary"
                            th:if="${hasType and hasChatId}"
-                           th:href="@{/strategies/{type}/dashboard(type=${s.type}, chatId=${s.chatId}, exchange=${exSafe}, network=${netSafe})}"
+                           th:href="@{/strategies/{type}/dashboard(type=${s.type}, chatId=${s.chatId})}"
                            th:title="${configured ? 'Открыть дашборд' : 'Стратегия не настроена — откроется подсказка'}">
                             <i class="bi bi-graph-up"></i>
                             <span th:text="${configured ? 'Дашборд' : 'Дашборд (не настроено)'}">Дашборд</span>
@@ -186,7 +181,7 @@
 
                         <a class="btn btn-outline-secondary"
                            th:if="${hasType and hasChatId}"
-                           th:href="@{/strategies/{type}/config(type=${s.type}, chatId=${s.chatId}, exchange=${exSafe}, network=${netSafe})}">
+                           th:href="@{/strategies/{type}/config(type=${s.type}, chatId=${s.chatId})}">
                             <i class="bi bi-gear"></i>
                             <span>Настройки</span>
                         </a>

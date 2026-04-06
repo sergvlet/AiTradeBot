@@ -23,8 +23,17 @@ $Manifest    = Join-Path $ExportDir "manifest.txt"
 #    "app.py"
 # =========================================================
 $FileNamesToPack = @(
-    "StrategySettingsController.java",
-    "WebStrategyFacadeImpl.java"
+    "AiStrategyOrchestrator.java",
+    "MarketDataStreamService.java",
+    "MarketStreamServiceImpl.java",
+    "BybitMarketStreamAdapter.java",
+    "WindowScalpingStrategyV4.java",
+    "WindowScalpingAutoTuner.java",
+    "ScalpingStrategyV4.java",
+    "ScalpingAutoTuner.java",
+    "StrategyReplayApiController.java",
+    "ChartTradeHistoryLoader.java",
+    "FibonacciGridStrategyV4.java"
 )
 # =========================================================
 # 3) ПОДГОТОВКА ПАПКИ РЕЗУЛЬТАТА

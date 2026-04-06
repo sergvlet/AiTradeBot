@@ -37,11 +37,14 @@ import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.time.ZoneId;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -241,6 +244,193 @@ public class AiStrategyOrchestrator {
                 (ml() != null ? "ON" : "OFF"),
                 eventBridgeEnabled,
                 blockWhenDegraded);
+
+        restoreActiveStrategiesAsync();
+    }
+
+    private void restoreActiveStrategiesAsync() {
+        CompletableFuture.runAsync(() -> {
+            try {
+                Thread.sleep(1500L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+
+            try {
+                restoreActiveStrategiesBestEffort();
+            } catch (Exception e) {
+                log.warn("⚠️ [ORCH] active restore failed: {}", e.toString());
+            }
+        });
+    }
+
+    private void restoreActiveStrategiesBestEffort() {
+        List<StrategySettings> all = discoverAllStrategySettings();
+        if (all.isEmpty()) {
+            log.info("🧠 [ORCH] startup restore: active StrategySettings not discovered");
+            return;
+        }
+
+        int restored = 0;
+        int skipped = 0;
+
+        for (StrategySettings s : all) {
+            if (s == null || !s.isActive() || s.getChatId() == null || s.getChatId() <= 0 || s.getType() == null) {
+                continue;
+            }
+
+            Long chatId = s.getChatId();
+            StrategyType type = s.getType();
+            String ex = sanitizeExchange(s.getExchangeName());
+            NetworkType net = s.getNetworkType();
+
+            if (isRunning(chatId, type, ex, net)) {
+                skipped++;
+                continue;
+            }
+
+            try {
+                StrategyRunInfo info = startStrategy(chatId, type, ex, net);
+                boolean ok = info != null && info.isActive();
+                if (ok) {
+                    restored++;
+                    log.info("♻️ [ORCH] startup restore OK chatId={} type={} ex={} net={} sym={} tf={}",
+                            chatId,
+                            type,
+                            ex,
+                            net,
+                            info.getSymbol(),
+                            info.getTimeframe());
+                } else {
+                    skipped++;
+                    log.warn("⚠️ [ORCH] startup restore skipped chatId={} type={} ex={} net={} reason={}",
+                            chatId,
+                            type,
+                            ex,
+                            net,
+                            info != null ? info.getMessage() : "null_info");
+                }
+            } catch (Exception e) {
+                skipped++;
+                log.warn("⚠️ [ORCH] startup restore exception chatId={} type={} ex={} net={} err={}",
+                        chatId,
+                        type,
+                        ex,
+                        net,
+                        e.toString());
+            }
+        }
+
+        log.info("🧠 [ORCH] startup restore finished restored={} skipped={} discovered={}", restored, skipped, all.size());
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<StrategySettings> discoverAllStrategySettings() {
+        List<StrategySettings> direct = extractStrategySettings(invokeNoArg(settingsService,
+                "findAll",
+                "listAll",
+                "getAll",
+                "findAllSettings",
+                "findAllActive",
+                "findActive",
+                "listActive"
+        ));
+        if (!direct.isEmpty()) {
+            return direct;
+        }
+
+        for (java.lang.reflect.Field field : settingsService.getClass().getDeclaredFields()) {
+            try {
+                field.setAccessible(true);
+                Object candidate = field.get(settingsService);
+                if (candidate == null) {
+                    continue;
+                }
+
+                List<StrategySettings> extracted = extractStrategySettings(invokeNoArg(candidate,
+                        "findAll",
+                        "listAll",
+                        "getAll",
+                        "findAllSettings",
+                        "findAllActive",
+                        "findActive",
+                        "listActive"
+                ));
+                if (!extracted.isEmpty()) {
+                    return extracted;
+                }
+            } catch (Exception ignored) {
+            }
+        }
+
+        return List.of();
+    }
+
+    private Object invokeNoArg(Object target, String... methodNames) {
+        if (target == null || methodNames == null) {
+            return null;
+        }
+
+        for (String methodName : methodNames) {
+            if (methodName == null || methodName.isBlank()) {
+                continue;
+            }
+            try {
+                var m = target.getClass().getMethod(methodName);
+                return m.invoke(target);
+            } catch (Exception ignored) {
+            }
+        }
+        return null;
+    }
+
+    private List<StrategySettings> extractStrategySettings(Object raw) {
+        if (raw == null) {
+            return List.of();
+        }
+
+        List<StrategySettings> out = new ArrayList<>();
+
+        if (raw instanceof StrategySettings one) {
+            out.add(one);
+            return out;
+        }
+
+        if (raw instanceof Iterable<?> iterable) {
+            for (Object item : iterable) {
+                if (item instanceof StrategySettings s) {
+                    out.add(s);
+                }
+            }
+            return out;
+        }
+
+        if (raw.getClass().isArray()) {
+            int len = java.lang.reflect.Array.getLength(raw);
+            for (int i = 0; i < len; i++) {
+                Object item = java.lang.reflect.Array.get(raw, i);
+                if (item instanceof StrategySettings s) {
+                    out.add(s);
+                }
+            }
+            return out;
+        }
+
+        try {
+            var contentMethod = raw.getClass().getMethod("getContent");
+            Object content = contentMethod.invoke(raw);
+            if (content instanceof Collection<?> col) {
+                for (Object item : col) {
+                    if (item instanceof StrategySettings s) {
+                        out.add(s);
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+
+        return out;
     }
 
     public Optional<RunBinding> getBinding(long chatId, StrategyType type) {
@@ -372,7 +562,7 @@ public class AiStrategyOrchestrator {
             desiredGateEnabled = false;
             desiredGateMinProb = null;
         } else if (mode == AdvancedControlMode.HYBRID) {
-            desiredAutoTune = false;
+            desiredAutoTune = true;
             desiredGateEnabled = true;
             desiredGateMinProb = clampProb(s.getGateMinProb() != null ? s.getGateMinProb() : DEFAULT_GATE_MIN_PROB);
         } else {
@@ -739,7 +929,7 @@ public class AiStrategyOrchestrator {
                     );
                 }
 
-                if (softPrepareError && allowStartWithoutPreparedModel(s)) {
+                if (softPrepareError && allowStartWithoutPreparedModel(s, type)) {
                     log.warn("⚠️ [ORCH] SOFT_PREPARE_MISS chatId={} type={} ex={} net={} sym={} tf={} reason={} | продолжу переключение контекста без подготовленной модели",
                             chatId, type, desired.exchange(), desired.network(), desired.symbol(), desired.timeframe(), prepareError);
                 } else {
@@ -787,8 +977,6 @@ public class AiStrategyOrchestrator {
             lastDegradedLogAtMs.remove(key);
 
             try {
-                strategy.start(chatId, desired.symbol(), desired.exchange(), desired.network());
-
                 marketStreamService.ensureSubscribed(
                         chatId,
                         type,
@@ -797,6 +985,8 @@ public class AiStrategyOrchestrator {
                         desired.exchange(),
                         desired.network()
                 );
+
+                strategy.start(chatId, desired.symbol(), desired.exchange(), desired.network());
             } catch (Exception e) {
                 running.put(key, current);
                 runtimePolicyCache.put(key, policyOf(s));
@@ -850,11 +1040,61 @@ public class AiStrategyOrchestrator {
                 || normalized.contains("no_samples")
                 || normalized.contains("no_context_samples")
                 || normalized.contains("not_enough_candle_rows")
-                || normalized.contains("not_enough_samples");
+                || normalized.contains("not_enough_samples")
+                || normalized.contains("too_few_trades")
+                || normalized.contains("not_enough_trades")
+                || normalized.contains("no_improvement")
+                || normalized.contains("prepare_tune_failed")
+                || normalized.contains("cooldown")
+                || normalized.contains("tune_skip")
+                || normalized.contains("validate_skip");
     }
 
-    private boolean allowStartWithoutPreparedModel(StrategySettings settings) {
-        return safeMode(settings) == AdvancedControlMode.HYBRID;
+    private boolean allowStartWithoutPreparedModel(StrategySettings settings, StrategyType type) {
+        AdvancedControlMode mode = safeMode(settings);
+
+        if (mode == AdvancedControlMode.HYBRID) {
+            return true;
+        }
+
+        return type == StrategyType.WINDOW_SCALPING
+               || type == StrategyType.FIBONACCI_GRID
+               || type == StrategyType.SCALPING
+               || type == StrategyType.EMA_CROSSOVER;
+    }
+    private StrategySettings markStartFailedInactive(StrategySettings settings, String source) {
+        if (settings == null) {
+            return null;
+        }
+
+        boolean changed = false;
+
+        if (settings.isActive()) {
+            settings.setActive(false);
+            changed = true;
+        }
+
+        LocalDateTime now = LocalDateTime.now();
+        if (settings.getStoppedAt() == null
+                || (settings.getStartedAt() != null && settings.getStoppedAt().isBefore(settings.getStartedAt()))) {
+            settings.setStoppedAt(now);
+            changed = true;
+        }
+
+        if (!changed) {
+            return settings;
+        }
+
+        try {
+            return saveSettingsWithRetry(settings, source);
+        } catch (Exception e) {
+            log.warn("⚠️ [ORCH] {} mark inactive failed chatId={} type={} err={}",
+                    source,
+                    settings.getChatId(),
+                    settings.getType(),
+                    e.toString());
+            return settings;
+        }
     }
 
     private void clearStaleMlContextOnSoftPrepareFailure(StrategySettings settings,
@@ -922,11 +1162,17 @@ public class AiStrategyOrchestrator {
 
     private boolean requiresPrepareBeforeStart(StrategyType type, StrategySettings settings) {
         if (type == null) return false;
-        if (type != StrategyType.WINDOW_SCALPING && type != StrategyType.EMA_CROSSOVER) return false;
+
+        if (type != StrategyType.WINDOW_SCALPING
+            && type != StrategyType.EMA_CROSSOVER
+            && type != StrategyType.FIBONACCI_GRID
+            && type != StrategyType.SCALPING) {
+            return false;
+        }
+
         AdvancedControlMode mode = safeMode(settings);
         return mode == AdvancedControlMode.AI || mode == AdvancedControlMode.HYBRID;
     }
-
     private String resolvePhaseAfterPrepare(NetworkType network) {
         return network == NetworkType.TESTNET ? "PAPER" : "LIVE";
     }
@@ -1117,10 +1363,11 @@ public class AiStrategyOrchestrator {
                     clearStaleMlContextOnSoftPrepareFailure(s, type, ex, net, sym, tf);
                 }
 
-                if (softPrepareError && allowStartWithoutPreparedModel(s)) {
+                if (softPrepareError && allowStartWithoutPreparedModel(s, type)) {
                     log.warn("⚠️ [ORCH] SOFT_PREPARE_MISS chatId={} type={} ex={} net={} sym={} tf={} reason={} | запускаю стратегию без подготовленной модели",
                             chatId, type, ex, net, sym, tf, prepareError);
                 } else {
+                    s = markStartFailedInactive(s, "start_prepare_failed");
                     return buildRunInfo(s, false, "Подготовка перед стартом не пройдена (" + prepareError + ")");
                 }
             }
@@ -1200,9 +1447,9 @@ public class AiStrategyOrchestrator {
             lastDegradedLogAtMs.remove(key);
 
             try {
-                strategy.start(chatId, sym, ex, net);
-
                 marketStreamService.ensureSubscribed(chatId, type, sym, tf, ex, net);
+
+                strategy.start(chatId, sym, ex, net);
             } catch (Exception e) {
                 running.remove(key, newBinding);
                 runtimePolicyCache.remove(key);
@@ -1213,6 +1460,7 @@ public class AiStrategyOrchestrator {
                 }
                 log.error("❌ [ORCH] startStrategy failed type={} chatId={} ex={} net={} sym={} tf={}",
                         type, chatId, ex, net, sym, tf, e);
+                s = markStartFailedInactive(s, "start_strategy_failed");
                 return buildRunInfo(s, false, "Ошибка запуска стратегии");
             }
 
@@ -2099,8 +2347,6 @@ public class AiStrategyOrchestrator {
         return s.isEmpty() ? null : s;
     }
 }
-
-
 
 
 

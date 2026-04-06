@@ -1,4 +1,4 @@
-package com.chicu.aitradebot.ai.tuning;
+package com.chicu.aitradebot.strategy.windowscalping;
 
 import jakarta.validation.constraints.DecimalMin;
 import jakarta.validation.constraints.Min;

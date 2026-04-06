@@ -3,6 +3,7 @@ package com.chicu.aitradebot.web.controller.web;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
+import com.chicu.aitradebot.orchestrator.dto.StrategyRunInfo;
 import com.chicu.aitradebot.service.StrategySettingsService;
 import com.chicu.aitradebot.service.UserProfileService;
 import com.chicu.aitradebot.web.facade.WebStrategyFacade;
@@ -41,8 +42,8 @@ public class StrategyController {
                 : resolveCurrentChatIdOrThrow();
 
         // ВАЖНО:
-        // список стратегий не должен фильтроваться по UI-дефолту,
-        // иначе карточки показывают не реальный сохранённый контекст стратегии.
+        // список карточек не должен фильтроваться по UI-дефолту,
+        // иначе можно показать пустой BINANCE/MAINNET вместо реально сохранённого контекста.
         String explicitExchange = normalizeExchangeOrNull(exchange);
         NetworkType explicitNetwork = parseNetworkOrNull(network);
 
@@ -58,7 +59,7 @@ public class StrategyController {
 
         model.addAttribute("chatId", resolvedChatId);
 
-        // Это только UI-контекст страницы, не источник истины для стратегии
+        // Это только UI-контекст страницы, а не источник истины для стратегии
         model.addAttribute("exchange", explicitExchange);
         model.addAttribute("network", explicitNetwork != null ? explicitNetwork.name() : null);
 
@@ -90,7 +91,7 @@ public class StrategyController {
         }
 
         // Источник истины = сохранённые настройки стратегии.
-        // UI-параметры используем только как fallback.
+        // Параметры из карточки/дашборда используем только как fallback.
         String effectiveExchange = firstNonBlankExchange(
                 settings != null ? settings.getExchangeName() : null,
                 exchange,
@@ -113,7 +114,7 @@ public class StrategyController {
                 timeframe
         );
 
-        log.info("🔁 TOGGLE FROM UI chatId={} type={} reqEx={} reqNet={} effEx={} effNet={} effSymbol={} effTf={} limit={}",
+        log.info("🔁 TOGGLE FROM UI chatId={} type={} reqEx={} reqNet={} effEx={} effNet={} effSymbol={} effTf={} limit={} settingsId={} settingsActive={}",
                 resolvedChatId,
                 type,
                 exchange,
@@ -122,25 +123,44 @@ public class StrategyController {
                 effectiveNetwork,
                 effectiveSymbol,
                 effectiveTimeframe,
-                limit);
+                limit,
+                settings != null ? settings.getId() : null,
+                settings != null && settings.isActive());
 
-        strategyFacade.toggle(resolvedChatId, type, effectiveExchange, effectiveNetwork);
+        StrategyRunInfo runInfo = strategyFacade.toggle(resolvedChatId, type, effectiveExchange, effectiveNetwork);
+
+        String redirectExchange = firstNonBlankExchange(
+                runInfo != null ? runInfo.getExchangeName() : null,
+                effectiveExchange,
+                DEFAULT_EXCHANGE
+        );
+        NetworkType redirectNetwork = firstNonNullNetwork(
+                runInfo != null ? runInfo.getNetworkType() : null,
+                effectiveNetwork,
+                DEFAULT_NETWORK
+        );
+        String redirectSymbol = firstNonBlankSymbol(
+                runInfo != null ? runInfo.getSymbol() : null,
+                effectiveSymbol
+        );
+        String redirectTimeframe = firstNonBlankTimeframe(
+                runInfo != null ? runInfo.getTimeframe() : null,
+                effectiveTimeframe
+        );
 
         StringBuilder url = new StringBuilder();
         url.append("/strategies/")
                 .append(type.name())
                 .append("/dashboard")
-                .append("?chatId=").append(resolvedChatId);
+                .append("?chatId=").append(resolvedChatId)
+                .append("&exchange=").append(enc(redirectExchange))
+                .append("&network=").append(enc(redirectNetwork.name()));
 
-        // прокидываем уже эффективный, а не карточный контекст
-        url.append("&exchange=").append(enc(effectiveExchange));
-        url.append("&network=").append(enc(effectiveNetwork.name()));
-
-        if (effectiveSymbol != null) {
-            url.append("&symbol=").append(enc(effectiveSymbol));
+        if (redirectSymbol != null) {
+            url.append("&symbol=").append(enc(redirectSymbol));
         }
-        if (effectiveTimeframe != null) {
-            url.append("&timeframe=").append(enc(effectiveTimeframe));
+        if (redirectTimeframe != null) {
+            url.append("&timeframe=").append(enc(redirectTimeframe));
         }
         if (limit != null && limit >= 10 && limit <= 1500) {
             url.append("&limit=").append(limit);
@@ -163,11 +183,6 @@ public class StrategyController {
         return s.isEmpty() ? null : s;
     }
 
-    private static String normalizeExchangeOrDefault(String exchange) {
-        String s = normalizeExchangeOrNull(exchange);
-        return s != null ? s : DEFAULT_EXCHANGE;
-    }
-
     private static NetworkType parseNetworkOrNull(String network) {
         if (network == null) return null;
         String s = network.trim();
@@ -179,11 +194,6 @@ public class StrategyController {
             }
         }
         return null;
-    }
-
-    private static NetworkType parseNetworkOrDefault(String network) {
-        NetworkType parsed = parseNetworkOrNull(network);
-        return parsed != null ? parsed : DEFAULT_NETWORK;
     }
 
     private static String normalizeSymbolOrNull(String symbol) {
@@ -237,3 +247,5 @@ public class StrategyController {
         return URLEncoder.encode(String.valueOf(s), StandardCharsets.UTF_8);
     }
 }
+
+

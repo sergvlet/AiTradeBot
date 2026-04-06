@@ -9,6 +9,8 @@ export class LayerRenderer {
         this.levelLines = [];
         this.activeLevelPrice = null;
         this.zoneLines = [];
+        this.zoneBackground = null;
+        this._lastZone = null;
         this.tradeZoneLines = [];
         this.tpLine = null;
         this.slLine = null;
@@ -23,6 +25,9 @@ export class LayerRenderer {
         this.emaSlowSeries = null;
         this._lastEmaSeries = null;
 
+        this.dynamicSeries = new Map();
+        this._lastSeriesBundle = null;
+
         this.lastAtr = null;
         this.lastVolatilityPct = null;
 
@@ -33,14 +38,22 @@ export class LayerRenderer {
         this.magnetTarget = null;
         this.magnetStrength = 0;
         this.currentPrice = null;
+        this.candlesData = [];
     }
 
     bind(chart, candleSeries) {
         this.chart = chart;
         this.candles = candleSeries;
+        this.restoreZone();
         this.restoreWindowZone();
         this.restoreEmaSeries();
+        this.restoreSeriesBundle();
         this.restoreMarkers();
+    }
+
+    restoreZone() {
+        if (!this._lastZone) return;
+        this.renderZone(this._lastZone);
     }
 
     restoreWindowZone() {
@@ -51,6 +64,11 @@ export class LayerRenderer {
     restoreEmaSeries() {
         if (!this._lastEmaSeries) return;
         this.renderEmaSeries(this._lastEmaSeries);
+    }
+
+    restoreSeriesBundle() {
+        if (!this._lastSeriesBundle) return;
+        this.renderSeriesBundle(this._lastSeriesBundle);
     }
 
     restoreMarkers() {
@@ -103,6 +121,135 @@ export class LayerRenderer {
             });
         } catch {
             return null;
+        }
+    }
+
+    _resolveSeriesColor(name, fallback) {
+        const key = String(name || "").toUpperCase();
+        if (key === "WINDOW_MID") return "#94a3b8";
+        if (key === "RSI_VIEW") return "#facc15";
+        if (key === "VOL_VIEW") return "#38bdf8";
+        if (key === "SPREAD_VIEW") return "#f87171";
+        if (key === "SCORE_VIEW") return "#e879f9";
+        if (key === "EMA_FAST") return "#f59e0b";
+        if (key === "EMA_SLOW") return "#60a5fa";
+        return fallback || "#94a3b8";
+    }
+
+    _isDebugMetricName(name) {
+        const key = String(name || "").toUpperCase();
+        return key === "RSI_VIEW" || key === "VOL_VIEW" || key === "SPREAD_VIEW" || key === "SCORE_VIEW";
+    }
+
+    _isMainPaneSeriesName(name) {
+        const key = String(name || "").toUpperCase();
+        return key === "EMA_FAST" || key === "EMA_SLOW" || key === "WINDOW_MID";
+    }
+
+    _shouldSkipPriceLine(name) {
+        const key = String(name || "").toUpperCase();
+        return this._isDebugMetricName(key)
+            || key === "EMA_FAST"
+            || key === "EMA_SLOW"
+            || key === "WINDOW_MID";
+    }
+
+    _removePriceLineByName(name) {
+        const key = String(name || "").toUpperCase();
+        if (!this.priceLines.has(key)) return;
+        this._safeRemovePriceLine(this.priceLines.get(key));
+        this.priceLines.delete(key);
+    }
+
+    _getTimeBounds() {
+        let fromTime = NaN;
+        let toTime = NaN;
+
+        if (Array.isArray(this.candlesData) && this.candlesData.length) {
+            fromTime = this._normalizeTime(this.candlesData[0]?.time);
+            toTime = this._normalizeTime(this.candlesData.at(-1)?.time);
+        }
+
+        if (!Number.isFinite(fromTime) || !Number.isFinite(toTime)) {
+            const vr = this.chart?.timeScale?.().getVisibleRange?.();
+            if (vr && vr.from != null && vr.to != null) {
+                fromTime = this._normalizeTime(vr.from);
+                toTime = this._normalizeTime(vr.to);
+            }
+        }
+
+        if (!Number.isFinite(fromTime) || !Number.isFinite(toTime)) return null;
+        if (toTime < fromTime) {
+            const tmp = fromTime;
+            fromTime = toTime;
+            toTime = tmp;
+        }
+
+        return { fromTime, toTime };
+    }
+
+    _inferStepSec() {
+        if (Array.isArray(this.candlesData) && this.candlesData.length >= 2) {
+            const t1 = this._normalizeTime(this.candlesData.at(-1)?.time);
+            const t0 = this._normalizeTime(this.candlesData.at(-2)?.time);
+            const dt = Math.abs(t1 - t0);
+            if (Number.isFinite(dt) && dt > 0) {
+                return dt;
+            }
+        }
+        return 60;
+    }
+
+    _makeBandFillColor(color, fallback) {
+        const c = String(color || "").trim();
+        if (!c) return fallback;
+        if (c.startsWith("rgba(")) return c;
+        return fallback;
+    }
+
+    _renderBand(top, bottom, fillColor, targetField) {
+        if (!Number.isFinite(top) || !Number.isFinite(bottom)) return;
+        if (typeof this.chart?.addBaselineSeries !== "function") return;
+
+        const bounds = this._getTimeBounds();
+        if (!bounds) return;
+
+        let { fromTime, toTime } = bounds;
+        let step = this._inferStepSec();
+        const range = Math.max(0, toTime - fromTime);
+        const maxPoints = 800;
+        if (step <= 0) step = 60;
+        if (range > 0 && Math.floor(range / step) > maxPoints) {
+            step = Math.max(1, Math.ceil(range / maxPoints));
+        }
+
+        const bg = this.chart.addBaselineSeries({
+            baseValue: { type: "price", price: bottom },
+            topFillColor1: fillColor,
+            topFillColor2: fillColor,
+            bottomFillColor1: fillColor,
+            bottomFillColor2: fillColor,
+            lineVisible: false,
+            priceLineVisible: false,
+            lastValueVisible: false,
+            crosshairMarkerVisible: false,
+            autoscaleInfoProvider: () => null
+        });
+
+        const data = [];
+        for (let t = fromTime; t <= toTime; t += step) {
+            data.push({ time: t, value: top });
+        }
+        if (!data.length) {
+            this._safeRemoveSeries(bg);
+            return;
+        }
+
+        try {
+            bg.setData(data);
+            this[targetField] = bg;
+        } catch {
+            this._safeRemoveSeries(bg);
         }
     }
 
@@ -166,27 +313,34 @@ export class LayerRenderer {
         const lo = Math.min(top, bottom);
         const color = zone.color || "rgba(59,130,246,0.15)";
 
+        this._lastZone = { top: hi, bottom: lo, color };
+
         this.zoneLines = [
             this.candles.createPriceLine({
                 price: hi,
-                color,
+                color: "#3b82f6",
                 lineWidth: 2,
                 axisLabelVisible: true,
                 title: "ZONE TOP"
             }),
             this.candles.createPriceLine({
                 price: lo,
-                color,
+                color: "#3b82f6",
                 lineWidth: 2,
                 axisLabelVisible: true,
                 title: "ZONE BOTTOM"
             })
         ];
+
+        this._renderBand(hi, lo, this._makeBandFillColor(color, "rgba(59,130,246,0.12)"), "zoneBackground");
     }
 
     clearZone() {
         this.zoneLines.forEach(l => this._safeRemovePriceLine(l));
         this.zoneLines = [];
+        this._safeRemoveSeries(this.zoneBackground);
+        this.zoneBackground = null;
+        this._lastZone = null;
     }
 
     renderTradeZone(zone) {
@@ -272,6 +426,11 @@ export class LayerRenderer {
         const price = Number(pl.price);
         if (!Number.isFinite(price)) return;
 
+        if (this._shouldSkipPriceLine(name)) {
+            this._removePriceLineByName(name);
+            return;
+        }
+
         if (this.priceLines.has(name)) {
             this._safeRemovePriceLine(this.priceLines.get(name));
         }
@@ -334,69 +493,7 @@ export class LayerRenderer {
             title: "WINDOW LOW"
         });
 
-        if (typeof this.chart?.addBaselineSeries !== "function") return;
-
-        let fromTime = NaN;
-        let toTime = NaN;
-        const candles = Array.isArray(zone.candlesData) ? zone.candlesData : null;
-
-        if (candles && candles.length) {
-            fromTime = this._normalizeTime(candles[0]?.time);
-            toTime = this._normalizeTime(candles.at(-1)?.time);
-        }
-
-        if (!Number.isFinite(fromTime) || !Number.isFinite(toTime)) {
-            const vr = this.chart?.timeScale?.().getVisibleRange?.();
-            if (vr && vr.from != null && vr.to != null) {
-                fromTime = this._normalizeTime(vr.from);
-                toTime = this._normalizeTime(vr.to);
-            }
-        }
-
-        if (!Number.isFinite(fromTime) || !Number.isFinite(toTime)) return;
-        if (toTime < fromTime) {
-            const tmp = fromTime;
-            fromTime = toTime;
-            toTime = tmp;
-        }
-
-        let step = 60;
-        if (candles && candles.length >= 2) {
-            const t1 = this._normalizeTime(candles.at(-1)?.time);
-            const t0 = this._normalizeTime(candles.at(-2)?.time);
-            const dt = Math.abs(t1 - t0);
-            if (Number.isFinite(dt) && dt > 0) step = dt;
-        }
-
-        const maxPoints = 600;
-        const range = toTime - fromTime;
-        const approx = Math.floor(range / step);
-        if (approx > maxPoints) step = Math.max(1, Math.ceil(range / maxPoints));
-
-        const bg = this.chart.addBaselineSeries({
-            baseValue: { type: "price", price: lo },
-            topFillColor1: "rgba(100, 116, 139, 0.12)",
-            topFillColor2: "rgba(100, 116, 139, 0.12)",
-            bottomFillColor1: "rgba(100, 116, 139, 0.12)",
-            bottomFillColor2: "rgba(100, 116, 139, 0.12)",
-            lineVisible: false,
-            priceLineVisible: false,
-            lastValueVisible: false,
-            autoscaleInfoProvider: () => null
-        });
-
-        const data = [];
-        for (let t = fromTime; t <= toTime; t += step) {
-            data.push({ time: t, value: hi });
-        }
-
-        if (!data.length) {
-            this._safeRemoveSeries(bg);
-            return;
-        }
-
-        bg.setData(data);
-        this.windowZoneBackground = bg;
+        this._renderBand(hi, lo, "rgba(100,116,139,0.12)", "windowZoneBackground");
     }
 
     clearWindowZone() {
@@ -419,6 +516,8 @@ export class LayerRenderer {
         };
 
         this.clearEmaSeries();
+        this._removePriceLineByName("EMA_FAST");
+        this._removePriceLineByName("EMA_SLOW");
 
         if (!fastData.length && !slowData.length) return;
 
@@ -494,7 +593,9 @@ export class LayerRenderer {
         }
 
         this._lastMarkers = [...this.markers];
-        this.candles.setMarkers(this.markers);
+        try {
+            this.candles.setMarkers(this.markers);
+        } catch {}
     }
 
     clearTrades() {
@@ -503,5 +604,55 @@ export class LayerRenderer {
         try {
             this.candles?.setMarkers?.([]);
         } catch {}
+    }
+
+    renderSeriesBundle(payload) {
+        if (!payload) return;
+
+        const series = Array.isArray(payload.series) ? payload.series : [];
+        this._lastSeriesBundle = {
+            series: series.map(s => ({
+                name: s?.name,
+                color: s?.color,
+                data: Array.isArray(s?.data) ? s.data.map(p => ({ ...p })) : []
+            }))
+        };
+
+        this.clearSeriesBundle();
+        if (!series.length) return;
+
+        for (const item of series) {
+            const name = String(item?.name || "").toUpperCase();
+            if (!this._isMainPaneSeriesName(name)) {
+                this._removePriceLineByName(name);
+                continue;
+            }
+
+            const rawData = Array.isArray(item?.data) ? item.data : [];
+            const data = rawData
+                .map(p => ({
+                    time: this._normalizeTime(p?.time),
+                    value: Number(p?.value)
+                }))
+                .filter(p => Number.isFinite(p.time) && Number.isFinite(p.value));
+
+            if (!data.length) continue;
+
+            const line = this._createLineSeries(this._resolveSeriesColor(name, item?.color));
+            if (!line) continue;
+
+            try {
+                line.setData(data);
+                this.dynamicSeries.set(name, line);
+                this._removePriceLineByName(name);
+            } catch {
+                this._safeRemoveSeries(line);
+            }
+        }
+    }
+
+    clearSeriesBundle() {
+        this.dynamicSeries.forEach(series => this._safeRemoveSeries(series));
+        this.dynamicSeries.clear();
     }
 }

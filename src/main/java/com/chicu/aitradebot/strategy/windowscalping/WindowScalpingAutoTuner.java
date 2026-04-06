@@ -1,13 +1,14 @@
-package com.chicu.aitradebot.ai.tuning;
+package com.chicu.aitradebot.strategy.windowscalping;
 
+import com.chicu.aitradebot.ai.tuning.StrategyAutoTuner;
+import com.chicu.aitradebot.ai.tuning.TuningRequest;
+import com.chicu.aitradebot.ai.tuning.TuningResult;
 import com.chicu.aitradebot.ai.tuning.eval.BacktestMetrics;
 import com.chicu.aitradebot.ai.tuning.eval.MlBacktestRunner;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
 import com.chicu.aitradebot.service.StrategySettingsService;
-import com.chicu.aitradebot.strategy.windowscalping.WindowScalpingStrategySettings;
-import com.chicu.aitradebot.strategy.windowscalping.WindowScalpingStrategySettingsService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;

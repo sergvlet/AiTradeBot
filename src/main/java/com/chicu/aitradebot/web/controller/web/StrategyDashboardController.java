@@ -15,6 +15,7 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 
+import java.time.LocalDateTime;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
@@ -55,6 +56,7 @@ public class StrategyDashboardController {
             NetworkType networkUi = parseNetworkOrDefault(network);
             String symbolUi = normalizeSymbolOrNull(symbol);
             String timeframeUi = normalizeTimeframeOrDefault(timeframe);
+            String journalPnlAsset = extractQuoteAsset(symbolUi);
 
             model.addAttribute("configured", false);
             model.addAttribute("strategy", null);
@@ -62,6 +64,7 @@ public class StrategyDashboardController {
             model.addAttribute("exchange", exchangeUi);
             model.addAttribute("network", networkUi.name());
             model.addAttribute("timeframe", timeframeUi);
+            model.addAttribute("journalPnlAsset", journalPnlAsset);
 
             StrategyRunInfo info = new StrategyRunInfo();
             info.setActive(false);
@@ -84,38 +87,39 @@ public class StrategyDashboardController {
         String exchangeFromSettings = normalizeExchangeOrNull(settings.getExchangeName());
         NetworkType networkFromSettings = settings.getNetworkType();
 
-        // ✅ UI-контекст: сначала query-параметры, потом settings, потом дефолт
         String symbolUi = firstNonBlankSymbol(
-                normalizeSymbolOrNull(symbol),
-                symbolFromSettings
+                symbolFromSettings,
+                normalizeSymbolOrNull(symbol)
         );
 
         String timeframeUi = firstNonBlankTimeframe(
-                normalizeTimeframeOrNull(timeframe),
                 timeframeFromSettings,
+                normalizeTimeframeOrNull(timeframe),
                 DEFAULT_TIMEFRAME
         );
 
         String exchangeUi = firstNonBlankExchange(
-                normalizeExchangeOrNull(exchange),
                 exchangeFromSettings,
+                normalizeExchangeOrNull(exchange),
                 DEFAULT_EXCHANGE
         );
 
         NetworkType networkUi = firstNonNullNetwork(
-                parseNetworkOrNull(network),
                 networkFromSettings,
+                parseNetworkOrNull(network),
                 DEFAULT_NETWORK
         );
 
+        String journalPnlAsset = extractQuoteAsset(symbolUi);
+
         boolean configuredBase =
                 symbolUi != null && !symbolUi.isBlank() &&
-                timeframeUi != null && !timeframeUi.isBlank();
+                        timeframeUi != null && !timeframeUi.isBlank();
 
         boolean configuredMarket =
                 configuredBase &&
-                exchangeUi != null && !exchangeUi.isBlank() &&
-                networkUi != null;
+                        exchangeUi != null && !exchangeUi.isBlank() &&
+                        networkUi != null;
 
         model.addAttribute("configured", configuredMarket);
         model.addAttribute("strategy", settings);
@@ -124,6 +128,7 @@ public class StrategyDashboardController {
         model.addAttribute("exchange", exchangeUi);
         model.addAttribute("network", networkUi != null ? networkUi.name() : null);
         model.addAttribute("timeframe", timeframeUi);
+        model.addAttribute("journalPnlAsset", journalPnlAsset);
 
         if (!configuredBase) {
             log.warn("⚠️ DASHBOARD: StrategySettings present but incomplete chatId={} type={} id={} symbol={} timeframe={}",
@@ -155,19 +160,6 @@ public class StrategyDashboardController {
             );
         }
 
-        log.info(
-                "📊 DASHBOARD SETTINGS id={} chatId={} type={} symbol={} tf={} limit={} ex={} net={} active={}",
-                settings.getId(),
-                chatId,
-                type,
-                symbolUi,
-                timeframeUi,
-                settings.getCachedCandlesLimit(),
-                exchangeUi,
-                networkUi,
-                settings.isActive()
-        );
-
         StrategyRunInfo info = webStrategyFacade.getRunInfo(chatId, type, exchangeUi, networkUi);
 
         if (info == null) {
@@ -183,17 +175,61 @@ public class StrategyDashboardController {
         if (info.getExchangeName() == null) info.setExchangeName(exchangeUi);
         if (info.getNetworkType() == null) info.setNetworkType(networkUi);
 
+        boolean runtimeActive = info.isActive();
+        model.addAttribute("runtimeActive", runtimeActive);
         model.addAttribute("info", info);
+
+        if (settings.isActive() != runtimeActive) {
+            log.warn("⚠️ DASHBOARD ACTIVE MISMATCH chatId={} type={} settingsActive={} runtimeActive={} ex={} net={} symbol={} tf={}",
+                    chatId, type, settings.isActive(), runtimeActive, exchangeUi, networkUi, symbolUi, timeframeUi);
+
+            if (settings.isActive() && !runtimeActive) {
+                repairStaleActiveFlag(settings, chatId, type, exchangeUi, networkUi, symbolUi, timeframeUi);
+                model.addAttribute("strategy", settings);
+            }
+        }
+
+        log.info(
+                "📊 DASHBOARD SETTINGS id={} chatId={} type={} symbol={} tf={} limit={} ex={} net={} runtimeActive={} dbActive={} pnlAsset={}",
+                settings.getId(),
+                chatId,
+                type,
+                symbolUi,
+                timeframeUi,
+                settings.getCachedCandlesLimit(),
+                exchangeUi,
+                networkUi,
+                runtimeActive,
+                settings.isActive(),
+                journalPnlAsset
+        );
 
         return "layout/app";
     }
 
-    /**
-     * baseline selection:
-     * - active=true first
-     * - then updatedAt desc
-     * - then id desc
-     */
+    private void repairStaleActiveFlag(StrategySettings settings,
+                                       Long chatId,
+                                       StrategyType type,
+                                       String exchange,
+                                       NetworkType network,
+                                       String symbol,
+                                       String timeframe) {
+        if (settings == null || !settings.isActive()) {
+            return;
+        }
+
+        try {
+            settings.setActive(false);
+            settings.setStoppedAt(LocalDateTime.now());
+            strategySettingsService.save(settings);
+            log.warn("🧹 DASHBOARD stale active flag repaired chatId={} type={} ex={} net={} symbol={} tf={} id={}",
+                    chatId, type, exchange, network, symbol, timeframe, settings.getId());
+        } catch (Exception e) {
+            log.warn("⚠️ DASHBOARD stale active repair failed chatId={} type={} ex={} net={} symbol={} tf={} : {}",
+                    chatId, type, exchange, network, symbol, timeframe, e.getMessage());
+        }
+    }
+
     private StrategySettings resolveBaselineSettings(Long chatId, StrategyType type) {
         if (chatId == null || chatId <= 0) return null;
 
@@ -291,6 +327,21 @@ public class StrategyDashboardController {
         for (NetworkType v : values) {
             if (v != null) return v;
         }
+        return null;
+    }
+
+    private static String extractQuoteAsset(String symbol) {
+        String normalized = normalizeSymbolOrNull(symbol);
+        if (normalized == null) {
+            return null;
+        }
+
+        for (String quote : List.of("USDT", "USDC", "FDUSD", "BUSD", "USDP", "DAI", "EUR", "TRY", "BTC", "ETH", "BNB")) {
+            if (normalized.endsWith(quote) && normalized.length() > quote.length()) {
+                return quote;
+            }
+        }
+
         return null;
     }
 }

@@ -81,6 +81,13 @@ public class MarketStreamServiceImpl implements MarketStreamService {
     @Value("${market.dispatch.skip-when-degraded:true}")
     private boolean skipWhenDegraded;
 
+    /**
+     * Если источник текущего события свежий, а деградация вызвана отставанием соседнего канала,
+     * разрешаем диспатч цены. Особенно важно для BYBIT, где kline и aggTrade нередко приходят несимметрично.
+     */
+    @Value("${market.dispatch.source-fresh-bypass-max-age-ms:5000}")
+    private long sourceFreshBypassMaxAgeMs;
+
     // ============================================================
     // AGG_TRADE maps (БЕЗ timeframe)
     // ============================================================
@@ -304,7 +311,7 @@ public class MarketStreamServiceImpl implements MarketStreamService {
         // 3.1) degraded guard
         if (skipWhenDegraded) {
             MarketDataStreamService.SubscriptionHealth health = resolveHealth(chatId, type, ex, networkType, sym, tf);
-            if (health != null && health.degraded()) {
+            if (shouldBlockAggTradeDispatch(health, ex)) {
                 maybeLogTickSkip(key, nowMs, safeSeq(push),
                         chatId, type, ex, networkType, sym, tf, price, qty, tradeTsMs,
                         sinceLastDispatchMs,
@@ -525,14 +532,11 @@ public class MarketStreamServiceImpl implements MarketStreamService {
             return;
         }
 
-        if (skipWhenDegraded) {
-            MarketDataStreamService.SubscriptionHealth health = resolveHealth(chatId, type, ex, networkType, sym, tf);
-            if (health != null && health.degraded()) {
-                maybeLogKlineSkip(key, nowMs,
-                        "Пропуск onCandleClosed(" + source + "): market degraded (" + formatHealthReason(health) + ")");
-                return;
-            }
-        }
+        // ВАЖНО:
+        // закрытая свеча — авторитетный сигнал для стратегий.
+        // Даже если fast-channel временно stale, закрытие KLINE/AGG bucket должно дойти
+        // до оркестратора, иначе стратегии перестают видеть завершение свечи и зависают в HOLD.
+        // Деградацию применяем только к тиковым price-update, но не к onCandleClosed().
 
         long candleOpenTime = extractCandleOpenTimeSafe(candle);
         if (candleOpenTime > 0) {
@@ -710,7 +714,7 @@ public class MarketStreamServiceImpl implements MarketStreamService {
             health = resolveHealth(chatId, type, ex, networkType, sym, tf);
         }
 
-        boolean marketDegraded = health != null && health.degraded();
+        boolean marketDegraded = shouldBlockKlinePriceDispatch(health, ex);
 
         // 4) kline -> price update (forming candle тоже)
         // Для WINDOW_SCALPING это лишний дубль:
@@ -896,6 +900,46 @@ public class MarketStreamServiceImpl implements MarketStreamService {
                + ",kAge=" + health.lastKlineAgeMs()
                + ",aggAge=" + health.lastAggTradeAgeMs()
                + ",bookAge=" + health.lastBookTickerAgeMs();
+    }
+
+    private boolean shouldBlockAggTradeDispatch(MarketDataStreamService.SubscriptionHealth health, String exchange) {
+        if (health == null || !health.degraded()) {
+            return false;
+        }
+
+        if (isFresh(health.lastAggTradeAgeMs())) {
+            return false;
+        }
+
+        if (isBybit(exchange) && isFresh(health.lastAggTradeAgeMs())) {
+            return false;
+        }
+
+        return true;
+    }
+
+    private boolean shouldBlockKlinePriceDispatch(MarketDataStreamService.SubscriptionHealth health, String exchange) {
+        if (health == null || !health.degraded()) {
+            return false;
+        }
+
+        if (isFresh(health.lastKlineAgeMs())) {
+            return false;
+        }
+
+        if (isBybit(exchange) && isFresh(health.lastKlineAgeMs())) {
+            return false;
+        }
+
+        return true;
+    }
+
+    private boolean isFresh(long ageMs) {
+        return ageMs >= 0L && ageMs <= Math.max(250L, sourceFreshBypassMaxAgeMs);
+    }
+
+    private boolean isBybit(String exchange) {
+        return exchange != null && "BYBIT".equalsIgnoreCase(exchange);
     }
 
     private static boolean safeBool(java.util.concurrent.Callable<Boolean> c) {

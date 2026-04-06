@@ -365,14 +365,14 @@ public class MarketDataStreamService {
         if (kline.getSymbol() == null || kline.getSymbol().isBlank()) kline.setSymbol(sym);
         if (kline.getTimeframe() == null || kline.getTimeframe().isBlank()) kline.setTimeframe(tf);
 
-        if (kline.isClosed()) {
-            publishSafe(new CandleClosedEvent(ex, networkType, chatId, strategyType, sym, tf, kline));
-        }
-
         Candle candle = toCandleSafe(kline);
         if (candle == null) return;
 
         onCandle(chatId, strategyType, ex, networkType, sym, tf, candle);
+
+        if (kline.isClosed()) {
+            publishSafe(new CandleClosedEvent(ex, networkType, chatId, strategyType, sym, tf, kline));
+        }
     }
 
     public void pushKline(String exchange,
@@ -422,8 +422,6 @@ public class MarketDataStreamService {
                     chatId, strategyType, exchange, networkType, symbol, timeframe);
             return;
         }
-
-        dropOtherSubscriptionsSameType(chatId, strategyType, ex, networkType, sym, tf);
 
         candleStorage.computeIfAbsent(
                 new CandleStoreKey(chatId, strategyType, ex, networkType, sym, tf),
@@ -798,7 +796,9 @@ public class MarketDataStreamService {
         boolean newBucket = false;
         boolean closedUpdate = false;
         boolean lateBucket = false;
+        boolean lateClosedMerged = false;
         long prevOpenTime = -1L;
+        Candle candleForStream = candle;
 
         synchronized (deque) {
             Candle last = deque.peekLast();
@@ -821,27 +821,49 @@ public class MarketDataStreamService {
             }
 
             if (lateBucket) {
-                log.warn("⏭️ [STREAM] LATE KLINE IGNORED chatId={} type={} ex={} net={} {} {} candleOpenTime={} lastOpenTime={} closed={}",
-                        chatId,
-                        strategyType,
-                        ex,
-                        networkType,
-                        sym,
-                        tf,
-                        candle.getTime(),
-                        prevOpenTime,
-                        candle.isClosed());
-                return;
+                if (candle.isClosed()) {
+                    Candle merged = tryMergePreviousClosedCandle(deque, candle);
+                    if (merged != null) {
+                        lateClosedMerged = true;
+                        candleForStream = merged;
+                    } else {
+                        log.warn("⏭️ [STREAM] LATE KLINE IGNORED chatId={} type={} ex={} net={} {} {} candleOpenTime={} lastOpenTime={} closed={}",
+                                chatId,
+                                strategyType,
+                                ex,
+                                networkType,
+                                sym,
+                                tf,
+                                candle.getTime(),
+                                prevOpenTime,
+                                candle.isClosed());
+                        return;
+                    }
+                } else {
+                    log.warn("⏭️ [STREAM] LATE KLINE IGNORED chatId={} type={} ex={} net={} {} {} candleOpenTime={} lastOpenTime={} closed={}",
+                            chatId,
+                            strategyType,
+                            ex,
+                            networkType,
+                            sym,
+                            tf,
+                            candle.getTime(),
+                            prevOpenTime,
+                            candle.isClosed());
+                    return;
+                }
             }
 
-            deque.addLast(candle);
+            if (!lateClosedMerged) {
+                deque.addLast(candle);
+            }
 
             while (deque.size() > MAX_CANDLES) {
                 deque.pollFirst();
             }
         }
 
-        pushToStreamManager(ex, networkType, sym, tf, candle);
+        pushToStreamManager(ex, networkType, sym, tf, candleForStream);
 
         if (newBucket) {
             log.info("🕯 [STREAM] NEW CANDLE FROM KLINE chatId={} type={} ex={} net={} {} {} openTime={} closed={} o={} h={} l={} c={} v={}",
@@ -880,6 +902,38 @@ public class MarketDataStreamService {
                     candle.getTime(),
                     BigDecimal.valueOf(candle.getClose()).stripTrailingZeros().toPlainString());
         }
+    }
+
+    private Candle tryMergePreviousClosedCandle(Deque<Candle> deque, Candle candle) {
+        if (deque == null || candle == null || !candle.isClosed()) {
+            return null;
+        }
+
+        Candle tail = deque.pollLast();
+        if (tail == null) {
+            return null;
+        }
+
+        Candle prev = deque.peekLast();
+        if (prev == null || prev.getTime() != candle.getTime()) {
+            deque.addLast(tail);
+            return null;
+        }
+
+        Candle merged = new Candle(
+                candle.getTime(),
+                candle.getOpen(),
+                Math.max(prev.getHigh(), candle.getHigh()),
+                Math.min(prev.getLow(), candle.getLow()),
+                candle.getClose(),
+                Math.max(prev.getVolume(), candle.getVolume()),
+                true
+        );
+
+        deque.pollLast();
+        deque.addLast(merged);
+        deque.addLast(tail);
+        return merged;
     }
 
     // =====================================================================
@@ -1424,3 +1478,4 @@ public class MarketDataStreamService {
         return strategyType != StrategyType.WINDOW_SCALPING || windowScalpingBookTickerEnabled;
     }
 }
+

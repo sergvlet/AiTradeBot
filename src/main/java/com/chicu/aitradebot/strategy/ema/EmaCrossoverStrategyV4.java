@@ -2,6 +2,7 @@ package com.chicu.aitradebot.strategy.ema;
 
 import com.chicu.aitradebot.ai.ml.MlGateway;
 import com.chicu.aitradebot.ai.ml.dto.MlPredictResponse;
+import com.chicu.aitradebot.ai.runtime.AdaptiveRuntimeController;
 import com.chicu.aitradebot.ai.tuning.AutoTunerOrchestrator;
 import com.chicu.aitradebot.ai.tuning.TuningRequest;
 import com.chicu.aitradebot.ai.tuning.TuningResult;
@@ -76,6 +77,7 @@ public class EmaCrossoverStrategyV4 implements
     private final ObjectProvider<MlGateway> mlGatewayProvider;
     private final ObjectProvider<EmaMlPreparationService> preparationServiceProvider;
     private final ObjectProvider<AutoTunerOrchestrator> autoTunerProvider;
+    private final AdaptiveRuntimeController adaptiveRuntimeController;
 
     private final Map<Long, LocalState> states = new ConcurrentHashMap<>();
 
@@ -100,6 +102,7 @@ public class EmaCrossoverStrategyV4 implements
         BigDecimal entryPrice;
         BigDecimal tpPrice;
         BigDecimal slPrice;
+        Instant lastEntryAt;
 
         Double fastEma;
         Double slowEma;
@@ -195,6 +198,7 @@ public class EmaCrossoverStrategyV4 implements
         syncRuntimeContext(st, ss);
         warmupFromHistory(chatId, st);
         states.put(chatId, st);
+        adaptiveRuntimeController.onStrategyStarted(chatId, StrategyType.EMA_CROSSOVER, st.exchange, st.network, st.symbol, st.timeframe);
 
         maybeRestoreOpenPosition(chatId, st);
         PrepareStatus prepareStatus = resolveStartStatus(st);
@@ -233,6 +237,7 @@ public class EmaCrossoverStrategyV4 implements
             return;
         }
 
+        adaptiveRuntimeController.onStrategyStopped(chatId, StrategyType.EMA_CROSSOVER, st.exchange, st.network);
         clearPositionVisuals(chatId, st);
         safeLive(() -> live.pushState(chatId, StrategyType.EMA_CROSSOVER, st.symbol, false));
         log.info("[EMA] ⏹ STOP chatId={} ex={} net={} symbol={}",
@@ -257,6 +262,13 @@ public class EmaCrossoverStrategyV4 implements
 
         LocalState st = states.get(chatId);
         if (st == null || !st.active) return;
+
+        adaptiveRuntimeController.onTick(chatId, StrategyType.EMA_CROSSOVER, st.exchange, st.network);
+        String tickSymbol = normalizeSymbol(symbolFromTick, st.symbol);
+        Instant eventTime = ts != null ? ts : Instant.now();
+        if (!isBlank(tickSymbol)) {
+            safeLive(() -> live.pushPriceTick(chatId, StrategyType.EMA_CROSSOVER, tickSymbol, price, eventTime));
+        }
 
         synchronized (st) {
             refreshSettingsIfNeeded(chatId, st, ts != null ? ts : Instant.now());
@@ -433,6 +445,8 @@ public class EmaCrossoverStrategyV4 implements
         BigDecimal slPct = resolveStopLossPct(st);
         BigDecimal diffPct = diffPct(st.fastEma, st.slowEma);
 
+        adaptiveRuntimeController.onCandleObserved(chatId, StrategyType.EMA_CROSSOVER, st.exchange, st.network, st.symbol, st.timeframe, null, diffPct, null, eventTime != null ? eventTime : Instant.now());
+
         if (maxSpreadPct > 0.0d && diffPct.doubleValue() > maxSpreadPct) {
             pushHold(chatId, st, "spread_too_wide");
             return;
@@ -480,11 +494,7 @@ public class EmaCrossoverStrategyV4 implements
                 }
 
                 logMlFailOpen(chatId, st, prediction);
-                pushHold(chatId, st, "ml_fail_open");
-                return;
-            }
-
-            if (prediction.proba < prediction.threshold) {
+            } else if (prediction.proba < prediction.threshold) {
                 maybeHandleMlDegradation(chatId, st, prediction, eventTime);
                 logMlBelow(chatId, st, prediction);
                 pushHold(chatId, st, "ml_below_threshold");
@@ -551,6 +561,7 @@ public class EmaCrossoverStrategyV4 implements
         st.entryPrice = executedPrice;
         st.tpPrice = tp;
         st.slPrice = sl;
+        st.lastEntryAt = eventTime != null ? eventTime : Instant.now();
 
         log.info("[EMA] ✅ BUY chatId={} ex={} net={} symbol={} entryPrice={} qty={} tp={} sl={} emaFast={} emaSlow={} diffPct={}",
                 chatId,
@@ -565,6 +576,7 @@ public class EmaCrossoverStrategyV4 implements
                 fmtDouble(st.slowEma),
                 fmtBd(diffPct));
 
+        adaptiveRuntimeController.onEntry(chatId, StrategyType.EMA_CROSSOVER, st.exchange, st.network, st.symbol, st.timeframe, eventTime != null ? eventTime : Instant.now());
         pushPositionVisuals(chatId, st, st.entryPrice, st.entryQty, st.tpPrice, st.slPrice, eventTime, true);
         safeLive(() -> live.pushSignal(chatId, StrategyType.EMA_CROSSOVER, st.symbol, null,
                 Signal.hold("EMA BUY confirmed")));
@@ -598,7 +610,12 @@ public class EmaCrossoverStrategyV4 implements
                 fmtBd(st.tpPrice),
                 fmtBd(st.slPrice));
 
-        publishExitVisuals(chatId, st, price, eventTime, st.tpPrice != null && price.compareTo(st.tpPrice) >= 0 ? "TP" : "SL");
+        String exitReason = st.tpPrice != null && price.compareTo(st.tpPrice) >= 0 ? "TP" : "SL";
+        BigDecimal realizedPnlPct = calcLongPnlPct(st.entryPrice, price);
+        BigDecimal realizedPnlUsd = calcLongPnlUsd(st.entryPrice, price, st.entryQty);
+        BigDecimal holdSeconds = calcHoldSeconds(st.lastEntryAt, eventTime);
+        publishExitVisuals(chatId, st, price, eventTime, exitReason);
+        adaptiveRuntimeController.onExit(chatId, StrategyType.EMA_CROSSOVER, st.exchange, st.network, st.symbol, st.timeframe, realizedPnlPct, realizedPnlUsd, exitReason, holdSeconds, eventTime != null ? eventTime : Instant.now());
         clearPosition(st);
         maybeRetrainAfterClose(chatId, st, "after_close_train");
         safeLive(() -> live.pushSignal(chatId, StrategyType.EMA_CROSSOVER, st.symbol, null,
@@ -652,7 +669,11 @@ public class EmaCrossoverStrategyV4 implements
         log.info("[EMA] ✅ FORCE EXIT on bearish confirm chatId={} ex={} net={} symbol={} price={} confirmBars={}",
                 chatId, safe(st.exchange), st.network, safe(st.symbol), fmtBd(price), st.bearishConfirmBars);
 
+        BigDecimal realizedPnlPct = calcLongPnlPct(st.entryPrice, price);
+        BigDecimal realizedPnlUsd = calcLongPnlUsd(st.entryPrice, price, st.entryQty);
+        BigDecimal holdSeconds = calcHoldSeconds(st.lastEntryAt, eventTime);
         publishExitVisuals(chatId, st, price, eventTime, "EMA_BEARISH_CROSS");
+        adaptiveRuntimeController.onExit(chatId, StrategyType.EMA_CROSSOVER, st.exchange, st.network, st.symbol, st.timeframe, realizedPnlPct, realizedPnlUsd, "EMA_BEARISH_CROSS", holdSeconds, eventTime != null ? eventTime : Instant.now());
         clearPosition(st);
         maybeRetrainAfterClose(chatId, st, "after_close_train");
         safeLive(() -> live.pushSignal(chatId, StrategyType.EMA_CROSSOVER, st.symbol, null,
@@ -716,6 +737,7 @@ public class EmaCrossoverStrategyV4 implements
             st.entryPrice = snap.entryPrice();
             st.tpPrice = snap.tp();
             st.slPrice = snap.sl();
+            st.lastEntryAt = Instant.now();
 
             log.info("[EMA] ♻ POSITION RESTORED chatId={} ex={} net={} symbol={} qty={} entry={} tp={} sl={}",
                     chatId,
@@ -1125,6 +1147,15 @@ public class EmaCrossoverStrategyV4 implements
         if (st.lastPredictAt != null && st.lastPredictPrice != null && now != null) {
             long dt = Duration.between(st.lastPredictAt, now).toMillis();
             if (dt < PREDICT_THROTTLE_MS && price.compareTo(st.lastPredictPrice) == 0) {
+                BigDecimal cachedConfidence = st.ss != null ? st.ss.getMlConfidence() : null;
+                if (cachedConfidence != null && cachedConfidence.signum() > 0) {
+                    return Prediction.ok(
+                            clamp01(cachedConfidence.doubleValue()),
+                            threshold,
+                            st.ss != null ? st.ss.getMlModelKey() : null,
+                            st.ss != null ? st.ss.getMlModelVersion() : null
+                    );
+                }
                 return Prediction.failOpen("predict_throttled", threshold);
             }
         }
@@ -1361,12 +1392,62 @@ public class EmaCrossoverStrategyV4 implements
 
     private BigDecimal resolveTakeProfitPct(LocalState st) {
         if (st == null || st.cfg == null) return DEFAULT_TP_PCT;
-        return positiveOrDefault(st.cfg.getTakeProfitPct(), DEFAULT_TP_PCT);
+
+        BigDecimal baseTp = positiveOrDefault(st.cfg.getTakeProfitPct(), DEFAULT_TP_PCT);
+        BigDecimal slPct = resolveStopLossPct(st);
+
+        if (tradeExecutionService instanceof TradeExecutionServiceImpl impl
+                && st.ss != null
+                && st.ss.getChatId() != null
+                && !isBlank(st.exchange)
+                && st.network != null) {
+            try {
+                BigDecimal floorTp = impl.resolveMinHealthyTpPct(st.ss.getChatId(), st.exchange, st.network, slPct);
+                if (floorTp != null && floorTp.signum() > 0 && floorTp.compareTo(baseTp) > 0) {
+                    return floorTp;
+                }
+            } catch (Exception e) {
+                log.debug("[EMA] resolveTakeProfitPct fee floor skipped chatId={} sym={} err={}",
+                        st.ss.getChatId(),
+                        safe(st.symbol),
+                        e.toString());
+            }
+        }
+
+        return baseTp;
     }
 
     private BigDecimal resolveStopLossPct(LocalState st) {
         if (st == null || st.cfg == null) return DEFAULT_SL_PCT;
         return positiveOrDefault(st.cfg.getStopLossPct(), DEFAULT_SL_PCT);
+    }
+
+    private static BigDecimal calcLongPnlPct(BigDecimal entryPrice, BigDecimal exitPrice) {
+        if (entryPrice == null || exitPrice == null || entryPrice.signum() <= 0) {
+            return BigDecimal.ZERO.setScale(8, RoundingMode.HALF_UP);
+        }
+        return exitPrice.subtract(entryPrice)
+                .multiply(new BigDecimal("100"))
+                .divide(entryPrice, 8, RoundingMode.HALF_UP);
+    }
+
+    private static BigDecimal calcLongPnlUsd(BigDecimal entryPrice, BigDecimal exitPrice, BigDecimal qty) {
+        if (entryPrice == null || exitPrice == null || qty == null) {
+            return BigDecimal.ZERO.setScale(8, RoundingMode.HALF_UP);
+        }
+        return exitPrice.subtract(entryPrice)
+                .multiply(qty)
+                .setScale(8, RoundingMode.HALF_UP);
+    }
+
+    private static BigDecimal calcHoldSeconds(Instant entryAt, Instant exitAt) {
+        if (entryAt == null) {
+            return BigDecimal.ZERO.setScale(8, RoundingMode.HALF_UP);
+        }
+        Instant effectiveExit = exitAt != null ? exitAt : Instant.now();
+        long ms = Math.max(0L, Duration.between(entryAt, effectiveExit).toMillis());
+        return BigDecimal.valueOf(ms)
+                .divide(new BigDecimal("1000"), 8, RoundingMode.HALF_UP);
     }
 
     private void pushHold(Long chatId, LocalState st, String reason) {
@@ -1381,6 +1462,7 @@ public class EmaCrossoverStrategyV4 implements
         if (st != null) {
             st.lastHoldReason = reason;
             st.lastHoldAt = now;
+            adaptiveRuntimeController.onHold(chatId, StrategyType.EMA_CROSSOVER, st.exchange, st.network, reason, now);
         }
 
         safeLive(() -> live.pushSignal(chatId, StrategyType.EMA_CROSSOVER,
@@ -1556,6 +1638,7 @@ public class EmaCrossoverStrategyV4 implements
         st.entryPrice = null;
         st.tpPrice = null;
         st.slPrice = null;
+        st.lastEntryAt = null;
     }
 
     private static int nvl(Integer value, int def) {
@@ -1690,5 +1773,6 @@ public class EmaCrossoverStrategyV4 implements
         }
     }
 }
+
 
 
