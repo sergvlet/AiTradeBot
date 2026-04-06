@@ -12,6 +12,10 @@ import com.chicu.aitradebot.ai.ml.dto.MlTrainResponse;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
+import com.chicu.aitradebot.market.stream.MarketDataStreamService;
+import com.chicu.aitradebot.market.model.Candle;
+import com.chicu.aitradebot.exchange.client.ExchangeClientFactory;
+import com.chicu.aitradebot.exchange.client.ExchangeClient;
 import com.chicu.aitradebot.strategy.windowscalping.WindowScalpingStrategySettingsService;
 import com.chicu.aitradebot.domain.enums.AdvancedControlMode;
 import com.chicu.aitradebot.events.StrategySettingsUpdatedEvent;
@@ -559,19 +563,114 @@ public class MlTrainingServiceImpl implements MlTrainingService {
                                              String symbol,
                                              String timeframe,
                                              int candlesLimit) {
-        List<Object> out = new ArrayList<>();
         tryWarmupHistory(chatId, type, exchange, network, symbol, timeframe, candlesLimit);
 
         Object service = getBeanByName("marketDataStreamService");
         if (service == null) {
             service = getBeanByName("marketStreamService");
         }
-        if (service == null) {
-            return out;
+
+        List<Object> cached = normalizeCandleResult(
+                tryInvokeCandleLoader(service, chatId, type, exchange, network, symbol, timeframe, candlesLimit),
+                candlesLimit
+        );
+        if (!cached.isEmpty()) {
+            return cached;
         }
 
-        Object res = tryInvokeCandleLoader(service, chatId, type, exchange, network, symbol, timeframe, candlesLimit);
-        return normalizeCandleResult(res, candlesLimit);
+        List<Object> direct = loadCandlesDirectFromExchange(exchange, network, symbol, timeframe, candlesLimit);
+        if (!direct.isEmpty()) {
+            backfillRuntimeCandleCache(chatId, type, exchange, network, symbol, timeframe, direct);
+            return direct;
+        }
+
+        return List.of();
+    }
+
+    private List<Object> loadCandlesDirectFromExchange(String exchange,
+                                                       NetworkType network,
+                                                       String symbol,
+                                                       String timeframe,
+                                                       int candlesLimit) {
+        Object bean = getBeanByName("exchangeClientFactory");
+        if (!(bean instanceof ExchangeClientFactory factory)) {
+            return List.of();
+        }
+
+        try {
+            ExchangeClient client = factory.get(exchange, network);
+            if (client == null) {
+                return List.of();
+            }
+
+            Object raw;
+            try {
+                raw = client.getKlines(symbol, timeframe, candlesLimit);
+            } catch (Exception first) {
+                long end = System.currentTimeMillis();
+                raw = client.getKlines(symbol, timeframe, end - Math.max(1L, candlesLimit) * 60_000L, end, candlesLimit);
+            }
+
+            List<Object> normalized = normalizeCandleResult(raw, candlesLimit);
+            if (!normalized.isEmpty()) {
+                log.info("🧠 TRAIN candle fallback: loaded from exchange ex={} net={} sym={} tf={} candles={}",
+                        exchange, network, symbol, timeframe, normalized.size());
+            }
+            return normalized;
+        } catch (Exception e) {
+            log.warn("🧠 TRAIN candle fallback failed ex={} net={} sym={} tf={} err={}",
+                    exchange, network, symbol, timeframe, e.toString());
+            return List.of();
+        }
+    }
+
+    private void backfillRuntimeCandleCache(Long chatId,
+                                            StrategyType type,
+                                            String exchange,
+                                            NetworkType network,
+                                            String symbol,
+                                            String timeframe,
+                                            List<Object> rawCandles) {
+        Object bean = getBeanByName("marketDataStreamService");
+        if (!(bean instanceof MarketDataStreamService streamService)) {
+            return;
+        }
+
+        List<Candle> candles = toMarketCandles(rawCandles);
+        if (candles.isEmpty()) {
+            return;
+        }
+
+        try {
+            streamService.putCandles(chatId, type, exchange, network, symbol, timeframe, candles);
+        } catch (Exception e) {
+            log.debug("🧠 TRAIN runtime cache backfill skipped chatId={} type={} ex={} net={} sym={} tf={} err={}",
+                    chatId, type, exchange, network, symbol, timeframe, e.toString());
+        }
+    }
+
+    private List<Candle> toMarketCandles(List<Object> rawCandles) {
+        if (rawCandles == null || rawCandles.isEmpty()) {
+            return List.of();
+        }
+
+        List<Candle> out = new ArrayList<>(rawCandles.size());
+        for (Object raw : rawCandles) {
+            CandlePoint point = toCandlePoint(raw);
+            if (point == null) {
+                continue;
+            }
+            out.add(new Candle(
+                    point.openTimeMs(),
+                    point.open(),
+                    point.high(),
+                    point.low(),
+                    point.close(),
+                    0.0d,
+                    true
+            ));
+        }
+        return out;
     }
 
     private Object tryInvokeCandleLoader(Object service,
@@ -1627,6 +1726,7 @@ private double calcCloseReturnPct(List<CandlePoint> points, int index, int back)
 
     private record Context(String symbol, String timeframe, String exchange, String network) {}
 }
+
 
 
 

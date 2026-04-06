@@ -15,7 +15,6 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 
-import java.time.LocalDateTime;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
@@ -183,9 +182,14 @@ public class StrategyDashboardController {
             log.warn("⚠️ DASHBOARD ACTIVE MISMATCH chatId={} type={} settingsActive={} runtimeActive={} ex={} net={} symbol={} tf={}",
                     chatId, type, settings.isActive(), runtimeActive, exchangeUi, networkUi, symbolUi, timeframeUi);
 
-            if (settings.isActive() && !runtimeActive) {
-                repairStaleActiveFlag(settings, chatId, type, exchangeUi, networkUi, symbolUi, timeframeUi);
-                model.addAttribute("strategy", settings);
+            // ВАЖНО: дашборд только отображает состояние и не должен сам менять active-флаг.
+            // Иначе при старте/рестарте стратегии можно получить ложный repair, когда runtime ещё
+            // не успел зарегистрировать binding или ответить через getRunInfo.
+            if (settings.isActive() && !runtimeActive && model.getAttribute("notice") == null) {
+                model.addAttribute(
+                        "notice",
+                        "Рантайм стратегии ещё синхронизируется с сохранёнными настройками. Обнови страницу через пару секунд."
+                );
             }
         }
 
@@ -205,29 +209,6 @@ public class StrategyDashboardController {
         );
 
         return "layout/app";
-    }
-
-    private void repairStaleActiveFlag(StrategySettings settings,
-                                       Long chatId,
-                                       StrategyType type,
-                                       String exchange,
-                                       NetworkType network,
-                                       String symbol,
-                                       String timeframe) {
-        if (settings == null || !settings.isActive()) {
-            return;
-        }
-
-        try {
-            settings.setActive(false);
-            settings.setStoppedAt(LocalDateTime.now());
-            strategySettingsService.save(settings);
-            log.warn("🧹 DASHBOARD stale active flag repaired chatId={} type={} ex={} net={} symbol={} tf={} id={}",
-                    chatId, type, exchange, network, symbol, timeframe, settings.getId());
-        } catch (Exception e) {
-            log.warn("⚠️ DASHBOARD stale active repair failed chatId={} type={} ex={} net={} symbol={} tf={} : {}",
-                    chatId, type, exchange, network, symbol, timeframe, e.getMessage());
-        }
     }
 
     private StrategySettings resolveBaselineSettings(Long chatId, StrategyType type) {

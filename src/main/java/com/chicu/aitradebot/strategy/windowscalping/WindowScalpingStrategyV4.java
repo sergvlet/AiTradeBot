@@ -774,15 +774,17 @@ public class WindowScalpingStrategyV4 implements
         if (mode != AdvancedControlMode.AI || !prepareStrictAiMode) {
             return false;
         }
-        if (res == null) return true;
+        if (res == null) {
+            return false;
+        }
         String reason = tuningReason(res);
         if (reason == null) return false;
         String normalized = reason.trim().toLowerCase(Locale.ROOT);
         if (normalized.isEmpty()) return false;
 
-        return normalized.contains("no_trades")
-                || normalized.contains("too_few_trades")
-                || normalized.contains("error")
+        // Для live-start у WINDOW_SCALPING нехватка сделок и отсутствие улучшения
+        // не должны ронять prepare целиком: ниже уже есть live-safe fallback.
+        return normalized.contains("error")
                 || normalized.contains("failed")
                 || normalized.contains("backtest")
                 || normalized.contains("env_missing")
@@ -2292,6 +2294,24 @@ public class WindowScalpingStrategyV4 implements
                         st.tickWindow != null ? st.tickWindow.size() : 0,
                         fmt(rangePct),
                         fmt(effectiveMinRangePct(st, cfg)));
+            }
+
+            /*
+             * Критичный фикс:
+             * path onCandleClosed() раньше только обновлял окно и зоны,
+             * но не запускал полноценную entry-оценку.
+             *
+             * В результате WINDOW_SCALPING видел закрытую свечу в логах,
+             * однако сигнал BUY/ENTRY не вычислялся, пока не приходил отдельный тик
+             * следующей свечи или не срабатывал candle-close fallback.
+             *
+             * Здесь запускаем ту же entry-логику, что и в price/tick path,
+             * уже на цене закрытия свечи и после обновления candle window.
+             * Дополнительная защита !st.inPosition не даёт сделать дубль-вход,
+             * если fallback/onPriceUpdate уже успел открыть позицию чуть раньше.
+             */
+            if (!st.inPosition) {
+                evaluateEntryOnTick(chatId, st, sym, close, time, holdMs);
             }
         }
     }
@@ -5742,5 +5762,7 @@ public class WindowScalpingStrategyV4 implements
         return (v != null && v.signum() > 0) ? v : null;
     }
 }
+
+
 
 

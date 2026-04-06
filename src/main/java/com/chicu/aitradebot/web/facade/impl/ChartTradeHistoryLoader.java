@@ -16,6 +16,7 @@ import org.springframework.stereotype.Service;
 import java.lang.reflect.Array;
 import java.lang.reflect.Method;
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
@@ -23,7 +24,6 @@ import java.util.Collection;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -37,6 +37,14 @@ public class ChartTradeHistoryLoader {
     private static final int MAX_LIMIT = 1000;
     private static final int BYBIT_PAGE_LIMIT = 100;
     private static final int BYBIT_MAX_PAGES = 5;
+
+    /**
+     * Для графика нам не нужна биржевая микроточность fill-by-fill.
+     * Нужна стабильная дедупликация одинаковых маркеров между разными ответами/страницами.
+     */
+    private static final long TRADE_TIME_BUCKET_MS = 1_000L;
+    private static final int PRICE_SCALE = 8;
+    private static final int QTY_SCALE = 8;
 
     private final ExchangeClientFactory exchangeClientFactory;
 
@@ -77,7 +85,7 @@ public class ChartTradeHistoryLoader {
         log.info("📭 [CHART] exchange trade-history is empty chatId={} type={} ex={} net={} sym={} range=[{},{}]",
                 chatId, strategyType, ex, network, sym, safeFromMs, safeToMs);
 
-        // По требованию: для графика источник истины только биржа.
+        // Для графика источник истины — только биржа.
         return List.of();
     }
 
@@ -110,8 +118,7 @@ public class ChartTradeHistoryLoader {
             return directTrades;
         }
 
-        // 2) Универсальный рефлексивный fallback.
-        // ВАЖНО: теперь здесь есть варианты сигнатур С network.
+        // 2) Универсальный рефлексивный fallback, включая сигнатуры c network.
         for (String method : List.of(
                 "getMyTrades",
                 "getTradeHistory",
@@ -136,7 +143,7 @@ public class ChartTradeHistoryLoader {
         }
 
         // 3) Спец-fallback для Bybit, если клиент ещё не реализовал getMyTrades(),
-        // но внутри есть signedV5()/resolve().
+        // но внутри уже есть signedV5()/resolve().
         if (isBybitClient(client)) {
             List<StrategyChartDto.TradeMarker> bybitTrades =
                     loadBybitExecutionsViaReflection(client, chatId, network, symbol, fromMs, toMs, limit);
@@ -277,7 +284,7 @@ public class ChartTradeHistoryLoader {
                                                                   long toMs,
                                                                   int limit,
                                                                   String source) {
-        List<StrategyChartDto.TradeMarker> out = new ArrayList<>();
+        LinkedHashMap<String, StrategyChartDto.TradeMarker> uniq = new LinkedHashMap<>();
         String sym = normUpper(symbol);
 
         for (Object row : rows) {
@@ -340,6 +347,9 @@ public class ChartTradeHistoryLoader {
                             "getQuantity", "quantity",
                             "getOrigQty", "origQty")
             );
+            if (qty != null && qty <= 0.0d) {
+                qty = null;
+            }
 
             String status = normUpper(firstNonBlank(
                     readString(row,
@@ -350,17 +360,22 @@ public class ChartTradeHistoryLoader {
                 continue;
             }
 
-            out.add(StrategyChartDto.TradeMarker.builder()
+            StrategyChartDto.TradeMarker marker = StrategyChartDto.TradeMarker.builder()
                     .side(side)
                     .price(price)
                     .qty(qty)
                     .time(time)
                     .source(source)
-                    .build());
+                    .build();
+
+            String key = buildObjectRowIdentityKey(row, sym, side, price, qty, time);
+            putBestTrade(uniq, key, marker);
         }
 
-        out.sort(Comparator.comparingLong(StrategyChartDto.TradeMarker::getTime));
-        out = dedup(out);
+        List<StrategyChartDto.TradeMarker> out = new ArrayList<>(uniq.values());
+        out.sort(Comparator
+                .comparingLong(StrategyChartDto.TradeMarker::getTime)
+                .thenComparing(t -> t.getSide() != null ? t.getSide() : ""));
 
         if (out.size() > limit) {
             out = new ArrayList<>(out.subList(out.size() - limit, out.size()));
@@ -387,11 +402,11 @@ public class ChartTradeHistoryLoader {
                 return List.of();
             }
 
-            List<StrategyChartDto.TradeMarker> collected = new ArrayList<>();
+            LinkedHashMap<String, StrategyChartDto.TradeMarker> uniq = new LinkedHashMap<>();
             String cursor = null;
             int page = 0;
 
-            while (page < BYBIT_MAX_PAGES && collected.size() < limit) {
+            while (page < BYBIT_MAX_PAGES && uniq.size() < limit) {
                 page++;
 
                 Map<String, String> params = new LinkedHashMap<>();
@@ -422,7 +437,10 @@ public class ChartTradeHistoryLoader {
 
                 List<StrategyChartDto.TradeMarker> pageTrades =
                         normalizeBybitExecutionList(list, sym, fromMs, toMs, limit, "exchange");
-                collected.addAll(pageTrades);
+                for (StrategyChartDto.TradeMarker marker : pageTrades) {
+                    String key = buildFallbackTradeKey(sym, marker.getSide(), marker.getPrice(), marker.getQty(), marker.getTime());
+                    putBestTrade(uniq, key, marker);
+                }
 
                 String nextCursor = result != null ? result.optString("nextPageCursor", null) : null;
                 if (nextCursor == null || nextCursor.isBlank() || nextCursor.equals(cursor)) {
@@ -431,8 +449,11 @@ public class ChartTradeHistoryLoader {
                 cursor = nextCursor;
             }
 
-            collected.sort(Comparator.comparingLong(StrategyChartDto.TradeMarker::getTime));
-            collected = dedup(collected);
+            List<StrategyChartDto.TradeMarker> collected = new ArrayList<>(uniq.values());
+            collected.sort(Comparator
+                    .comparingLong(StrategyChartDto.TradeMarker::getTime)
+                    .thenComparing(t -> t.getSide() != null ? t.getSide() : ""));
+
             if (collected.size() > limit) {
                 collected = new ArrayList<>(collected.subList(collected.size() - limit, collected.size()));
             }
@@ -495,7 +516,7 @@ public class ChartTradeHistoryLoader {
                                                                            long toMs,
                                                                            int limit,
                                                                            String source) {
-        List<StrategyChartDto.TradeMarker> out = new ArrayList<>();
+        LinkedHashMap<String, StrategyChartDto.TradeMarker> uniq = new LinkedHashMap<>();
         String sym = normUpper(symbol);
 
         for (int i = 0; i < arr.length(); i++) {
@@ -520,6 +541,10 @@ public class ChartTradeHistoryLoader {
             }
 
             BigDecimal qty = bdOrNull(row.opt("execQty"));
+            if (qty != null && qty.signum() <= 0) {
+                qty = null;
+            }
+
             Long time = parseTime(row.opt("execTime"));
             if (time == null || time < fromMs || time > toMs) {
                 continue;
@@ -530,17 +555,23 @@ public class ChartTradeHistoryLoader {
                 continue;
             }
 
-            out.add(StrategyChartDto.TradeMarker.builder()
+            StrategyChartDto.TradeMarker marker = StrategyChartDto.TradeMarker.builder()
                     .side(side)
                     .price(px.doubleValue())
                     .qty(qty != null ? qty.doubleValue() : null)
                     .time(time)
                     .source(source)
-                    .build());
+                    .build();
+
+            String key = buildJsonRowIdentityKey(row, sym, side, px.doubleValue(), qty != null ? qty.doubleValue() : null, time);
+            putBestTrade(uniq, key, marker);
         }
 
-        out.sort(Comparator.comparingLong(StrategyChartDto.TradeMarker::getTime));
-        out = dedup(out);
+        List<StrategyChartDto.TradeMarker> out = new ArrayList<>(uniq.values());
+        out.sort(Comparator
+                .comparingLong(StrategyChartDto.TradeMarker::getTime)
+                .thenComparing(t -> t.getSide() != null ? t.getSide() : ""));
+
         if (out.size() > limit) {
             out = new ArrayList<>(out.subList(out.size() - limit, out.size()));
         }
@@ -556,15 +587,138 @@ public class ChartTradeHistoryLoader {
     }
 
     private List<StrategyChartDto.TradeMarker> dedup(List<StrategyChartDto.TradeMarker> rows) {
-        LinkedHashMap<String, StrategyChartDto.TradeMarker> map = new LinkedHashMap<>();
+        LinkedHashMap<String, StrategyChartDto.TradeMarker> uniq = new LinkedHashMap<>();
         for (StrategyChartDto.TradeMarker row : rows) {
-            if (row == null) {
+            if (row == null || row.getTime() == null || row.getPrice() == null) {
                 continue;
             }
-            String key = row.getSide() + "|" + row.getTime() + "|" + row.getPrice();
-            map.put(key, row);
+            String key = buildFallbackTradeKey(null, row.getSide(), row.getPrice(), row.getQty(), row.getTime());
+            putBestTrade(uniq, key, row);
         }
-        return new ArrayList<>(map.values());
+        List<StrategyChartDto.TradeMarker> out = new ArrayList<>(uniq.values());
+        out.sort(Comparator
+                .comparingLong(StrategyChartDto.TradeMarker::getTime)
+                .thenComparing(t -> t.getSide() != null ? t.getSide() : ""));
+        return out;
+    }
+
+    private void putBestTrade(Map<String, StrategyChartDto.TradeMarker> uniq,
+                              String key,
+                              StrategyChartDto.TradeMarker candidate) {
+        if (candidate == null || key == null || key.isBlank()) {
+            return;
+        }
+
+        StrategyChartDto.TradeMarker existing = uniq.get(key);
+        if (existing == null) {
+            uniq.put(key, candidate);
+            return;
+        }
+
+        uniq.put(key, pickBetterTrade(existing, candidate));
+    }
+
+    private StrategyChartDto.TradeMarker pickBetterTrade(StrategyChartDto.TradeMarker left,
+                                                         StrategyChartDto.TradeMarker right) {
+        if (left == null) {
+            return right;
+        }
+        if (right == null) {
+            return left;
+        }
+
+        boolean leftHasQty = left.getQty() != null && Double.isFinite(left.getQty()) && left.getQty() > 0.0d;
+        boolean rightHasQty = right.getQty() != null && Double.isFinite(right.getQty()) && right.getQty() > 0.0d;
+        if (leftHasQty != rightHasQty) {
+            return rightHasQty ? right : left;
+        }
+
+        long leftTime = left.getTime() != null ? left.getTime() : Long.MIN_VALUE;
+        long rightTime = right.getTime() != null ? right.getTime() : Long.MIN_VALUE;
+        if (rightTime != leftTime) {
+            return rightTime > leftTime ? right : left;
+        }
+
+        double leftQty = leftHasQty ? left.getQty() : -1.0d;
+        double rightQty = rightHasQty ? right.getQty() : -1.0d;
+        if (Double.compare(rightQty, leftQty) != 0) {
+            return rightQty > leftQty ? right : left;
+        }
+
+        return right;
+    }
+
+    private String buildObjectRowIdentityKey(Object row,
+                                             String symbol,
+                                             String side,
+                                             Double price,
+                                             Double qty,
+                                             Long time) {
+        String identity = firstNonBlank(readString(row,
+                "getExecId", "execId",
+                "getExecutionId", "executionId",
+                "getTradeId", "tradeId",
+                "getFillId", "fillId",
+                "getOrderId", "orderId",
+                "getId", "id"));
+
+        if (identity != null) {
+            return "ID|" + symbol + "|" + side + "|" + identity.trim();
+        }
+
+        return buildFallbackTradeKey(symbol, side, price, qty, time);
+    }
+
+    private String buildJsonRowIdentityKey(JSONObject row,
+                                           String symbol,
+                                           String side,
+                                           Double price,
+                                           Double qty,
+                                           Long time) {
+        String identity = firstNonBlank(firstNonBlank(row.optString("execId", null)));
+        if (identity == null) {
+            identity = firstNonBlank(row.optString("tradeId", null));
+        }
+        if (identity == null) {
+            identity = firstNonBlank(row.optString("orderId", null));
+        }
+        if (identity == null) {
+            identity = firstNonBlank(row.optString("execOrderId", null));
+        }
+
+        if (identity != null) {
+            return "ID|" + symbol + "|" + side + "|" + identity.trim();
+        }
+
+        return buildFallbackTradeKey(symbol, side, price, qty, time);
+    }
+
+    private String buildFallbackTradeKey(String symbol,
+                                         String side,
+                                         Double price,
+                                         Double qty,
+                                         Long time) {
+        String sym = normUpper(symbol);
+        String normalizedSide = normUpper(side);
+        long bucket = time != null && time > 0L ? time / TRADE_TIME_BUCKET_MS : 0L;
+        String px = normalizeDecimal(price, PRICE_SCALE);
+        String q = normalizeDecimal(qty, QTY_SCALE);
+        return String.join("|",
+                sym != null ? sym : "",
+                normalizedSide != null ? normalizedSide : "",
+                String.valueOf(bucket),
+                px,
+                q);
+    }
+
+    private String normalizeDecimal(Double value, int scale) {
+        if (value == null || !Double.isFinite(value)) {
+            return "";
+        }
+        return BigDecimal.valueOf(value)
+                .setScale(scale, RoundingMode.HALF_UP)
+                .stripTrailingZeros()
+                .toPlainString();
     }
 
     private Object invokeNoArg(Object target, String methodName) {

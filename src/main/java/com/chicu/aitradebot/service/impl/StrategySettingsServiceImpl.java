@@ -7,6 +7,7 @@ import com.chicu.aitradebot.domain.StrategySettings.CapitalMode;
 import com.chicu.aitradebot.domain.enums.AdvancedControlMode;
 import com.chicu.aitradebot.events.StrategySettingsUpdatedEvent;
 import com.chicu.aitradebot.repository.StrategySettingsRepository;
+import com.chicu.aitradebot.service.StrategySettingsCommandService;
 import com.chicu.aitradebot.service.StrategySettingsService;
 import jakarta.persistence.EntityManager;
 import lombok.RequiredArgsConstructor;
@@ -54,6 +55,7 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
     private final StrategySettingsRepository repo;
     private final EntityManager em;
     private final ApplicationEventPublisher events;
+    private final StrategySettingsCommandService commandService;
 
     // =====================================================
     // API
@@ -66,9 +68,9 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
         if (s.getChatId() == null) throw new IllegalArgumentException("chatId is null");
         if (s.getType() == null) throw new IllegalArgumentException("type is null");
 
-        StrategySettings saved = persist(s, false);
-        events.publishEvent(new StrategySettingsUpdatedEvent(saved.getChatId(), saved.getType(), "save"));
-        return saved;
+        normalizeAndDefaults(s);
+        applyControlModeFlags(s);
+        return commandService.savePatchWithRetry(s.getChatId(), s.getType(), s);
     }
 
     /**
@@ -80,21 +82,17 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
         if (chatId == null || chatId <= 0) throw new IllegalArgumentException("chatId must be positive");
         if (incoming == null) throw new IllegalArgumentException("incoming StrategySettings is null");
 
-        // если вдруг кто-то принёс entity без chatId — подставим
-        if (incoming.getChatId() == null || incoming.getChatId() <= 0) {
-            incoming.setChatId(chatId);
-        } else if (!incoming.getChatId().equals(chatId)) {
+        if (incoming.getChatId() == null || incoming.getChatId() <= 0 || !incoming.getChatId().equals(chatId)) {
             incoming.setChatId(chatId);
         }
 
-        // type обязан быть задан, иначе невозможно сохранить корректно
         if (incoming.getType() == null) {
             throw new IllegalArgumentException("type is null (cannot update StrategySettings without type)");
         }
 
-        StrategySettings saved = persist(incoming, false);
-        events.publishEvent(new StrategySettingsUpdatedEvent(saved.getChatId(), saved.getType(), "update"));
-        return saved;
+        normalizeAndDefaults(incoming);
+        applyControlModeFlags(incoming);
+        return commandService.savePatchWithRetry(chatId, incoming.getType(), incoming);
     }
 
     /**
@@ -130,9 +128,9 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
         boolean changed = patchContextInternal(s, exchange, network);
         if (!changed) return s;
 
-        StrategySettings saved = persist(s, false);
-        events.publishEvent(new StrategySettingsUpdatedEvent(saved.getChatId(), saved.getType(), "patchContext"));
-        return saved;
+        normalizeAndDefaults(s);
+        applyControlModeFlags(s);
+        return commandService.savePatchWithRetry(s.getChatId(), s.getType(), s);
     }
 
     @Override
@@ -142,14 +140,35 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
         boolean changed = patchContextInternal(settings, exchange, network);
         if (!changed) return;
 
-        StrategySettings saved = persist(settings, false);
-        events.publishEvent(new StrategySettingsUpdatedEvent(saved.getChatId(), saved.getType(), "patchContext"));
+        normalizeAndDefaults(settings);
+        applyControlModeFlags(settings);
+        commandService.savePatchWithRetry(settings.getChatId(), settings.getType(), settings);
     }
 
     @Override
     @Transactional(readOnly = true)
     public List<StrategySettings> findAllByChatId(long chatId) {
         return repo.findAllByChatId(chatId);
+    }
+
+    /**
+     * Публичный метод нужен как fallback для runtime-рефлексии оркестратора.
+     * Не ломает интерфейс StrategySettingsService и безопасен для внутренних вызовов.
+     */
+    @Transactional(readOnly = true)
+    public List<StrategySettings> findAll() {
+        return repo.findAll();
+    }
+
+    /**
+     * Возвращает только реально помеченные как active в БД.
+     * Это дополнительный совместимый fallback для старых механизмов discovery.
+     */
+    @Transactional(readOnly = true)
+    public List<StrategySettings> findAllActive() {
+        return repo.findAll().stream()
+                .filter(StrategySettings::isActive)
+                .toList();
     }
 
     // =====================================================
@@ -377,3 +396,4 @@ public class StrategySettingsServiceImpl implements StrategySettingsService {
         return v != null ? v.longValue() : null;
     }
 }
+

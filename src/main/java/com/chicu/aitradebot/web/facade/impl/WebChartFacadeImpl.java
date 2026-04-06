@@ -1,4 +1,3 @@
-
 package com.chicu.aitradebot.web.facade.impl;
 
 import com.chicu.aitradebot.common.enums.NetworkType;
@@ -18,6 +17,8 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -38,6 +39,9 @@ public class WebChartFacadeImpl implements WebChartFacade {
     private static final int MAX_TRADE_MARKERS = 300;
     private static final int EXCHANGE_PRELOAD_MAX_LIMIT = 1000;
     private static final long PRELOAD_COOLDOWN_MS = 15_000L;
+    private static final long TRADE_TIME_BUCKET_MS = 2_000L;
+    private static final int PRICE_SCALE = 8;
+    private static final int QTY_SCALE = 8;
 
     private final MarketDataStreamService streamService;
     private final ExchangeClientFactory exchangeClientFactory;
@@ -114,7 +118,7 @@ public class WebChartFacadeImpl implements WebChartFacade {
         }
 
         List<Candle> candles = loadCandlesForChart(chatId, strategyType, exchange, network, sym, tf, finalLimit);
-        candles = safeCandles(candles);
+        candles = sanitizeCandleSeries(candles);
 
         long fromMs;
         long toMs;
@@ -201,14 +205,14 @@ public class WebChartFacadeImpl implements WebChartFacade {
                                              int limit) {
 
         List<Candle> exact = trimTail(
-                safeCandles(streamService.getCandles(chatId, strategyType, exchange, network, symbol, timeframe)),
+                sanitizeCandleSeries(streamService.getCandles(chatId, strategyType, exchange, network, symbol, timeframe)),
                 limit
         );
 
         List<Candle> best = exact;
 
         List<Candle> fallbackBySymbol = trimTail(
-                safeCandles(streamService.getCachedCandles(chatId, strategyType, symbol, timeframe, limit)),
+                sanitizeCandleSeries(streamService.getCachedCandles(chatId, strategyType, symbol, timeframe, limit)),
                 limit
         );
 
@@ -220,7 +224,7 @@ public class WebChartFacadeImpl implements WebChartFacade {
         if (exactCacheMissing && shouldAttemptPreload(chatId, strategyType, exchange, network, symbol, timeframe)) {
             List<Candle> preloaded = tryPreloadFromExchange(chatId, strategyType, exchange, network, symbol, timeframe, limit);
             if (preloaded.size() > best.size()) {
-                best = trimTail(preloaded, limit);
+                best = trimTail(sanitizeCandleSeries(preloaded), limit);
             }
         }
 
@@ -233,7 +237,7 @@ public class WebChartFacadeImpl implements WebChartFacade {
                     log.debug("⚠️ Chart direct putCandles failed chatId={} type={} ex={} net={} {} {} : {}",
                             chatId, strategyType, exchange, network, symbol, timeframe, e.toString());
                 }
-                best = trimTail(direct, limit);
+                best = trimTail(sanitizeCandleSeries(direct), limit);
             }
         }
 
@@ -251,7 +255,7 @@ public class WebChartFacadeImpl implements WebChartFacade {
         ChartContextKey key = new ChartContextKey(chatId, type, exchange, network, symbol, timeframe);
         lastPreloadAtMs.put(key, System.currentTimeMillis());
 
-        List<Candle> preload = loadCandlesDirectFromExchange(exchange, network, symbol, timeframe, limit);
+        List<Candle> preload = sanitizeCandleSeries(loadCandlesDirectFromExchange(exchange, network, symbol, timeframe, limit));
         if (preload.isEmpty()) {
             return List.of();
         }
@@ -295,7 +299,7 @@ public class WebChartFacadeImpl implements WebChartFacade {
             }
 
             return klines.stream()
-                    .filter(k -> k != null)
+                    .filter(Objects::nonNull)
                     .sorted(Comparator.comparingLong(ExchangeClient.Kline::openTime))
                     .map(k -> new Candle(
                             k.openTime(),
@@ -322,10 +326,7 @@ public class WebChartFacadeImpl implements WebChartFacade {
         ChartContextKey key = new ChartContextKey(chatId, strategyType, exchange, network, symbol, timeframe);
         long nowMs = System.currentTimeMillis();
         Long last = lastPreloadAtMs.get(key);
-        if (last != null && nowMs - last < PRELOAD_COOLDOWN_MS) {
-            return false;
-        }
-        return true;
+        return last == null || nowMs - last >= PRELOAD_COOLDOWN_MS;
     }
 
     private StrategyChartDto.Layers mergeWithTradeHistory(StrategyChartDto.Layers snapshot,
@@ -334,29 +335,55 @@ public class WebChartFacadeImpl implements WebChartFacade {
                                                           long toMs,
                                                           int maxTrades) {
         StrategyChartDto.Layers base = snapshot != null ? snapshot : StrategyChartDto.Layers.empty();
-        List<StrategyChartDto.TradeMarker> merged = new ArrayList<>();
 
-        if (historyTrades != null) {
-            merged.addAll(historyTrades);
-        }
-        if (base.getTrades() != null) {
-            merged.addAll(base.getTrades());
+        List<StrategyChartDto.TradeMarker> history = historyTrades == null ? List.of() : historyTrades;
+        List<StrategyChartDto.TradeMarker> live = base.getTrades() == null ? List.of() : base.getTrades();
+
+        // Источник истины для трейдов на графике — история исполнений с биржи.
+        // Snapshot-trades используем только как fallback, когда история с биржи пуста
+        // (например, нет exchange/network или биржа временно ничего не вернула).
+        List<StrategyChartDto.TradeMarker> merged = new ArrayList<>(
+                !history.isEmpty() ? history.size() : history.size() + live.size()
+        );
+        merged.addAll(history);
+        if (merged.isEmpty()) {
+            merged.addAll(live);
         }
 
         merged = merged.stream()
-                .filter(t -> t != null && t.getTime() != null && t.getTime() >= fromMs && t.getTime() <= toMs)
-                .sorted(Comparator.comparingLong(StrategyChartDto.TradeMarker::getTime))
+                .filter(Objects::nonNull)
+                .filter(t -> t.getTime() != null && t.getTime() >= fromMs && t.getTime() <= toMs)
+                .sorted(Comparator
+                        .comparingLong((StrategyChartDto.TradeMarker t) -> t.getTime() != null ? t.getTime() : 0L)
+                        .thenComparing(t -> String.valueOf(t.getSide()))
+                        .thenComparing(t -> normalizeNumberForKey(t.getPrice(), PRICE_SCALE))
+                        .thenComparing(t -> normalizeNumberForKey(t.getQty(), QTY_SCALE)))
                 .toList();
 
         LinkedHashMap<String, StrategyChartDto.TradeMarker> uniq = new LinkedHashMap<>();
-        for (StrategyChartDto.TradeMarker t : merged) {
-            String key = String.valueOf(t.getSide()) + "|" + t.getTime() + "|" + t.getPrice() + "|" + t.getQty();
-            uniq.put(key, t);
-        }
-        merged = new ArrayList<>(uniq.values());
+        for (StrategyChartDto.TradeMarker marker : merged) {
+            String strictKey = strictTradeKey(marker);
+            String softKey = softTradeKey(marker);
 
-        if (merged.size() > maxTrades) {
-            merged = new ArrayList<>(merged.subList(merged.size() - maxTrades, merged.size()));
+            StrategyChartDto.TradeMarker existingStrict = uniq.get(strictKey);
+            if (existingStrict != null) {
+                uniq.put(strictKey, chooseBetterTradeMarker(existingStrict, marker));
+                continue;
+            }
+
+            StrategyChartDto.TradeMarker existingSoft = uniq.get(softKey);
+            if (existingSoft != null) {
+                StrategyChartDto.TradeMarker better = chooseBetterTradeMarker(existingSoft, marker);
+                uniq.put(softKey, better);
+                continue;
+            }
+
+            uniq.put(strictKey, marker);
+        }
+
+        List<StrategyChartDto.TradeMarker> deduped = new ArrayList<>(uniq.values());
+        if (deduped.size() > maxTrades) {
+            deduped = new ArrayList<>(deduped.subList(deduped.size() - maxTrades, deduped.size()));
         }
 
         return StrategyChartDto.Layers.builder()
@@ -365,7 +392,7 @@ public class WebChartFacadeImpl implements WebChartFacade {
                 .tpSl(base.getTpSl())
                 .windowZone(base.getWindowZone())
                 .priceLines(base.getPriceLines() != null ? base.getPriceLines() : List.of())
-                .trades(merged)
+                .trades(deduped)
                 .build();
     }
 
@@ -504,8 +531,23 @@ public class WebChartFacadeImpl implements WebChartFacade {
         return s.isBlank() ? null : s;
     }
 
-    private static List<Candle> safeCandles(List<Candle> list) {
-        return list == null ? List.of() : list;
+    private static List<Candle> sanitizeCandleSeries(List<Candle> list) {
+        if (list == null || list.isEmpty()) {
+            return List.of();
+        }
+
+        LinkedHashMap<Long, Candle> uniq = new LinkedHashMap<>();
+        for (Candle candle : list) {
+            if (candle == null) {
+                continue;
+            }
+            uniq.put(candle.getTime(), candle);
+        }
+
+        return uniq.values().stream()
+                .filter(Objects::nonNull)
+                .sorted(Comparator.comparingLong(Candle::getTime))
+                .toList();
     }
 
     private static List<Candle> trimTail(List<Candle> list, int limit) {
@@ -517,6 +559,55 @@ public class WebChartFacadeImpl implements WebChartFacade {
             return list;
         }
         return new ArrayList<>(list.subList(list.size() - lim, list.size()));
+    }
+
+    private static String strictTradeKey(StrategyChartDto.TradeMarker marker) {
+        return baseTradeKey(marker) + "|q=" + normalizeNumberForKey(marker.getQty(), QTY_SCALE);
+    }
+
+    private static String softTradeKey(StrategyChartDto.TradeMarker marker) {
+        return baseTradeKey(marker) + "|q=*";
+    }
+
+    private static String baseTradeKey(StrategyChartDto.TradeMarker marker) {
+        long bucket = marker.getTime() == null ? 0L : marker.getTime() / TRADE_TIME_BUCKET_MS;
+        return String.valueOf(marker.getSide())
+                + "|tb=" + bucket
+                + "|p=" + normalizeNumberForKey(marker.getPrice(), PRICE_SCALE);
+    }
+
+    private static String normalizeNumberForKey(Number value, int scale) {
+        if (value == null) {
+            return "null";
+        }
+        try {
+            BigDecimal bd = new BigDecimal(String.valueOf(value));
+            return bd.setScale(scale, RoundingMode.HALF_UP).stripTrailingZeros().toPlainString();
+        } catch (Exception e) {
+            return String.valueOf(value);
+        }
+    }
+
+    private static StrategyChartDto.TradeMarker chooseBetterTradeMarker(StrategyChartDto.TradeMarker a,
+                                                                        StrategyChartDto.TradeMarker b) {
+        if (a == null) return b;
+        if (b == null) return a;
+
+        boolean aHasQty = a.getQty() != null && Math.abs(a.getQty()) > 0d;
+        boolean bHasQty = b.getQty() != null && Math.abs(b.getQty()) > 0d;
+        if (aHasQty != bHasQty) {
+            return bHasQty ? b : a;
+        }
+
+        boolean aHasPrice = a.getPrice() != null && Double.isFinite(a.getPrice());
+        boolean bHasPrice = b.getPrice() != null && Double.isFinite(b.getPrice());
+        if (aHasPrice != bHasPrice) {
+            return bHasPrice ? b : a;
+        }
+
+        long aTime = a.getTime() != null ? a.getTime() : Long.MIN_VALUE;
+        long bTime = b.getTime() != null ? b.getTime() : Long.MIN_VALUE;
+        return bTime >= aTime ? b : a;
     }
 
     private static StrategyChartDto empty() {

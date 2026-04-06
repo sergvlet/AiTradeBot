@@ -178,6 +178,56 @@ public class WebStrategyFacadeImpl implements WebStrategyFacade {
         }
     }
 
+    private StrategySettings ensureExecutionContext(Long chatId,
+                                                    StrategyType type,
+                                                    String exchange,
+                                                    NetworkType network,
+                                                    StrategySettings current) {
+        if (chatId == null || chatId <= 0 || type == null || exchange == null || network == null) {
+            return current;
+        }
+
+        try {
+            if (current == null) {
+                return settingsService.getOrCreateAndPatchContext(chatId, type, exchange, network);
+            }
+
+            boolean changed = !eq(current.getExchangeName(), exchange)
+                    || current.getNetworkType() != network;
+
+            if (!changed) {
+                return current;
+            }
+
+            return settingsService.getOrCreateAndPatchContext(chatId, type, exchange, network);
+        } catch (Exception e) {
+            log.warn("⚠ ensureExecutionContext failed chatId={} type={} ex={} net={} : {}",
+                    chatId, type, exchange, network, e.getMessage());
+            return current;
+        }
+    }
+
+    private static String firstNonBlankExchange(String... values) {
+        if (values == null) return null;
+        for (String value : values) {
+            String normalized = normExchange(value);
+            if (normalized != null) {
+                return normalized;
+            }
+        }
+        return null;
+    }
+
+    private static NetworkType firstNonNullNetwork(NetworkType... values) {
+        if (values == null) return null;
+        for (NetworkType value : values) {
+            if (value != null) {
+                return value;
+            }
+        }
+        return null;
+    }
+
     private StrategyRunInfo statusFromBindingOrRequest(Long chatId,
                                                        StrategyType type,
                                                        String exchange,
@@ -260,15 +310,15 @@ public class WebStrategyFacadeImpl implements WebStrategyFacade {
     @Override
     public StrategyRunInfo toggle(Long chatId, StrategyType type, String exchange, NetworkType network) {
 
-        String ex = normExchange(exchange);
-        NetworkType net = network;
+        String requestedEx = normExchange(exchange);
+        NetworkType requestedNet = network;
 
-        if (chatId == null || chatId <= 0 || type == null || ex == null || net == null) {
+        if (chatId == null || chatId <= 0 || type == null) {
             log.warn("⚠ TOGGLE пропуск: chatId={} type={} ex={} net={}", chatId, type, exchange, network);
             StrategyRunInfo info = new StrategyRunInfo();
             info.setActive(false);
-            info.setExchangeName(ex);
-            info.setNetworkType(net);
+            info.setExchangeName(requestedEx);
+            info.setNetworkType(requestedNet);
             return info;
         }
 
@@ -276,26 +326,14 @@ public class WebStrategyFacadeImpl implements WebStrategyFacade {
 
             StrategySettings settings = null;
             try {
-                settings = settingsService.getOrCreateAndPatchContext(chatId, type, ex, net);
-            } catch (Exception ignore) {
-                try {
-                    settings = settingsService.getOrCreate(chatId, type);
-                    try {
-                        settingsService.patchContext(settings, ex, net);
-                    } catch (Exception ignored2) {
-                    }
-                    try {
-                        settingsService.save(settings);
-                    } catch (Exception ignored3) {
-                    }
-                } catch (Exception e) {
-                    log.warn("⚠ TOGGLE: settings load failed chatId={} type={} ex={} net={} : {}",
-                            chatId, type, ex, net, e.getMessage());
-                }
+                settings = settingsService.getOrCreate(chatId, type);
+            } catch (Exception e) {
+                log.warn("⚠ TOGGLE: settings load failed chatId={} type={} ex={} net={} : {}",
+                        chatId, type, requestedEx, requestedNet, e.getMessage());
             }
 
-            String targetEx = ex;
-            NetworkType targetNet = net;
+            String targetEx = firstNonBlankExchange(requestedEx, settings != null ? settings.getExchangeName() : null);
+            NetworkType targetNet = firstNonNullNetwork(requestedNet, settings != null ? settings.getNetworkType() : null);
             String targetSymbol = settings != null ? normUpper(settings.getSymbol()) : null;
             String targetTf = settings != null ? normUpper(settings.getTimeframe()) : null;
 
@@ -339,15 +377,21 @@ public class WebStrategyFacadeImpl implements WebStrategyFacade {
                     runtime != null ? runtime.getSymbol() : null,
                     runtime != null ? runtime.getTimeframe() : null);
 
+            if (isRunning && !contextMismatch) {
+                return orchestrator.stopStrategy(chatId, type, targetEx, targetNet);
+            }
+
+            StrategySettings preparedSettings = ensureExecutionContext(chatId, type, targetEx, targetNet, settings);
+            if (preparedSettings != null) {
+                targetSymbol = normUpper(preparedSettings.getSymbol());
+                targetTf = normUpper(preparedSettings.getTimeframe());
+            }
+
             if (!isRunning) {
                 return orchestrator.startStrategy(chatId, type, targetEx, targetNet);
             }
 
-            if (contextMismatch) {
-                return orchestrator.restartStrategyAtomic(chatId, type, targetEx, targetNet, "web_toggle_context_switch");
-            }
-
-            return orchestrator.stopStrategy(chatId, type, targetEx, targetNet);
+            return orchestrator.restartStrategyAtomic(chatId, type, targetEx, targetNet, "web_toggle_context_switch");
         }
     }
 
@@ -687,3 +731,4 @@ public class WebStrategyFacadeImpl implements WebStrategyFacade {
         return s.isEmpty() ? null : s;
     }
 }
+

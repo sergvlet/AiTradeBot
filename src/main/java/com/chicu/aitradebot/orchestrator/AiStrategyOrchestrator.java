@@ -86,6 +86,12 @@ public class AiStrategyOrchestrator {
     @Value("${orch.market-events.degraded-log-cooldown-ms:30000}")
     private long degradedLogCooldownMs;
 
+    @Value("${orch.startup.restore-initial-delay-ms:2500}")
+    private long startupRestoreInitialDelayMs;
+
+    @Value("${orch.startup.restore-ml-wait-ms:12000}")
+    private long startupRestoreMlWaitMs;
+
     private MlAutoTuneRuntime ml() {
         return mlAutoTuneRuntime != null ? mlAutoTuneRuntime.getIfAvailable() : null;
     }
@@ -250,12 +256,11 @@ public class AiStrategyOrchestrator {
 
     private void restoreActiveStrategiesAsync() {
         CompletableFuture.runAsync(() -> {
-            try {
-                Thread.sleep(1500L);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+            if (!sleepQuietly(Math.max(1000L, startupRestoreInitialDelayMs))) {
                 return;
             }
+
+            waitForMlReadinessBeforeRestore();
 
             try {
                 restoreActiveStrategiesBestEffort();
@@ -263,6 +268,99 @@ public class AiStrategyOrchestrator {
                 log.warn("⚠️ [ORCH] active restore failed: {}", e.toString());
             }
         });
+    }
+
+    private void waitForMlReadinessBeforeRestore() {
+        MlGateway gw = mlGateway();
+        if (gw == null) {
+            return;
+        }
+
+        boolean enabled;
+        try {
+            enabled = gw.isEnabled();
+        } catch (Exception e) {
+            log.debug("⚠️ [ORCH] ML readiness check skipped: {}", e.toString());
+            return;
+        }
+
+        if (!enabled) {
+            return;
+        }
+
+        long waitMs = Math.max(0L, startupRestoreMlWaitMs);
+        if (waitMs <= 0L) {
+            return;
+        }
+
+        long deadline = System.currentTimeMillis() + waitMs;
+        while (System.currentTimeMillis() < deadline) {
+            if (isMlReadyForRestore(gw)) {
+                log.info("🧠 [ORCH] startup restore: ML sidecar is ready");
+                return;
+            }
+
+            if (!sleepQuietly(500L)) {
+                return;
+            }
+        }
+
+        log.warn("⚠️ [ORCH] startup restore: ML sidecar readiness wait timed out after {} ms", waitMs);
+    }
+
+    private boolean isMlReadyForRestore(MlGateway gw) {
+        try {
+            Object health = gw.health();
+            if (health == null) {
+                return false;
+            }
+
+            Boolean ok = readBooleanNoThrow(health, "isOk", "getOk", "ok");
+            if (Boolean.TRUE.equals(ok)) {
+                return true;
+            }
+
+            String status = readStringNoThrow(health, "getStatus", "status", "getState", "state");
+            return status != null
+                    && ("ok".equalsIgnoreCase(status) || "healthy".equalsIgnoreCase(status) || "up".equalsIgnoreCase(status));
+        } catch (Exception e) {
+            log.debug("⚠️ [ORCH] ML readiness probe failed: {}", e.toString());
+            return false;
+        }
+    }
+
+    private static Boolean readBooleanNoThrow(Object target, String... methodNames) {
+        if (target == null || methodNames == null) {
+            return null;
+        }
+
+        for (String methodName : methodNames) {
+            if (methodName == null || methodName.isBlank()) {
+                continue;
+            }
+            try {
+                var m = target.getClass().getMethod(methodName);
+                Object v = m.invoke(target);
+                if (v instanceof Boolean b) {
+                    return b;
+                }
+                if (v != null) {
+                    return Boolean.parseBoolean(String.valueOf(v));
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        return null;
+    }
+
+    private static boolean sleepQuietly(long millis) {
+        try {
+            Thread.sleep(millis);
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
     }
 
     private void restoreActiveStrategiesBestEffort() {
@@ -2347,6 +2445,7 @@ public class AiStrategyOrchestrator {
         return s.isEmpty() ? null : s;
     }
 }
+
 
 
 

@@ -1,6 +1,11 @@
 package com.chicu.aitradebot.strategy.fibonacci_grid;
 
+import com.chicu.aitradebot.ai.ml.training.MlTrainingResult;
+import com.chicu.aitradebot.ai.ml.training.MlTrainingServiceImpl;
 import com.chicu.aitradebot.ai.runtime.AdaptiveRuntimeController;
+import com.chicu.aitradebot.ai.tuning.AutoTunerOrchestrator;
+import com.chicu.aitradebot.ai.tuning.TuningRequest;
+import com.chicu.aitradebot.ai.tuning.TuningResult;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
@@ -17,6 +22,7 @@ import com.chicu.aitradebot.web.dto.StrategyChartDto;
 import com.chicu.aitradebot.web.ui.UiStrategyLayerService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.stereotype.Component;
 
@@ -37,7 +43,7 @@ import java.util.concurrent.ConcurrentHashMap;
 @Component
 @RequiredArgsConstructor
 @StrategyBinding(StrategyType.FIBONACCI_GRID)
-public class FibonacciGridStrategyV4 implements TradingStrategy, AiStrategyOrchestrator.PriceUpdateAware, AiStrategyOrchestrator.CandleCloseAware {
+public class FibonacciGridStrategyV4 implements TradingStrategy, AiStrategyOrchestrator.PriceUpdateAware, AiStrategyOrchestrator.CandleCloseAware, AiStrategyOrchestrator.PrepareStartAware {
 
     private static final Duration SETTINGS_REFRESH_EVERY = Duration.ofSeconds(10);
     private static final Duration HOLD_SIGNAL_COOLDOWN = Duration.ofSeconds(2);
@@ -69,8 +75,19 @@ public class FibonacciGridStrategyV4 implements TradingStrategy, AiStrategyOrche
     private final UiStrategyLayerService uiLayers;
     private final SimpMessagingTemplate ws;
     private final AdaptiveRuntimeController adaptiveRuntimeController;
+    private final ObjectProvider<MlTrainingServiceImpl> mlTrainingServiceProvider;
+    private final ObjectProvider<AutoTunerOrchestrator> autoTunerProvider;
 
     private final Map<Long, LocalState> states = new ConcurrentHashMap<>();
+
+
+    private MlTrainingServiceImpl trainer() {
+        return mlTrainingServiceProvider != null ? mlTrainingServiceProvider.getIfAvailable() : null;
+    }
+
+    private AutoTunerOrchestrator autoTuner() {
+        return autoTunerProvider != null ? autoTunerProvider.getIfAvailable() : null;
+    }
 
     private static final class LocalState {
         boolean active;
@@ -104,6 +121,115 @@ public class FibonacciGridStrategyV4 implements TradingStrategy, AiStrategyOrche
         Instant lastHoldAt;
         long candlesWithoutEntry;
         Instant lastGridRearmAt;
+    }
+
+
+    @Override
+    public AiStrategyOrchestrator.PreparationResult prepareStart(long chatId,
+                                                                 StrategyType type,
+                                                                 String symbol,
+                                                                 String timeframe,
+                                                                 String exchange,
+                                                                 NetworkType network) {
+        if (type != StrategyType.FIBONACCI_GRID) {
+            return AiStrategyOrchestrator.PreparationResult.ok("skip:type_mismatch");
+        }
+
+        StrategySettings ss = strategySettingsService.getOrCreate(chatId, StrategyType.FIBONACCI_GRID);
+        FibonacciGridStrategySettings cfg = fiboSettingsService.getOrCreate(chatId);
+        if (ss == null) {
+            return AiStrategyOrchestrator.PreparationResult.fail("settings_missing");
+        }
+
+        String ex = safeUpper(exchange);
+        if (ex == null) ex = safeUpper(ss.getExchangeName());
+
+        NetworkType net = network != null ? network : ss.getNetworkType();
+
+        String sym = safeUpper(symbol);
+        if (sym == null) sym = safeUpper(ss.getSymbol());
+
+        String tf = safeTimeframe(timeframe);
+        if (tf == null) tf = safeTimeframe(readTimeframe(ss));
+
+        if (ex == null || net == null || sym == null || tf == null) {
+            return AiStrategyOrchestrator.PreparationResult.fail("prepare_context_incomplete");
+        }
+
+        switchRunPhaseSafely(ss, "PREPARE");
+
+        MlTrainingServiceImpl trainer = trainer();
+        if (trainer == null) {
+            restoreRunPhaseSafely(ss, net);
+            return AiStrategyOrchestrator.PreparationResult.fail("trainer_missing");
+        }
+
+        MlTrainingResult trainRes;
+        try {
+            trainRes = trainer.trainOnSelectedCandles(
+                    chatId,
+                    StrategyType.FIBONACCI_GRID,
+                    ex,
+                    net,
+                    sym,
+                    tf,
+                    ss.getCachedCandlesLimit(),
+                    "prepare_start_train"
+            );
+        } catch (Exception e) {
+            restoreRunPhaseSafely(ss, net);
+            log.warn("[FIBO_GRID] prepareStart train failed chatId={} ex={} net={} sym={} tf={} err={}",
+                    chatId, ex, net, sym, tf, e.toString());
+            return AiStrategyOrchestrator.PreparationResult.fail("train_exception");
+        }
+
+        if (trainRes == null || !trainRes.ok() || !trainRes.applied()) {
+            restoreRunPhaseSafely(ss, net);
+            return AiStrategyOrchestrator.PreparationResult.fail("train_failed:" + trainingError(trainRes));
+        }
+
+        TuningResult tuneRes = null;
+        try {
+            AutoTunerOrchestrator tuner = autoTuner();
+            if (tuner != null) {
+                tuneRes = tuner.tune(TuningRequest.builder()
+                        .chatId(chatId)
+                        .strategyType(StrategyType.FIBONACCI_GRID)
+                        .exchange(ex)
+                        .network(net)
+                        .symbol(sym)
+                        .timeframe(tf)
+                        .candlesLimit(ss.getCachedCandlesLimit())
+                        .reason("prepare_start_validate")
+                        .build());
+            }
+        } catch (Exception e) {
+            restoreRunPhaseSafely(ss, net);
+            log.warn("[FIBO_GRID] prepareStart tune failed chatId={} ex={} net={} sym={} tf={} err={}",
+                    chatId, ex, net, sym, tf, e.toString());
+            return AiStrategyOrchestrator.PreparationResult.fail("prepare_tune_exception");
+        }
+
+        if (isHardPrepareTuneFailure(tuneRes)) {
+            restoreRunPhaseSafely(ss, net);
+            return AiStrategyOrchestrator.PreparationResult.fail("prepare_tune_failed:" + tuningReason(tuneRes));
+        }
+
+        StrategySettings refreshed = strategySettingsService.getOrCreate(chatId, StrategyType.FIBONACCI_GRID);
+        if (refreshed != null) {
+            ss = refreshed;
+        }
+        switchRunPhaseSafely(ss, livePhase(net));
+
+        log.info("[FIBO_GRID] 🧠 prepare chatId={} sym={} train={} tune={}",
+                chatId,
+                sym,
+                trainingStatus(trainRes),
+                tuningStatus(tuneRes));
+
+        return AiStrategyOrchestrator.PreparationResult.ok(
+                "prepare_ok train=" + trainingStatus(trainRes) + " tune=" + tuningStatus(tuneRes)
+        );
     }
 
     @Override
@@ -1155,6 +1281,73 @@ private Object readKlineValue(UnifiedKline kline, String... methods) {
         safeLive(() -> live.pushSignal(chatId, StrategyType.FIBONACCI_GRID, symbol, null, Signal.hold(reason)));
     }
 
+
+    private void switchRunPhaseSafely(StrategySettings ss, String phase) {
+        if (ss == null || phase == null || phase.isBlank()) {
+            return;
+        }
+        try {
+            ss.setRunPhase(phase);
+            strategySettingsService.save(ss);
+        } catch (Exception e) {
+            log.warn("[FIBO_GRID] ⚠ runPhase save failed chatId={} phase={} err={}",
+                    ss.getChatId(), phase, e.toString());
+        }
+    }
+
+    private void restoreRunPhaseSafely(StrategySettings ss, NetworkType network) {
+        switchRunPhaseSafely(ss, livePhase(network));
+    }
+
+    private static String livePhase(NetworkType network) {
+        return network == NetworkType.TESTNET ? "PAPER" : "LIVE";
+    }
+
+    private static String trainingError(MlTrainingResult res) {
+        return res != null && res.error() != null && !res.error().isBlank() ? res.error() : "train_failed";
+    }
+
+    private static String trainingStatus(MlTrainingResult res) {
+        if (res == null) return "null";
+        return "ok=" + res.ok() + ",applied=" + res.applied() + ",error=" + trainingError(res);
+    }
+
+    private static String tuningReason(TuningResult res) {
+        if (res == null) return "null";
+        String reason = res.reason();
+        return reason == null || reason.isBlank() ? "null" : reason.trim();
+    }
+
+    private static String tuningStatus(TuningResult res) {
+        if (res == null) return "null";
+        return "applied=" + res.applied() + ",reason=" + tuningReason(res);
+    }
+
+    private static boolean isHardPrepareTuneFailure(TuningResult res) {
+        if (res == null) {
+            return false;
+        }
+        String normalized = tuningReason(res).toLowerCase(Locale.ROOT);
+        if (normalized.isBlank() || "null".equals(normalized)) {
+            return false;
+        }
+        return normalized.contains("error")
+                || normalized.contains("failed")
+                || normalized.contains("backtest")
+                || normalized.contains("env_missing")
+                || normalized.contains("no_settings")
+                || normalized.contains("bad_chatid")
+                || normalized.contains("request=null");
+    }
+
+    private static String safeTimeframe(String value) {
+        if (value == null) {
+            return null;
+        }
+        String trimmed = value.trim().toLowerCase(Locale.ROOT);
+        return trimmed.isEmpty() ? null : trimmed;
+    }
+
     private static String safe(String value) {
         return value == null ? "null" : value.trim();
     }
@@ -1197,4 +1390,5 @@ private Object readKlineValue(UnifiedKline kline, String... methods) {
         return Double.isFinite(d) ? d : null;
     }
 }
+
 

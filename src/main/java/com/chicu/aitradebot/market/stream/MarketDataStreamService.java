@@ -365,14 +365,14 @@ public class MarketDataStreamService {
         if (kline.getSymbol() == null || kline.getSymbol().isBlank()) kline.setSymbol(sym);
         if (kline.getTimeframe() == null || kline.getTimeframe().isBlank()) kline.setTimeframe(tf);
 
+        if (kline.isClosed()) {
+            publishSafe(new CandleClosedEvent(ex, networkType, chatId, strategyType, sym, tf, kline));
+        }
+
         Candle candle = toCandleSafe(kline);
         if (candle == null) return;
 
         onCandle(chatId, strategyType, ex, networkType, sym, tf, candle);
-
-        if (kline.isClosed()) {
-            publishSafe(new CandleClosedEvent(ex, networkType, chatId, strategyType, sym, tf, kline));
-        }
     }
 
     public void pushKline(String exchange,
@@ -422,6 +422,8 @@ public class MarketDataStreamService {
                     chatId, strategyType, exchange, networkType, symbol, timeframe);
             return;
         }
+
+        dropOtherSubscriptionsSameType(chatId, strategyType, ex, networkType, sym, tf);
 
         candleStorage.computeIfAbsent(
                 new CandleStoreKey(chatId, strategyType, ex, networkType, sym, tf),
@@ -707,6 +709,7 @@ public class MarketDataStreamService {
                                            long bookAge) {
 
         long silence = Math.max(5_000L, maxSilenceMs);
+        long relaxedKlineSilence = Math.max(silence, 90_000L);
 
         boolean klineFresh = klineConnected && isFresh(klineAge, silence);
         boolean aggFresh = aggConnected && isFresh(aggAge, silence);
@@ -717,25 +720,37 @@ public class MarketDataStreamService {
         boolean fastPendingWarmup = fastConnected
                                     && !fastOk
                                     && ((aggConnected && aggAge < 0) || (bookConnected && bookAge < 0));
+
+        // Важный кейс старта: AGG уже идёт, а первый KLINE для текущей минуты ещё не пришёл.
+        // Это не деградация рынка, а обычный прогрев канала свечей.
+        boolean klineSoftFresh = !klineFresh
+                                 && klineConnected
+                                 && fastOk
+                                 && (klineAge < 0 || isFresh(klineAge, relaxedKlineSilence));
+        boolean effectiveKlineFresh = klineFresh || klineSoftFresh;
+
         boolean allowWarmup = requireFastChannel
-                              && klineFresh
+                              && effectiveKlineFresh
                               && fastPendingWarmup
                               && Math.max(1_000L, fastChannelWarmupMs) > 0;
 
         boolean degraded;
         if (requireFastChannel) {
-            degraded = !klineFresh || (!fastOk && !allowWarmup);
+            degraded = !effectiveKlineFresh || (!fastOk && !allowWarmup);
         } else {
-            degraded = !klineFresh && !fastOk;
+            degraded = !effectiveKlineFresh && !fastOk;
         }
 
         String reason;
         if (!klineConnected && !aggConnected && !bookConnected) {
             reason = "all_channels_disconnected";
             degraded = true;
-        } else if (!klineFresh && !fastOk) {
+        } else if (!effectiveKlineFresh && !fastOk) {
             reason = "all_channels_stale";
-        } else if (!klineFresh && requireFastChannel) {
+        } else if (klineSoftFresh) {
+            reason = (klineAge < 0 ? "kline_warming_up" : "kline_slow_but_fast_ok");
+            degraded = false;
+        } else if (!effectiveKlineFresh && requireFastChannel) {
             reason = "kline_stale";
         } else if (!fastOk && allowWarmup) {
             reason = "fast_channels_warming_up";
@@ -796,9 +811,8 @@ public class MarketDataStreamService {
         boolean newBucket = false;
         boolean closedUpdate = false;
         boolean lateBucket = false;
-        boolean lateClosedMerged = false;
+        boolean lateClosedApplied = false;
         long prevOpenTime = -1L;
-        Candle candleForStream = candle;
 
         synchronized (deque) {
             Candle last = deque.peekLast();
@@ -821,24 +835,9 @@ public class MarketDataStreamService {
             }
 
             if (lateBucket) {
-                if (candle.isClosed()) {
-                    Candle merged = tryMergePreviousClosedCandle(deque, candle);
-                    if (merged != null) {
-                        lateClosedMerged = true;
-                        candleForStream = merged;
-                    } else {
-                        log.warn("⏭️ [STREAM] LATE KLINE IGNORED chatId={} type={} ex={} net={} {} {} candleOpenTime={} lastOpenTime={} closed={}",
-                                chatId,
-                                strategyType,
-                                ex,
-                                networkType,
-                                sym,
-                                tf,
-                                candle.getTime(),
-                                prevOpenTime,
-                                candle.isClosed());
-                        return;
-                    }
+                if (candle.isClosed() && applyLateClosedKlineLocked(deque, candle)) {
+                    lateClosedApplied = true;
+                    lateBucket = false;
                 } else {
                     log.warn("⏭️ [STREAM] LATE KLINE IGNORED chatId={} type={} ex={} net={} {} {} candleOpenTime={} lastOpenTime={} closed={}",
                             chatId,
@@ -854,7 +853,7 @@ public class MarketDataStreamService {
                 }
             }
 
-            if (!lateClosedMerged) {
+            if (!lateClosedApplied) {
                 deque.addLast(candle);
             }
 
@@ -863,7 +862,22 @@ public class MarketDataStreamService {
             }
         }
 
-        pushToStreamManager(ex, networkType, sym, tf, candleForStream);
+        pushToStreamManager(ex, networkType, sym, tf, candle);
+
+        if (lateClosedApplied) {
+            log.info("🕯 [STREAM] LATE CLOSED KLINE APPLIED chatId={} type={} ex={} net={} {} {} candleOpenTime={} lastOpenTime={} close={} volume={}",
+                    chatId,
+                    strategyType,
+                    ex,
+                    networkType,
+                    sym,
+                    tf,
+                    candle.getTime(),
+                    prevOpenTime,
+                    BigDecimal.valueOf(candle.getClose()).stripTrailingZeros().toPlainString(),
+                    BigDecimal.valueOf(candle.getVolume()).stripTrailingZeros().toPlainString());
+            return;
+        }
 
         if (newBucket) {
             log.info("🕯 [STREAM] NEW CANDLE FROM KLINE chatId={} type={} ex={} net={} {} {} openTime={} closed={} o={} h={} l={} c={} v={}",
@@ -902,38 +916,6 @@ public class MarketDataStreamService {
                     candle.getTime(),
                     BigDecimal.valueOf(candle.getClose()).stripTrailingZeros().toPlainString());
         }
-    }
-
-    private Candle tryMergePreviousClosedCandle(Deque<Candle> deque, Candle candle) {
-        if (deque == null || candle == null || !candle.isClosed()) {
-            return null;
-        }
-
-        Candle tail = deque.pollLast();
-        if (tail == null) {
-            return null;
-        }
-
-        Candle prev = deque.peekLast();
-        if (prev == null || prev.getTime() != candle.getTime()) {
-            deque.addLast(tail);
-            return null;
-        }
-
-        Candle merged = new Candle(
-                candle.getTime(),
-                candle.getOpen(),
-                Math.max(prev.getHigh(), candle.getHigh()),
-                Math.min(prev.getLow(), candle.getLow()),
-                candle.getClose(),
-                Math.max(prev.getVolume(), candle.getVolume()),
-                true
-        );
-
-        deque.pollLast();
-        deque.addLast(merged);
-        deque.addLast(tail);
-        return merged;
     }
 
     // =====================================================================
@@ -1243,6 +1225,27 @@ public class MarketDataStreamService {
 
         Candle last = list.get(list.size() - 1);
         return new AggTradeApplyResult(true, true, null, last);
+    }
+
+    private boolean applyLateClosedKlineLocked(Deque<Candle> deque, Candle candle) {
+        if (deque == null || candle == null || !candle.isClosed()) {
+            return false;
+        }
+
+        ArrayList<Candle> ordered = new ArrayList<>(deque);
+        upsertOrderedCandle(ordered, candle);
+
+        if (ordered.isEmpty()) {
+            return false;
+        }
+
+        deque.clear();
+        for (Candle item : ordered) {
+            if (item != null) {
+                deque.addLast(item);
+            }
+        }
+        return true;
     }
 
     private void upsertOrderedCandle(List<Candle> list, Candle candle) {
