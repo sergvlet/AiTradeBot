@@ -907,15 +907,7 @@ public class MarketStreamServiceImpl implements MarketStreamService {
             return false;
         }
 
-        if (isFresh(health.lastAggTradeAgeMs())) {
-            return false;
-        }
-
-        if (isBybit(exchange) && isFresh(health.lastAggTradeAgeMs())) {
-            return false;
-        }
-
-        return true;
+        return !hasFreshMarketSource(health);
     }
 
     private boolean shouldBlockKlinePriceDispatch(MarketDataStreamService.SubscriptionHealth health, String exchange) {
@@ -923,23 +915,21 @@ public class MarketStreamServiceImpl implements MarketStreamService {
             return false;
         }
 
-        if (isFresh(health.lastKlineAgeMs())) {
+        return !hasFreshMarketSource(health);
+    }
+
+    private boolean hasFreshMarketSource(MarketDataStreamService.SubscriptionHealth health) {
+        if (health == null) {
             return false;
         }
 
-        if (isBybit(exchange) && isFresh(health.lastKlineAgeMs())) {
-            return false;
-        }
-
-        return true;
+        return isFresh(health.lastAggTradeAgeMs())
+                || isFresh(health.lastKlineAgeMs())
+                || isFresh(health.lastBookTickerAgeMs());
     }
 
     private boolean isFresh(long ageMs) {
         return ageMs >= 0L && ageMs <= Math.max(250L, sourceFreshBypassMaxAgeMs);
-    }
-
-    private boolean isBybit(String exchange) {
-        return exchange != null && "BYBIT".equalsIgnoreCase(exchange);
     }
 
     private static boolean safeBool(java.util.concurrent.Callable<Boolean> c) {
@@ -1044,3 +1034,4 @@ public class MarketStreamServiceImpl implements MarketStreamService {
         }
     }
 }
+

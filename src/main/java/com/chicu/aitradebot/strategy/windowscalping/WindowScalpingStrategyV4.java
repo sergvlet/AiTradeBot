@@ -705,6 +705,16 @@ public class WindowScalpingStrategyV4 implements
                     log.warn("[WINDOW] ⚠ PREPARE fallback apply failed chatId={} ex={} net={} sym={} tf={} err={}",
                             chatId, ex, net, sym, tf, e.toString());
                 }
+            } else if (shouldApplyTradeRecoveryFallbackAfterPrepare(tuneRes)) {
+                try {
+                    WindowScalpingStrategySettings relaxedCfg = applyTradeRecoveryFallbackForContext(chatId, ex, net, sym, tf);
+                    if (relaxedCfg != null) {
+                        cfg = relaxedCfg;
+                    }
+                } catch (Exception e) {
+                    log.warn("[WINDOW] ⚠ PREPARE trade-recovery fallback failed chatId={} ex={} net={} sym={} tf={} err={}",
+                            chatId, ex, net, sym, tf, e.toString());
+                }
             }
 
             StrategySettings refreshed = loadStrategySettingsAuto(chatId, ex, net);
@@ -816,9 +826,132 @@ public class WindowScalpingStrategyV4 implements
         String reason = safeNullable(res.reason());
         if (reason == null) return false;
         String normalized = reason.trim().toLowerCase(Locale.ROOT);
-        return normalized.contains("too_few_trades")
+
+        // Для prepare-start fallback нужен не только при полном no_trades,
+        // но и при too_few_trades: стратегия уже почти не торгует,
+        // а боевой старт иначе уходит в пустой runtime без сделок.
+        if (normalized.contains("no_trades")) {
+            return true;
+        }
+
+        if (normalized.contains("too_few_trades")) {
+            return true;
+        }
+
+        // На обычное no_improvement fallback не накатываем,
+        // чтобы не перетирать уже рабочий пользовательский конфиг.
+        return false;
+    }
+
+    private boolean shouldApplyTradeRecoveryFallbackAfterPrepare(TuningResult res) {
+        if (res == null || res.applied()) return false;
+        String reason = safeNullable(res.reason());
+        if (reason == null) return false;
+        String normalized = reason.trim().toLowerCase(Locale.ROOT);
+
+        // ВАЖНО:
+        // если тюнер вернул no_trades / too_few_trades / no_improvement,
+        // он уже мог сам сделать coarse-adjust и сохранить ослабленные фильтры.
+        // Поверх этого нельзя накатывать strategy-level fallback,
+        // иначе мы сразу затираем результат тюнера и снова ломаем старт.
+        if (normalized.contains("too_few_trades")
                 || normalized.contains("no_trades")
-                || normalized.contains("no_improvement");
+                || normalized.contains("no_improvement")) {
+            return false;
+        }
+
+        return normalized.contains("negative_score_");
+    }
+
+    private WindowScalpingStrategySettings applyTradeRecoveryFallbackForContext(Long chatId,
+                                                                                String exchange,
+                                                                                NetworkType network,
+                                                                                String symbol,
+                                                                                String timeframe) {
+        if (chatId == null || chatId <= 0 || exchange == null || network == null || symbol == null || timeframe == null) {
+            return null;
+        }
+
+        WindowScalpingStrategySettings current = sanitizeRuntimeConfig(windowSettingsService.getOrCreate(chatId, exchange, network, symbol, timeframe));
+        if (current == null) {
+            return null;
+        }
+
+        int relaxedWindow = current.getWindowSize() != null ? current.getWindowSize() : 5;
+        if (relaxedWindow < 5) relaxedWindow = 5;
+        if (relaxedWindow > 8) relaxedWindow = 8;
+
+        double currentMinRange = current.getMinRangePct() != null ? current.getMinRangePct() : 0.018;
+        if (!Double.isFinite(currentMinRange) || currentMinRange <= 0.0) currentMinRange = 0.018;
+        double relaxedMinRange = clampPct(Math.min(currentMinRange * 0.65d, 0.028d), 0.0035d, 0.028d);
+
+        double currentEntryLow = current.getEntryFromLowPct() != null ? current.getEntryFromLowPct() : 42.0;
+        if (!Double.isFinite(currentEntryLow) || currentEntryLow <= 0.0) currentEntryLow = 42.0;
+        double relaxedEntryLow = clampPct(Math.max(currentEntryLow, 48.0d), 32.0d, 62.0d);
+
+        double currentEntryHigh = current.getEntryFromHighPct() != null ? current.getEntryFromHighPct() : 16.0;
+        if (!Double.isFinite(currentEntryHigh) || currentEntryHigh <= 0.0) currentEntryHigh = 16.0;
+        double relaxedEntryHigh = clampPct(Math.max(currentEntryHigh, 18.0d), 8.0d, 26.0d);
+
+        double currentMaxSpread = current.getMaxSpreadPct() != null ? current.getMaxSpreadPct() : 0.35;
+        if (!Double.isFinite(currentMaxSpread) || currentMaxSpread <= 0.0) currentMaxSpread = 0.35;
+        double relaxedMaxSpread = clampPct(Math.max(currentMaxSpread, 0.08d), 0.03d, 0.80d);
+
+        current.setWindowSize(relaxedWindow);
+        current.setMinRangePct(relaxedMinRange);
+        current.setEntryFromLowPct(relaxedEntryLow);
+        current.setEntryFromHighPct(relaxedEntryHigh);
+        current.setMaxSpreadPct(relaxedMaxSpread);
+
+        WindowScalpingStrategySettings patch = WindowScalpingStrategySettings.builder()
+                .chatId(chatId)
+                .exchangeName(exchange)
+                .networkType(network)
+                .symbol(symbol)
+                .timeframe(timeframe)
+                .windowSize(relaxedWindow)
+                .minRangePct(relaxedMinRange)
+                .entryFromLowPct(relaxedEntryLow)
+                .entryFromHighPct(relaxedEntryHigh)
+                .maxSpreadPct(relaxedMaxSpread)
+                .build();
+
+        WindowScalpingStrategySettings updated = windowSettingsService.update(
+                chatId,
+                exchange,
+                network,
+                symbol,
+                timeframe,
+                patch
+        );
+        if (updated == null) {
+            try {
+                updated = windowSettingsService.update(chatId, current);
+            } catch (Exception ignored) {
+                updated = null;
+            }
+        }
+
+        WindowScalpingStrategySettings effective = updated != null
+                ? sanitizeRuntimeConfig(updated)
+                : sanitizeRuntimeConfig(windowSettingsService.getOrCreate(chatId, exchange, network, symbol, timeframe));
+
+        if (effective != null) {
+            log.warn("[WINDOW] 🛠 PREPARE trade-recovery fallback applied chatId={} ex={} net={} sym={} tf={} window={} minRange={} entryLow={} entryHigh={} spread={}",
+                    chatId,
+                    exchange,
+                    network,
+                    symbol,
+                    timeframe,
+                    effective.getWindowSize(),
+                    fmt(effective.getMinRangePct() != null ? effective.getMinRangePct() : 0.0),
+                    fmt(effective.getEntryFromLowPct() != null ? effective.getEntryFromLowPct() : 0.0),
+                    fmt(effective.getEntryFromHighPct() != null ? effective.getEntryFromHighPct() : 0.0),
+                    fmt(effective.getMaxSpreadPct() != null ? effective.getMaxSpreadPct() : 0.0)
+            );
+        }
+
+        return effective;
     }
 
     private WindowScalpingStrategySettings applyLiveSafeFallbackForContext(Long chatId,
@@ -837,23 +970,23 @@ public class WindowScalpingStrategyV4 implements
 
         int safeWindow = current.getWindowSize() != null ? current.getWindowSize() : 5;
         if (safeWindow < 5) safeWindow = 5;
-        if (safeWindow > 12) safeWindow = 12;
+        if (safeWindow > 10) safeWindow = 10;
 
-        double safeMinRange = current.getMinRangePct() != null ? current.getMinRangePct() : 0.012;
-        if (!Double.isFinite(safeMinRange) || safeMinRange <= 0.0) safeMinRange = 0.012;
-        safeMinRange = clampPct(safeMinRange, 0.006, 0.080);
+        double safeMinRange = current.getMinRangePct() != null ? current.getMinRangePct() : 0.008;
+        if (!Double.isFinite(safeMinRange) || safeMinRange <= 0.0) safeMinRange = 0.008;
+        safeMinRange = clampPct(safeMinRange, 0.003, 0.030);
 
-        double safeEntryLow = current.getEntryFromLowPct() != null ? current.getEntryFromLowPct() : 38.0;
-        if (!Double.isFinite(safeEntryLow) || safeEntryLow <= 0.0) safeEntryLow = 38.0;
-        safeEntryLow = clampPct(safeEntryLow, 24.0, 42.0);
+        double safeEntryLow = current.getEntryFromLowPct() != null ? current.getEntryFromLowPct() : 42.0;
+        if (!Double.isFinite(safeEntryLow) || safeEntryLow <= 0.0) safeEntryLow = 42.0;
+        safeEntryLow = clampPct(safeEntryLow, 28.0, 48.0);
 
-        double safeEntryHigh = current.getEntryFromHighPct() != null ? current.getEntryFromHighPct() : 22.0;
-        if (!Double.isFinite(safeEntryHigh) || safeEntryHigh <= 0.0) safeEntryHigh = 22.0;
-        safeEntryHigh = clampPct(safeEntryHigh, 12.0, 30.0);
+        double safeEntryHigh = current.getEntryFromHighPct() != null ? current.getEntryFromHighPct() : 16.0;
+        if (!Double.isFinite(safeEntryHigh) || safeEntryHigh <= 0.0) safeEntryHigh = 16.0;
+        safeEntryHigh = clampPct(safeEntryHigh, 8.0, 18.0);
 
-        double safeMaxSpread = current.getMaxSpreadPct() != null ? current.getMaxSpreadPct() : 0.80;
-        if (!Double.isFinite(safeMaxSpread) || safeMaxSpread <= 0.0) safeMaxSpread = 0.80;
-        safeMaxSpread = clampPct(safeMaxSpread, 0.10, 1.50);
+        double safeMaxSpread = current.getMaxSpreadPct() != null ? current.getMaxSpreadPct() : 0.35;
+        if (!Double.isFinite(safeMaxSpread) || safeMaxSpread <= 0.0) safeMaxSpread = 0.35;
+        safeMaxSpread = clampPct(safeMaxSpread, 0.03, 0.60);
 
         current.setWindowSize(safeWindow);
         current.setMinRangePct(safeMinRange);
@@ -987,7 +1120,10 @@ public class WindowScalpingStrategyV4 implements
     private void switchRunPhaseSafely(StrategySettings ss, String phase) {
         if (ss == null) return;
         String normalized = (phase == null || phase.isBlank()) ? null : phase.trim().toUpperCase(Locale.ROOT);
-        if (Objects.equals(normalizeExchangeOrNull(ss.getRunPhase()), normalized)) {
+        String current = (ss.getRunPhase() == null || ss.getRunPhase().isBlank())
+                ? null
+                : ss.getRunPhase().trim().toUpperCase(Locale.ROOT);
+        if (Objects.equals(current, normalized)) {
             return;
         }
         ss.setRunPhase(normalized);
@@ -1112,7 +1248,12 @@ public class WindowScalpingStrategyV4 implements
         ensureRuntimeContext(st, ss);
 
         AdvancedControlMode mode = modeOrManual(ss);
-        boolean gate = (ss != null && ss.isMlGateEnabled() && mode != AdvancedControlMode.MANUAL);
+        boolean effectiveAutoTuneForLog = ss != null
+                && mode != AdvancedControlMode.MANUAL
+                && (ss.isAutoTuneEnabled() || mode == AdvancedControlMode.HYBRID);
+        boolean effectiveMlGateForLog = ss != null
+                && mode != AdvancedControlMode.MANUAL
+                && (ss.isMlGateEnabled() || mode == AdvancedControlMode.HYBRID);
         BigDecimal thrBd = (ss != null ? ss.getGateMinProb() : null);
         double effectiveGateThreshold = resolveEffectiveMlThreshold(ss, st, adaptiveMlGateMinStrongScore + 100.0d);
 
@@ -1123,8 +1264,8 @@ public class WindowScalpingStrategyV4 implements
                 st.symbol,
                 st.timeframe,
                 mode,
-                (ss != null && ss.isAutoTuneEnabled()),
-                gate,
+                effectiveAutoTuneForLog,
+                effectiveMlGateForLog,
                 (thrBd != null ? thrBd.stripTrailingZeros().toPlainString() : "null"),
                 fmt(effectiveGateThreshold),
                 (ss != null ? safeNullable(ss.getMlModelVersion()) : "null"),
@@ -1139,7 +1280,7 @@ public class WindowScalpingStrategyV4 implements
                 autoMinRangeEnabled
         );
 
-        if (adaptiveMlGateEnabled && gate) {
+        if (adaptiveMlGateEnabled && effectiveMlGateForLog) {
             log.info("[WINDOW] 🤖 Adaptive ML gate enabled chatId={} sym={} baseThreshold={} floor={} quantile={} margin={} strongScore>= {}",
                     chatId,
                     st.symbol,
@@ -2294,24 +2435,6 @@ public class WindowScalpingStrategyV4 implements
                         st.tickWindow != null ? st.tickWindow.size() : 0,
                         fmt(rangePct),
                         fmt(effectiveMinRangePct(st, cfg)));
-            }
-
-            /*
-             * Критичный фикс:
-             * path onCandleClosed() раньше только обновлял окно и зоны,
-             * но не запускал полноценную entry-оценку.
-             *
-             * В результате WINDOW_SCALPING видел закрытую свечу в логах,
-             * однако сигнал BUY/ENTRY не вычислялся, пока не приходил отдельный тик
-             * следующей свечи или не срабатывал candle-close fallback.
-             *
-             * Здесь запускаем ту же entry-логику, что и в price/tick path,
-             * уже на цене закрытия свечи и после обновления candle window.
-             * Дополнительная защита !st.inPosition не даёт сделать дубль-вход,
-             * если fallback/onPriceUpdate уже успел открыть позицию чуть раньше.
-             */
-            if (!st.inPosition) {
-                evaluateEntryOnTick(chatId, st, sym, close, time, holdMs);
             }
         }
     }
@@ -5213,32 +5336,78 @@ public class WindowScalpingStrategyV4 implements
         BigDecimal staticTp = positiveOrNull(cfg.getTakeProfitPct());
         BigDecimal staticSl = positiveOrNull(cfg.getStopLossPct());
 
-        if (!dynamicTpEnabled) {
+        Boolean autoTpSlEnabled = cfg.getAutoTpSlEnabled();
+        boolean useAutoRiskModel = dynamicTpEnabled && !Boolean.FALSE.equals(autoTpSlEnabled);
+
+        if (!useAutoRiskModel) {
             if (staticTp == null || staticSl == null) return null;
             return new EntryRisk(staticTp, staticSl, "static");
         }
 
-        double configuredTpMinPct = dynamicTpMinPct;
+        double configuredTpMinPct = cfg.getAutoTpMinPct() != null
+                ? cfg.getAutoTpMinPct().doubleValue()
+                : dynamicTpMinPct;
         if (!Double.isFinite(configuredTpMinPct) || configuredTpMinPct <= 0.0) {
             configuredTpMinPct = 0.20;
         }
 
-        double configuredSlMinPct = dynamicSlMinPct;
+        double configuredTpMaxPct = cfg.getAutoTpMaxPct() != null
+                ? cfg.getAutoTpMaxPct().doubleValue()
+                : dynamicTpMaxPct;
+        if (!Double.isFinite(configuredTpMaxPct) || configuredTpMaxPct <= 0.0) {
+            configuredTpMaxPct = 0.65;
+        }
+
+        double configuredSlMinPct = cfg.getAutoSlMinPct() != null
+                ? cfg.getAutoSlMinPct().doubleValue()
+                : dynamicSlMinPct;
         if (!Double.isFinite(configuredSlMinPct) || configuredSlMinPct <= 0.0) {
             configuredSlMinPct = 0.08;
         }
 
-        double tpCap = clampPct(
-                staticTp != null ? staticTp.doubleValue() : dynamicTpMaxPct,
-                configuredTpMinPct,
-                dynamicTpMaxPct
-        );
+        double configuredSlMaxPct = cfg.getAutoSlMaxPct() != null
+                ? cfg.getAutoSlMaxPct().doubleValue()
+                : dynamicSlMaxPct;
+        if (!Double.isFinite(configuredSlMaxPct) || configuredSlMaxPct <= 0.0) {
+            configuredSlMaxPct = 0.18;
+        }
 
-        double slCap = clampPct(
-                staticSl != null ? staticSl.doubleValue() : dynamicSlMaxPct,
-                configuredSlMinPct,
-                dynamicSlMaxPct
-        );
+        if (configuredTpMaxPct < configuredTpMinPct) {
+            configuredTpMaxPct = configuredTpMinPct;
+        }
+        if (configuredSlMaxPct < configuredSlMinPct) {
+            configuredSlMaxPct = configuredSlMinPct;
+        }
+
+        double tpFromRangeFactor = cfg.getAutoTpFromRangeFactor() != null
+                ? cfg.getAutoTpFromRangeFactor().doubleValue()
+                : dynamicTpFromRangeFactor;
+        if (!Double.isFinite(tpFromRangeFactor) || tpFromRangeFactor <= 0.0) {
+            tpFromRangeFactor = 0.72;
+        }
+
+        double slFromRangeFactor = cfg.getAutoSlFromRangeFactor() != null
+                ? cfg.getAutoSlFromRangeFactor().doubleValue()
+                : dynamicSlFromRangeFactor;
+        if (!Double.isFinite(slFromRangeFactor) || slFromRangeFactor <= 0.0) {
+            slFromRangeFactor = 0.28;
+        }
+
+        double tpMlBoostFactor = cfg.getAutoTpMlBoostFactor() != null
+                ? cfg.getAutoTpMlBoostFactor().doubleValue()
+                : 1.08;
+        if (!Double.isFinite(tpMlBoostFactor) || tpMlBoostFactor <= 0.0) {
+            tpMlBoostFactor = 1.08;
+        }
+        tpMlBoostFactor = clampPct(tpMlBoostFactor, 0.80, 1.40);
+
+        double tpWeakSignalFactor = cfg.getAutoTpWeakSignalFactor() != null
+                ? cfg.getAutoTpWeakSignalFactor().doubleValue()
+                : 0.92;
+        if (!Double.isFinite(tpWeakSignalFactor) || tpWeakSignalFactor <= 0.0) {
+            tpWeakSignalFactor = 0.92;
+        }
+        tpWeakSignalFactor = clampPct(tpWeakSignalFactor, 0.60, 1.10);
 
         double safeRangePct = Double.isFinite(rangePct) ? rangePct : 0.0;
 
@@ -5246,12 +5415,12 @@ public class WindowScalpingStrategyV4 implements
         double effectiveSlMinPct = Math.max(0.02, Math.min(configuredSlMinPct, Math.max(0.02, rangeAwareSlMinPct)));
 
         double dynSl = clampPct(
-                safeRangePct * dynamicSlFromRangeFactor,
+                safeRangePct * slFromRangeFactor,
                 effectiveSlMinPct,
-                slCap
+                configuredSlMaxPct
         );
 
-        double dynTp = safeRangePct * dynamicTpFromRangeFactor;
+        double dynTp = safeRangePct * tpFromRangeFactor;
 
         double feeFloorTp = minProfitAfterFeesPct;
         TradeExecutionServiceImpl exec = tradeExecImpl();
@@ -5279,10 +5448,14 @@ public class WindowScalpingStrategyV4 implements
                 Math.max(0.03, Math.min(configuredTpMinPct, Math.max(rangeAwareTpMinPct, feeFloorTp)))
         );
 
-        double effectiveMinRiskReward = dynamicMinRiskReward;
+        double effectiveMinRiskReward = cfg.getAutoMinRiskReward() != null
+                ? cfg.getAutoMinRiskReward().doubleValue()
+                : dynamicMinRiskReward;
         if (!Double.isFinite(effectiveMinRiskReward) || effectiveMinRiskReward <= 0.0) {
             effectiveMinRiskReward = 0.85;
         }
+        effectiveMinRiskReward = Math.max(0.85, effectiveMinRiskReward);
+
         if (safeRangePct > 0.0 && safeRangePct < configuredTpMinPct * 1.35) {
             effectiveMinRiskReward = Math.max(0.60, Math.min(effectiveMinRiskReward, 0.90));
         }
@@ -5296,9 +5469,9 @@ public class WindowScalpingStrategyV4 implements
 
         if (pred != null && pred.ok) {
             if (pred.proba >= effectiveThreshold + 0.08) {
-                dynTp *= 1.08;
+                dynTp *= tpMlBoostFactor;
             } else if (pred.proba <= effectiveThreshold + 0.02) {
-                dynTp *= 0.92;
+                dynTp *= tpWeakSignalFactor;
             }
         }
 
@@ -5306,7 +5479,7 @@ public class WindowScalpingStrategyV4 implements
             dynTp *= 1.04;
         }
 
-        dynTp = clampPct(dynTp, minTp, tpCap);
+        dynTp = clampPct(dynTp, minTp, configuredTpMaxPct);
 
         if (!Double.isFinite(dynTp) || dynTp <= 0.0) return null;
         if (!Double.isFinite(dynSl) || dynSl <= 0.0) return null;
@@ -5326,7 +5499,7 @@ public class WindowScalpingStrategyV4 implements
             return null;
         }
 
-        return new EntryRisk(pctBd(dynTp), pctBd(dynSl), "dynamic");
+        return new EntryRisk(pctBd(dynTp), pctBd(dynSl), "auto_tp_sl");
     }
 
 
@@ -5762,6 +5935,7 @@ public class WindowScalpingStrategyV4 implements
         return (v != null && v.signum() > 0) ? v : null;
     }
 }
+
 
 
 

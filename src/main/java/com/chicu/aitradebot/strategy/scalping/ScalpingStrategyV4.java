@@ -3,13 +3,9 @@ package com.chicu.aitradebot.strategy.scalping;
 import com.chicu.aitradebot.ai.ml.training.MlTrainingResult;
 import com.chicu.aitradebot.ai.ml.training.MlTrainingServiceImpl;
 import com.chicu.aitradebot.ai.runtime.AdaptiveRuntimeController;
-import com.chicu.aitradebot.ai.tuning.AutoTunerOrchestrator;
-import com.chicu.aitradebot.ai.tuning.TuningRequest;
-import com.chicu.aitradebot.ai.tuning.TuningResult;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
-import com.chicu.aitradebot.domain.enums.AdvancedControlMode;
 import com.chicu.aitradebot.market.model.Candle;
 import com.chicu.aitradebot.market.model.UnifiedKline;
 import com.chicu.aitradebot.market.stream.MarketDataStreamService;
@@ -63,13 +59,16 @@ public class ScalpingStrategyV4 implements TradingStrategy, AiStrategyOrchestrat
     private final StrategyLivePublisher live;
     private final ScalpingStrategySettingsService scalpingSettingsService;
     private final StrategySettingsService strategySettingsService;
+    private final ObjectProvider<MlTrainingServiceImpl> mlTrainingServiceProvider;
     private final TradeExecutionService tradeExecutionService;
     private final MarketDataStreamService marketDataStreamService;
     private final AdaptiveRuntimeController adaptiveRuntimeController;
-    private final ObjectProvider<MlTrainingServiceImpl> mlTrainingServiceProvider;
-    private final ObjectProvider<AutoTunerOrchestrator> autoTunerProvider;
 
     private final Map<Long, LocalState> states = new ConcurrentHashMap<>();
+
+    private MlTrainingServiceImpl mlTrainer() {
+        return mlTrainingServiceProvider != null ? mlTrainingServiceProvider.getIfAvailable() : null;
+    }
 
     public record WindowZoneSnapshot(BigDecimal high, BigDecimal low) {}
     private record TimedClose(long timeSec, BigDecimal close) {}
@@ -140,125 +139,13 @@ public class ScalpingStrategyV4 implements TradingStrategy, AiStrategyOrchestrat
         return snapshot == null ? Map.of() : snapshot.toMlFeatures();
     }
 
-    private MlTrainingServiceImpl trainer() {
-        return mlTrainingServiceProvider != null ? mlTrainingServiceProvider.getIfAvailable() : null;
-    }
-
-    private AutoTunerOrchestrator autoTuner() {
-        return autoTunerProvider != null ? autoTunerProvider.getIfAvailable() : null;
-    }
-
-    @Override
-    public AiStrategyOrchestrator.PreparationResult prepareStart(long chatId,
-                                                                 StrategyType type,
-                                                                 String symbol,
-                                                                 String timeframe,
-                                                                 String exchange,
-                                                                 NetworkType network) {
-        if (type != StrategyType.SCALPING) {
-            return AiStrategyOrchestrator.PreparationResult.ok("skip:type_mismatch");
-        }
-
-        StrategySettings ss = strategySettingsService.getOrCreate(chatId, StrategyType.SCALPING);
-        ScalpingStrategySettings cfg = scalpingSettingsService.getEffective(chatId);
-        if (ss == null) {
-            return AiStrategyOrchestrator.PreparationResult.fail("settings_missing");
-        }
-
-        String ex = safeUpper(exchange);
-        if (ex == null) ex = safeUpper(ss.getExchangeName());
-
-        NetworkType net = network != null ? network : ss.getNetworkType();
-
-        String sym = safeUpper(symbol);
-        if (sym == null) sym = resolveSymbol(ss, cfg);
-
-        String tf = safeTf(timeframe);
-        if (tf == null) tf = resolveTimeframe(ss, cfg);
-
-        if (ex == null || net == null || sym == null || tf == null) {
-            return AiStrategyOrchestrator.PreparationResult.fail("prepare_context_incomplete");
-        }
-
-        switchRunPhaseSafely(ss, "PREPARE");
-
-        MlTrainingServiceImpl trainer = trainer();
-        if (trainer == null) {
-            restoreRunPhaseSafely(ss, net);
-            return AiStrategyOrchestrator.PreparationResult.fail("trainer_missing");
-        }
-
-        MlTrainingResult trainRes;
-        try {
-            trainRes = trainer.trainOnSelectedCandles(
-                    chatId,
-                    StrategyType.SCALPING,
-                    ex,
-                    net,
-                    sym,
-                    tf,
-                    ss.getCachedCandlesLimit(),
-                    "prepare_start_train"
-            );
-        } catch (Exception e) {
-            restoreRunPhaseSafely(ss, net);
-            log.warn("[SCALPING] prepareStart train failed chatId={} ex={} net={} sym={} tf={} err={}",
-                    chatId, ex, net, sym, tf, e.toString());
-            return AiStrategyOrchestrator.PreparationResult.fail("train_exception");
-        }
-
-        if (trainRes == null || !trainRes.ok() || !trainRes.applied()) {
-            restoreRunPhaseSafely(ss, net);
-            return AiStrategyOrchestrator.PreparationResult.fail("train_failed:" + trainingError(trainRes));
-        }
-
-        TuningResult tuneRes = null;
-        try {
-            AutoTunerOrchestrator tuner = autoTuner();
-            if (tuner != null) {
-                tuneRes = tuner.tune(TuningRequest.builder()
-                        .chatId(chatId)
-                        .strategyType(StrategyType.SCALPING)
-                        .exchange(ex)
-                        .network(net)
-                        .symbol(sym)
-                        .timeframe(tf)
-                        .candlesLimit(ss.getCachedCandlesLimit())
-                        .reason("prepare_start_validate")
-                        .build());
-            }
-        } catch (Exception e) {
-            restoreRunPhaseSafely(ss, net);
-            log.warn("[SCALPING] prepareStart tune failed chatId={} ex={} net={} sym={} tf={} err={}",
-                    chatId, ex, net, sym, tf, e.toString());
-            return AiStrategyOrchestrator.PreparationResult.fail("prepare_tune_exception");
-        }
-
-        if (isHardPrepareTuneFailure(tuneRes)) {
-            restoreRunPhaseSafely(ss, net);
-            return AiStrategyOrchestrator.PreparationResult.fail("prepare_tune_failed:" + tuningReason(tuneRes));
-        }
-
-        StrategySettings refreshed = strategySettingsService.getOrCreate(chatId, StrategyType.SCALPING);
-        if (refreshed != null) {
-            ss = refreshed;
-        }
-        switchRunPhaseSafely(ss, livePhase(net));
-
-        log.info("[SCALPING] 🧠 prepare chatId={} sym={} train={} tune={}",
-                chatId,
-                sym,
-                trainingStatus(trainRes),
-                tuningStatus(tuneRes));
-
-        return AiStrategyOrchestrator.PreparationResult.ok(
-                "prepare_ok train=" + trainingStatus(trainRes) + " tune=" + tuningStatus(tuneRes)
-        );
-    }
-
-
     @Override
     public void start(Long chatId, String ignored) {
+        start(chatId, ignored, null, null);
+    }
+
+    @Override
+    public void start(Long chatId, String ignored, String exchange, NetworkType network) {
         StrategySettings strategy = loadStrategySettings(chatId);
         ScalpingStrategySettings cfg = scalpingSettingsService.getEffective(chatId);
 
@@ -268,8 +155,8 @@ public class ScalpingStrategyV4 implements TradingStrategy, AiStrategyOrchestrat
         st.strategySettings = strategy;
         st.scalpingSettings = cfg;
         st.symbol = resolveSymbol(strategy, cfg);
-        st.exchange = strategy.getExchangeName();
-        st.network = strategy.getNetworkType();
+        st.exchange = safeUpper(exchange) != null ? safeUpper(exchange) : strategy.getExchangeName();
+        st.network = network != null ? network : strategy.getNetworkType();
         st.timeframe = resolveTimeframe(strategy, cfg);
         st.lastSettingsLoadAt = Instant.now();
         st.lastSettingsUpdatedAt = toInstant(strategy.getUpdatedAt());
@@ -296,10 +183,24 @@ public class ScalpingStrategyV4 implements TradingStrategy, AiStrategyOrchestrat
                 cfg != null ? cfg.getAtrPctRange() : null,
                 cfg != null ? cfg.getRsiFilter() : null,
                 cfg != null ? cfg.getRiskRewardMin() : null);
+
+        if (strategy != null && strategy.isMlGateEnabled()) {
+            log.info("[SCALPING] 🧠 ML context chatId={} symbol={} modelKey={} modelVer={} gateMinProb={}",
+                    chatId,
+                    st.symbol,
+                    strategy.getMlModelKey(),
+                    strategy.getMlModelVersion(),
+                    strategy.getGateMinProb());
+        }
     }
 
     @Override
     public void stop(Long chatId, String ignored) {
+        stop(chatId, ignored, null, null);
+    }
+
+    @Override
+    public void stop(Long chatId, String ignored, String exchange, NetworkType network) {
         LocalState st = states.remove(chatId);
         if (st == null) return;
 
@@ -327,6 +228,152 @@ public class ScalpingStrategyV4 implements TradingStrategy, AiStrategyOrchestrat
     public Instant getStartedAt(Long chatId) {
         LocalState st = states.get(chatId);
         return st != null ? st.startedAt : null;
+    }
+
+
+    @Override
+    public AiStrategyOrchestrator.PreparationResult prepareStart(long chatId,
+                                                                 StrategyType type,
+                                                                 String symbol,
+                                                                 String timeframe,
+                                                                 String exchange,
+                                                                 NetworkType network) {
+        if (type != StrategyType.SCALPING) {
+            return AiStrategyOrchestrator.PreparationResult.fail("wrong_type");
+        }
+
+        try {
+            StrategySettings strategy = loadStrategySettings(chatId);
+            ScalpingStrategySettings cfg = scalpingSettingsService.getEffective(chatId);
+
+            String effectiveSymbol = safeUpper(symbol);
+            if (effectiveSymbol == null) effectiveSymbol = resolveSymbol(strategy, cfg);
+
+            String effectiveTf = safeTf(timeframe);
+            if (effectiveTf == null) effectiveTf = resolveTimeframe(strategy, cfg);
+
+            String effectiveExchange = safeUpper(exchange);
+            if (effectiveExchange == null) effectiveExchange = strategy != null ? safeUpper(strategy.getExchangeName()) : null;
+
+            NetworkType effectiveNetwork = network != null ? network : (strategy != null ? strategy.getNetworkType() : null);
+
+            if (effectiveSymbol == null) {
+                return AiStrategyOrchestrator.PreparationResult.fail("symbol_missing");
+            }
+            if (effectiveTf == null) {
+                return AiStrategyOrchestrator.PreparationResult.fail("timeframe_missing");
+            }
+            if (effectiveExchange == null) {
+                return AiStrategyOrchestrator.PreparationResult.fail("exchange_missing");
+            }
+            if (effectiveNetwork == null) {
+                return AiStrategyOrchestrator.PreparationResult.fail("network_missing");
+            }
+
+            int desired = Math.max(effectiveWindowSize(cfg) * 3, 120);
+            Integer limitFromSettings = strategy != null ? strategy.getCachedCandlesLimit() : null;
+            if ((limitFromSettings == null || limitFromSettings <= 0) && cfg != null && cfg.getCachedCandlesLimit() != null) {
+                limitFromSettings = cfg.getCachedCandlesLimit();
+            }
+            if (limitFromSettings != null && limitFromSettings > 0) {
+                desired = Math.max(desired, limitFromSettings);
+            }
+            desired = Math.min(desired, 1000);
+
+            List<Candle> candles = marketDataStreamService.getCachedCandles(
+                    chatId,
+                    StrategyType.SCALPING,
+                    effectiveExchange,
+                    effectiveNetwork,
+                    effectiveSymbol,
+                    effectiveTf,
+                    desired
+            );
+
+            int usable = 0;
+            if (candles != null) {
+                for (Candle candle : candles) {
+                    if (candle == null || !candle.isClosed()) continue;
+                    if (candle.getClose() <= 0.0d) continue;
+                    usable++;
+                }
+            }
+
+            int minNeeded = Math.max(effectiveWindowSize(cfg) + 12, 48);
+            if (usable < minNeeded) {
+                log.warn("[SCALPING] prepareStart blocked chatId={} symbol={} ex={} net={} tf={} usable={} need={}",
+                        chatId, effectiveSymbol, effectiveExchange, effectiveNetwork, effectiveTf, usable, minNeeded);
+                return AiStrategyOrchestrator.PreparationResult.fail("no_context_samples");
+            }
+
+            MlTrainingServiceImpl trainer = mlTrainer();
+            if (trainer == null) {
+                log.warn("[SCALPING] prepareStart blocked chatId={} symbol={} ex={} net={} tf={} reason=trainer_missing",
+                        chatId, effectiveSymbol, effectiveExchange, effectiveNetwork, effectiveTf);
+                return AiStrategyOrchestrator.PreparationResult.fail("trainer_missing");
+            }
+
+            MlTrainingResult trainResult = trainer.trainOnSelectedCandles(
+                    chatId,
+                    StrategyType.SCALPING,
+                    effectiveExchange,
+                    effectiveNetwork,
+                    effectiveSymbol,
+                    effectiveTf,
+                    desired,
+                    "prepare_start_train"
+            );
+
+            if (trainResult == null) {
+                log.warn("[SCALPING] prepareStart blocked chatId={} symbol={} ex={} net={} tf={} reason=train_result_null",
+                        chatId, effectiveSymbol, effectiveExchange, effectiveNetwork, effectiveTf);
+                return AiStrategyOrchestrator.PreparationResult.fail("train_result_null");
+            }
+
+            if (!trainResult.ok() || !trainResult.applied()) {
+                String reason = (trainResult.error() != null && !trainResult.error().isBlank())
+                        ? trainResult.error()
+                        : (!trainResult.ok() ? "train_not_ok" : "train_not_applied");
+                log.warn("[SCALPING] prepareStart blocked chatId={} symbol={} ex={} net={} tf={} reason={} modelKey={} modelVer={} schemaHash={}",
+                        chatId,
+                        effectiveSymbol,
+                        effectiveExchange,
+                        effectiveNetwork,
+                        effectiveTf,
+                        reason,
+                        trainResult.modelKey(),
+                        trainResult.modelVersion(),
+                        trainResult.schemaHash());
+                return AiStrategyOrchestrator.PreparationResult.fail(reason);
+            }
+
+            StrategySettings refreshed = loadStrategySettings(chatId);
+            String modelVersion = refreshed != null ? refreshed.getMlModelVersion() : null;
+            if (modelVersion == null || modelVersion.isBlank()) {
+                log.warn("[SCALPING] prepareStart blocked chatId={} symbol={} ex={} net={} tf={} reason=model_version_missing_after_train modelKey={} schemaHash={}",
+                        chatId, effectiveSymbol, effectiveExchange, effectiveNetwork, effectiveTf,
+                        trainResult.modelKey(), trainResult.schemaHash());
+                return AiStrategyOrchestrator.PreparationResult.fail("model_version_missing_after_train");
+            }
+
+            log.info("[SCALPING] prepareStart OK chatId={} symbol={} ex={} net={} tf={} usable={} window={} desired={} modelKey={} modelVer={} schemaHash={}",
+                    chatId,
+                    effectiveSymbol,
+                    effectiveExchange,
+                    effectiveNetwork,
+                    effectiveTf,
+                    usable,
+                    effectiveWindowSize(cfg),
+                    desired,
+                    refreshed != null ? refreshed.getMlModelKey() : trainResult.modelKey(),
+                    modelVersion,
+                    refreshed != null ? refreshed.getMlSchemaHash() : trainResult.schemaHash());
+
+            return AiStrategyOrchestrator.PreparationResult.ok("context_ready");
+        } catch (Exception e) {
+            log.warn("[SCALPING] prepareStart failed chatId={} err={}", chatId, rootMessage(e));
+            return AiStrategyOrchestrator.PreparationResult.fail("prepare_exception:" + rootMessage(e));
+        }
     }
 
     @Override
@@ -641,13 +688,7 @@ public class ScalpingStrategyV4 implements TradingStrategy, AiStrategyOrchestrat
                                  Instant time,
                                  ScalpingFeatureSnapshot features) {
         log.info("[SCALPING] ⚡ ENTRY try chatId={} symbol={} price={} features={}", chatId, symbol, bd(price), features.toMlFeatures());
-
-        BigDecimal previousMlConfidence = strategy != null ? strategy.getMlConfidence() : null;
-        Boolean previousMlFailOpen = readStrategyMlFailOpen(strategy);
-        boolean runtimeMlGatePrepared = false;
-
         try {
-            runtimeMlGatePrepared = prepareRuntimeMlGateForEntry(strategy);
             Object res = invokeTradeEntry(chatId, symbol, price, features.score(), cfg, time, strategy);
             if (!invokeBoolean(res, "executed", "isExecuted")) {
                 String reason = invokeString(res, "reason", "getReason", "message", "getMessage");
@@ -691,166 +732,6 @@ public class ScalpingStrategyV4 implements TradingStrategy, AiStrategyOrchestrat
             String msg = rootMessage(e);
             log.error("[SCALPING] ❌ ENTRY failed chatId={} symbol={} err={}", chatId, symbol, msg, e);
             pushHoldThrottled(chatId, symbol, st, msg == null || msg.isBlank() ? "entry_failed" : msg, time);
-        } finally {
-            if (runtimeMlGatePrepared) {
-                restoreRuntimeMlGateAfterEntry(strategy, previousMlConfidence, previousMlFailOpen);
-            }
-        }
-    }
-
-    /*
-     * Критичный фикс:
-     * SCALPING не передавал в TradeExecutionService актуальный runtime mlConfidence.
-     * Из-за этого executor видел raw confidence == null/0 и ML gate резал вход:
-     * "confidence_below_threshold | conf=0 < minProb=..."
-     *
-     * Для стратегий, у которых на момент входа нет отдельного live ML-predict,
-     * корректное поведение — не отправлять stale/zero confidence в executor.
-     * Поэтому перед executeEntry временно:
-     *   1) обнуляем mlConfidence,
-     *   2) включаем fail-open для AI/HYBRID режима,
-     * после чего восстанавливаем прежние значения.
-     */
-    private boolean prepareRuntimeMlGateForEntry(StrategySettings strategy) {
-        if (strategy == null) {
-            return false;
-        }
-        if (!strategy.isMlGateEnabled()) {
-            return false;
-        }
-
-        BigDecimal currentConfidence = strategy.getMlConfidence();
-        boolean missingRuntimeConfidence = currentConfidence == null || currentConfidence.signum() <= 0;
-        if (!missingRuntimeConfidence) {
-            return false;
-        }
-
-        try {
-            strategy.setMlConfidence(null);
-
-            AdvancedControlMode mode = strategy.getAdvancedControlMode() != null
-                    ? strategy.getAdvancedControlMode()
-                    : AdvancedControlMode.MANUAL;
-
-            if (mode != AdvancedControlMode.MANUAL) {
-                writeBooleanReflective(
-                        strategy,
-                        true,
-                        "setMlFailOpenEnabled",
-                        "setMlFailOpen",
-                        "setFailOpen"
-                );
-            }
-
-            return true;
-        } catch (Exception e) {
-            log.warn("[SCALPING] ⚠ runtime ML gate prepare failed err={}", e.toString());
-            return false;
-        }
-    }
-
-    private void restoreRuntimeMlGateAfterEntry(StrategySettings strategy,
-                                                BigDecimal previousMlConfidence,
-                                                Boolean previousMlFailOpen) {
-        if (strategy == null) {
-            return;
-        }
-
-        try {
-            strategy.setMlConfidence(previousMlConfidence);
-        } catch (Exception e) {
-            log.warn("[SCALPING] ⚠ runtime mlConfidence restore failed err={}", e.toString());
-        }
-
-        if (previousMlFailOpen != null) {
-            try {
-                writeBooleanReflective(
-                        strategy,
-                        previousMlFailOpen,
-                        "setMlFailOpenEnabled",
-                        "setMlFailOpen",
-                        "setFailOpen"
-                );
-            } catch (Exception e) {
-                log.warn("[SCALPING] ⚠ runtime mlFailOpen restore failed err={}", e.toString());
-            }
-        }
-    }
-
-    private static Boolean readStrategyMlFailOpen(StrategySettings strategy) {
-        return readBooleanReflective(
-                strategy,
-                "isMlFailOpenEnabled",
-                "getMlFailOpenEnabled",
-                "isMlFailOpen",
-                "getMlFailOpen",
-                "isFailOpen",
-                "getFailOpen"
-        );
-    }
-
-    private static Boolean readBooleanReflective(Object target, String... methodNames) {
-        if (target == null || methodNames == null) {
-            return null;
-        }
-
-        for (String methodName : methodNames) {
-            if (methodName == null || methodName.isBlank()) {
-                continue;
-            }
-            try {
-                Method method = target.getClass().getMethod(methodName);
-                Object value = method.invoke(target);
-                if (value instanceof Boolean b) {
-                    return b;
-                }
-                if (value instanceof Number n) {
-                    return n.intValue() != 0;
-                }
-                if (value != null) {
-                    String s = String.valueOf(value).trim();
-                    if ("true".equalsIgnoreCase(s) || "1".equals(s)) {
-                        return true;
-                    }
-                    if ("false".equalsIgnoreCase(s) || "0".equals(s)) {
-                        return false;
-                    }
-                }
-            } catch (Exception ignored) {
-            }
-        }
-
-        return null;
-    }
-
-    private static void writeBooleanReflective(Object target,
-                                               boolean value,
-                                               String... methodNames) {
-        if (target == null || methodNames == null) {
-            return;
-        }
-
-        for (String methodName : methodNames) {
-            if (methodName == null || methodName.isBlank()) {
-                continue;
-            }
-            try {
-                Method method = target.getClass().getMethod(methodName, boolean.class);
-                method.invoke(target, value);
-                return;
-            } catch (NoSuchMethodException ignored) {
-            } catch (Exception e) {
-                return;
-            }
-
-            try {
-                Method method = target.getClass().getMethod(methodName, Boolean.class);
-                method.invoke(target, value);
-                return;
-            } catch (NoSuchMethodException ignored) {
-            } catch (Exception e) {
-                return;
-            }
         }
     }
 
@@ -1300,65 +1181,6 @@ public class ScalpingStrategyV4 implements TradingStrategy, AiStrategyOrchestrat
         return msg == null || msg.isBlank() ? throwable.getClass().getSimpleName() : msg;
     }
 
-
-    private void switchRunPhaseSafely(StrategySettings ss, String phase) {
-        if (ss == null || phase == null || phase.isBlank()) {
-            return;
-        }
-        try {
-            ss.setRunPhase(phase);
-            strategySettingsService.save(ss);
-        } catch (Exception e) {
-            log.warn("[SCALPING] ⚠ runPhase save failed chatId={} phase={} err={}",
-                    ss.getChatId(), phase, e.toString());
-        }
-    }
-
-    private void restoreRunPhaseSafely(StrategySettings ss, NetworkType network) {
-        switchRunPhaseSafely(ss, livePhase(network));
-    }
-
-    private static String livePhase(NetworkType network) {
-        return network == NetworkType.TESTNET ? "PAPER" : "LIVE";
-    }
-
-    private static String trainingError(MlTrainingResult res) {
-        return res != null && res.error() != null && !res.error().isBlank() ? res.error() : "train_failed";
-    }
-
-    private static String trainingStatus(MlTrainingResult res) {
-        if (res == null) return "null";
-        return "ok=" + res.ok() + ",applied=" + res.applied() + ",error=" + trainingError(res);
-    }
-
-    private static String tuningReason(TuningResult res) {
-        if (res == null) return "null";
-        String reason = res.reason();
-        return reason == null || reason.isBlank() ? "null" : reason.trim();
-    }
-
-    private static String tuningStatus(TuningResult res) {
-        if (res == null) return "null";
-        return "applied=" + res.applied() + ",reason=" + tuningReason(res);
-    }
-
-    private static boolean isHardPrepareTuneFailure(TuningResult res) {
-        if (res == null) {
-            return false;
-        }
-        String normalized = tuningReason(res).toLowerCase(Locale.ROOT);
-        if (normalized.isBlank() || "null".equals(normalized)) {
-            return false;
-        }
-        return normalized.contains("error")
-                || normalized.contains("failed")
-                || normalized.contains("backtest")
-                || normalized.contains("env_missing")
-                || normalized.contains("no_settings")
-                || normalized.contains("bad_chatid")
-                || normalized.contains("request=null");
-    }
-
     private static double nz(Double value, double def) { return value == null ? def : value; }
     private static BigDecimal positive(BigDecimal value) { return value != null && value.signum() > 0 ? value : null; }
     private static String safeUpper(String s) { if (s == null) return null; String t = s.trim(); return t.isEmpty() ? null : t.toUpperCase(Locale.ROOT); }
@@ -1372,7 +1194,3 @@ public class ScalpingStrategyV4 implements TradingStrategy, AiStrategyOrchestrat
         return String.valueOf(value);
     }
 }
-
-
-
-

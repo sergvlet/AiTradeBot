@@ -5,6 +5,7 @@ import jakarta.persistence.*;
 import lombok.*;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Instant;
 import java.util.Locale;
 
@@ -152,6 +153,8 @@ public class WindowScalpingStrategySettings {
     @PrePersist
     void prePersist() {
         normalizeContext();
+        normalizeWindowModel();
+        normalizeRiskModel();
         Instant now = Instant.now();
         if (createdAt == null) {
             createdAt = now;
@@ -162,20 +165,11 @@ public class WindowScalpingStrategySettings {
     @PreUpdate
     void preUpdate() {
         normalizeContext();
+        normalizeWindowModel();
+        normalizeRiskModel();
         updatedAt = Instant.now();
     }
 
-    public void alignContext(Long chatId,
-                             String exchangeName,
-                             NetworkType networkType,
-                             String symbol,
-                             String timeframe) {
-        this.chatId = chatId;
-        this.exchangeName = normalizeExchange(exchangeName);
-        this.networkType = (networkType != null ? networkType : DEFAULT_NETWORK);
-        this.symbol = normalizeSymbol(symbol);
-        this.timeframe = normalizeTimeframe(timeframe);
-    }
 
     private void normalizeContext() {
         exchangeName = normalizeExchange(exchangeName);
@@ -184,6 +178,107 @@ public class WindowScalpingStrategySettings {
         }
         symbol = normalizeSymbol(symbol);
         timeframe = normalizeTimeframe(timeframe);
+    }
+    private void normalizeWindowModel() {
+        if (autoTpSlEnabled == null) {
+            autoTpSlEnabled = Boolean.TRUE;
+        }
+
+        if (windowSize == null || windowSize < 5) {
+            windowSize = 5;
+        } else if (windowSize > 60) {
+            windowSize = 60;
+        }
+
+        entryFromLowPct = clampDouble(entryFromLowPct, 5.0, 80.0, 20.0);
+        entryFromHighPct = clampDouble(entryFromHighPct, 5.0, 80.0, 20.0);
+
+        if (entryFromLowPct + entryFromHighPct > 95.0) {
+            double scale = 95.0 / (entryFromLowPct + entryFromHighPct);
+            entryFromLowPct = roundDouble(entryFromLowPct * scale);
+            entryFromHighPct = roundDouble(entryFromHighPct * scale);
+        }
+
+        minRangePct = clampDouble(minRangePct, 0.001, 5.0, 0.25);
+        maxSpreadPct = clampDouble(maxSpreadPct, 0.001, 5.0, 0.08);
+    }
+
+
+    public BigDecimal resolvedAutoSlMinPct() {
+        return positiveOrDefault(autoSlMinPct, new BigDecimal("0.04"));
+    }
+
+    public BigDecimal resolvedAutoSlMaxPct() {
+        BigDecimal min = resolvedAutoSlMinPct();
+        BigDecimal max = positiveOrDefault(autoSlMaxPct, new BigDecimal("0.18"));
+        return max.compareTo(min) < 0 ? min : max;
+    }
+
+    public BigDecimal resolvedAutoTpMinPct() {
+        return positiveOrDefault(autoTpMinPct, new BigDecimal("0.10"));
+    }
+
+    public BigDecimal resolvedAutoTpMaxPct() {
+        BigDecimal min = resolvedAutoTpMinPct();
+        BigDecimal max = positiveOrDefault(autoTpMaxPct, new BigDecimal("0.80"));
+        return max.compareTo(min) < 0 ? min : max;
+    }
+
+    public BigDecimal resolvedAutoMinRiskReward() {
+        return positiveOrDefault(autoMinRiskReward, new BigDecimal("2.40"));
+    }
+
+    public void normalizeRiskModel() {
+        BigDecimal slMin = resolvedAutoSlMinPct();
+        BigDecimal slMax = resolvedAutoSlMaxPct();
+        BigDecimal tpMin = resolvedAutoTpMinPct();
+        BigDecimal tpMax = resolvedAutoTpMaxPct();
+        BigDecimal minRr = resolvedAutoMinRiskReward();
+
+        BigDecimal minTpByRr = slMin.multiply(minRr).setScale(8, RoundingMode.HALF_UP);
+        if (tpMin.compareTo(minTpByRr) < 0) tpMin = minTpByRr;
+        if (tpMax.compareTo(tpMin) < 0) tpMax = tpMin;
+
+        autoSlMinPct = slMin.setScale(8, RoundingMode.HALF_UP);
+        autoSlMaxPct = slMax.setScale(8, RoundingMode.HALF_UP);
+        autoTpMinPct = tpMin.setScale(8, RoundingMode.HALF_UP);
+        autoTpMaxPct = tpMax.setScale(8, RoundingMode.HALF_UP);
+        autoMinRiskReward = minRr.setScale(8, RoundingMode.HALF_UP);
+
+        BigDecimal effectiveSl = clamp(stopLossPct, slMin, slMax);
+        BigDecimal effectiveTp = clamp(takeProfitPct, tpMin, tpMax);
+        if (effectiveSl == null) effectiveSl = slMin;
+        if (effectiveTp == null) effectiveTp = tpMin;
+
+        BigDecimal minAllowedTp = effectiveSl.multiply(minRr).setScale(8, RoundingMode.HALF_UP);
+        if (effectiveTp.compareTo(minAllowedTp) < 0) {
+            effectiveTp = clamp(minAllowedTp, tpMin, tpMax);
+        }
+
+        stopLossPct = effectiveSl.setScale(8, RoundingMode.HALF_UP);
+        takeProfitPct = effectiveTp.setScale(8, RoundingMode.HALF_UP);
+    }
+
+    private static BigDecimal positiveOrDefault(BigDecimal value, BigDecimal def) {
+        return value != null && value.signum() > 0 ? value : def;
+    }
+
+    private static BigDecimal clamp(BigDecimal value, BigDecimal min, BigDecimal max) {
+        if (value == null) return null;
+        if (value.compareTo(min) < 0) return min;
+        if (value.compareTo(max) > 0) return max;
+        return value;
+    }
+
+    private static Double clampDouble(Double value, double min, double max, double def) {
+        double v = value != null && Double.isFinite(value) ? value : def;
+        if (v < min) v = min;
+        if (v > max) v = max;
+        return roundDouble(v);
+    }
+
+    private static Double roundDouble(double value) {
+        return BigDecimal.valueOf(value).setScale(8, RoundingMode.HALF_UP).doubleValue();
     }
 
     public static String normalizeExchange(String value) {

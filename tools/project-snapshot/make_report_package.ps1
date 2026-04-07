@@ -1,7 +1,7 @@
 # tools/project-snapshot/make_report_package.ps1
 # Генерирует ОДИН текстовый дамп по выбранному пакету/пути.
 # Примеры:
-#   .\tools\project-snapshot\make_report_package.ps1 -Package com.chicu.aitradebot.strategy.windowscalping
+#   .\tools\project-snapshot\make_report_package.ps1 -Package com.chicu.aitradebot
 #   .\tools\project-snapshot\make_report_package.ps1 -Path src\main\java\com\chicu\aitradebot\strategy\windowscalping
 #   .\tools\project-snapshot\make_report_package.ps1 -Package com.chicu.aitradebot.strategy -IncludeContent -MaxLines 250
 

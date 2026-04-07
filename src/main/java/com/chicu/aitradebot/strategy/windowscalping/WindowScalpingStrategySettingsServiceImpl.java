@@ -174,6 +174,7 @@ public class WindowScalpingStrategySettingsServiceImpl implements WindowScalping
         changed |= applyDouble(incoming.getMaxSpreadPct(), defaults.getMaxSpreadPct(), cur.getMaxSpreadPct(), patchMode, 0.0, 100.0, cur::setMaxSpreadPct);
 
         normalizeAutoBounds(cur);
+        changed |= normalizeTpSlAgainstAutoBounds(cur);
 
         if (!changed) {
             return cur;
@@ -483,6 +484,30 @@ public class WindowScalpingStrategySettingsServiceImpl implements WindowScalping
         cur.setAutoTpMaxPct(tpMax.setScale(8, RoundingMode.HALF_UP));
     }
 
+    private boolean normalizeTpSlAgainstAutoBounds(WindowScalpingStrategySettings cur) {
+        if (cur == null) {
+            return false;
+        }
+
+        BigDecimal prevTp = cur.getTakeProfitPct();
+        BigDecimal prevSl = cur.getStopLossPct();
+        BigDecimal prevAutoSlMin = cur.getAutoSlMinPct();
+        BigDecimal prevAutoSlMax = cur.getAutoSlMaxPct();
+        BigDecimal prevAutoTpMin = cur.getAutoTpMinPct();
+        BigDecimal prevAutoTpMax = cur.getAutoTpMaxPct();
+        BigDecimal prevAutoMinRr = cur.getAutoMinRiskReward();
+
+        cur.normalizeRiskModel();
+
+        return !bdEquals(prevTp, cur.getTakeProfitPct())
+                || !bdEquals(prevSl, cur.getStopLossPct())
+                || !bdEquals(prevAutoSlMin, cur.getAutoSlMinPct())
+                || !bdEquals(prevAutoSlMax, cur.getAutoSlMaxPct())
+                || !bdEquals(prevAutoTpMin, cur.getAutoTpMinPct())
+                || !bdEquals(prevAutoTpMax, cur.getAutoTpMaxPct())
+                || !bdEquals(prevAutoMinRr, cur.getAutoMinRiskReward());
+    }
+
     private void publishAfterCommit(Object event) {
         if (!TransactionSynchronizationManager.isActualTransactionActive()) {
             events.publishEvent(event);
@@ -634,3 +659,4 @@ public class WindowScalpingStrategySettingsServiceImpl implements WindowScalping
                                    String timeframe) {
     }
 }
+

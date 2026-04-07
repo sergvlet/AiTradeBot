@@ -3,8 +3,10 @@ package com.chicu.aitradebot.web.facade.impl;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.ExchangeSettings;
+import com.chicu.aitradebot.domain.OrderEntity;
 import com.chicu.aitradebot.exchange.client.ExchangeClient;
 import com.chicu.aitradebot.exchange.client.ExchangeClientFactory;
+import com.chicu.aitradebot.repository.OrderRepository;
 import com.chicu.aitradebot.web.dto.StrategyChartDto;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -47,6 +49,7 @@ public class ChartTradeHistoryLoader {
     private static final int QTY_SCALE = 8;
 
     private final ExchangeClientFactory exchangeClientFactory;
+    private final OrderRepository orderRepository;
 
     public List<StrategyChartDto.TradeMarker> loadTradeMarkers(Long chatId,
                                                                StrategyType strategyType,
@@ -73,20 +76,145 @@ public class ChartTradeHistoryLoader {
         long safeToMs = Math.max(safeFromMs, toMs);
         int max = Math.max(10, Math.min(limit > 0 ? limit : DEFAULT_LIMIT, MAX_LIMIT));
 
-        List<StrategyChartDto.TradeMarker> exchangeTrades =
-                loadFromExchange(chatId, strategyType, ex, network, sym, timeframe, safeFromMs, safeToMs, max);
+        List<StrategyChartDto.TradeMarker> localTrades =
+                loadFromLocalOrders(chatId, strategyType, ex, network, sym, safeFromMs, safeToMs, max);
 
-        if (!exchangeTrades.isEmpty()) {
-            log.info("📈 [CHART] trade-history loaded from exchange chatId={} type={} ex={} net={} sym={} trades={} range=[{},{}]",
-                    chatId, strategyType, ex, network, sym, exchangeTrades.size(), safeFromMs, safeToMs);
-            return exchangeTrades;
+        if (!localTrades.isEmpty()) {
+            log.info("📈 [CHART] trade-history loaded from local strategy orders chatId={} type={} ex={} net={} sym={} trades={} range=[{},{}]",
+                    chatId, strategyType, ex, network, sym, localTrades.size(), safeFromMs, safeToMs);
+            return localTrades;
         }
 
-        log.info("📭 [CHART] exchange trade-history is empty chatId={} type={} ex={} net={} sym={} range=[{},{}]",
+        log.info("📭 [CHART] local strategy trade-history is empty chatId={} type={} ex={} net={} sym={} range=[{},{}]",
                 chatId, strategyType, ex, network, sym, safeFromMs, safeToMs);
 
-        // Для графика источник истины — только биржа.
+        // ВАЖНО:
+        // Для strategy-specific графика биржевые executions нельзя считать источником истины,
+        // потому что биржа не знает, какой именно стратегией была открыта сделка.
+        // Иначе одинаковые account-wide сделки начинают рисоваться сразу в нескольких стратегиях.
         return List.of();
+    }
+
+    private List<StrategyChartDto.TradeMarker> loadFromLocalOrders(Long chatId,
+                                                                   StrategyType strategyType,
+                                                                   String exchange,
+                                                                   NetworkType network,
+                                                                   String symbol,
+                                                                   long fromMs,
+                                                                   long toMs,
+                                                                   int limit) {
+        if (orderRepository == null) {
+            return List.of();
+        }
+
+        String strategy = strategyType.name();
+        String networkKey = network != null ? network.name() : null;
+
+        List<OrderEntity> rows;
+        try {
+            rows = orderRepository.findByChatIdAndStrategyTypeAndSymbolAndExchangeNameAndNetworkTypeOrderByTimestampAsc(
+                    chatId,
+                    strategy,
+                    symbol,
+                    exchange,
+                    networkKey
+            );
+
+            if (rows == null || rows.isEmpty()) {
+                rows = orderRepository.findByChatIdAndStrategyTypeAndSymbolOrderByTimestampAsc(chatId, strategy, symbol);
+            }
+        } catch (Exception e) {
+            log.debug("⚠️ [CHART] local trade-history read failed chatId={} type={} sym={} err={}",
+                    chatId, strategyType, symbol, e.toString());
+            return List.of();
+        }
+
+        if (rows == null || rows.isEmpty()) {
+            return List.of();
+        }
+
+        LinkedHashMap<String, StrategyChartDto.TradeMarker> uniq = new LinkedHashMap<>();
+
+        for (OrderEntity row : rows) {
+            if (row == null) {
+                continue;
+            }
+            if (!matchesContext(row, exchange, networkKey)) {
+                continue;
+            }
+            if (!isFilled(row)) {
+                continue;
+            }
+
+            String side = normUpper(row.getSide());
+            if (!"BUY".equals(side) && !"SELL".equals(side)) {
+                continue;
+            }
+
+            BigDecimal rowPrice = row.getPrice();
+            BigDecimal rowQty = row.getQuantity();
+            Long rowTime = row.getTimestamp();
+
+            if (rowTime == null || rowTime <= 0L || rowTime < fromMs || rowTime > toMs) {
+                continue;
+            }
+            if (rowPrice == null || rowPrice.signum() <= 0) {
+                continue;
+            }
+
+            StrategyChartDto.TradeMarker marker = StrategyChartDto.TradeMarker.builder()
+                    .side(side)
+                    .price(rowPrice.doubleValue())
+                    .qty(rowQty != null ? rowQty.doubleValue() : null)
+                    .time(rowTime)
+                    .source("local")
+                    .build();
+
+            String key = buildFallbackTradeKey(symbol, side, marker.getPrice(), marker.getQty(), rowTime);
+            putBestTrade(uniq, key, marker);
+        }
+
+        List<StrategyChartDto.TradeMarker> out = new ArrayList<>(uniq.values());
+        out.sort(Comparator
+                .comparingLong(StrategyChartDto.TradeMarker::getTime)
+                .thenComparing(t -> t.getSide() != null ? t.getSide() : ""));
+
+        if (out.size() > limit) {
+            out = new ArrayList<>(out.subList(out.size() - limit, out.size()));
+        }
+
+        return out;
+    }
+
+    private boolean matchesContext(OrderEntity row, String exchange, String networkKey) {
+        String rowExchange = normUpper(row.getExchangeName());
+        String rowNetwork = normUpper(row.getNetworkType());
+
+        if (rowExchange != null && exchange != null && !rowExchange.equals(exchange)) {
+            return false;
+        }
+        if (rowNetwork != null && networkKey != null && !rowNetwork.equals(networkKey)) {
+            return false;
+        }
+        return true;
+    }
+
+    private boolean isFilled(OrderEntity row) {
+        if (row == null) {
+            return false;
+        }
+        if (Boolean.TRUE.equals(row.getFilled())) {
+            return true;
+        }
+
+        String status = normUpper(row.getStatus());
+        if (status == null) {
+            return false;
+        }
+
+        return status.equals("FILLED")
+                || status.startsWith("PARTIALLY_FILLED")
+                || status.equals("PARTIALLYFILLED");
     }
 
     private List<StrategyChartDto.TradeMarker> loadFromExchange(Long chatId,
@@ -111,14 +239,12 @@ public class ChartTradeHistoryLoader {
             return List.of();
         }
 
-        // 1) Нормальный путь через интерфейс ExchangeClient.
         List<StrategyChartDto.TradeMarker> directTrades =
                 tryDirectGetMyTrades(client, chatId, network, symbol, fromMs, toMs, limit);
         if (!directTrades.isEmpty()) {
             return directTrades;
         }
 
-        // 2) Универсальный рефлексивный fallback, включая сигнатуры c network.
         for (String method : List.of(
                 "getMyTrades",
                 "getTradeHistory",
@@ -142,8 +268,6 @@ public class ChartTradeHistoryLoader {
             }
         }
 
-        // 3) Спец-fallback для Bybit, если клиент ещё не реализовал getMyTrades(),
-        // но внутри уже есть signedV5()/resolve().
         if (isBybitClient(client)) {
             List<StrategyChartDto.TradeMarker> bybitTrades =
                     loadBybitExecutionsViaReflection(client, chatId, network, symbol, fromMs, toMs, limit);
@@ -224,7 +348,6 @@ public class ChartTradeHistoryLoader {
                 try {
                     return m.invoke(target, coerceArgs(m.getParameterTypes(), args));
                 } catch (Exception ignored) {
-                    // Идём к следующей совместимой сигнатуре.
                 }
             }
         }
@@ -584,22 +707,6 @@ public class ChartTradeHistoryLoader {
         }
         String name = client.getClass().getName().toUpperCase(Locale.ROOT);
         return name.contains("BYBIT");
-    }
-
-    private List<StrategyChartDto.TradeMarker> dedup(List<StrategyChartDto.TradeMarker> rows) {
-        LinkedHashMap<String, StrategyChartDto.TradeMarker> uniq = new LinkedHashMap<>();
-        for (StrategyChartDto.TradeMarker row : rows) {
-            if (row == null || row.getTime() == null || row.getPrice() == null) {
-                continue;
-            }
-            String key = buildFallbackTradeKey(null, row.getSide(), row.getPrice(), row.getQty(), row.getTime());
-            putBestTrade(uniq, key, row);
-        }
-        List<StrategyChartDto.TradeMarker> out = new ArrayList<>(uniq.values());
-        out.sort(Comparator
-                .comparingLong(StrategyChartDto.TradeMarker::getTime)
-                .thenComparing(t -> t.getSide() != null ? t.getSide() : ""));
-        return out;
     }
 
     private void putBestTrade(Map<String, StrategyChartDto.TradeMarker> uniq,

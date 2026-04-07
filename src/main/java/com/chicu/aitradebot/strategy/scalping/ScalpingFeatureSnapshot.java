@@ -20,7 +20,8 @@ public record ScalpingFeatureSnapshot(
         BigDecimal priceFromWindowHigh,
         BigDecimal rsi,
         BigDecimal riskRewardRatio,
-        BigDecimal score
+        BigDecimal score,
+        boolean volumeProxy
 ) {
 
     public Map<String, Object> toMlFeatures() {

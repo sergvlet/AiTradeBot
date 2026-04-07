@@ -185,7 +185,7 @@ public class FibonacciGridStrategyV4 implements TradingStrategy, AiStrategyOrche
 
         if (trainRes == null || !trainRes.ok() || !trainRes.applied()) {
             restoreRunPhaseSafely(ss, net);
-            return AiStrategyOrchestrator.PreparationResult.fail("train_failed:" + trainingError(trainRes));
+            return AiStrategyOrchestrator.PreparationResult.fail("train_failed:" + trainingErrorOrDefault(trainRes, "train_failed"));
         }
 
         TuningResult tuneRes = null;
@@ -1304,12 +1304,26 @@ private Object readKlineValue(UnifiedKline kline, String... methods) {
     }
 
     private static String trainingError(MlTrainingResult res) {
-        return res != null && res.error() != null && !res.error().isBlank() ? res.error() : "train_failed";
+        if (res == null || res.error() == null || res.error().isBlank()) {
+            return null;
+        }
+        return res.error().trim();
+    }
+
+    private static String trainingErrorOrDefault(MlTrainingResult res, String fallback) {
+        String error = trainingError(res);
+        if (error != null) {
+            return error;
+        }
+        return fallback == null || fallback.isBlank() ? "train_failed" : fallback;
     }
 
     private static String trainingStatus(MlTrainingResult res) {
         if (res == null) return "null";
-        return "ok=" + res.ok() + ",applied=" + res.applied() + ",error=" + trainingError(res);
+
+        String status = "ok=" + res.ok() + ",applied=" + res.applied();
+        String error = trainingError(res);
+        return error != null ? status + ",error=" + error : status;
     }
 
     private static String tuningReason(TuningResult res) {
@@ -1390,5 +1404,6 @@ private Object readKlineValue(UnifiedKline kline, String... methods) {
         return Double.isFinite(d) ? d : null;
     }
 }
+
 
 

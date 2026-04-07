@@ -11,9 +11,22 @@ public final class ScalpingFeatureCalculator {
 
     private static final int SCALE = 8;
 
+    public record CandleInput(
+            Instant timestamp,
+            BigDecimal open,
+            BigDecimal high,
+            BigDecimal low,
+            BigDecimal close,
+            BigDecimal volume
+    ) {}
+
     private ScalpingFeatureCalculator() {
     }
 
+    /**
+     * Фолбэк для intrabar/tick-режима, когда у нас есть только closes.
+     * Здесь volumeToAverage считается как proxy и не должен блокировать вход сам по себе.
+     */
     public static ScalpingFeatureSnapshot calculate(Deque<BigDecimal> priceWindow,
                                                     ScalpingStrategySettings cfg,
                                                     Instant ts) {
@@ -51,17 +64,12 @@ public final class ScalpingFeatureCalculator {
         double emaSlow = ema(prices, slowPeriod);
         BigDecimal emaDiff = pct(BigDecimal.valueOf(emaSlow), BigDecimal.valueOf(emaFast));
 
-        BigDecimal atrPct = calculateAtrPct(prices);
-        BigDecimal spreadPct = calculateMicroSpreadPct(prices);
-        BigDecimal volumeToAverage = calculateActivityRatio(prices);
+        BigDecimal atrPct = calculateAtrPctFromCloses(prices);
+        BigDecimal spreadPct = calculateMicroSpreadPctFromCloses(prices);
+        BigDecimal volumeToAverage = BigDecimal.ONE.setScale(SCALE, RoundingMode.HALF_UP);
         BigDecimal rsi = BigDecimal.valueOf(calculateRsi(prices, Math.min(14, Math.max(6, prices.size() / 2))));
 
-        BigDecimal riskRewardRatio = BigDecimal.ZERO;
-        if (cfg.getTakeProfitPct() != null && cfg.getStopLossPct() != null && cfg.getStopLossPct() > 0) {
-            riskRewardRatio = BigDecimal.valueOf(cfg.getTakeProfitPct())
-                    .divide(BigDecimal.valueOf(cfg.getStopLossPct()), SCALE, RoundingMode.HALF_UP);
-        }
-
+        BigDecimal riskRewardRatio = riskRewardRatio(cfg);
         BigDecimal score = buildScore(priceChangePct, emaDiff, volumeToAverage, spreadPct, atrPct, rsi, riskRewardRatio);
 
         return new ScalpingFeatureSnapshot(
@@ -79,8 +87,96 @@ public final class ScalpingFeatureCalculator {
                 priceFromWindowHigh,
                 rsi.setScale(SCALE, RoundingMode.HALF_UP),
                 riskRewardRatio.setScale(SCALE, RoundingMode.HALF_UP),
-                score.setScale(SCALE, RoundingMode.HALF_UP)
+                score.setScale(SCALE, RoundingMode.HALF_UP),
+                true
         );
+    }
+
+    /**
+     * Основной расчёт по реальным свечам OHLCV.
+     */
+    public static ScalpingFeatureSnapshot calculateFromCandles(Deque<CandleInput> candleWindow,
+                                                               ScalpingStrategySettings cfg,
+                                                               Instant ts) {
+        if (candleWindow == null || cfg == null || candleWindow.size() < 3) {
+            return null;
+        }
+
+        List<CandleInput> candles = candleWindow.stream()
+                .filter(c -> c != null && positive(c.close()))
+                .toList();
+
+        if (candles.size() < 3) {
+            return null;
+        }
+
+        List<BigDecimal> closes = candles.stream().map(CandleInput::close).toList();
+
+        BigDecimal first = closes.get(0);
+        BigDecimal last = closes.get(closes.size() - 1);
+
+        BigDecimal low = candles.stream()
+                .map(CandleInput::low)
+                .filter(ScalpingFeatureCalculator::positive)
+                .min(BigDecimal::compareTo)
+                .orElse(null);
+
+        BigDecimal high = candles.stream()
+                .map(CandleInput::high)
+                .filter(ScalpingFeatureCalculator::positive)
+                .max(BigDecimal::compareTo)
+                .orElse(null);
+
+        if (!positive(first) || !positive(last) || !positive(low) || !positive(high)) {
+            return null;
+        }
+
+        BigDecimal priceChangePct = pct(first, last);
+        BigDecimal windowRange = pct(low, high);
+        BigDecimal priceFromWindowLow = pct(low, last);
+        BigDecimal priceFromWindowHigh = pct(last, high);
+
+        int fastPeriod = Math.max(3, cfg.getWindowSize() / 4);
+        int slowPeriod = Math.max(fastPeriod + 2, cfg.getWindowSize() / 2);
+        double emaFast = ema(closes, fastPeriod);
+        double emaSlow = ema(closes, slowPeriod);
+        BigDecimal emaDiff = pct(BigDecimal.valueOf(emaSlow), BigDecimal.valueOf(emaFast));
+
+        BigDecimal atrPct = calculateAtrPctFromCandles(candles);
+        BigDecimal spreadPct = calculateMicroSpreadPctFromCloses(closes);
+        BigDecimal volumeToAverage = calculateVolumeRatio(candles);
+        BigDecimal rsi = BigDecimal.valueOf(calculateRsi(closes, Math.min(14, Math.max(6, closes.size() / 2))));
+
+        BigDecimal riskRewardRatio = riskRewardRatio(cfg);
+        BigDecimal score = buildScore(priceChangePct, emaDiff, volumeToAverage, spreadPct, atrPct, rsi, riskRewardRatio);
+
+        return new ScalpingFeatureSnapshot(
+                ts != null ? ts : candles.get(candles.size() - 1).timestamp(),
+                last.setScale(SCALE, RoundingMode.HALF_UP),
+                low.setScale(SCALE, RoundingMode.HALF_UP),
+                high.setScale(SCALE, RoundingMode.HALF_UP),
+                priceChangePct,
+                emaDiff,
+                volumeToAverage,
+                spreadPct,
+                atrPct,
+                windowRange,
+                priceFromWindowLow,
+                priceFromWindowHigh,
+                rsi.setScale(SCALE, RoundingMode.HALF_UP),
+                riskRewardRatio.setScale(SCALE, RoundingMode.HALF_UP),
+                score.setScale(SCALE, RoundingMode.HALF_UP),
+                false
+        );
+    }
+
+    private static BigDecimal riskRewardRatio(ScalpingStrategySettings cfg) {
+        BigDecimal riskRewardRatio = BigDecimal.ZERO;
+        if (cfg != null && cfg.getTakeProfitPct() != null && cfg.getStopLossPct() != null && cfg.getStopLossPct() > 0) {
+            riskRewardRatio = BigDecimal.valueOf(cfg.getTakeProfitPct())
+                    .divide(BigDecimal.valueOf(cfg.getStopLossPct()), SCALE, RoundingMode.HALF_UP);
+        }
+        return riskRewardRatio;
     }
 
     private static BigDecimal buildScore(BigDecimal priceChangePct,
@@ -101,9 +197,44 @@ public final class ScalpingFeatureCalculator {
         return BigDecimal.valueOf(score);
     }
 
-    private static BigDecimal calculateAtrPct(List<BigDecimal> prices) {
+    private static BigDecimal calculateAtrPctFromCandles(List<CandleInput> candles) {
+        if (candles.size() < 2) {
+            return BigDecimal.ZERO.setScale(SCALE, RoundingMode.HALF_UP);
+        }
+
+        double sum = 0.0d;
+        int count = 0;
+        BigDecimal prevClose = candles.get(0).close();
+
+        for (int i = 1; i < candles.size(); i++) {
+            CandleInput c = candles.get(i);
+            if (!positive(c.high()) || !positive(c.low()) || !positive(prevClose) || !positive(c.close())) {
+                prevClose = c.close();
+                continue;
+            }
+
+            double highLow = c.high().subtract(c.low()).doubleValue();
+            double highPrev = c.high().subtract(prevClose).abs().doubleValue();
+            double lowPrev = c.low().subtract(prevClose).abs().doubleValue();
+            double tr = Math.max(highLow, Math.max(highPrev, lowPrev));
+
+            if (c.close().signum() > 0) {
+                sum += (tr / c.close().doubleValue()) * 100.0d;
+                count++;
+            }
+            prevClose = c.close();
+        }
+
+        if (count == 0) {
+            return BigDecimal.ZERO.setScale(SCALE, RoundingMode.HALF_UP);
+        }
+
+        return BigDecimal.valueOf(sum / count).setScale(SCALE, RoundingMode.HALF_UP);
+    }
+
+    private static BigDecimal calculateAtrPctFromCloses(List<BigDecimal> prices) {
         if (prices.size() < 2) {
-            return BigDecimal.ZERO;
+            return BigDecimal.ZERO.setScale(SCALE, RoundingMode.HALF_UP);
         }
         double sum = 0.0d;
         int count = 0;
@@ -119,14 +250,14 @@ public final class ScalpingFeatureCalculator {
             count++;
         }
         if (count == 0) {
-            return BigDecimal.ZERO;
+            return BigDecimal.ZERO.setScale(SCALE, RoundingMode.HALF_UP);
         }
         return BigDecimal.valueOf(sum / count).setScale(SCALE, RoundingMode.HALF_UP);
     }
 
-    private static BigDecimal calculateMicroSpreadPct(List<BigDecimal> prices) {
+    private static BigDecimal calculateMicroSpreadPctFromCloses(List<BigDecimal> prices) {
         if (prices.size() < 3) {
-            return BigDecimal.ZERO;
+            return BigDecimal.ZERO.setScale(SCALE, RoundingMode.HALF_UP);
         }
         int start = Math.max(1, prices.size() - 3);
         double sum = 0.0d;
@@ -143,47 +274,41 @@ public final class ScalpingFeatureCalculator {
             count++;
         }
         if (count == 0) {
-            return BigDecimal.ZERO;
+            return BigDecimal.ZERO.setScale(SCALE, RoundingMode.HALF_UP);
         }
         return BigDecimal.valueOf(sum / count).setScale(SCALE, RoundingMode.HALF_UP);
     }
 
-    /**
-     * proxy для volumeToAverage, пока в onPriceUpdate нет реального объёма свечи.
-     * Сравниваем "энергию" последних движений с базовым средним окном.
-     */
-    private static BigDecimal calculateActivityRatio(List<BigDecimal> prices) {
-        if (prices.size() < 4) {
-            return BigDecimal.ONE;
+    private static BigDecimal calculateVolumeRatio(List<CandleInput> candles) {
+        if (candles.size() < 4) {
+            return BigDecimal.ONE.setScale(SCALE, RoundingMode.HALF_UP);
         }
 
-        List<Double> absMoves = new ArrayList<>();
-        for (int i = 1; i < prices.size(); i++) {
-            BigDecimal prev = prices.get(i - 1);
-            BigDecimal curr = prices.get(i);
-            if (!positive(prev) || !positive(curr)) {
-                continue;
-            }
-            absMoves.add(Math.abs(curr.subtract(prev)
-                    .divide(prev, SCALE, RoundingMode.HALF_UP)
-                    .doubleValue()) * 100.0d);
+        List<BigDecimal> volumes = candles.stream()
+                .map(CandleInput::volume)
+                .filter(ScalpingFeatureCalculator::positive)
+                .toList();
+
+        if (volumes.size() < 4) {
+            return BigDecimal.ONE.setScale(SCALE, RoundingMode.HALF_UP);
         }
 
-        if (absMoves.isEmpty()) {
-            return BigDecimal.ONE;
-        }
+        double baseAvg = volumes.stream()
+                .mapToDouble(BigDecimal::doubleValue)
+                .average()
+                .orElse(0.0d);
 
-        double baseAvg = absMoves.stream().mapToDouble(Double::doubleValue).average().orElse(0.0d);
-        int recentCount = Math.max(2, absMoves.size() / 4);
-        double recentAvg = absMoves.subList(absMoves.size() - recentCount, absMoves.size())
+        int recentCount = Math.max(2, volumes.size() / 4);
+        double recentAvg = volumes.subList(volumes.size() - recentCount, volumes.size())
                 .stream()
-                .mapToDouble(Double::doubleValue)
+                .mapToDouble(BigDecimal::doubleValue)
                 .average()
                 .orElse(0.0d);
 
         if (baseAvg <= 0.0d) {
-            return BigDecimal.ONE;
+            return BigDecimal.ONE.setScale(SCALE, RoundingMode.HALF_UP);
         }
+
         return BigDecimal.valueOf(recentAvg / baseAvg).setScale(SCALE, RoundingMode.HALF_UP);
     }
 
@@ -229,7 +354,7 @@ public final class ScalpingFeatureCalculator {
 
     private static BigDecimal pct(BigDecimal base, BigDecimal value) {
         if (!positive(base) || value == null) {
-            return BigDecimal.ZERO;
+            return BigDecimal.ZERO.setScale(SCALE, RoundingMode.HALF_UP);
         }
         return value.subtract(base)
                 .divide(base, SCALE, RoundingMode.HALF_UP)

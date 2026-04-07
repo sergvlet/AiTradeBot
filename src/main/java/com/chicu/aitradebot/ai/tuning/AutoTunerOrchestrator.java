@@ -157,13 +157,22 @@ public class AutoTunerOrchestrator {
             // и НЕ блокируем следующий прогон cooldown-ом.
             // ==========================
             if (isNoTrades(res)) {
-                tryAdjustCoarseFilters(tuner, normalized);
+                // Для стартового/обычного live-запуска coarse-adjust опасен:
+                // стратегия уже прошла prepare/validate, а этот прогон лишь диагностический.
+                // Разжимать фильтры можно только по адаптивным триггерам.
+                if (adaptiveReason) {
+                    tryAdjustCoarseFilters(tuner, normalized);
+                } else if (log.isDebugEnabled()) {
+                    log.debug("🧠 NO_TRADES without adaptive reason -> coarse-adjust skipped chatId={} type={} ex={} net={} reason={}",
+                            chatId, type, env.exchange, env.network, safe(normalized.reason()));
+                }
 
-                log.info("✅ TUNE DONE outcome=NO_TRADES applied=false scoreBefore={} scoreAfter={} model={} tookMs={} reason=no_trades",
+                log.info("✅ TUNE DONE outcome=NO_TRADES applied=false scoreBefore={} scoreAfter={} model={} tookMs={} reason={}",
                         res.scoreBefore(),
                         res.scoreAfter(),
                         safe(res.modelVersion()),
-                        tookMs
+                        tookMs,
+                        safe(res.reason())
                 );
 
                 lastRunByKey.put(key, new LastRun(signature, System.currentTimeMillis(), safe(res.modelVersion()), TuneOutcome.NO_TRADES));
@@ -404,4 +413,6 @@ public class AutoTunerOrchestrator {
             TuneOutcome outcome
     ) {}
 }
+
+
 

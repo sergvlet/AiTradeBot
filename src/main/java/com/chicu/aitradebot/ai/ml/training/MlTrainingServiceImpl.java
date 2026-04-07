@@ -312,7 +312,7 @@ public class MlTrainingServiceImpl implements MlTrainingService {
 
     /**
      * Первый запуск: обучаемся не по ml_samples, а прямо по выбранным свечам.
-     * Используется только для WINDOW_SCALPING.
+     * Используется для WINDOW_SCALPING / FIBONACCI_GRID / SCALPING.
      */
     public MlTrainingResult trainOnSelectedCandles(Long chatId,
                                                    StrategyType type,
@@ -322,7 +322,7 @@ public class MlTrainingServiceImpl implements MlTrainingService {
                                                    String timeframeOverride,
                                                    Integer candlesLimitOverride,
                                                    String reason) {
-        if (type != StrategyType.WINDOW_SCALPING && type != StrategyType.FIBONACCI_GRID) {
+        if (type != StrategyType.WINDOW_SCALPING && type != StrategyType.FIBONACCI_GRID && type != StrategyType.SCALPING) {
             return trainNow(chatId, type, reason);
         }
         if (props == null || !props.isEnabled()) {
@@ -1009,6 +1009,23 @@ public class MlTrainingServiceImpl implements MlTrainingService {
         return ((last - prev) / prev) * 100.0d;
     }
 
+    private double calcReturnPct(List<CandlePoint> points, int endIndex, int lookbackBars) {
+        if (points == null || points.isEmpty() || endIndex <= 0 || endIndex >= points.size()) return 0.0d;
+        int safeLookback = Math.max(1, lookbackBars);
+        int startIndex = Math.max(0, endIndex - safeLookback);
+        if (startIndex >= endIndex) return 0.0d;
+
+        CandlePoint start = points.get(startIndex);
+        CandlePoint end = points.get(endIndex);
+        if (start == null || end == null) return 0.0d;
+
+        double startClose = start.close();
+        double endClose = end.close();
+        if (!Double.isFinite(startClose) || !Double.isFinite(endClose) || startClose <= 0.0d) return 0.0d;
+
+        return ((endClose - startClose) / startClose) * 100.0d;
+    }
+
     private double calcVolatilityPct(List<CandlePoint> window) {
         if (window == null || window.size() < 3) return 0.0d;
         double mean = 0.0d;
@@ -1391,6 +1408,138 @@ private double calcCloseReturnPct(List<CandlePoint> points, int index, int back)
         if (!Double.isFinite(prev) || !Double.isFinite(cur) || prev <= 0.0d) return 0.0d;
         return ((cur - prev) / prev) * 100.0d;
     }
+
+    private ScalpingTrainingConfig resolveScalpingTrainingConfig(Long chatId,
+                                                                 String exchange,
+                                                                 NetworkType network,
+                                                                 String symbol,
+                                                                 String timeframe) {
+        int windowSize = 24;
+        double takeProfitPct = 0.80d;
+        double stopLossPct = 0.40d;
+        double minImpulsePct = 0.08d;
+
+        try {
+            Object svc = getBeanByName("scalpingStrategySettingsService");
+            if (svc != null) {
+                Object cfg = invokeCompatible(svc, "getEffective", chatId);
+                if (cfg == null) cfg = invokeCompatible(svc, "getOrCreate", chatId);
+                if (cfg != null) {
+                    Integer w = toInt(readBeanValue(cfg, "getWindowSize", "windowSize"));
+                    Double tp = toDouble(readBeanValue(cfg, "getTakeProfitPct", "takeProfitPct"));
+                    Double sl = toDouble(readBeanValue(cfg, "getStopLossPct", "stopLossPct"));
+                    Double impulse = toDouble(readBeanValue(cfg, "getMinImpulsePct", "minImpulsePct", "getPriceChangeThreshold", "priceChangeThreshold"));
+                    if (w != null && w >= 6) windowSize = w;
+                    if (tp != null && tp > 0) takeProfitPct = tp;
+                    if (sl != null && sl > 0) stopLossPct = sl;
+                    if (impulse != null && impulse > 0) minImpulsePct = impulse;
+                }
+            }
+        } catch (Exception e) {
+            log.debug("🧠 TRAIN scalping-config fallback chatId={} ex={} net={} sym={} tf={} err={}",
+                    chatId, exchange, network, symbol, timeframe, e.toString());
+        }
+
+        return new ScalpingTrainingConfig(Math.max(6, windowSize), takeProfitPct, stopLossPct, Math.max(0.0001d, minImpulsePct));
+    }
+
+    private List<Map<String, Object>> buildScalpingRowsFromCandles(List<Object> candles,
+                                                                   ScalpingTrainingConfig cfg,
+                                                                   int candlesLimit,
+                                                                   Long chatId,
+                                                                   String symbol,
+                                                                   String exchange,
+                                                                   String network,
+                                                                   String timeframe) {
+        List<Map<String, Object>> rows = new ArrayList<>();
+        if (candles == null || candles.isEmpty() || cfg == null) return rows;
+
+        List<CandlePoint> points = new ArrayList<>(candles.size());
+        for (Object candle : candles) {
+            CandlePoint p = toCandlePoint(candle);
+            if (p != null) points.add(p);
+        }
+        points.sort(Comparator.comparingLong(CandlePoint::openTimeMs));
+
+        int windowSize = Math.max(6, cfg.windowSize);
+        int horizon = Math.max(8, Math.min(48, windowSize * 2));
+
+        for (int i = windowSize - 1; i < points.size() - 2; i++) {
+            List<CandlePoint> window = points.subList(i - windowSize + 1, i + 1);
+
+            double low = window.stream().mapToDouble(CandlePoint::low).min().orElse(Double.NaN);
+            double high = window.stream().mapToDouble(CandlePoint::high).max().orElse(Double.NaN);
+            double price = points.get(i).close();
+            if (!Double.isFinite(low) || !Double.isFinite(high) || !Double.isFinite(price) || low <= 0.0d || high <= low) continue;
+
+            double range = high - low;
+            double rangePct = (range / low) * 100.0d;
+            if (!Double.isFinite(rangePct) || rangePct <= 0.0d) continue;
+
+            double ret1 = calcReturnPct(points, i, 1);
+            double ret3 = calcReturnPct(points, i, Math.min(3, i));
+            double ret5 = calcReturnPct(points, i, Math.min(5, i));
+            double impulsePct = Math.max(ret1, Math.max(ret3, ret5));
+            if (!Double.isFinite(impulsePct) || impulsePct + 1e-12 < cfg.minImpulsePct) continue;
+
+            double pos01 = (Math.max(low, Math.min(high, price)) - low) / range;
+            if (!Double.isFinite(pos01)) continue;
+
+            double emaFast = calcEma(points, i, Math.max(3, Math.min(5, windowSize)));
+            double emaSlow = calcEma(points, i, Math.max(8, Math.min(13, windowSize)));
+            double volatilityPct = calcVolatilityPct(window);
+
+            Integer label = simulateTpSlLabel(points, i, horizon, cfg.takeProfitPct, cfg.stopLossPct);
+            if (label == null) continue;
+
+            LinkedHashMap<String, Object> row = new LinkedHashMap<>();
+            row.put("windowSize", windowSize);
+            row.put("price", price);
+            row.put("lastPrice", price);
+            row.put("low", low);
+            row.put("high", high);
+            row.put("range", range);
+            row.put("rangePct", rangePct);
+            row.put("impulsePct", impulsePct);
+            row.put("emaFastRel", relPct(price, emaFast));
+            row.put("emaSlowRel", relPct(price, emaSlow));
+            row.put("emaDiffPct", relPct(emaSlow, emaFast));
+            row.put("ret1Pct", ret1);
+            row.put("ret3Pct", ret3);
+            row.put("ret5Pct", ret5);
+            row.put("volatilityPct", volatilityPct);
+            row.put("positionInRange01", pos01);
+            row.put("distanceFromLowPct", pos01 * 100.0d);
+            row.put("distanceFromHighPct", (1.0d - pos01) * 100.0d);
+            row.put("label", label);
+            row.put("chatId", chatId);
+            row.put("strategyType", StrategyType.SCALPING.name());
+            row.put("symbol", symbol);
+            row.put("exchange", exchange);
+            row.put("network", network);
+            row.put("timeframe", timeframe);
+            row.put("ts", points.get(i).closeTimeMs());
+            rows.add(row);
+        }
+
+        int rowsLimit = Math.max(100, props.getRowsLimit());
+        if (rows.size() > rowsLimit) {
+            rows = new ArrayList<>(rows.subList(rows.size() - rowsLimit, rows.size()));
+        }
+        return rows;
+    }
+
+    private double calcEma(List<CandlePoint> points, int index, int period) {
+        if (points == null || points.isEmpty() || index < 0 || index >= points.size()) return 0.0d;
+        int start = Math.max(0, index - Math.max(period * 3, period));
+        double alpha = 2.0d / (period + 1.0d);
+        double ema = points.get(start).close();
+        for (int i = start + 1; i <= index; i++) {
+            ema = (points.get(i).close() * alpha) + (ema * (1.0d - alpha));
+        }
+        return ema;
+    }
+
     private record FiboTrainingConfig(int gridLevels,
                                       double distancePct,
                                       double takeProfitPct,
@@ -1402,6 +1551,11 @@ private double calcCloseReturnPct(List<CandlePoint> points, int index, int back)
                                         double takeProfitPct,
                                         double stopLossPct,
                                         double minRangePct) {}
+
+    private record ScalpingTrainingConfig(int windowSize,
+                                          double takeProfitPct,
+                                          double stopLossPct,
+                                          double minImpulsePct) {}
 
     private record CandlePoint(double open,
                                double high,

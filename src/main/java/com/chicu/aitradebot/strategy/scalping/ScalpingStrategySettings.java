@@ -140,47 +140,78 @@ public class ScalpingStrategySettings {
 
         if (minImpulsePct == null || minImpulsePct <= 0) {
             minImpulsePct = 0.08d;
+        } else if (minImpulsePct > 5.0d) {
+            minImpulsePct = 5.0d;
         }
+
         if (emaDiffThreshold == null || emaDiffThreshold < 0) {
             emaDiffThreshold = 0.05d;
+        } else if (emaDiffThreshold > 5.0d) {
+            emaDiffThreshold = 5.0d;
         }
+
         if (volumeRatio == null || volumeRatio <= 0) {
             volumeRatio = 1.00d;
+        } else if (volumeRatio > 10.0d) {
+            volumeRatio = 10.0d;
         }
+
         if (spreadLimitPct == null || spreadLimitPct <= 0) {
             spreadLimitPct = 0.35d;
+        } else if (spreadLimitPct > 10.0d) {
+            spreadLimitPct = 10.0d;
         }
+
         if (atrPctRange == null || atrPctRange <= 0) {
             atrPctRange = 0.90d;
+        } else if (atrPctRange > 10.0d) {
+            atrPctRange = 10.0d;
         }
+
         if (rsiFilter == null || rsiFilter < 1 || rsiFilter > 99) {
             rsiFilter = 38.0d;
         }
+
         if (riskRewardMin == null || riskRewardMin <= 0) {
             riskRewardMin = 1.10d;
+        } else if (riskRewardMin > 20.0d) {
+            riskRewardMin = 20.0d;
         }
+
         if (orderVolume == null || orderVolume <= 0) {
             orderVolume = 20.0d;
         }
+
         if (takeProfitPct == null || takeProfitPct <= 0) {
             takeProfitPct = 0.28d;
+        } else if (takeProfitPct > 10.0d) {
+            takeProfitPct = 10.0d;
         }
+
         if (stopLossPct == null || stopLossPct <= 0) {
             stopLossPct = 0.18d;
+        } else if (stopLossPct > 10.0d) {
+            stopLossPct = 10.0d;
         }
+
         if (symbol == null || symbol.isBlank()) {
             symbol = "BTCUSDT";
         } else {
             symbol = symbol.trim().toUpperCase();
         }
+
         if (timeframe == null || timeframe.isBlank()) {
             timeframe = "1m";
         } else {
             timeframe = timeframe.trim().toLowerCase();
         }
+
         if (cachedCandlesLimit == null || cachedCandlesLimit < 50) {
             cachedCandlesLimit = 1000;
+        } else if (cachedCandlesLimit > 5000) {
+            cachedCandlesLimit = 5000;
         }
+
         if (active == null) {
             active = false;
         }

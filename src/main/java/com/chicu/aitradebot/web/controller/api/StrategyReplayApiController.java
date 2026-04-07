@@ -1,11 +1,10 @@
-
 package com.chicu.aitradebot.web.controller.api;
 
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
+import com.chicu.aitradebot.service.StrategySettingsService;
 import com.chicu.aitradebot.web.dto.StrategyChartDto;
 import com.chicu.aitradebot.web.facade.WebChartFacade;
-import com.chicu.aitradebot.service.StrategySettingsService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
@@ -16,6 +15,8 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.Locale;
@@ -93,7 +94,7 @@ public class StrategyReplayApiController {
         int levels = layers.getLevels() != null ? layers.getLevels().size() : 0;
         int priceLines = layers.getPriceLines() != null ? layers.getPriceLines().size() : 0;
         boolean empty = isEmpty(layers);
-        String fingerprint = buildFingerprint(exchange, network, symbol, timeframe, snapshot, trades, levels, priceLines, empty);
+        String fingerprint = buildFingerprint(exchange, network, symbol, timeframe, snapshot, layers, trades, levels, priceLines, empty);
 
         ReplayKey replayKey = new ReplayKey(chatId, type, symbol);
         long nowMs = System.currentTimeMillis();
@@ -206,6 +207,7 @@ public class StrategyReplayApiController {
                                            String symbol,
                                            String timeframe,
                                            StrategyChartDto snapshot,
+                                           StrategyChartDto.Layers layers,
                                            int trades,
                                            int levels,
                                            int priceLines,
@@ -214,6 +216,8 @@ public class StrategyReplayApiController {
                 ? String.format(Locale.ROOT, "%.8f", snapshot.getLastPrice())
                 : "null";
         int candles = snapshot != null && snapshot.getCandles() != null ? snapshot.getCandles().size() : 0;
+        String layersDigest = digestHex(buildLayersSignature(layers));
+
         return String.join("|",
                 String.valueOf(exchange),
                 String.valueOf(network),
@@ -224,7 +228,35 @@ public class StrategyReplayApiController {
                 String.valueOf(levels),
                 String.valueOf(priceLines),
                 String.valueOf(empty),
-                lastPrice);
+                lastPrice,
+                layersDigest);
+    }
+
+    private static String buildLayersSignature(StrategyChartDto.Layers layers) {
+        if (layers == null) {
+            return "null";
+        }
+        return String.join("|",
+                String.valueOf(layers.getTrades()),
+                String.valueOf(layers.getLevels()),
+                String.valueOf(layers.getPriceLines()),
+                String.valueOf(layers.getZone()),
+                String.valueOf(layers.getTpSl()),
+                String.valueOf(layers.getWindowZone()));
+    }
+
+    private static String digestHex(String raw) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] hash = md.digest(String.valueOf(raw).getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(hash.length * 2);
+            for (byte b : hash) {
+                sb.append(String.format(Locale.ROOT, "%02x", b));
+            }
+            return sb.toString();
+        } catch (Exception e) {
+            return Integer.toHexString(Objects.hashCode(raw));
+        }
     }
 
     private record ReplayKey(long chatId, StrategyType type, String symbol) {}

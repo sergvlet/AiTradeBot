@@ -19,6 +19,7 @@ import com.chicu.aitradebot.orchestrator.dto.StrategyRunInfo;
 import com.chicu.aitradebot.service.OrderService;
 import com.chicu.aitradebot.service.StrategySettingsCommandService;
 import com.chicu.aitradebot.service.StrategySettingsService;
+import com.chicu.aitradebot.repository.StrategySettingsRepository;
 import com.chicu.aitradebot.strategy.core.TradingStrategy;
 import com.chicu.aitradebot.strategy.registry.StrategyRegistry;
 import com.chicu.aitradebot.trade.ExitResult;
@@ -62,6 +63,7 @@ public class AiStrategyOrchestrator {
     private final OrderService orderService;
     private final StrategySettingsCommandService strategySettingsCommandService;
     private final StrategySettingsService settingsService;
+    private final StrategySettingsRepository strategySettingsRepository;
     private final StrategyRegistry strategyRegistry;
     private final MarketStreamService marketStreamService;
     private final MarketDataStreamService marketDataStreamService;
@@ -86,10 +88,13 @@ public class AiStrategyOrchestrator {
     @Value("${orch.market-events.degraded-log-cooldown-ms:30000}")
     private long degradedLogCooldownMs;
 
-    @Value("${orch.startup.restore-initial-delay-ms:2500}")
+    @Value("${orch.market-events.degraded-bypass-max-age-ms:5000}")
+    private long degradedBypassMaxAgeMs;
+
+    @Value("${orch.startup-restore.initial-delay-ms:1500}")
     private long startupRestoreInitialDelayMs;
 
-    @Value("${orch.startup.restore-ml-wait-ms:12000}")
+    @Value("${orch.startup-restore.ml-wait-ms:15000}")
     private long startupRestoreMlWaitMs;
 
     private MlAutoTuneRuntime ml() {
@@ -134,10 +139,48 @@ public class AiStrategyOrchestrator {
         return null;
     }
 
-    private String resolveEffectiveModelVersion(StrategySettings s) {
+    private static Boolean readBooleanNoThrow(Object target, String... methodNames) {
+        if (target == null || methodNames == null) {
+            return null;
+        }
+
+        for (String methodName : methodNames) {
+            if (methodName == null || methodName.isBlank()) {
+                continue;
+            }
+            try {
+                var m = target.getClass().getMethod(methodName);
+                Object v = m.invoke(target);
+                if (v instanceof Boolean b) {
+                    return b;
+                }
+                if (v != null) {
+                    return Boolean.parseBoolean(String.valueOf(v));
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        return null;
+    }
+
+    private static boolean sleepQuietly(long millis) {
+        try {
+            Thread.sleep(millis);
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    private String resolveEffectiveModelVersion(StrategyType type, StrategySettings s) {
         String fromSettings = blankToNull(s != null ? s.getMlModelVersion() : null);
         if (fromSettings != null) {
             return fromSettings;
+        }
+
+        if (requiresContextBoundPreparedModel(type)) {
+            return null;
         }
 
         try {
@@ -204,6 +247,16 @@ public class AiStrategyOrchestrator {
     // RUNTIME POLICY CACHE (чтобы не лезть в БД на каждый тик)
     // =====================================================================
 
+    private boolean requiresContextBoundPreparedModel(StrategyType type) {
+        if (type == null) {
+            return false;
+        }
+        return type == StrategyType.WINDOW_SCALPING
+                || type == StrategyType.EMA_CROSSOVER
+                || type == StrategyType.FIBONACCI_GRID
+                || type == StrategyType.SCALPING;
+    }
+
     private record RuntimePolicy(
             AdvancedControlMode mode,
             String runPhase,
@@ -221,7 +274,7 @@ public class AiStrategyOrchestrator {
         return x.isEmpty() ? "LIVE" : x;
     }
 
-    private RuntimePolicy policyOf(StrategySettings s) {
+    private RuntimePolicy policyOf(StrategyType type, StrategySettings s) {
         AdvancedControlMode m = (s != null && s.getAdvancedControlMode() != null)
                 ? s.getAdvancedControlMode()
                 : AdvancedControlMode.MANUAL;
@@ -231,7 +284,7 @@ public class AiStrategyOrchestrator {
         boolean autoTune = (s != null) && s.isAutoTuneEnabled();
         boolean gate = (s != null) && s.isMlGateEnabled();
         BigDecimal thr = (s != null) ? s.getGateMinProb() : null;
-        String modelVer = resolveEffectiveModelVersion(s);
+        String modelVer = resolveEffectiveModelVersion(type, s);
 
         return new RuntimePolicy(m, rp, autoTune, gate, thr, modelVer);
     }
@@ -329,40 +382,6 @@ public class AiStrategyOrchestrator {
         }
     }
 
-    private static Boolean readBooleanNoThrow(Object target, String... methodNames) {
-        if (target == null || methodNames == null) {
-            return null;
-        }
-
-        for (String methodName : methodNames) {
-            if (methodName == null || methodName.isBlank()) {
-                continue;
-            }
-            try {
-                var m = target.getClass().getMethod(methodName);
-                Object v = m.invoke(target);
-                if (v instanceof Boolean b) {
-                    return b;
-                }
-                if (v != null) {
-                    return Boolean.parseBoolean(String.valueOf(v));
-                }
-            } catch (Exception ignored) {
-            }
-        }
-        return null;
-    }
-
-    private static boolean sleepQuietly(long millis) {
-        try {
-            Thread.sleep(millis);
-            return true;
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return false;
-        }
-    }
-
     private void restoreActiveStrategiesBestEffort() {
         List<StrategySettings> all = discoverAllStrategySettings();
         if (all.isEmpty()) {
@@ -425,6 +444,15 @@ public class AiStrategyOrchestrator {
 
     @SuppressWarnings("unchecked")
     private List<StrategySettings> discoverAllStrategySettings() {
+        try {
+            List<StrategySettings> fromRepo = strategySettingsRepository.findAll();
+            if (fromRepo != null && !fromRepo.isEmpty()) {
+                return fromRepo;
+            }
+        } catch (Exception e) {
+            log.debug("⚠️ [ORCH] repository findAll failed: {}", e.toString());
+        }
+
         List<StrategySettings> direct = extractStrategySettings(invokeNoArg(settingsService,
                 "findAll",
                 "listAll",
@@ -706,7 +734,7 @@ public class AiStrategyOrchestrator {
         }
 
         BigDecimal effThr = desiredGateEnabled ? desiredGateMinProb : null;
-        String effectiveModelVer = resolveEffectiveModelVersion(s);
+        String effectiveModelVer = resolveEffectiveModelVersion(type, s);
 
         RuntimePolicy rp = new RuntimePolicy(
                 mode,
@@ -1087,7 +1115,7 @@ public class AiStrategyOrchestrator {
                 strategy.start(chatId, desired.symbol(), desired.exchange(), desired.network());
             } catch (Exception e) {
                 running.put(key, current);
-                runtimePolicyCache.put(key, policyOf(s));
+                runtimePolicyCache.put(key, policyOf(type, s));
 
                 try {
                     marketStreamService.ensureSubscribed(
@@ -1157,7 +1185,6 @@ public class AiStrategyOrchestrator {
 
         return type == StrategyType.WINDOW_SCALPING
                || type == StrategyType.FIBONACCI_GRID
-               || type == StrategyType.SCALPING
                || type == StrategyType.EMA_CROSSOVER;
     }
     private StrategySettings markStartFailedInactive(StrategySettings settings, String source) {
@@ -1237,6 +1264,14 @@ public class AiStrategyOrchestrator {
                 target.setMlSchemaHash(null);
                 changed = true;
             }
+            if (requiresContextBoundPreparedModel(type) && target.isMlGateEnabled()) {
+                target.setMlGateEnabled(false);
+                changed = true;
+            }
+            if (requiresContextBoundPreparedModel(type) && target.getGateMinProb() != null) {
+                target.setGateMinProb(null);
+                changed = true;
+            }
             if (!livePhase.equalsIgnoreCase(sanitizePhase(target.getRunPhase()))) {
                 target.setRunPhase(livePhase);
                 changed = true;
@@ -1250,6 +1285,8 @@ public class AiStrategyOrchestrator {
                 settings.setMlModelKey(target.getMlModelKey());
                 settings.setMlModelVersion(target.getMlModelVersion());
                 settings.setMlSchemaHash(target.getMlSchemaHash());
+                settings.setMlGateEnabled(target.isMlGateEnabled());
+                settings.setGateMinProb(target.getGateMinProb());
                 settings.setRunPhase(target.getRunPhase());
             }
         } catch (Exception e) {
@@ -2099,6 +2136,10 @@ public class AiStrategyOrchestrator {
                     );
 
             if (health != null && health.degraded()) {
+                if (hasFreshSourceBypass(health)) {
+                    return false;
+                }
+
                 logDegradedThrottled(key, sym, tf, health);
                 return true;
             }
@@ -2108,6 +2149,21 @@ public class AiStrategyOrchestrator {
         }
 
         return false;
+    }
+
+    private boolean hasFreshSourceBypass(MarketDataStreamService.SubscriptionHealth health) {
+        if (health == null) {
+            return false;
+        }
+
+        long maxAge = Math.max(250L, degradedBypassMaxAgeMs);
+        return isFreshAge(health.lastAggTradeAgeMs(), maxAge)
+                || isFreshAge(health.lastKlineAgeMs(), maxAge)
+                || isFreshAge(health.lastBookTickerAgeMs(), maxAge);
+    }
+
+    private boolean isFreshAge(long ageMs, long maxAgeMs) {
+        return ageMs >= 0L && ageMs <= maxAgeMs;
     }
 
     private void logDegradedThrottled(RunKey key,
@@ -2445,8 +2501,4 @@ public class AiStrategyOrchestrator {
         return s.isEmpty() ? null : s;
     }
 }
-
-
-
-
 

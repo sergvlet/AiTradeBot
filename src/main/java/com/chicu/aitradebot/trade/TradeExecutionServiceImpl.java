@@ -1982,8 +1982,26 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             return MlGateDecision.pass(confidence, minProb);
         }
 
-        boolean failOpen = isMlFailOpenEnabled(ss);
-        boolean mlConfidenceMissing = (confidenceRaw == null);
+        boolean hasUsableModel = hasUsableMlModel(ss);
+        boolean failOpen = isMlFailOpenEnabled(ss, hasUsableModel);
+
+        boolean mlConfidenceMissing = (confidenceRaw == null)
+                || (!hasUsableModel && confidence.signum() <= 0);
+
+        if (!hasUsableModel) {
+            if (mode == AdvancedControlMode.HYBRID || failOpen) {
+                return MlGateDecision.bypass(
+                        BigDecimal.ZERO,
+                        minProb,
+                        "ml_model_not_ready"
+                );
+            }
+            return MlGateDecision.reject(
+                    BigDecimal.ZERO,
+                    minProb,
+                    "ml_model_required"
+            );
+        }
 
         if (mlConfidenceMissing && mode == AdvancedControlMode.HYBRID) {
             return MlGateDecision.bypass(
@@ -2018,7 +2036,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         return MlGateDecision.pass(confidence, minProb);
     }
 
-    private boolean isMlFailOpenEnabled(StrategySettings ss) {
+    private boolean isMlFailOpenEnabled(StrategySettings ss, boolean hasUsableModel) {
         Boolean flag = readBooleanReflective(
                 ss,
                 "isMlFailOpenEnabled",
@@ -2028,7 +2046,41 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                 "isFailOpen",
                 "getFailOpen"
         );
-        return Boolean.TRUE.equals(flag);
+        if (flag != null) {
+            return Boolean.TRUE.equals(flag);
+        }
+        return !hasUsableModel;
+    }
+
+    private boolean hasUsableMlModel(StrategySettings ss) {
+        if (ss == null) {
+            return false;
+        }
+
+        String modelVersion = readStringReflective(
+                ss,
+                "getMlModelVersion",
+                "getModelVersion"
+        );
+        if (safe(modelVersion) != null) {
+            return true;
+        }
+
+        String modelKey = readStringReflective(
+                ss,
+                "getMlModelKey",
+                "getModelKey"
+        );
+        if (safe(modelKey) != null) {
+            return true;
+        }
+
+        String schemaHash = readStringReflective(
+                ss,
+                "getMlSchemaHash",
+                "getSchemaHash"
+        );
+        return safe(schemaHash) != null;
     }
 
     private Boolean readBooleanReflective(Object target, String... methodNames) {
@@ -2054,6 +2106,32 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                     if ("false".equalsIgnoreCase(s) || "0".equals(s)) {
                         return false;
                     }
+                }
+            } catch (Exception ignored) {
+            }
+        }
+
+        return null;
+    }
+
+    private String readStringReflective(Object target, String... methodNames) {
+        if (target == null || methodNames == null) {
+            return null;
+        }
+
+        for (String methodName : methodNames) {
+            if (methodName == null || methodName.isBlank()) {
+                continue;
+            }
+            try {
+                java.lang.reflect.Method method = target.getClass().getMethod(methodName);
+                Object value = method.invoke(target);
+                if (value == null) {
+                    continue;
+                }
+                String s = String.valueOf(value).trim();
+                if (!s.isEmpty() && !"null".equalsIgnoreCase(s)) {
+                    return s;
                 }
             } catch (Exception ignored) {
             }
@@ -3078,6 +3156,8 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         }
     }
 }
+
+
 
 
 
