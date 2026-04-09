@@ -684,6 +684,126 @@ public class BybitExchangeClient implements ExchangeClient {
         return true;
     }
 
+
+    @Override
+    public List<OrderSnapshot> getOpenOrders(Long chatId, NetworkType network, String symbol) throws Exception {
+        if (chatId == null) throw new IllegalArgumentException("chatId=null");
+        if (network == null) throw new IllegalArgumentException("network=null");
+
+        String sym = normalizeSymbolOrThrow(symbol);
+        ExchangeSettings s = resolve(chatId, network);
+
+        Map<String, String> p = new LinkedHashMap<>();
+        p.put("category", "spot");
+        p.put("symbol", sym);
+        p.put("openOnly", "0");
+        p.put("limit", "50");
+
+        String raw = signedV5(s, "/v5/order/realtime", p, HttpMethod.GET);
+        if (raw == null || raw.isBlank()) {
+            return List.of();
+        }
+
+        JSONObject root = new JSONObject(raw);
+        int rc = root.optInt("retCode", -1);
+        if (rc != 0) {
+            throw new RuntimeException("BYBIT getOpenOrders error: " + root.optString("retMsg") + " (retCode=" + rc + ")");
+        }
+
+        JSONObject result = root.optJSONObject("result");
+        JSONArray list = result != null ? result.optJSONArray("list") : null;
+        if (list == null || list.isEmpty()) {
+            return List.of();
+        }
+
+        List<OrderSnapshot> out = new ArrayList<>(list.length());
+        for (int i = 0; i < list.length(); i++) {
+            JSONObject item = list.optJSONObject(i);
+            if (item == null) continue;
+
+            String status = normalizeRealtimeStatus(item.optString("orderStatus", null));
+            if (!isOpenStatus(status)) {
+                continue;
+            }
+
+            String snapshotSymbol = normalizeSymbolOrThrow(item.optString("symbol", sym));
+            out.add(new OrderSnapshot(
+                    trimToNull(item.optString("orderId", null)),
+                    firstNonBlank(item.optString("orderLinkId", null), item.optString("clientOrderId", null)),
+                    snapshotSymbol,
+                    normalizeRealtimeSide(item.optString("side", null)),
+                    normalizeRealtimeType(item.optString("orderType", null)),
+                    status,
+                    safeDecimal(item.opt("qty")),
+                    safeDecimal(item.opt("cumExecQty")),
+                    safeDecimal(item.opt("price")),
+                    safeDecimal(item.opt("avgPrice")),
+                    parseTimeMs(item)
+            ));
+        }
+
+        return out;
+    }
+
+    @Override
+    public OrderSnapshot getOrder(Long chatId, NetworkType network, String symbol, String orderIdOrClientOrderId) throws Exception {
+        if (chatId == null) throw new IllegalArgumentException("chatId=null");
+        if (network == null) throw new IllegalArgumentException("network=null");
+        if (orderIdOrClientOrderId == null || orderIdOrClientOrderId.isBlank()) {
+            throw new IllegalArgumentException("orderIdOrClientOrderId пустой");
+        }
+
+        String sym = normalizeSymbolOrThrow(symbol);
+        ExchangeSettings s = resolve(chatId, network);
+
+        Map<String, String> p = new LinkedHashMap<>();
+        p.put("category", "spot");
+        p.put("symbol", sym);
+
+        String id = orderIdOrClientOrderId.trim();
+        if (looksLikeOrderLinkId(id)) {
+            p.put("orderLinkId", id);
+        } else {
+            p.put("orderId", id);
+        }
+
+        String raw = signedV5(s, "/v5/order/realtime", p, HttpMethod.GET);
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+
+        JSONObject root = new JSONObject(raw);
+        int rc = root.optInt("retCode", -1);
+        if (rc != 0) {
+            throw new RuntimeException("BYBIT getOrder error: " + root.optString("retMsg") + " (retCode=" + rc + ")");
+        }
+
+        JSONObject result = root.optJSONObject("result");
+        JSONArray list = result != null ? result.optJSONArray("list") : null;
+        if (list == null || list.isEmpty()) {
+            return null;
+        }
+
+        JSONObject item = list.optJSONObject(0);
+        if (item == null) {
+            return null;
+        }
+
+        return new OrderSnapshot(
+                trimToNull(item.optString("orderId", null)),
+                firstNonBlank(item.optString("orderLinkId", null), item.optString("clientOrderId", null)),
+                normalizeSymbolOrThrow(item.optString("symbol", sym)),
+                normalizeRealtimeSide(item.optString("side", null)),
+                normalizeRealtimeType(item.optString("orderType", null)),
+                normalizeRealtimeStatus(item.optString("orderStatus", null)),
+                safeDecimal(item.opt("qty")),
+                safeDecimal(item.opt("cumExecQty")),
+                safeDecimal(item.opt("price")),
+                safeDecimal(item.opt("avgPrice")),
+                parseTimeMs(item)
+        );
+    }
+
     // =================================================================
     // BALANCE
     // =================================================================
@@ -1289,6 +1409,82 @@ public class BybitExchangeClient implements ExchangeClient {
         return out;
     }
 
+    private static String normalizeRealtimeStatus(String status) {
+        String s = normalizeUpper(status);
+        if (s == null) return "NEW";
+
+        return switch (s) {
+            case "NEW", "OPEN", "UNTRIGGERED", "TRIGGERED" -> "OPEN";
+            case "PARTIALLYFILLED", "PARTIALLY_FILLED" -> "PARTIALLY_FILLED";
+            case "CANCELLED", "CANCELED" -> "CANCELED";
+            default -> s;
+        };
+    }
+
+    private static boolean isOpenStatus(String status) {
+        if (status == null || status.isBlank()) return false;
+        String s = status.trim().toUpperCase(Locale.ROOT);
+        return "OPEN".equals(s) || "NEW".equals(s) || "PARTIALLY_FILLED".equals(s);
+    }
+
+    private static String normalizeRealtimeSide(String side) {
+        String s = normalizeUpper(side);
+        return "SELL".equals(s) ? "SELL" : "BUY";
+    }
+
+    private static String normalizeRealtimeType(String type) {
+        String s = normalizeUpper(type);
+        return s != null ? s : "UNKNOWN";
+    }
+
+    private static long parseTimeMs(JSONObject item) {
+        if (item == null) return System.currentTimeMillis();
+
+        long updated = parseLong(item.opt("updatedTime"));
+        if (updated > 0) return updated;
+
+        long created = parseLong(item.opt("createdTime"));
+        if (created > 0) return created;
+
+        return System.currentTimeMillis();
+    }
+
+    private static long parseLong(Object value) {
+        if (value == null) return 0L;
+        try {
+            if (value instanceof Number n) {
+                return n.longValue();
+            }
+            String s = String.valueOf(value).trim();
+            if (s.isEmpty()) return 0L;
+            return new BigDecimal(s).longValue();
+        } catch (Exception ignored) {
+            return 0L;
+        }
+    }
+
+    private static String firstNonBlank(String... values) {
+        if (values == null) return null;
+        for (String value : values) {
+            String trimmed = trimToNull(value);
+            if (trimmed != null) {
+                return trimmed;
+            }
+        }
+        return null;
+    }
+
+    private static String trimToNull(String value) {
+        if (value == null) return null;
+        String trimmed = value.trim();
+        return trimmed.isEmpty() ? null : trimmed;
+    }
+
+    private static boolean looksLikeOrderLinkId(String value) {
+        if (value == null || value.isBlank()) return false;
+        return value.contains("-") || value.startsWith("cid") || value.startsWith("CID");
+    }
+
     // =================================================================
     // SIGN
     // =================================================================
@@ -1449,6 +1645,7 @@ public class BybitExchangeClient implements ExchangeClient {
         return safe.setScale(4, RoundingMode.DOWN).stripTrailingZeros();
     }
 }
+
 
 
 

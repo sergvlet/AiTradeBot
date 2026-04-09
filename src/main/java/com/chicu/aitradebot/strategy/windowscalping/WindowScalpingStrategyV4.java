@@ -12,20 +12,17 @@ import com.chicu.aitradebot.ai.tuning.TuningRequest;
 import com.chicu.aitradebot.ai.tuning.TuningResult;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
-import com.chicu.aitradebot.domain.OrderEntity;
 import com.chicu.aitradebot.domain.StrategySettings;
 import com.chicu.aitradebot.domain.enums.AdvancedControlMode;
 import com.chicu.aitradebot.events.StrategySettingsUpdatedEvent;
 import com.chicu.aitradebot.events.WindowScalpingSettingsUpdatedEvent;
 import com.chicu.aitradebot.market.model.UnifiedKline;
 import com.chicu.aitradebot.orchestrator.AiStrategyOrchestrator;
-import com.chicu.aitradebot.repository.OrderRepository;
 import com.chicu.aitradebot.service.StrategySettingsService;
 import com.chicu.aitradebot.strategy.core.TradingStrategy;
 import com.chicu.aitradebot.strategy.core.signal.Signal;
 import com.chicu.aitradebot.strategy.live.StrategyLivePublisher;
 import com.chicu.aitradebot.strategy.registry.StrategyBinding;
-import com.chicu.aitradebot.trade.InMemoryPositionStoreImpl;
 import com.chicu.aitradebot.trade.TradeExecutionServiceImpl;
 import com.chicu.aitradebot.trade.PositionStore;
 import com.chicu.aitradebot.trade.TradeExecutionService;
@@ -373,7 +370,6 @@ public class WindowScalpingStrategyV4 implements
     private final StrategySettingsService strategySettingsService;
     private final TradeExecutionService tradeExecutionService;
     private final PositionStore positionStore;
-    private final OrderRepository orderRepository;
     private final MlSampleIngestService mlSampleIngestService;
     private final ObjectMapper objectMapper;
 
@@ -429,7 +425,24 @@ public class WindowScalpingStrategyV4 implements
         return (tradeExecutionService instanceof TradeExecutionServiceImpl impl) ? impl : null;
     }
 
-    private static final BigDecimal MIN_RESTORABLE_NOTIONAL = new BigDecimal("10.50");
+    private BigDecimal resolveMinRestorableNotional(String exchange, NetworkType network, String symbol) {
+        TradeExecutionServiceImpl exec = tradeExecImpl();
+        if (exec != null) {
+            try {
+                BigDecimal resolved = exec.resolveMinRestorableNotional(exchange, network, symbol);
+                BigDecimal positive = positiveOrNull(resolved);
+                if (positive != null) {
+                    return positive.stripTrailingZeros();
+                }
+            } catch (Exception e) {
+                log.debug("[WINDOW] resolveMinRestorableNotional skipped ex={} net={} sym={} err={}",
+                        exchange, network, symbol, e.toString());
+            }
+        }
+        return DEFAULT_MIN_RESTORABLE_NOTIONAL;
+    }
+
+    private static final BigDecimal DEFAULT_MIN_RESTORABLE_NOTIONAL = new BigDecimal("5.00");
 
     private final Map<Long, LocalState> states = new ConcurrentHashMap<>();
 
@@ -588,19 +601,6 @@ public class WindowScalpingStrategyV4 implements
                               boolean tickBased,
                               boolean fallbackUsed) {}
 
-    private static final class OpenLot {
-        private BigDecimal qty;
-        private final BigDecimal price;
-        private final Long orderId;
-        private final Instant openedAt;
-
-        private OpenLot(BigDecimal qty, BigDecimal price, Long orderId, Instant openedAt) {
-            this.qty = qty;
-            this.price = price;
-            this.orderId = orderId;
-            this.openedAt = openedAt;
-        }
-    }
 
     private record PrepareRange(Instant startAt, Instant validationStartAt, Instant endAt, int candlesLimit) {}
 
@@ -4593,12 +4593,12 @@ public class WindowScalpingStrategyV4 implements
     // POSITION RESTORE
     // =====================================================
 
-    private boolean isDustPosition(BigDecimal qty, BigDecimal entryPrice) {
-        if (qty == null || entryPrice == null) return false;
-        if (qty.signum() <= 0 || entryPrice.signum() <= 0) return false;
+    private boolean isDustPosition(BigDecimal qty, BigDecimal entryPrice, BigDecimal minRestorableNotional) {
+        if (qty == null || entryPrice == null || minRestorableNotional == null) return false;
+        if (qty.signum() <= 0 || entryPrice.signum() <= 0 || minRestorableNotional.signum() <= 0) return false;
 
         BigDecimal notional = qty.multiply(entryPrice);
-        return notional.compareTo(MIN_RESTORABLE_NOTIONAL) < 0;
+        return notional.compareTo(minRestorableNotional) < 0;
     }
 
     private void clearLocalPosition(LocalState st) {
@@ -4686,6 +4686,7 @@ public class WindowScalpingStrategyV4 implements
                                              BigDecimal qty,
                                              BigDecimal entryPrice,
                                              BigDecimal notional,
+                                             BigDecimal minRestorableNotional,
                                              String source,
                                              Instant now) {
         String key = buildDustRestoreLogKey(chatId, symbol, exchange, network, source);
@@ -4701,7 +4702,7 @@ public class WindowScalpingStrategyV4 implements
                     network,
                     fmtBd(qty),
                     fmtBd(notional),
-                    fmtBd(MIN_RESTORABLE_NOTIONAL));
+                    fmtBd(minRestorableNotional));
             return;
         }
 
@@ -4713,7 +4714,7 @@ public class WindowScalpingStrategyV4 implements
                 fmtBd(qty),
                 fmtBd(entryPrice),
                 fmtBd(notional),
-                fmtBd(MIN_RESTORABLE_NOTIONAL));
+                fmtBd(minRestorableNotional));
     }
 
     private void maybeRestorePositionFromStore(Long chatId, LocalState st, String symbol, Instant now) {
@@ -4769,7 +4770,6 @@ public class WindowScalpingStrategyV4 implements
                 positionStore.clearPosition(chatId, StrategyType.WINDOW_SCALPING, ex, net, sym);
             } catch (Exception ignored) {
             }
-            suppressRestoreForContext(chatId, ex, net, sym, "window_store_restore_qty_unavailable");
             markRestoreMiss(st, now);
             return;
         }
@@ -4777,14 +4777,14 @@ public class WindowScalpingStrategyV4 implements
         BigDecimal alignedNotional = restoredEntry.multiply(safeAlignedQty)
                 .setScale(8, RoundingMode.HALF_UP)
                 .stripTrailingZeros();
-        if (alignedNotional.compareTo(MIN_RESTORABLE_NOTIONAL) < 0) {
-            logDustRestoreSkipThrottled(chatId, st, sym, ex, net, safeAlignedQty, restoredEntry, alignedNotional, "store", now);
+        BigDecimal minRestorableNotional = resolveMinRestorableNotional(ex, net, sym);
+        if (alignedNotional.compareTo(minRestorableNotional) < 0) {
+            logDustRestoreSkipThrottled(chatId, st, sym, ex, net, safeAlignedQty, restoredEntry, alignedNotional, minRestorableNotional, "store", now);
             clearLocalPosition(st);
             try {
                 positionStore.clearPosition(chatId, StrategyType.WINDOW_SCALPING, ex, net, sym);
             } catch (Exception ignored) {
             }
-            suppressRestoreForContext(chatId, ex, net, sym, "window_store_dust_skip_aligned_qty");
             safeLive(() -> live.clearTpSl(chatId, StrategyType.WINDOW_SCALPING, sym));
             safeLive(() -> live.clearPriceLines(chatId, StrategyType.WINDOW_SCALPING, sym));
             markRestoreMiss(st, now);
@@ -4948,8 +4948,9 @@ public class WindowScalpingStrategyV4 implements
         }
 
         BigDecimal notional = entryPrice.multiply(safeAlignedQty).setScale(8, RoundingMode.HALF_UP).stripTrailingZeros();
-        if (notional.compareTo(MIN_RESTORABLE_NOTIONAL) < 0) {
-            logDustRestoreSkipThrottled(chatId, st, symbol, exchange, network, safeAlignedQty, entryPrice, notional, "store", now);
+        BigDecimal minRestorableNotional = resolveMinRestorableNotional(exchange, network, symbol);
+        if (notional.compareTo(minRestorableNotional) < 0) {
+            logDustRestoreSkipThrottled(chatId, st, symbol, exchange, network, safeAlignedQty, entryPrice, notional, minRestorableNotional, "store", now);
             clearLocalPosition(st);
             try {
                 positionStore.clearPosition(chatId, StrategyType.WINDOW_SCALPING, exchange, network, symbol);
@@ -4989,270 +4990,6 @@ public class WindowScalpingStrategyV4 implements
         }
     }
 
-    private boolean isRestoreSuppressedForContext(Long chatId,
-                                                  String exchange,
-                                                  NetworkType network,
-                                                  String symbol) {
-        if (chatId == null || exchange == null || network == null || symbol == null) {
-            return false;
-        }
-
-        if (positionStore instanceof InMemoryPositionStoreImpl store) {
-            return store.isRestoreSuppressed(
-                    chatId,
-                    StrategyType.WINDOW_SCALPING,
-                    exchange,
-                    network,
-                    symbol
-            );
-        }
-
-        return false;
-    }
-
-    private void suppressRestoreForContext(Long chatId,
-                                           String exchange,
-                                           NetworkType network,
-                                           String symbol,
-                                           String reason) {
-        if (chatId == null || exchange == null || network == null || symbol == null) {
-            return;
-        }
-
-        if (positionStore instanceof InMemoryPositionStoreImpl store) {
-            store.suppressRestore(
-                    chatId,
-                    StrategyType.WINDOW_SCALPING,
-                    exchange,
-                    network,
-                    symbol,
-                    0L,
-                    reason != null ? reason : "window_restore_suppressed"
-            );
-        }
-    }
-
-    private boolean restorePositionFromOrderHistory(Long chatId,
-                                                    LocalState st,
-                                                    String exchange,
-                                                    NetworkType network,
-                                                    String symbol,
-                                                    Instant now) {
-        if (chatId == null || st == null || exchange == null || network == null || symbol == null) {
-            return false;
-        }
-
-        if (isRestoreSuppressedForContext(chatId, exchange, network, symbol)) {
-            return false;
-        }
-
-        if (orderRepository == null) {
-            return false;
-        }
-
-        List<OrderEntity> orders;
-        try {
-            orders = orderRepository.findByChatIdAndSymbolOrderByTimestampAsc(chatId, symbol);
-        } catch (Exception e) {
-            log.warn("[WINDOW] ⚠ Не удалось прочитать историю ордеров для восстановления chatId={} sym={} err={}",
-                    chatId, symbol, e.toString());
-            return false;
-        }
-
-        if (orders == null || orders.isEmpty()) {
-            return false;
-        }
-
-        boolean hasExactContextOrders = false;
-        for (OrderEntity o : orders) {
-            if (matchesRuntimeContext(o, exchange, network, false)) {
-                hasExactContextOrders = true;
-                break;
-            }
-        }
-
-        List<OpenLot> openLots = new ArrayList<>();
-
-        for (OrderEntity o : orders) {
-            if (o == null) continue;
-            if (!StrategyType.WINDOW_SCALPING.name().equalsIgnoreCase(safeNullable(o.getStrategyType()))) continue;
-            if (!Boolean.TRUE.equals(o.getFilled())) continue;
-
-            boolean allowLegacy = !hasExactContextOrders;
-            if (!matchesRuntimeContext(o, exchange, network, allowLegacy)) continue;
-
-            String side = safeNullable(o.getSide());
-            BigDecimal qty = positiveOrNull(o.getQuantity());
-            BigDecimal price = positiveOrNull(o.getPrice());
-
-            if (qty == null || price == null) continue;
-
-            if ("BUY".equalsIgnoreCase(side)) {
-                openLots.add(new OpenLot(qty, price, o.getId(), resolveOrderTime(o, now)));
-                continue;
-            }
-
-            if ("SELL".equalsIgnoreCase(side)) {
-                BigDecimal leftToClose = qty;
-
-                while (leftToClose.signum() > 0 && !openLots.isEmpty()) {
-                    OpenLot first = openLots.get(0);
-
-                    if (first.qty.compareTo(leftToClose) <= 0) {
-                        leftToClose = leftToClose.subtract(first.qty);
-                        openLots.remove(0);
-                    } else {
-                        first.qty = first.qty.subtract(leftToClose);
-                        leftToClose = BigDecimal.ZERO;
-                    }
-                }
-            }
-        }
-
-        if (openLots.isEmpty()) {
-            return false;
-        }
-
-        BigDecimal totalQty = BigDecimal.ZERO;
-        BigDecimal totalCost = BigDecimal.ZERO;
-        Instant firstOpenedAt = null;
-        Long lastOrderId = null;
-
-        for (OpenLot lot : openLots) {
-            if (lot == null || lot.qty == null || lot.price == null) continue;
-            if (lot.qty.signum() <= 0 || lot.price.signum() <= 0) continue;
-
-            totalQty = totalQty.add(lot.qty);
-            totalCost = totalCost.add(lot.qty.multiply(lot.price));
-
-            if (firstOpenedAt == null || (lot.openedAt != null && lot.openedAt.isBefore(firstOpenedAt))) {
-                firstOpenedAt = lot.openedAt;
-            }
-            lastOrderId = lot.orderId;
-        }
-
-        if (totalQty.signum() <= 0 || totalCost.signum() <= 0) {
-            return false;
-        }
-
-        if (totalCost.compareTo(MIN_RESTORABLE_NOTIONAL) < 0) {
-            logDustRestoreSkipThrottled(
-                    chatId,
-                    st,
-                    symbol,
-                    exchange,
-                    network,
-                    totalQty,
-                    null,
-                    totalCost,
-                    "history",
-                    now
-            );
-            suppressRestoreForContext(chatId, exchange, network, symbol, "window_history_dust_skip_total_cost");
-            return false;
-        }
-
-        BigDecimal entryPrice = totalCost.divide(totalQty, 12, RoundingMode.HALF_UP);
-        totalQty = alignQtyToExchangeBalance(chatId, st, exchange, network, symbol, totalQty);
-        totalCost = entryPrice.multiply(totalQty).setScale(8, RoundingMode.HALF_UP).stripTrailingZeros();
-
-        if (isDustPosition(totalQty, entryPrice)) {
-            logDustRestoreSkipThrottled(
-                    chatId,
-                    st,
-                    symbol,
-                    exchange,
-                    network,
-                    totalQty,
-                    entryPrice,
-                    totalCost,
-                    "history",
-                    now
-            );
-            suppressRestoreForContext(chatId, exchange, network, symbol, "window_history_dust_skip_aligned_qty");
-            return false;
-        }
-
-        BigDecimal tp = resolveTpForRestore(st, entryPrice);
-        BigDecimal sl = resolveSlForRestore(st, entryPrice);
-
-        if (tp == null || sl == null) {
-            log.warn("[WINDOW] ⚠ Не удалось восстановить TP/SL из истории chatId={} sym={} entry={} qty={}",
-                    chatId, symbol, fmtBd(entryPrice), fmtBd(totalQty));
-            return false;
-        }
-
-        positionStore.markOpened(
-                chatId,
-                StrategyType.WINDOW_SCALPING,
-                exchange,
-                network,
-                symbol,
-                entryPrice,
-                totalQty,
-                tp,
-                sl,
-                totalCost,
-                lastOrderId,
-                (firstOpenedAt != null ? firstOpenedAt : now)
-        );
-
-        st.inPosition = true;
-        st.isLong = true;
-        st.entryPrice = entryPrice;
-        st.entryQty = totalQty;
-        st.tp = tp;
-        st.sl = sl;
-        st.entryOrderId = lastOrderId;
-        st.lastEntryAt = (firstOpenedAt != null ? firstOpenedAt : now);
-        rememberEntryCandle(st, st.lastEntryAt);
-
-        publishPositionLines(chatId, symbol, st);
-        resetMlCache(st);
-        markRestoreSuccess(st, now);
-
-        log.warn("[WINDOW] ♻ Восстановлена позиция из истории ордеров chatId={} sym={} ex={} net={} lots={} qty={} entry={} tp={} sl={} orderId={}",
-                chatId,
-                symbol,
-                exchange,
-                network,
-                openLots.size(),
-                fmtBd(totalQty),
-                fmtBd(entryPrice),
-                fmtBd(tp),
-                fmtBd(sl),
-                lastOrderId);
-
-        safeLive(() -> live.pushSignal(
-                chatId,
-                StrategyType.WINDOW_SCALPING,
-                symbol,
-                null,
-                Signal.hold("Позиция восстановлена после перезапуска")
-        ));
-
-        return true;
-    }
-
-    private boolean matchesRuntimeContext(OrderEntity order,
-                                          String exchange,
-                                          NetworkType network,
-                                          boolean allowLegacyWithoutContext) {
-        if (order == null) return false;
-
-        String orderEx = normalizeExchangeOrNull(order.getExchangeName());
-        String orderNet = normalizeExchangeOrNull(order.getNetworkType());
-
-        String runtimeEx = normalizeExchangeOrNull(exchange);
-        String runtimeNet = normalizeExchangeOrNull(network != null ? network.name() : null);
-
-        boolean orderHasNoContext = (orderEx == null && orderNet == null);
-        if (orderHasNoContext) {
-            return allowLegacyWithoutContext;
-        }
-
-        return Objects.equals(orderEx, runtimeEx) && Objects.equals(orderNet, runtimeNet);
-    }
 
     private boolean isValidRestoredLongTp(BigDecimal entryPrice, BigDecimal tp) {
         return positiveOrNull(entryPrice) != null
@@ -5288,22 +5025,6 @@ public class WindowScalpingStrategyV4 implements
         return calcSlFromPct(entryPrice, cfg.getStopLossPct());
     }
 
-    private Instant resolveOrderTime(OrderEntity order, Instant fallback) {
-        if (order == null) return fallback;
-        try {
-            if (order.getTimestamp() != null && order.getTimestamp() > 0) {
-                return Instant.ofEpochMilli(order.getTimestamp());
-            }
-        } catch (Exception ignored) {
-        }
-        try {
-            if (order.getCreatedAt() != null) {
-                return order.getCreatedAt().atZone(ZoneId.systemDefault()).toInstant();
-            }
-        } catch (Exception ignored) {
-        }
-        return fallback;
-    }
 
     private BigDecimal calcTpFromPct(BigDecimal entryPrice, BigDecimal tpPct) {
         if (entryPrice == null || entryPrice.signum() <= 0) return null;
@@ -5935,8 +5656,6 @@ public class WindowScalpingStrategyV4 implements
         return (v != null && v.signum() > 0) ? v : null;
     }
 }
-
-
 
 
 

@@ -16,6 +16,7 @@ import com.chicu.aitradebot.strategy.core.TradingStrategy;
 import com.chicu.aitradebot.strategy.core.signal.Signal;
 import com.chicu.aitradebot.strategy.live.StrategyLivePublisher;
 import com.chicu.aitradebot.strategy.registry.StrategyBinding;
+import com.chicu.aitradebot.trade.PositionStore;
 import com.chicu.aitradebot.trade.TradeExecutionService;
 import com.chicu.aitradebot.trade.TradeExecutionServiceImpl;
 import com.chicu.aitradebot.web.dto.StrategyChartDto;
@@ -72,6 +73,7 @@ public class FibonacciGridStrategyV4 implements TradingStrategy, AiStrategyOrche
     private final FibonacciGridStrategySettingsService fiboSettingsService;
     private final StrategySettingsService strategySettingsService;
     private final TradeExecutionService tradeExecutionService;
+    private final PositionStore positionStore;
     private final UiStrategyLayerService uiLayers;
     private final SimpMessagingTemplate ws;
     private final AdaptiveRuntimeController adaptiveRuntimeController;
@@ -266,7 +268,7 @@ public class FibonacciGridStrategyV4 implements TradingStrategy, AiStrategyOrche
 
         final String sym = st.symbol;
         safeLive(() -> live.pushState(chatId, StrategyType.FIBONACCI_GRID, sym, true));
-        safeLive(() -> live.pushSignal(chatId, StrategyType.FIBONACCI_GRID, sym, null, Signal.hold("started")));
+        safeLive(() -> live.pushSignal(chatId, StrategyType.FIBONACCI_GRID, sym, null, Signal.hold(hasOpenPosition(st) ? "position_restored" : "started")));
     }
 
     @Override
@@ -377,6 +379,7 @@ public class FibonacciGridStrategyV4 implements TradingStrategy, AiStrategyOrche
 
         synchronized (st) {
             refreshSettingsIfNeeded(chatId, st, time);
+            syncPositionState(chatId, st, false);
 
             StrategySettings ss = st.ss;
             FibonacciGridStrategySettings cfg = st.cfg;
@@ -571,6 +574,7 @@ public void onCandleClosed(long chatId,
     Instant now = Instant.now();
     synchronized (st) {
         refreshSettingsIfNeeded(chatId, st, now);
+        syncPositionState(chatId, st, false);
 
         String eventSymbol = safeUpper(symbol);
         String stateSymbol = safeUpper(st.symbol);
@@ -661,6 +665,51 @@ public void onCandleClosed(long chatId,
                 .multiply(ONE_HUNDRED)
                 .divide(from, PRICE_SCALE, RoundingMode.HALF_UP)
                 .setScale(4, RoundingMode.HALF_UP);
+    }
+
+    private void syncPositionState(Long chatId, LocalState st, boolean pushVisualsIfRestored) {
+        if (chatId == null || st == null || positionStore == null) return;
+        if (st.exchange == null || st.network == null || st.symbol == null) return;
+
+        try {
+            var opt = positionStore.getPosition(chatId, StrategyType.FIBONACCI_GRID, st.exchange, st.network, st.symbol);
+            if (opt.isPresent() && opt.get().qty() != null && opt.get().qty().signum() > 0) {
+                PositionStore.PositionSnapshot snap = opt.get();
+                boolean wasOpen = hasOpenPosition(st);
+                boolean changed = !wasOpen
+                        || !Objects.equals(st.entryQty, snap.qty())
+                        || !Objects.equals(st.entryPrice, snap.entryPrice())
+                        || !Objects.equals(st.tp, snap.tp())
+                        || !Objects.equals(st.sl, snap.sl());
+
+                st.inPosition = true;
+                st.entryQty = snap.qty();
+                st.entryPrice = snap.entryPrice();
+                st.tp = snap.tp();
+                st.sl = snap.sl();
+                st.lastEntryAt = snap.openedAt();
+
+                if (changed) {
+                    log.info("[FIBO_GRID] ♻ POSITION SYNC chatId={} sym={} qty={} entry={} tp={} sl={}",
+                            chatId, st.symbol, fmtBd(st.entryQty), fmtBd(st.entryPrice), fmtBd(st.tp), fmtBd(st.sl));
+                }
+
+                if (pushVisualsIfRestored || !wasOpen) {
+                    pushEntryVisuals(chatId, st.symbol, st, st.entryPrice, st.entryQty, Instant.now());
+                    publishRuntimeUi(chatId, st.symbol, st, Instant.now());
+                }
+                return;
+            }
+
+            if (hasOpenPosition(st)) {
+                log.warn("[FIBO_GRID] 🧹 PositionStore empty, clearing local position chatId={} sym={} qty={} entry={}",
+                        chatId, st.symbol, fmtBd(st.entryQty), fmtBd(st.entryPrice));
+                clearPosition(st);
+                publishRuntimeUi(chatId, st.symbol, st, Instant.now());
+            }
+        } catch (Exception e) {
+            log.debug("[FIBO_GRID] position sync skipped chatId={} sym={} err={}", chatId, st.symbol, e.toString());
+        }
     }
 
     private void refreshSettingsIfNeeded(Long chatId, LocalState st, Instant now) {

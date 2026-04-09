@@ -25,6 +25,11 @@ public class Order {
     /** id ордера на бирже */
     private String orderId;
 
+    private String clientOrderId;
+    private String positionUid;
+    private String correlationId;
+    private String intent;
+
     /** chatId пользователя */
     private Long chatId;
 
@@ -37,14 +42,9 @@ public class Order {
     /** MARKET / LIMIT / OCO */
     private String type;
 
-    /**
-     * Старое поле количества.
-     * Оставлено для совместимости.
-     */
     @Deprecated
     private BigDecimal qty;
 
-    /** Новое поле количества */
     private BigDecimal quantity;
 
     /** Цена ордера или фактическая цена исполнения */
@@ -56,34 +56,23 @@ public class Order {
     /** Фактически исполненное количество */
     private BigDecimal executedQty;
 
+    private BigDecimal executedQuoteQty;
+    private BigDecimal requestedQty;
+    private BigDecimal requestedPrice;
+
     /** Статус ордера */
     private String status;
 
-    /**
-     * Старое поле времени.
-     * Оставлено для совместимости.
-     */
     @Deprecated
     private Long timestamp;
 
-    /** Новое поле времени */
     private Long time;
 
-    /** Исполнен ли ордер полностью */
     private boolean filled;
 
-    /** Стратегия-инициатор */
     private StrategyType strategyType;
-
-    /** Биржа исполнения */
     private String exchangeName;
-
-    /** Сеть исполнения */
     private NetworkType networkType;
-
-    // =====================================================
-    // Legacy sync
-    // =====================================================
 
     public BigDecimal getQuantity() {
         return quantity != null ? quantity : qty;
@@ -103,10 +92,6 @@ public class Order {
         this.timestamp = time;
     }
 
-    // =====================================================
-    // Safety helpers
-    // =====================================================
-
     public String getSideUpper() {
         return side != null ? side.toUpperCase() : null;
     }
@@ -114,10 +99,6 @@ public class Order {
     public String getTypeUpper() {
         return type != null ? type.toUpperCase() : null;
     }
-
-    // =====================================================
-    // Factory
-    // =====================================================
 
     public static Order market(Long chatId,
                                String symbol,
@@ -131,9 +112,12 @@ public class Order {
         order.side = side != null ? side.toUpperCase() : null;
         order.type = "MARKET";
         order.setQuantity(quantity);
+        order.requestedQty = quantity;
+        order.requestedPrice = executionPrice;
         order.price = executionPrice;
         order.avgPrice = executionPrice;
         order.executedQty = quantity;
+        order.executedQuoteQty = executionPrice != null && quantity != null ? executionPrice.multiply(quantity) : null;
         order.status = "FILLED";
         order.filled = true;
         order.time = System.currentTimeMillis();

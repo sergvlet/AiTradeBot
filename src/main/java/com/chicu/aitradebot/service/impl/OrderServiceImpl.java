@@ -19,8 +19,8 @@ import com.chicu.aitradebot.service.OrderService;
 import com.chicu.aitradebot.service.TradeJournalGateway;
 import com.chicu.aitradebot.strategy.live.StrategyLivePublisher;
 import com.chicu.aitradebot.trade.math.QtyMath;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -35,7 +35,6 @@ import java.util.Objects;
 import java.util.stream.Collectors;
 
 @Service
-@RequiredArgsConstructor
 @Slf4j
 public class OrderServiceImpl implements OrderService {
 
@@ -49,6 +48,22 @@ public class OrderServiceImpl implements OrderService {
     private final ExchangeAIGuard aiGuard;
     private final MarketSymbolService marketSymbolService;
     private final TradeJournalGateway tradeJournalGateway;
+
+    public OrderServiceImpl(OrderRepository orderRepository,
+                            StrategyLivePublisher livePublisher,
+                            ExchangeSettingsService exchangeSettingsService,
+                            List<ExchangeClient> exchangeClients,
+                            ExchangeAIGuard aiGuard,
+                            MarketSymbolService marketSymbolService,
+                            @Qualifier("tradeJournalGatewayImpl") TradeJournalGateway tradeJournalGateway) {
+        this.orderRepository = orderRepository;
+        this.livePublisher = livePublisher;
+        this.exchangeSettingsService = exchangeSettingsService;
+        this.exchangeClients = exchangeClients;
+        this.aiGuard = aiGuard;
+        this.marketSymbolService = marketSymbolService;
+        this.tradeJournalGateway = tradeJournalGateway;
+    }
 
     @Override
     @Transactional
@@ -176,27 +191,40 @@ public class OrderServiceImpl implements OrderService {
         entity.setUserId(chatId);
         entity.setSymbol(symbol);
         entity.setSide("SELL");
+        entity.setOrderType("OCO");
+        entity.setIntent(defaultIntent(ctx, "EXIT"));
+        entity.setPositionUid(ctx.positionUid());
+        entity.setCorrelationId(correlationId);
+        entity.setClientOrderId(clientOrderId);
+        entity.setRequestedQty(quantity);
+        entity.setRequestedPrice(takeProfitPrice != null ? takeProfitPrice : stopLossPrice);
         entity.setQuantity(quantity);
+        entity.setExecutedQty(BigDecimal.ZERO);
         entity.setStrategyType(strategyType.name());
         entity.setTimestamp(System.currentTimeMillis());
         entity.setCreatedAt(LocalDateTime.now());
         entity.setExchangeName(exchangeName);
         entity.setNetworkType(networkType.name());
+        entity.setSource("STRATEGY");
+        entity.setReduceOnly(Boolean.TRUE);
+        entity.setCloseOrder(Boolean.TRUE);
         entity.setTakeProfitPrice(takeProfitPrice);
         entity.setStopLossPrice(stopLossPrice);
 
         BigDecimal refPrice = takeProfitPrice != null ? takeProfitPrice : stopLossPrice;
         entity.setPrice(refPrice);
-        if (refPrice != null) {
-            entity.setTotal(refPrice.multiply(quantity));
-        }
+        entity.setTotal(refPrice.multiply(quantity));
 
         String status = "NEW";
         if (placedOnExchange && ocoResult != null && ocoResult.status() != null && !ocoResult.status().isBlank()) {
             status = ocoResult.status().trim().toUpperCase(Locale.ROOT);
         }
         entity.setStatus(status);
+        entity.setExchangeStatus(status);
         entity.setFilled(false);
+        if (ocoResult != null) {
+            entity.setExchangeOrderId(firstNonBlank(ocoResult.orderIdTp(), ocoResult.orderIdSl(), ocoResult.orderListId()));
+        }
 
         orderRepository.save(entity);
         return mapToDto(entity);
@@ -216,9 +244,10 @@ public class OrderServiceImpl implements OrderService {
         }
 
         StrategyType parsedStrategy = parseStrategyOrThrow(strategyType);
-        String exchangeName = resolveDefaultExchange(chatId);
-        NetworkType networkType = resolveDefaultNetwork(chatId, exchangeName);
         String normalizedSymbol = normalizeSymbolOrThrow(symbol);
+
+        String exchangeName = resolveExchangeForSymbol(chatId, normalizedSymbol);
+        NetworkType networkType = resolveNetworkForSymbol(chatId, exchangeName, normalizedSymbol);
 
         OrderContext ctx = new OrderContext(
                 chatId,
@@ -260,13 +289,15 @@ public class OrderServiceImpl implements OrderService {
         }
 
         StrategyType parsedStrategy = parseStrategyOrThrow(strategyType);
-        String exchangeName = resolveDefaultExchange(chatId);
-        NetworkType networkType = resolveDefaultNetwork(chatId, exchangeName);
+        String normalizedSymbol = normalizeSymbolOrThrow(symbol);
+
+        String exchangeName = resolveExchangeForSymbol(chatId, normalizedSymbol);
+        NetworkType networkType = resolveNetworkForSymbol(chatId, exchangeName, normalizedSymbol);
 
         OrderContext ctx = new OrderContext(
                 chatId,
                 parsedStrategy,
-                normalizeSymbolOrThrow(symbol),
+                normalizedSymbol,
                 "1m",
                 null,
                 "ENTRY",
@@ -291,13 +322,15 @@ public class OrderServiceImpl implements OrderService {
         }
 
         StrategyType parsedStrategy = parseStrategyOrThrow(strategyType);
-        String exchangeName = resolveDefaultExchange(chatId);
-        NetworkType networkType = resolveDefaultNetwork(chatId, exchangeName);
+        String normalizedSymbol = normalizeSymbolOrThrow(symbol);
+
+        String exchangeName = resolveExchangeForSymbol(chatId, normalizedSymbol);
+        NetworkType networkType = resolveNetworkForSymbol(chatId, exchangeName, normalizedSymbol);
 
         OrderContext ctx = new OrderContext(
                 chatId,
                 parsedStrategy,
-                normalizeSymbolOrThrow(symbol),
+                normalizedSymbol,
                 "1m",
                 null,
                 "OCO",
@@ -352,18 +385,313 @@ public class OrderServiceImpl implements OrderService {
     }
 
     @Override
-    @Transactional(readOnly = true)
+    @Transactional
     public List<Order> getOpenOrders(Long chatId, String symbol) {
         if (chatId == null) {
             return List.of();
         }
 
         String normalizedSymbol = normalizeSymbolOrThrow(symbol);
+        String exchangeName = resolveExchangeForSymbol(chatId, normalizedSymbol);
+        NetworkType networkType = resolveNetworkForSymbol(chatId, exchangeName, normalizedSymbol);
+
+        return getOpenOrders(chatId, exchangeName, networkType, normalizedSymbol);
+    }
+
+    @Override
+    @Transactional
+    public List<Order> getOpenOrders(Long chatId,
+                                     String exchangeName,
+                                     NetworkType networkType,
+                                     String symbol) {
+        if (chatId == null) {
+            return List.of();
+        }
+
+        String normalizedSymbol = normalizeSymbolOrThrow(symbol);
+
+        String resolvedExchangeTmp = safeUpper(exchangeName);
+        if (resolvedExchangeTmp.isBlank()) {
+            resolvedExchangeTmp = resolveExchangeForSymbol(chatId, normalizedSymbol);
+        }
+        final String resolvedExchange = resolvedExchangeTmp;
+
+        NetworkType resolvedNetworkTmp = networkType != null
+                ? networkType
+                : resolveNetworkForSymbol(chatId, resolvedExchange, normalizedSymbol);
+        final NetworkType resolvedNetwork = resolvedNetworkTmp;
+
+        try {
+            ExchangeClient client = resolveClientOrThrow(resolvedExchange);
+            List<ExchangeClient.OrderSnapshot> snapshots = client.getOpenOrders(chatId, resolvedNetwork, normalizedSymbol);
+
+            if (snapshots == null || snapshots.isEmpty()) {
+                syncCloseLocalOpenOrders(chatId, normalizedSymbol, resolvedExchange, resolvedNetwork);
+                return List.of();
+            }
+
+            return syncExchangeOpenOrdersToLocal(chatId, normalizedSymbol, resolvedExchange, resolvedNetwork, snapshots);
+
+        } catch (UnsupportedOperationException e) {
+            log.warn("⚠️ [OPEN_ORDERS] Биржевой клиент не реализует getOpenOrders | chatId={} ex={} net={} sym={} -> fallback local",
+                    chatId, resolvedExchange, resolvedNetwork, normalizedSymbol);
+        } catch (Exception e) {
+            log.warn("⚠️ [OPEN_ORDERS] Не удалось получить open orders с биржи | chatId={} ex={} net={} sym={} err={} -> fallback local",
+                    chatId, resolvedExchange, resolvedNetwork, normalizedSymbol, e.toString());
+        }
+
         return orderRepository.findByChatIdAndSymbolAndStatusIn(chatId, normalizedSymbol, List.of("NEW", "OPEN", "PARTIALLY_FILLED"))
                 .stream()
+                .filter(order -> matchesOrderContext(order, resolvedExchange, resolvedNetwork))
                 .map(this::mapToDto)
                 .collect(Collectors.toList());
     }
+
+    private List<Order> syncExchangeOpenOrdersToLocal(Long chatId,
+                                                      String symbol,
+                                                      String exchangeName,
+                                                      NetworkType networkType,
+                                                      List<ExchangeClient.OrderSnapshot> snapshots) {
+
+        List<Order> result = new java.util.ArrayList<>();
+        java.util.Set<String> actualOpenKeys = new java.util.HashSet<>();
+
+        for (ExchangeClient.OrderSnapshot snapshot : snapshots) {
+            if (snapshot == null) {
+                continue;
+            }
+
+            String exchangeOrderId = trimToNull(snapshot.orderId());
+            String clientOrderId = trimToNull(snapshot.clientOrderId());
+            String status = normalizeOpenStatus(snapshot.status());
+            String side = normalizeSide(snapshot.side());
+            String type = trimToNull(snapshot.type()) != null
+                    ? snapshot.type().trim().toUpperCase(Locale.ROOT)
+                    : "UNKNOWN";
+
+            String key = firstNonBlank(exchangeOrderId, clientOrderId);
+            if (key != null) {
+                actualOpenKeys.add(key);
+            }
+
+            OrderEntity entity = findLocalOrderForExchangeSnapshot(chatId, symbol, exchangeOrderId, clientOrderId)
+                    .orElseGet(() -> {
+                        OrderEntity created = new OrderEntity();
+                        created.setChatId(chatId);
+                        created.setUserId(chatId);
+                        created.setSymbol(symbol);
+                        created.setExchangeName(exchangeName);
+                        created.setNetworkType(networkType != null ? networkType.name() : null);
+                        created.setStrategyType("UNKNOWN");
+                        created.setCreatedAt(LocalDateTime.now());
+                        created.setTimestamp(snapshot.updateTimeMs() > 0 ? snapshot.updateTimeMs() : System.currentTimeMillis());
+                        return created;
+                    });
+
+            entity.setExchangeOrderId(exchangeOrderId);
+            if (clientOrderId != null) {
+                entity.setClientOrderId(clientOrderId);
+            }
+
+            entity.setSide(side);
+            entity.setOrderType(type);
+            entity.setStatus(status);
+            entity.setExchangeStatus(status);
+            entity.setFilled("FILLED".equals(status));
+            entity.setUpdatedAt(LocalDateTime.now());
+
+            BigDecimal origQty = positiveOrZero(snapshot.origQty());
+            BigDecimal executedQty = positiveOrZero(snapshot.executedQty());
+            BigDecimal price = positiveOrZero(snapshot.price());
+            BigDecimal avgPrice = positiveOrZero(snapshot.avgPrice());
+
+            if (origQty.signum() > 0) {
+                entity.setQuantity(origQty);
+                if (entity.getRequestedQty() == null || entity.getRequestedQty().signum() <= 0) {
+                    entity.setRequestedQty(origQty);
+                }
+            }
+
+            if (executedQty.signum() > 0) {
+                entity.setExecutedQty(executedQty);
+            }
+
+            if (price.signum() > 0) {
+                entity.setPrice(price);
+                if (entity.getRequestedPrice() == null || entity.getRequestedPrice().signum() <= 0) {
+                    entity.setRequestedPrice(price);
+                }
+            }
+
+            if (avgPrice.signum() > 0) {
+                entity.setAvgExecutedPrice(avgPrice);
+            }
+
+            BigDecimal totalQty = positiveOrZero(entity.getQuantity());
+            BigDecimal totalPrice = positiveOrZero(entity.getPrice());
+            entity.setTotal(totalQty.signum() > 0 && totalPrice.signum() > 0
+                    ? totalQty.multiply(totalPrice)
+                    : BigDecimal.ZERO);
+
+            if (entity.getTimestamp() == null || entity.getTimestamp() <= 0) {
+                entity.setTimestamp(snapshot.updateTimeMs() > 0 ? snapshot.updateTimeMs() : System.currentTimeMillis());
+            }
+
+            OrderEntity saved = orderRepository.save(entity);
+            result.add(mapToDto(saved));
+        }
+
+        closeMissingLocalOpenOrders(chatId, symbol, exchangeName, networkType, actualOpenKeys);
+
+        return result;
+    }
+
+    private java.util.Optional<OrderEntity> findLocalOrderForExchangeSnapshot(Long chatId,
+                                                                              String symbol,
+                                                                              String exchangeOrderId,
+                                                                              String clientOrderId) {
+
+        List<OrderEntity> rows = orderRepository.findByChatIdAndSymbolOrderByTimestampAsc(chatId, symbol);
+        if (rows == null || rows.isEmpty()) {
+            return java.util.Optional.empty();
+        }
+
+        for (OrderEntity row : rows) {
+            if (row == null) continue;
+
+            if (exchangeOrderId != null && exchangeOrderId.equals(trimToNull(row.getExchangeOrderId()))) {
+                return java.util.Optional.of(row);
+            }
+            if (clientOrderId != null && clientOrderId.equals(trimToNull(row.getClientOrderId()))) {
+                return java.util.Optional.of(row);
+            }
+        }
+
+        return java.util.Optional.empty();
+    }
+
+    private void closeMissingLocalOpenOrders(Long chatId,
+                                             String symbol,
+                                             String exchangeName,
+                                             NetworkType networkType,
+                                             java.util.Set<String> actualOpenKeys) {
+
+        List<OrderEntity> localOpen = orderRepository.findByChatIdAndSymbolAndStatusIn(
+                chatId,
+                symbol,
+                List.of("NEW", "OPEN", "PARTIALLY_FILLED")
+        );
+
+        for (OrderEntity row : localOpen) {
+            if (row == null) continue;
+
+            String rowExchange = trimToNull(row.getExchangeName());
+            String rowNetwork = trimToNull(row.getNetworkType());
+
+            if (rowExchange != null && !rowExchange.equalsIgnoreCase(exchangeName)) {
+                continue;
+            }
+            if (rowNetwork != null && networkType != null && !rowNetwork.equalsIgnoreCase(networkType.name())) {
+                continue;
+            }
+
+            String key = firstNonBlank(trimToNull(row.getExchangeOrderId()), trimToNull(row.getClientOrderId()));
+            if (key != null && actualOpenKeys.contains(key)) {
+                continue;
+            }
+
+            row.setStatus("CANCELED");
+            row.setExchangeStatus("NOT_OPEN_ON_EXCHANGE");
+            row.setFilled(false);
+            row.setUpdatedAt(LocalDateTime.now());
+            orderRepository.save(row);
+        }
+    }
+
+    private void syncCloseLocalOpenOrders(Long chatId,
+                                          String symbol,
+                                          String exchangeName,
+                                          NetworkType networkType) {
+        closeMissingLocalOpenOrders(chatId, symbol, exchangeName, networkType, java.util.Set.of());
+    }
+
+    private static String normalizeOpenStatus(String status) {
+        String s = trimToNull(status);
+        if (s == null) {
+            return "OPEN";
+        }
+
+        s = s.toUpperCase(Locale.ROOT);
+        return switch (s) {
+            case "NEW", "OPEN", "PARTIALLY_FILLED", "PARTIALLYFILLED", "UNTRIGGERED", "TRIGGERED",
+                 "FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED" -> s;
+            default -> "OPEN";
+        };
+    }
+
+    private static BigDecimal positiveOrZero(BigDecimal value) {
+        return value != null && value.signum() > 0 ? value : BigDecimal.ZERO;
+    }
+
+    private static String trimToNull(String value) {
+        if (value == null) return null;
+        String v = value.trim();
+        return v.isEmpty() ? null : v;
+    }
+    private String resolveExchangeForSymbol(Long chatId, String symbol) {
+        List<OrderEntity> rows = orderRepository.findByChatIdAndSymbolOrderByTimestampAsc(chatId, symbol);
+        for (int i = rows.size() - 1; i >= 0; i--) {
+            OrderEntity row = rows.get(i);
+            String exchange = row != null ? trimToNull(row.getExchangeName()) : null;
+            if (exchange != null) {
+                return exchange.toUpperCase(Locale.ROOT);
+            }
+        }
+        return resolveDefaultExchange(chatId);
+    }
+
+    private NetworkType resolveNetworkForSymbol(Long chatId, String exchangeName, String symbol) {
+        String targetExchange = safeUpper(exchangeName);
+        List<OrderEntity> rows = orderRepository.findByChatIdAndSymbolOrderByTimestampAsc(chatId, symbol);
+        for (int i = rows.size() - 1; i >= 0; i--) {
+            OrderEntity row = rows.get(i);
+            if (row == null) continue;
+
+            String rowExchange = trimToNull(row.getExchangeName());
+            String rowNetwork = trimToNull(row.getNetworkType());
+
+            if (rowExchange == null || rowNetwork == null) continue;
+            if (!targetExchange.isBlank() && !targetExchange.equalsIgnoreCase(rowExchange)) continue;
+
+            try {
+                return NetworkType.valueOf(rowNetwork.toUpperCase(Locale.ROOT));
+            } catch (Exception ignored) {
+            }
+        }
+        return resolveDefaultNetwork(chatId, targetExchange);
+    }
+
+    private boolean matchesOrderContext(OrderEntity entity, String exchangeName, NetworkType networkType) {
+        if (entity == null) {
+            return false;
+        }
+
+        String rowExchange = trimToNull(entity.getExchangeName());
+        String rowNetwork = trimToNull(entity.getNetworkType());
+
+        if (exchangeName != null && !exchangeName.isBlank() && rowExchange != null
+                && !exchangeName.equalsIgnoreCase(rowExchange)) {
+            return false;
+        }
+
+        if (networkType != null && rowNetwork != null
+                && !networkType.name().equalsIgnoreCase(rowNetwork)) {
+            return false;
+        }
+
+        return true;
+    }
+
 
     @Override
     @Transactional(readOnly = true)
@@ -393,12 +721,25 @@ public class OrderServiceImpl implements OrderService {
         entity.setUserId(order.getChatId());
         entity.setSymbol(normalizeSymbolOrThrow(order.getSymbol()));
         entity.setSide(normalizeSide(order.getSide()));
+        entity.setOrderType(order.getTypeUpper());
+        entity.setIntent(order.getIntent());
+        entity.setPositionUid(order.getPositionUid());
+        entity.setCorrelationId(order.getCorrelationId());
+        entity.setClientOrderId(order.getClientOrderId());
+        entity.setExchangeOrderId(order.getOrderId());
+        entity.setRequestedQty(order.getRequestedQty() != null ? order.getRequestedQty() : order.getQuantity());
+        entity.setRequestedPrice(order.getRequestedPrice() != null ? order.getRequestedPrice() : order.getPrice());
         entity.setPrice(order.getPrice());
         entity.setQuantity(order.getQuantity());
+        entity.setExecutedQty(order.getExecutedQty());
+        entity.setExecutedQuoteQty(order.getExecutedQuoteQty());
+        entity.setAvgExecutedPrice(order.getAvgPrice());
         entity.setStatus(order.getStatus());
+        entity.setExchangeStatus(order.getStatus());
         entity.setFilled(order.isFilled());
         entity.setTimestamp(order.getTime());
         entity.setCreatedAt(LocalDateTime.now());
+        entity.setSource("SYNC");
 
         if (order.getStrategyType() != null) {
             entity.setStrategyType(order.getStrategyType().name());
@@ -587,15 +928,30 @@ public class OrderServiceImpl implements OrderService {
         entity.setUserId(chatId);
         entity.setSymbol(symbol);
         entity.setSide(sideNorm);
+        entity.setOrderType("MARKET");
+        entity.setIntent(defaultIntent(ctx, "BUY".equals(sideNorm) ? "ENTRY" : "EXIT"));
+        entity.setPositionUid(ctx.positionUid());
+        entity.setCorrelationId(correlationId);
+        entity.setClientOrderId(clientOrderId);
+        entity.setExchangeOrderId(executed != null ? executed.getOrderId() : null);
+        entity.setRequestedQty(finalQty);
+        entity.setRequestedPrice(finalPrice);
         entity.setPrice(executedPrice);
         entity.setQuantity(executedQty);
+        entity.setExecutedQty(executedQty);
+        entity.setExecutedQuoteQty(executedPrice != null && executedQty != null ? executedPrice.multiply(executedQty) : null);
+        entity.setAvgExecutedPrice(executedPrice);
         entity.setStrategyType(strategyType.name());
         entity.setStatus(status);
+        entity.setExchangeStatus(status);
         entity.setFilled(filled);
         entity.setTimestamp(System.currentTimeMillis());
         entity.setCreatedAt(LocalDateTime.now());
         entity.setExchangeName(exchangeName);
         entity.setNetworkType(networkType.name());
+        entity.setSource("STRATEGY");
+        entity.setReduceOnly("SELL".equals(sideNorm));
+        entity.setCloseOrder("SELL".equals(sideNorm));
 
         if (executedPrice != null && executedQty != null) {
             entity.setTotal(executedPrice.multiply(executedQty));
@@ -712,15 +1068,30 @@ public class OrderServiceImpl implements OrderService {
         entity.setUserId(chatId);
         entity.setSymbol(symbol);
         entity.setSide(sideNorm);
+        entity.setOrderType("LIMIT");
+        entity.setIntent(defaultIntent(ctx, "BUY".equals(sideNorm) ? "ENTRY" : "EXIT"));
+        entity.setPositionUid(ctx.positionUid());
+        entity.setCorrelationId(correlationId);
+        entity.setClientOrderId(clientOrderId);
+        entity.setExchangeOrderId(placed != null ? placed.orderId() : null);
+        entity.setRequestedQty(finalQty);
+        entity.setRequestedPrice(finalPrice);
         entity.setPrice(finalPrice);
         entity.setQuantity(finalQty);
+        entity.setExecutedQty(filled ? finalQty : BigDecimal.ZERO);
+        entity.setExecutedQuoteQty(filled ? finalPrice.multiply(finalQty) : BigDecimal.ZERO);
+        entity.setAvgExecutedPrice(filled ? finalPrice : null);
         entity.setStrategyType(strategyType.name());
         entity.setStatus(status);
+        entity.setExchangeStatus(status);
         entity.setFilled(filled);
         entity.setTimestamp(System.currentTimeMillis());
         entity.setCreatedAt(LocalDateTime.now());
         entity.setExchangeName(exchangeName);
         entity.setNetworkType(networkType.name());
+        entity.setSource("STRATEGY");
+        entity.setReduceOnly("SELL".equals(sideNorm));
+        entity.setCloseOrder("SELL".equals(sideNorm));
         entity.setTotal(finalPrice.multiply(finalQty));
 
         orderRepository.save(entity);
@@ -932,14 +1303,42 @@ public class OrderServiceImpl implements OrderService {
         }
     }
 
+    private static String defaultIntent(OrderContext ctx, String def) {
+        if (ctx == null || ctx.intent() == null || ctx.intent().isBlank()) {
+            return def;
+        }
+        return ctx.intent().trim().toUpperCase(Locale.ROOT);
+    }
+
+    private static String firstNonBlank(String... values) {
+        if (values == null) return null;
+        for (String value : values) {
+            if (value != null && !value.isBlank()) {
+                return value.trim();
+            }
+        }
+        return null;
+    }
+
     private Order mapToDto(OrderEntity entity) {
         Order order = new Order();
         order.setId(entity.getId());
+        order.setOrderId(entity.getExchangeOrderId());
+        order.setClientOrderId(entity.getClientOrderId());
+        order.setPositionUid(entity.getPositionUid());
+        order.setCorrelationId(entity.getCorrelationId());
+        order.setIntent(entity.getIntent());
         order.setChatId(entity.getChatId());
         order.setSymbol(entity.getSymbol());
         order.setSide(entity.getSide());
+        order.setType(entity.getOrderType());
         order.setPrice(entity.getPrice());
         order.setQuantity(entity.getQuantity());
+        order.setRequestedQty(entity.getRequestedQty());
+        order.setRequestedPrice(entity.getRequestedPrice());
+        order.setExecutedQty(entity.getExecutedQty());
+        order.setExecutedQuoteQty(entity.getExecutedQuoteQty());
+        order.setAvgPrice(entity.getAvgExecutedPrice());
         order.setStatus(entity.getStatus());
         order.setFilled(Boolean.TRUE.equals(entity.getFilled()));
         order.setTime(entity.getTimestamp());
@@ -1029,5 +1428,8 @@ public class OrderServiceImpl implements OrderService {
         return guard != null ? guard.minNotional() : null;
     }
 }
+
+
+
 
 

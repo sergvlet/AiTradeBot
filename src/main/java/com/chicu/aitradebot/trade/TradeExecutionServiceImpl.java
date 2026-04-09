@@ -37,6 +37,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
@@ -467,6 +468,8 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         if (sl.compareTo(price) >= 0) return EntryResult.fail("sl_ge_entry");
         if (sl.signum() <= 0) return EntryResult.fail("sl_le_0");
 
+        String entryPositionUid = buildPositionUid(chatId, strategyType, ex, net, sym);
+
         safeLive(() -> live.pushSignal(chatId, strategyType, sym, null, Signal.buy(price.doubleValue(), "entry")));
 
         if (collectMode) {
@@ -488,6 +491,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         if (paperBlocksNow) {
             positionStore.markOpened(
                     chatId, strategyType, ex, net, sym,
+                    entryPositionUid,
                     price, tradableQty, tp, sl,
                     quoteAmount, null, effectiveTime
             );
@@ -506,15 +510,15 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             return EntryResult.ok(false, "BUY", tradableQty.stripTrailingZeros(), price, tp, sl, null);
         }
 
-        OrderService.OrderContext ctx = new OrderService.OrderContext(
+        OrderService.OrderContext ctx = OrderService.OrderContext.entry(
                 chatId,
                 strategyType,
                 sym,
                 safe(ss.getTimeframe()),
                 null,
-                "ENTRY",
                 ex,
-                net
+                net,
+                entryPositionUid
         );
 
         try {
@@ -532,6 +536,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
 
             Order order = orderService.placeMarket(ctx, OrderSide.BUY, quoteAmount, price);
             Long orderId = (order != null ? order.getId() : null);
+            String actualPositionUid = firstNonBlank(order != null ? order.getPositionUid() : null, entryPositionUid);
 
             BigDecimal executedQty = pickExecutedQty(order, tradableQty);
             BigDecimal executedPrice = pickExecutedPrice(order, price);
@@ -566,6 +571,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                     ex,
                     net,
                     sym,
+                    actualPositionUid,
                     executedPrice,
                     runtimeQty,
                     tpExec,
@@ -887,15 +893,15 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             return ExitResult.ok(tpHit, slHit, executedExitPrice, pnlPct != null ? pnlPct : BigDecimal.ZERO);
         }
 
-        OrderService.OrderContext ctx = new OrderService.OrderContext(
+        OrderService.OrderContext ctx = OrderService.OrderContext.exit(
                 chatId,
                 strategyType,
                 sym,
                 (ss != null ? safe(ss.getTimeframe()) : null),
                 null,
-                "EXIT",
                 ex,
-                net
+                net,
+                null
         );
 
         BigDecimal freeBase = resolveFreeBaseQty(chatId, strategyType, ss, ex, net, sym);
@@ -1299,7 +1305,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                                                     String symbol,
                                                     String exchange,
                                                     NetworkType network) {
-        EntryOrderBlock exchangeBlock = detectExchangeOpenOrders(chatId, symbol);
+        EntryOrderBlock exchangeBlock = detectExchangeOpenOrders(chatId, exchange, network, symbol);
         if (exchangeBlock.blocked()) {
             return exchangeBlock;
         }
@@ -1308,13 +1314,15 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
     }
 
     private EntryOrderBlock detectExchangeOpenOrders(Long chatId,
+                                                     String exchange,
+                                                     NetworkType network,
                                                      String symbol) {
         if (orderService == null || chatId == null || symbol == null) {
             return EntryOrderBlock.allow();
         }
 
         try {
-            List<Order> openOrders = orderService.getOpenOrders(chatId, symbol);
+            List<Order> openOrders = orderService.getOpenOrders(chatId, exchange, network, symbol);
             if (openOrders == null || openOrders.isEmpty()) {
                 return EntryOrderBlock.allow();
             }
@@ -1341,8 +1349,8 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                 return EntryOrderBlock.block("open_order_exists", "exchange open orders=" + String.join(", ", details));
             }
         } catch (Exception e) {
-            log.debug("⚠️ [Вход] Не удалось проверить открытые ордера через OrderService | chatId={} sym={} err={}",
-                    chatId, symbol, e.toString());
+            log.debug("⚠️ [Вход] Не удалось проверить открытые ордера через OrderService | chatId={} ex={} net={} sym={} err={}",
+                    chatId, exchange, network, symbol, e.toString());
         }
 
         return EntryOrderBlock.allow();
@@ -2879,6 +2887,22 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         return roundTripFeePct.add(TP_FEE_BUFFER_PCT).setScale(6, RoundingMode.HALF_UP).stripTrailingZeros();
     }
 
+    public BigDecimal resolveMinRestorableNotional(String exchange,
+                                                   NetworkType network,
+                                                   String symbol) {
+        String ex = safeExchange(exchange);
+        String sym = normalizeSymbol(symbol);
+
+        BigDecimal minNotional = tryResolveMinNotional(ex, network, sym);
+        if (!QtyMath.isPositive(minNotional)) {
+            minNotional = DEFAULT_MIN_NOTIONAL;
+        }
+
+        return minNotional.max(MIN_RESTORABLE_NOTIONAL)
+                .setScale(8, RoundingMode.HALF_UP)
+                .stripTrailingZeros();
+    }
+
     public BigDecimal estimateNetPnlPct(Long chatId,
                                         String exchange,
                                         NetworkType network,
@@ -3142,6 +3166,32 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         return EntryPrecheckResult.allow();
     }
 
+    private String buildPositionUid(Long chatId,
+                                    StrategyType strategyType,
+                                    String exchange,
+                                    NetworkType network,
+                                    String symbol) {
+        return firstNonBlank(
+                null,
+                "pos-" + chatId + "-"
+                        + (strategyType != null ? strategyType.name() : "NA") + "-"
+                        + safeExchange(exchange) + "-"
+                        + (network != null ? network.name() : "NA") + "-"
+                        + normalizeSymbol(symbol) + "-"
+                        + UUID.randomUUID()
+        );
+    }
+
+    private static String firstNonBlank(String... values) {
+        if (values == null) return null;
+        for (String value : values) {
+            if (value != null && !value.isBlank()) {
+                return value.trim();
+            }
+        }
+        return null;
+    }
+
     public record EntryPrecheckResult(
             boolean allowed,
             String code,
@@ -3156,11 +3206,5 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         }
     }
 }
-
-
-
-
-
-
 
 

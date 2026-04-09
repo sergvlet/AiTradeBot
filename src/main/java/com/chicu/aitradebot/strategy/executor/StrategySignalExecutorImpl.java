@@ -5,12 +5,17 @@ import com.chicu.aitradebot.ai.ml.MlClient;
 import com.chicu.aitradebot.ai.ml.dto.MlHealthResponse;
 import com.chicu.aitradebot.ai.ml.dto.MlPredictRequest;
 import com.chicu.aitradebot.ai.ml.dto.MlPredictResponse;
+import com.chicu.aitradebot.common.enums.NetworkType;
+import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
 import com.chicu.aitradebot.domain.enums.AdvancedControlMode;
 import com.chicu.aitradebot.strategy.core.context.StrategyContext;
 import com.chicu.aitradebot.strategy.core.runtime.StrategyRuntimeState;
 import com.chicu.aitradebot.strategy.core.signal.Signal;
 import com.chicu.aitradebot.strategy.live.StrategyLivePublisher;
+import com.chicu.aitradebot.trade.ExitResult;
+import com.chicu.aitradebot.trade.PositionStore;
+import com.chicu.aitradebot.trade.TradeExecutionService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
@@ -19,17 +24,25 @@ import org.springframework.stereotype.Service;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class StrategySignalExecutorImpl implements StrategySignalExecutor {
 
+    private static final BigDecimal DEFAULT_DIFF_PCT = new BigDecimal("0.010000");
+    private static final BigDecimal DEFAULT_TP_PCT = new BigDecimal("1.00");
+    private static final BigDecimal DEFAULT_SL_PCT = new BigDecimal("0.80");
+
     private final StrategyLivePublisher live;
+    private final TradeExecutionService tradeExecutionService;
+    private final PositionStore positionStore;
 
     private final ObjectProvider<MlClient> mlClientProvider;
     private final ObjectProvider<ModelKeyFactory> modelKeyFactory;
@@ -41,6 +54,8 @@ public class StrategySignalExecutorImpl implements StrategySignalExecutor {
         StrategyRuntimeState state = ctx.getState();
         if (state == null) return;
 
+        syncStateFromPositionStore(ctx, state);
+
         switch (signal.getType()) {
             case BUY -> handleBuy(signal, ctx, state);
             case SELL -> handleSell(signal, ctx, state);
@@ -50,6 +65,12 @@ public class StrategySignalExecutorImpl implements StrategySignalExecutor {
     }
 
     private void handleBuy(Signal signal, StrategyContext ctx, StrategyRuntimeState state) {
+        StrategySettings ss = extractStrategySettings(ctx);
+        if (ss == null) {
+            log.warn("⚠️ StrategySignalExecutor BUY skipped: StrategySettings not found");
+            return;
+        }
+
         if (state.hasOpenPosition()) return;
         if (!state.canEnterTrade()) return;
 
@@ -61,66 +82,287 @@ public class StrategySignalExecutorImpl implements StrategySignalExecutor {
             return;
         }
 
-        state.setEntryPrice(price);
-        state.openPosition();
+        BigDecimal tpPct = resolveStrategyPct(ctx, ss, "getTakeProfitPct", DEFAULT_TP_PCT);
+        BigDecimal slPct = resolveStrategyPct(ctx, ss, "getStopLossPct", DEFAULT_SL_PCT);
+        BigDecimal diffPct = resolveDiffPct(signal);
 
-        live.pushTrade(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol(), "BUY", price, BigDecimal.ONE, Instant.now());
-        live.pushPriceLine(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol(), "ENTRY", price);
+        try {
+            var entry = tradeExecutionService.executeEntry(
+                    ctx.getChatId(),
+                    resolveStrategyType(ctx, ss),
+                    safeUpper(ctx.getSymbol()),
+                    price,
+                    diffPct,
+                    Instant.now(),
+                    ss,
+                    tpPct,
+                    slPct
+            );
 
-        if (state.getTakeProfit() != null) live.pushPriceLine(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol(), "TP", state.getTakeProfit());
-        if (state.getStopLoss() != null) live.pushPriceLine(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol(), "SL", state.getStopLoss());
+            if (entry == null || !entry.executed()) {
+                log.info("🟡 BUY rejected by trade-layer | reason={}", entry != null ? entry.reason() : "null");
+                return;
+            }
 
-        if (state.getWindowHigh() != null && state.getWindowLow() != null) {
-            live.pushWindowZone(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol(), state.getWindowHigh(), state.getWindowLow());
-        } else {
-            live.clearWindowZone(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol());
+            BigDecimal entryPrice = positive(firstNonNull(entry.entryPrice(), price));
+            BigDecimal qty = positive(entry.qty());
+            BigDecimal tp = positive(entry.tp());
+            BigDecimal sl = positive(entry.sl());
+
+            state.setEntryPrice(entryPrice);
+            state.setTakeProfit(tp);
+            state.setStopLoss(sl);
+            state.openPosition();
+
+            live.pushTrade(ctx.getChatId(), resolveStrategyType(ctx, ss), ctx.getSymbol(), "BUY", entryPrice, qty, Instant.now());
+            live.pushPriceLine(ctx.getChatId(), resolveStrategyType(ctx, ss), ctx.getSymbol(), "ENTRY", entryPrice);
+            if (tp != null) live.pushPriceLine(ctx.getChatId(), resolveStrategyType(ctx, ss), ctx.getSymbol(), "TP", tp);
+            if (sl != null) live.pushPriceLine(ctx.getChatId(), resolveStrategyType(ctx, ss), ctx.getSymbol(), "SL", sl);
+
+            if (state.getWindowHigh() != null && state.getWindowLow() != null) {
+                live.pushWindowZone(ctx.getChatId(), resolveStrategyType(ctx, ss), ctx.getSymbol(), state.getWindowHigh(), state.getWindowLow());
+            } else {
+                live.clearWindowZone(ctx.getChatId(), resolveStrategyType(ctx, ss), ctx.getSymbol());
+            }
+        } catch (Exception e) {
+            log.error("❌ StrategySignalExecutor BUY failed chatId={} symbol={} err={}",
+                    ctx.getChatId(), ctx.getSymbol(), e.toString(), e);
         }
     }
 
     private void handleSell(Signal signal, StrategyContext ctx, StrategyRuntimeState state) {
-        if (state.hasOpenPosition()) return;
-        if (!state.canEnterTrade()) return;
+        syncStateFromPositionStore(ctx, state);
+
+        if (state.hasOpenPosition()) {
+            handleExit(signal, ctx, state);
+            return;
+        }
+
+        log.info("🟡 SELL signal ignored: no open position, short entry is disabled for shared spot trade-layer | {}", safeReason(signal));
+    }
+
+    private void handleExit(Signal signal, StrategyContext ctx, StrategyRuntimeState state) {
+        StrategySettings ss = extractStrategySettings(ctx);
+        StrategyType type = resolveStrategyType(ctx, ss);
+
+        syncStateFromPositionStore(ctx, state);
+        if (!state.hasOpenPosition()) return;
 
         BigDecimal price = safePrice(ctx.getPrice());
         if (price == null) return;
 
-        if (!passesMlGate(signal, ctx)) {
-            log.info("🟡 SELL blocked by ML gate | {}", safeReason(signal));
+        BigDecimal qty = positive(state.getEntryPrice()) != null ? positive(resolveOpenQty(ctx)) : null;
+        if (qty == null) {
+            qty = resolveQtyFromPositionStore(ctx);
+        }
+        if (qty == null || qty.signum() <= 0) {
+            log.warn("⚠️ EXIT skipped: qty not resolved | chatId={} type={} symbol={}", ctx.getChatId(), type, ctx.getSymbol());
             return;
         }
 
-        state.setEntryPrice(price);
-        state.openPosition();
+        String exchange = safeUpper(ctx.getExchange());
+        NetworkType network = ctx.getNetworkType();
 
-        live.pushTrade(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol(), "SELL", price, BigDecimal.ONE, Instant.now());
-        live.pushPriceLine(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol(), "ENTRY", price);
+        try {
+            ExitResult exit = invokeExitNow(
+                    ctx.getChatId(),
+                    type,
+                    safeUpper(ctx.getSymbol()),
+                    price,
+                    Instant.now(),
+                    qty,
+                    positive(state.getTakeProfit()) != null ? state.getTakeProfit() : price,
+                    positive(state.getStopLoss()) != null ? state.getStopLoss() : BigDecimal.ZERO,
+                    exchange,
+                    network,
+                    "LEGACY_SIGNAL_EXIT"
+            );
 
-        if (state.getTakeProfit() != null) live.pushPriceLine(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol(), "TP", state.getTakeProfit());
-        if (state.getStopLoss() != null) live.pushPriceLine(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol(), "SL", state.getStopLoss());
+            if (exit == null || !exit.executed()) {
+                log.info("🟡 EXIT rejected by trade-layer | reason={}", exit != null ? exit.reason() : "null");
+                return;
+            }
 
-        if (state.getWindowHigh() != null && state.getWindowLow() != null) {
-            live.pushWindowZone(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol(), state.getWindowHigh(), state.getWindowLow());
-        } else {
-            live.clearWindowZone(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol());
+            state.closePosition();
+            if (price != null) {
+                live.pushTrade(ctx.getChatId(), type, ctx.getSymbol(), "EXIT", price, qty, Instant.now());
+            }
+            clearUi(ctx, type);
+        } catch (Exception e) {
+            log.error("❌ StrategySignalExecutor EXIT failed chatId={} symbol={} err={}",
+                    ctx.getChatId(), ctx.getSymbol(), e.toString(), e);
         }
     }
 
-    private void handleExit(Signal signal, StrategyContext ctx, StrategyRuntimeState state) {
-        if (!state.hasOpenPosition()) return;
+    private void syncStateFromPositionStore(StrategyContext ctx, StrategyRuntimeState state) {
+        StrategySettings ss = extractStrategySettings(ctx);
+        StrategyType type = resolveStrategyType(ctx, ss);
+        String exchange = safeUpper(ctx.getExchange());
+        NetworkType network = ctx.getNetworkType();
+        String symbol = safeUpper(ctx.getSymbol());
 
-        BigDecimal price = safePrice(ctx.getPrice());
-        state.closePosition();
-
-        if (price != null) {
-            live.pushTrade(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol(), "EXIT", price, BigDecimal.ONE, Instant.now());
+        if (ctx.getChatId() == null || type == null || exchange == null || network == null || symbol == null) {
+            return;
         }
 
-        clearUi(ctx);
+        try {
+            Optional<PositionStore.PositionSnapshot> opt = positionStore.getPosition(
+                    ctx.getChatId(),
+                    type,
+                    exchange,
+                    network,
+                    symbol
+            );
+
+            if (opt.isPresent()) {
+                PositionStore.PositionSnapshot snap = opt.get();
+                state.setEntryPrice(snap.entryPrice());
+                state.setTakeProfit(snap.tp());
+                state.setStopLoss(snap.sl());
+                if (!state.hasOpenPosition()) {
+                    state.openPosition();
+                } else {
+                    state.touch();
+                }
+                return;
+            }
+
+            if (state.hasOpenPosition()) {
+                state.closePosition();
+            }
+        } catch (Exception e) {
+            log.debug("⚠️ StrategySignalExecutor state sync skipped chatId={} type={} symbol={} err={}",
+                    ctx.getChatId(), type, symbol, e.toString());
+        }
+    }
+
+    private BigDecimal resolveQtyFromPositionStore(StrategyContext ctx) {
+        StrategySettings ss = extractStrategySettings(ctx);
+        StrategyType type = resolveStrategyType(ctx, ss);
+        String exchange = safeUpper(ctx.getExchange());
+        NetworkType network = ctx.getNetworkType();
+        String symbol = safeUpper(ctx.getSymbol());
+
+        if (ctx.getChatId() == null || type == null || exchange == null || network == null || symbol == null) {
+            return null;
+        }
+
+        try {
+            return positionStore.getPosition(ctx.getChatId(), type, exchange, network, symbol)
+                    .map(PositionStore.PositionSnapshot::qty)
+                    .orElse(null);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private BigDecimal resolveOpenQty(StrategyContext ctx) {
+        StrategyRuntimeState state = ctx.getState();
+        if (state == null) return null;
+
+        Object value = reflectAny(state, "getEntryQty");
+        if (value instanceof BigDecimal bd) return bd;
+        if (value instanceof Number n) return BigDecimal.valueOf(n.doubleValue());
+        return null;
+    }
+
+    private ExitResult invokeExitNow(Long chatId,
+                                     StrategyType type,
+                                     String symbol,
+                                     BigDecimal price,
+                                     Instant time,
+                                     BigDecimal entryQty,
+                                     BigDecimal tp,
+                                     BigDecimal sl,
+                                     String exchange,
+                                     NetworkType network,
+                                     String exitReason) throws Exception {
+
+        for (Method method : tradeExecutionService.getClass().getMethods()) {
+            if (!"executeExitNow".equals(method.getName())) continue;
+            Class<?>[] types = method.getParameterTypes();
+            if (types.length != 10 && types.length != 11) continue;
+
+            Object[] args = new Object[types.length];
+            int i = 0;
+            args[i++] = chatId;
+            args[i++] = type;
+            args[i++] = symbol;
+            args[i++] = price;
+            args[i++] = time;
+            args[i++] = entryQty;
+            args[i++] = tp;
+            args[i++] = sl;
+            args[i++] = exchange;
+            args[i++] = network;
+            if (types.length == 11) {
+                args[i] = exitReason;
+            }
+
+            Object result = method.invoke(tradeExecutionService, args);
+            if (result instanceof ExitResult exitResult) {
+                return exitResult;
+            }
+            return null;
+        }
+
+        return tradeExecutionService.executeExitIfHit(
+                chatId,
+                type,
+                symbol,
+                price,
+                time,
+                true,
+                entryQty,
+                tp != null ? tp : price,
+                sl != null ? sl : BigDecimal.ZERO,
+                exchange,
+                network
+        );
+    }
+
+    private StrategySettings extractStrategySettings(StrategyContext ctx) {
+        if (ctx == null) return null;
+        Object raw = ctx.getSettings();
+        if (raw instanceof StrategySettings ss) return ss;
+
+        try {
+            return ctx.getTypedSettings(StrategySettings.class);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private StrategyType resolveStrategyType(StrategyContext ctx, StrategySettings ss) {
+        if (ctx != null && ctx.getStrategyType() != null) {
+            return ctx.getStrategyType();
+        }
+        return ss != null ? ss.getType() : null;
+    }
+
+    private BigDecimal resolveStrategyPct(StrategyContext ctx,
+                                          StrategySettings ss,
+                                          String methodName,
+                                          BigDecimal fallback) {
+        Object raw = ctx != null ? ctx.getSettings() : null;
+        BigDecimal value = reflectBigDecimal(raw, methodName);
+        if (positive(value) != null) return value;
+        value = reflectBigDecimal(ss, methodName);
+        if (positive(value) != null) return value;
+        return fallback;
+    }
+
+    private BigDecimal resolveDiffPct(Signal signal) {
+        BigDecimal confidence = reflectBigDecimal(signal, "getConfidence");
+        if (confidence != null && confidence.signum() > 0) {
+            return confidence.setScale(6, RoundingMode.HALF_UP);
+        }
+        return DEFAULT_DIFF_PCT;
     }
 
     private boolean passesMlGate(Signal signal, StrategyContext ctx) {
-        Object raw = ctx.getSettings();
-        if (!(raw instanceof StrategySettings ss)) return true;
+        StrategySettings ss = extractStrategySettings(ctx);
+        if (ss == null) return true;
 
         if (!ss.isMlGateEnabled()) return true;
 
@@ -175,19 +417,13 @@ public class StrategySignalExecutorImpl implements StrategySignalExecutor {
         try {
             MlHealthResponse h = ml.health();
             boolean ok = mlOk(h);
-            boolean modelOk = mlModelExistsOrUnknown(h); // если поля нет — не валим
+            boolean modelOk = mlModelExistsOrUnknown(h);
             return ok && modelOk;
         } catch (Exception e) {
             return false;
         }
     }
 
-    /**
-     * ✅ Совместимая проверка ok:
-     * - isOk()
-     * - getOk()
-     * - поле ok
-     */
     private static boolean mlOk(MlHealthResponse h) {
         if (h == null) return false;
 
@@ -213,14 +449,6 @@ public class StrategySignalExecutorImpl implements StrategySignalExecutor {
         return false;
     }
 
-    /**
-     * ✅ Совместимая проверка model_exists:
-     * - getModel_exists()/isModel_exists()
-     * - getModelExists()/isModelExists()
-     * - поле model_exists/modelExists
-     *
-     * Если этого поля нет в DTO — считаем "unknown" и НЕ блокируем.
-     */
     private static boolean mlModelExistsOrUnknown(MlHealthResponse h) {
         if (h == null) return true;
 
@@ -280,7 +508,6 @@ public class StrategySignalExecutorImpl implements StrategySignalExecutor {
             return type + ":" + symbol + ":" + tf;
         }
 
-        // ✅ ВАЖНО: build(String strategyType, String symbol, String timeframe)
         return f.build(type, symbol, tf);
     }
 
@@ -309,7 +536,46 @@ public class StrategySignalExecutorImpl implements StrategySignalExecutor {
         f.put("smaFastRel", smaFastRel);
         f.put("smaSlowRel", smaSlowRel);
         f.put("lastPrice", last);
+        f.put("exchange", safeUpper(ctx.getExchange()));
+        f.put("network", ctx.getNetworkType() != null ? ctx.getNetworkType().name() : null);
         return f;
+    }
+
+    private void clearUi(StrategyContext ctx, StrategyType type) {
+        live.clearPriceLines(ctx.getChatId(), type, ctx.getSymbol());
+        live.clearTpSl(ctx.getChatId(), type, ctx.getSymbol());
+        live.clearWindowZone(ctx.getChatId(), type, ctx.getSymbol());
+    }
+
+    private static Object reflectAny(Object obj, String method) {
+        if (obj == null || isBlank(method)) return null;
+        try {
+            var m = obj.getClass().getMethod(method);
+            if (m.getParameterCount() != 0) return null;
+            return m.invoke(obj);
+        } catch (Exception ignore) {
+            return null;
+        }
+    }
+
+    private static BigDecimal reflectBigDecimal(Object obj, String method) {
+        Object v = reflectAny(obj, method);
+        if (v == null) return null;
+        if (v instanceof BigDecimal bd) return bd;
+        if (v instanceof Number n) return BigDecimal.valueOf(n.doubleValue());
+        try {
+            return new BigDecimal(String.valueOf(v).trim());
+        } catch (Exception ignore) {
+            return null;
+        }
+    }
+
+    private static BigDecimal firstNonNull(BigDecimal a, BigDecimal b) {
+        return a != null ? a : b;
+    }
+
+    private static BigDecimal positive(BigDecimal v) {
+        return v != null && v.signum() > 0 ? v : null;
     }
 
     private static double lastClose(double[] closes) {
@@ -358,12 +624,6 @@ public class StrategySignalExecutorImpl implements StrategySignalExecutor {
         return Math.sqrt(var) * 100.0d;
     }
 
-    private void clearUi(StrategyContext ctx) {
-        live.clearPriceLines(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol());
-        live.clearTpSl(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol());
-        live.clearWindowZone(ctx.getChatId(), ctx.getStrategyType(), ctx.getSymbol());
-    }
-
     private static BigDecimal safePrice(BigDecimal price) {
         if (price == null) return null;
         if (price.signum() <= 0) return null;
@@ -382,6 +642,10 @@ public class StrategySignalExecutorImpl implements StrategySignalExecutor {
         if (s == null) return null;
         String t = s.trim();
         return t.isEmpty() ? null : t.toUpperCase(Locale.ROOT);
+    }
+
+    private static boolean isBlank(String s) {
+        return s == null || s.isBlank();
     }
 
     private static double clamp01(double v) {

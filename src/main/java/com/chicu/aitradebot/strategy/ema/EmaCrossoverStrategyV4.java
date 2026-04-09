@@ -715,7 +715,7 @@ public class EmaCrossoverStrategyV4 implements
     }
 
     private void maybeRestoreOpenPosition(Long chatId, LocalState st) {
-        if (st == null || st.inPosition) return;
+        if (st == null) return;
         if (chatId == null || chatId <= 0) return;
         if (isBlank(st.exchange) || st.network == null || isBlank(st.symbol)) return;
 
@@ -727,29 +727,45 @@ public class EmaCrossoverStrategyV4 implements
                     st.network,
                     st.symbol
             );
-            if (opt.isEmpty()) return;
+
+            if (opt.isEmpty() || opt.get().qty() == null || opt.get().qty().signum() <= 0) {
+                if (st.inPosition) {
+                    log.warn("[EMA] 🧹 PositionStore empty, clearing local position chatId={} ex={} net={} symbol={} qty={} entry={}",
+                            chatId, safe(st.exchange), st.network, safe(st.symbol), fmtBd(st.entryQty), fmtBd(st.entryPrice));
+                    clearPosition(st);
+                    clearPositionVisuals(chatId, st);
+                }
+                return;
+            }
 
             PositionStore.PositionSnapshot snap = opt.get();
-            if (snap.qty() == null || snap.qty().signum() <= 0) return;
+            boolean changed = !st.inPosition
+                    || !Objects.equals(st.entryQty, snap.qty())
+                    || !Objects.equals(st.entryPrice, snap.entryPrice())
+                    || !Objects.equals(st.tpPrice, snap.tp())
+                    || !Objects.equals(st.slPrice, snap.sl());
 
             st.inPosition = true;
             st.entryQty = snap.qty();
             st.entryPrice = snap.entryPrice();
             st.tpPrice = snap.tp();
             st.slPrice = snap.sl();
-            st.lastEntryAt = Instant.now();
+            st.lastEntryAt = snap.openedAt() != null ? snap.openedAt() : Instant.now();
 
-            log.info("[EMA] ♻ POSITION RESTORED chatId={} ex={} net={} symbol={} qty={} entry={} tp={} sl={}",
-                    chatId,
-                    safe(st.exchange),
-                    st.network,
-                    safe(st.symbol),
-                    fmtBd(st.entryQty),
-                    fmtBd(st.entryPrice),
-                    fmtBd(st.tpPrice),
-                    fmtBd(st.slPrice));
+            if (changed) {
+                log.info("[EMA] ♻ POSITION SYNC chatId={} ex={} net={} symbol={} qty={} entry={} tp={} sl={}",
+                        chatId,
+                        safe(st.exchange),
+                        st.network,
+                        safe(st.symbol),
+                        fmtBd(st.entryQty),
+                        fmtBd(st.entryPrice),
+                        fmtBd(st.tpPrice),
+                        fmtBd(st.slPrice));
+                pushPositionVisuals(chatId, st, st.entryPrice, st.entryQty, st.tpPrice, st.slPrice, null, false);
+            }
         } catch (Exception e) {
-            log.debug("[EMA] position restore skipped chatId={} err={}", chatId, e.toString());
+            log.debug("[EMA] position sync skipped chatId={} err={}", chatId, e.toString());
         }
     }
 

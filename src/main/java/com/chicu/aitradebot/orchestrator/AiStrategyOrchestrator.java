@@ -11,6 +11,7 @@ import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
 import com.chicu.aitradebot.domain.enums.AdvancedControlMode;
+import com.chicu.aitradebot.exchange.enums.OrderSide;
 import com.chicu.aitradebot.exchange.model.Order;
 import com.chicu.aitradebot.market.MarketStreamService;
 import com.chicu.aitradebot.market.model.UnifiedKline;
@@ -2374,7 +2375,8 @@ public class AiStrategyOrchestrator {
                 : null;
     }
 
-    // =====================================================================
+    
+// =====================================================================
     // ORDER API
     // =====================================================================
     public record OrderResult(boolean success, String message, Long orderId) {}
@@ -2390,28 +2392,229 @@ public class AiStrategyOrchestrator {
             Long timestamp
     ) {}
 
+    private record ManualOrderContext(
+            StrategyType type,
+            String exchange,
+            NetworkType network,
+            String symbol,
+            String timeframe
+    ) {}
+
     public OrderResult marketBuy(Long chatId, String symbol, BigDecimal qty) {
         try {
-            Order order = orderService.placeMarket(
-                    chatId, symbol, "BUY", qty, BigDecimal.ZERO, "WEB_UI"
+            ManualOrderContext manualCtx = resolveManualOrderContext(chatId, symbol);
+            if (manualCtx == null) {
+                return new OrderResult(false, "Контекст стратегии для BUY не найден", null);
+            }
+
+            if (qty == null || qty.signum() <= 0) {
+                return new OrderResult(false, "qty must be > 0", null);
+            }
+
+            String positionUid = buildManualEntryPositionUid(
+                    chatId,
+                    manualCtx.type(),
+                    manualCtx.exchange(),
+                    manualCtx.network(),
+                    manualCtx.symbol()
             );
+
+            OrderService.OrderContext orderCtx = new OrderService.OrderContext(
+                    chatId,
+                    manualCtx.type(),
+                    manualCtx.symbol(),
+                    manualCtx.timeframe(),
+                    null,
+                    "MANUAL_ENTRY",
+                    manualCtx.exchange(),
+                    manualCtx.network(),
+                    "MANUAL_ENTRY",
+                    positionUid
+            );
+
+            Order order = orderService.placeMarket(orderCtx, OrderSide.BUY, qty, BigDecimal.ZERO);
             return new OrderResult(true, "BUY OK", order != null ? order.getId() : null);
+        } catch (IllegalStateException e) {
+            log.warn("⚠️ marketBuy blocked chatId={} symbol={} err={}", chatId, symbol, e.getMessage());
+            return new OrderResult(false, e.getMessage(), null);
         } catch (Exception e) {
-            log.error("❌ marketBuy error", e);
+            log.error("❌ marketBuy error chatId={} symbol={}", chatId, symbol, e);
             return new OrderResult(false, e.getMessage(), null);
         }
     }
 
     public OrderResult marketSell(Long chatId, String symbol, BigDecimal qty) {
         try {
-            Order order = orderService.placeMarket(
-                    chatId, symbol, "SELL", qty, BigDecimal.ZERO, "WEB_UI"
+            ManualOrderContext manualCtx = resolveManualOrderContext(chatId, symbol);
+            if (manualCtx == null) {
+                return new OrderResult(false, "Контекст стратегии для SELL не найден", null);
+            }
+
+            if (qty == null || qty.signum() <= 0) {
+                return new OrderResult(false, "qty must be > 0", null);
+            }
+
+            String positionUid = resolveManualExitPositionUid(
+                    chatId,
+                    manualCtx.type(),
+                    manualCtx.exchange(),
+                    manualCtx.network(),
+                    manualCtx.symbol()
             );
+
+            OrderService.OrderContext orderCtx = new OrderService.OrderContext(
+                    chatId,
+                    manualCtx.type(),
+                    manualCtx.symbol(),
+                    manualCtx.timeframe(),
+                    null,
+                    "MANUAL_CLOSE",
+                    manualCtx.exchange(),
+                    manualCtx.network(),
+                    "MANUAL_CLOSE",
+                    positionUid
+            );
+
+            Order order = orderService.placeMarket(orderCtx, OrderSide.SELL, qty, BigDecimal.ZERO);
             return new OrderResult(true, "SELL OK", order != null ? order.getId() : null);
+        } catch (IllegalStateException e) {
+            log.warn("⚠️ marketSell blocked chatId={} symbol={} err={}", chatId, symbol, e.getMessage());
+            return new OrderResult(false, e.getMessage(), null);
         } catch (Exception e) {
-            log.error("❌ marketSell error", e);
+            log.error("❌ marketSell error chatId={} symbol={}", chatId, symbol, e);
             return new OrderResult(false, e.getMessage(), null);
         }
+    }
+
+    private ManualOrderContext resolveManualOrderContext(Long chatId, String symbol) {
+        if (chatId == null || chatId <= 0) {
+            throw new IllegalStateException("chatId пустой");
+        }
+
+        String sym = sanitizeSymbol(symbol);
+        if (sym == null) {
+            throw new IllegalStateException("symbol пустой");
+        }
+
+        List<ManualOrderContext> candidates = new ArrayList<>();
+
+        for (var entry : running.entrySet()) {
+            RunKey key = entry.getKey();
+            RunBinding binding = entry.getValue();
+            if (key == null || binding == null) continue;
+            if (key.chatId() != chatId) continue;
+            if (!eq(sym, binding.symbol())) continue;
+
+            candidates.add(new ManualOrderContext(
+                    key.type(),
+                    binding.exchange(),
+                    binding.network(),
+                    binding.symbol(),
+                    binding.timeframe()
+            ));
+        }
+
+        if (candidates.isEmpty()) {
+            for (StrategySettings s : discoverAllStrategySettings()) {
+                if (s == null || s.getChatId() == null || !chatId.equals(s.getChatId()) || s.getType() == null) {
+                    continue;
+                }
+
+                String candidateSymbol = sanitizeSymbol(s.getSymbol());
+                if (!eq(sym, candidateSymbol)) {
+                    continue;
+                }
+
+                candidates.add(new ManualOrderContext(
+                        s.getType(),
+                        sanitizeExchange(s.getExchangeName()),
+                        s.getNetworkType(),
+                        candidateSymbol,
+                        sanitizeTf(s.getTimeframe())
+                ));
+            }
+        }
+
+        List<ManualOrderContext> distinct = new ArrayList<>();
+        for (ManualOrderContext candidate : candidates) {
+            boolean exists = distinct.stream().anyMatch(x ->
+                    x.type() == candidate.type()
+                            && eq(x.exchange(), candidate.exchange())
+                            && x.network() == candidate.network()
+                            && eq(x.symbol(), candidate.symbol())
+                            && eq(x.timeframe(), candidate.timeframe()));
+            if (!exists) {
+                distinct.add(candidate);
+            }
+        }
+
+        if (distinct.isEmpty()) {
+            throw new IllegalStateException("Не найден run/settings context для symbol=" + sym);
+        }
+
+        if (distinct.size() > 1) {
+            String variants = distinct.stream()
+                    .map(x -> x.type() + ":" + x.exchange() + ":" + x.network() + ":" + x.symbol() + ":" + x.timeframe())
+                    .reduce((a, b) -> a + ", " + b)
+                    .orElse("ambiguous");
+            throw new IllegalStateException("Несколько контекстов для symbol=" + sym + ": " + variants);
+        }
+
+        return distinct.get(0);
+    }
+
+    private String buildManualEntryPositionUid(Long chatId,
+                                               StrategyType type,
+                                               String exchange,
+                                               NetworkType network,
+                                               String symbol) {
+        return "manual-entry:"
+                + chatId + ":"
+                + (type != null ? type.name() : "NA") + ":"
+                + sanitizeExchange(exchange) + ":"
+                + (network != null ? network.name() : "NA") + ":"
+                + sanitizeSymbol(symbol) + ":"
+                + Instant.now().toEpochMilli();
+    }
+
+    private String resolveManualExitPositionUid(Long chatId,
+                                                StrategyType type,
+                                                String exchange,
+                                                NetworkType network,
+                                                String symbol) {
+        try {
+            Optional<PositionStore.PositionSnapshot> opt = positionStore.getPosition(
+                    chatId,
+                    type,
+                    exchange,
+                    network,
+                    symbol
+            );
+            if (opt.isPresent()) {
+                PositionStore.PositionSnapshot snap = opt.get();
+                long openedAtMs = snap.openedAt() != null ? snap.openedAt().toEpochMilli() : 0L;
+                Long entryOrderId = snap.entryOrderId();
+                return "pos:"
+                        + chatId + ":"
+                        + (type != null ? type.name() : "NA") + ":"
+                        + sanitizeExchange(exchange) + ":"
+                        + (network != null ? network.name() : "NA") + ":"
+                        + sanitizeSymbol(symbol) + ":"
+                        + openedAtMs + ":"
+                        + (entryOrderId != null ? entryOrderId : "NA");
+            }
+        } catch (Exception e) {
+            log.debug("⚠️ resolveManualExitPositionUid failed chatId={} type={} symbol={} err={}",
+                    chatId, type, symbol, e.toString());
+        }
+
+        return "manual-close:"
+                + chatId + ":"
+                + (type != null ? type.name() : "NA") + ":"
+                + sanitizeExchange(exchange) + ":"
+                + (network != null ? network.name() : "NA") + ":"
+                + sanitizeSymbol(symbol) + ":"
+                + Instant.now().toEpochMilli();
     }
 
     public boolean cancelOrder(Long chatId, long orderId) {
@@ -2450,7 +2653,7 @@ public class AiStrategyOrchestrator {
         return (t != null && t > 0) ? t : null;
     }
 
-    // =====================================================================
+// =====================================================================
     // ТИПОБЕЗОПАСНЫЕ ХУКИ ДЛЯ РЫНКА
     // =====================================================================
     public interface PriceUpdateAware {
@@ -2501,4 +2704,5 @@ public class AiStrategyOrchestrator {
         return s.isEmpty() ? null : s;
     }
 }
+
 

@@ -8,6 +8,7 @@ import com.chicu.aitradebot.exchange.model.Order;
 
 import java.math.BigDecimal;
 import java.util.List;
+import java.util.Locale;
 
 public interface OrderService {
 
@@ -19,8 +20,151 @@ public interface OrderService {
             String correlationId,
             String role,
             String exchangeName,
-            NetworkType networkType
-    ) {}
+            NetworkType networkType,
+            String intent,
+            String positionUid
+    ) {
+        public OrderContext(
+                Long chatId,
+                StrategyType strategyType,
+                String symbol,
+                String timeframe,
+                String correlationId,
+                String role,
+                String exchangeName,
+                NetworkType networkType
+        ) {
+            this(
+                    chatId,
+                    strategyType,
+                    symbol,
+                    timeframe,
+                    correlationId,
+                    role,
+                    exchangeName,
+                    networkType,
+                    null,
+                    null
+            );
+        }
+
+        public OrderContext(
+                Long chatId,
+                StrategyType strategyType,
+                String symbol,
+                String timeframe,
+                String correlationId,
+                String role,
+                String exchangeName,
+                NetworkType networkType,
+                String intent
+        ) {
+            this(
+                    chatId,
+                    strategyType,
+                    symbol,
+                    timeframe,
+                    correlationId,
+                    role,
+                    exchangeName,
+                    networkType,
+                    intent,
+                    null
+            );
+        }
+
+        public static OrderContext entry(
+                Long chatId,
+                StrategyType strategyType,
+                String symbol,
+                String timeframe,
+                String correlationId,
+                String exchangeName,
+                NetworkType networkType,
+                String positionUid
+        ) {
+            return new OrderContext(
+                    chatId,
+                    strategyType,
+                    symbol,
+                    timeframe,
+                    correlationId,
+                    "ENTRY",
+                    exchangeName,
+                    networkType,
+                    "ENTRY",
+                    positionUid
+            );
+        }
+
+        public static OrderContext exit(
+                Long chatId,
+                StrategyType strategyType,
+                String symbol,
+                String timeframe,
+                String correlationId,
+                String exchangeName,
+                NetworkType networkType,
+                String positionUid
+        ) {
+            return new OrderContext(
+                    chatId,
+                    strategyType,
+                    symbol,
+                    timeframe,
+                    correlationId,
+                    "EXIT",
+                    exchangeName,
+                    networkType,
+                    "EXIT",
+                    positionUid
+            );
+        }
+
+        public static OrderContext oco(
+                Long chatId,
+                StrategyType strategyType,
+                String symbol,
+                String timeframe,
+                String correlationId,
+                String exchangeName,
+                NetworkType networkType,
+                String positionUid
+        ) {
+            return new OrderContext(
+                    chatId,
+                    strategyType,
+                    symbol,
+                    timeframe,
+                    correlationId,
+                    "OCO",
+                    exchangeName,
+                    networkType,
+                    "OCO",
+                    positionUid
+            );
+        }
+
+        public String safeIntent() {
+            if (intent == null || intent.isBlank()) {
+                if (role == null || role.isBlank()) {
+                    return null;
+                }
+                return role.trim().toUpperCase(Locale.ROOT);
+            }
+            return intent.trim().toUpperCase(Locale.ROOT);
+        }
+
+        public String safeRole() {
+            if (role == null || role.isBlank()) {
+                if (intent == null || intent.isBlank()) {
+                    return null;
+                }
+                return intent.trim().toUpperCase(Locale.ROOT);
+            }
+            return role.trim().toUpperCase(Locale.ROOT);
+        }
+    }
 
     Order placeMarket(OrderContext ctx,
                       OrderSide side,
@@ -76,6 +220,11 @@ public interface OrderService {
 
     List<Order> getOpenOrders(Long chatId, String symbol);
 
+    List<Order> getOpenOrders(Long chatId,
+                              String exchangeName,
+                              NetworkType networkType,
+                              String symbol);
+
     default Order createOrder(Order order) {
         return createOrder(order, null, null);
     }
@@ -90,3 +239,4 @@ public interface OrderService {
 
     BigDecimal getMinNotional(String exchangeName, NetworkType networkType, String symbol);
 }
+

@@ -14,7 +14,10 @@ import java.util.Locale;
                 @Index(name = "idx_orders_chat_symbol", columnList = "chat_id,symbol"),
                 @Index(name = "idx_orders_chat_strategy", columnList = "chat_id,strategy_type"),
                 @Index(name = "idx_orders_status", columnList = "status"),
-                @Index(name = "idx_orders_ctx_runtime", columnList = "chat_id,strategy_type,symbol,exchange_name,network_type,timestamp")
+                @Index(name = "idx_orders_ctx_runtime", columnList = "chat_id,strategy_type,symbol,exchange_name,network_type,timestamp"),
+                @Index(name = "idx_orders_position_uid", columnList = "position_uid"),
+                @Index(name = "idx_orders_client_order", columnList = "client_order_id"),
+                @Index(name = "idx_orders_exchange_order", columnList = "exchange_order_id")
         }
 )
 @Getter
@@ -27,6 +30,9 @@ public class OrderEntity {
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
+
+    @Column(name = "position_uid", length = 80)
+    private String positionUid;
 
     /** chatId — идентификатор пользователя */
     @Column(name = "chat_id", nullable = false)
@@ -42,6 +48,14 @@ public class OrderEntity {
     /** BUY / SELL */
     @Column(nullable = false, length = 10)
     private String side;
+
+    /** MARKET / LIMIT / OCO */
+    @Column(name = "order_type", length = 16)
+    private String orderType;
+
+    /** ENTRY / EXIT / TP / SL / MANUAL_CLOSE / RESTORE */
+    @Column(name = "intent", length = 24)
+    private String intent;
 
     @Column(nullable = false, precision = 28, scale = 12)
     private BigDecimal price;
@@ -83,6 +97,51 @@ public class OrderEntity {
     @Column(name = "network_type", length = 32)
     private String networkType;
 
+    @Column(name = "client_order_id", length = 128)
+    private String clientOrderId;
+
+    @Column(name = "exchange_order_id", length = 128)
+    private String exchangeOrderId;
+
+    @Column(name = "exchange_status", length = 64)
+    private String exchangeStatus;
+
+    @Column(name = "requested_qty", precision = 28, scale = 12)
+    private BigDecimal requestedQty;
+
+    @Column(name = "requested_price", precision = 28, scale = 12)
+    private BigDecimal requestedPrice;
+
+    @Column(name = "executed_qty", precision = 28, scale = 12)
+    private BigDecimal executedQty;
+
+    @Column(name = "executed_quote_qty", precision = 28, scale = 12)
+    private BigDecimal executedQuoteQty;
+
+    @Column(name = "avg_executed_price", precision = 28, scale = 12)
+    private BigDecimal avgExecutedPrice;
+
+    @Column(name = "fee_total", precision = 28, scale = 12)
+    private BigDecimal feeTotal;
+
+    @Column(name = "fee_asset", length = 16)
+    private String feeAsset;
+
+    @Column(name = "parent_order_id")
+    private Long parentOrderId;
+
+    @Column(name = "is_reduce_only")
+    private Boolean reduceOnly;
+
+    @Column(name = "is_close_order")
+    private Boolean closeOrder;
+
+    @Column(name = "source", length = 24)
+    private String source;
+
+    @Column(name = "correlation_id", length = 80)
+    private String correlationId;
+
     // ============================================
     // ULTRA-поля (TP/SL, ML, причины, PnL)
     // ============================================
@@ -120,6 +179,12 @@ public class OrderEntity {
     @Column(name = "ml_confidence", precision = 10, scale = 5)
     private BigDecimal mlConfidence;
 
+    @Column(name = "reject_code", length = 64)
+    private String rejectCode;
+
+    @Column(name = "reject_message", length = 512)
+    private String rejectMessage;
+
     // ============================================
     // Lifecycle
     // ============================================
@@ -134,6 +199,9 @@ public class OrderEntity {
 
         if (createdAt == null) {
             createdAt = LocalDateTime.now();
+        }
+        if (updatedAt == null) {
+            updatedAt = createdAt;
         }
 
         if (timestamp == null) {
@@ -152,7 +220,6 @@ public class OrderEntity {
     @PreUpdate
     public void preUpdate() {
         normalizeContext();
-
         updatedAt = LocalDateTime.now();
 
         if (price != null && quantity != null) {
@@ -167,15 +234,32 @@ public class OrderEntity {
     private void normalizeContext() {
         symbol = normalizeUpperOrNull(symbol);
         side = normalizeUpperOrNull(side);
+        orderType = normalizeUpperOrNull(orderType);
+        intent = normalizeUpperOrNull(intent);
         status = normalizeUpperOrNull(status);
         strategyType = normalizeUpperOrNull(strategyType);
         exchangeName = normalizeUpperOrNull(exchangeName);
         networkType = normalizeUpperOrNull(networkType);
+        source = normalizeUpperOrNull(source);
+        exchangeStatus = normalizeUpperOrNull(exchangeStatus);
+        feeAsset = normalizeUpperOrNull(feeAsset);
+        clientOrderId = normalizeTrimOrNull(clientOrderId);
+        exchangeOrderId = normalizeTrimOrNull(exchangeOrderId);
+        positionUid = normalizeTrimOrNull(positionUid);
+        correlationId = normalizeTrimOrNull(correlationId);
+        rejectCode = normalizeUpperOrNull(rejectCode);
+        rejectMessage = normalizeTrimOrNull(rejectMessage);
     }
 
     private static String normalizeUpperOrNull(String value) {
         if (value == null) return null;
         String v = value.trim().toUpperCase(Locale.ROOT);
+        return v.isEmpty() ? null : v;
+    }
+
+    private static String normalizeTrimOrNull(String value) {
+        if (value == null) return null;
+        String v = value.trim();
         return v.isEmpty() ? null : v;
     }
 }

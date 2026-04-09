@@ -16,6 +16,7 @@ import com.chicu.aitradebot.strategy.core.signal.Signal;
 import com.chicu.aitradebot.strategy.live.StrategyLiveEvent;
 import com.chicu.aitradebot.strategy.live.StrategyLivePublisher;
 import com.chicu.aitradebot.strategy.registry.StrategyBinding;
+import com.chicu.aitradebot.trade.PositionStore;
 import com.chicu.aitradebot.trade.TradeExecutionService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -61,6 +62,7 @@ public class ScalpingStrategyV4 implements TradingStrategy, AiStrategyOrchestrat
     private final StrategySettingsService strategySettingsService;
     private final ObjectProvider<MlTrainingServiceImpl> mlTrainingServiceProvider;
     private final TradeExecutionService tradeExecutionService;
+    private final PositionStore positionStore;
     private final MarketDataStreamService marketDataStreamService;
     private final AdaptiveRuntimeController adaptiveRuntimeController;
 
@@ -155,7 +157,7 @@ public class ScalpingStrategyV4 implements TradingStrategy, AiStrategyOrchestrat
         st.strategySettings = strategy;
         st.scalpingSettings = cfg;
         st.symbol = resolveSymbol(strategy, cfg);
-        st.exchange = safeUpper(exchange) != null ? safeUpper(exchange) : strategy.getExchangeName();
+        st.exchange = safeUpper(exchange) != null ? safeUpper(exchange) : safeUpper(strategy.getExchangeName());
         st.network = network != null ? network : strategy.getNetworkType();
         st.timeframe = resolveTimeframe(strategy, cfg);
         st.lastSettingsLoadAt = Instant.now();
@@ -167,9 +169,10 @@ public class ScalpingStrategyV4 implements TradingStrategy, AiStrategyOrchestrat
         states.put(chatId, st);
 
         adaptiveRuntimeController.onStrategyStarted(chatId, StrategyType.SCALPING, st.exchange, st.network, st.symbol, st.timeframe);
+        syncPositionState(chatId, st, true);
 
         safeLive(() -> live.pushState(chatId, StrategyType.SCALPING, st.symbol, true));
-        safeLive(() -> live.pushSignal(chatId, StrategyType.SCALPING, st.symbol, st.timeframe, Signal.hold("started")));
+        safeLive(() -> live.pushSignal(chatId, StrategyType.SCALPING, st.symbol, st.timeframe, Signal.hold(st.inPosition ? "position_restored" : "started")));
 
         log.info("[SCALPING] ▶ START chatId={} symbol={} ex={} net={} tf={} cfgWindow={} effWindow={} cachedCloses={} impulse={} emaDiff={} volumeRatio={} spreadLimit={} atrLimit={} rsiFilter={} rrMin={}",
                 chatId, st.symbol, st.exchange, st.network, st.timeframe,
@@ -401,6 +404,7 @@ public class ScalpingStrategyV4 implements TradingStrategy, AiStrategyOrchestrat
 
         synchronized (st) {
             refreshSettingsIfNeeded(chatId, st, time);
+            syncPositionState(chatId, st, false);
             if (st.inPosition && st.entryQty != null && st.tp != null && st.sl != null) {
                 tryClosePosition(chatId, st, st.symbol, price, time);
                 return;
@@ -420,6 +424,7 @@ public class ScalpingStrategyV4 implements TradingStrategy, AiStrategyOrchestrat
         Instant time = Instant.ofEpochMilli(kline.getCloseTime() > 0 ? kline.getCloseTime() : kline.getOpenTime());
         synchronized (st) {
             refreshSettingsIfNeeded(chatId, st, time);
+            syncPositionState(chatId, st, false);
             if (!matchesContext(st, symbol, timeframe, exchange, network)) return;
 
             BigDecimal close = positive(kline.getClose());
@@ -551,6 +556,76 @@ public class ScalpingStrategyV4 implements TradingStrategy, AiStrategyOrchestrat
         if (kline != null) {
             safeLive(() -> live.publishCandle(chatId, StrategyType.SCALPING, kline));
         }
+    }
+
+
+    private void syncPositionState(Long chatId, LocalState st, boolean pushVisualsIfRestored) {
+        if (chatId == null || st == null || positionStore == null) return;
+        if (st.exchange == null || st.network == null || st.symbol == null) return;
+
+        try {
+            var opt = positionStore.getPosition(chatId, StrategyType.SCALPING, st.exchange, st.network, st.symbol);
+            if (opt.isPresent() && opt.get().qty() != null && opt.get().qty().signum() > 0) {
+                PositionStore.PositionSnapshot snap = opt.get();
+                boolean wasInPosition = st.inPosition;
+                boolean changed = !wasInPosition
+                        || !Objects.equals(st.entryQty, snap.qty())
+                        || !Objects.equals(st.entryPrice, snap.entryPrice())
+                        || !Objects.equals(st.tp, snap.tp())
+                        || !Objects.equals(st.sl, snap.sl());
+
+                st.inPosition = true;
+                st.isLong = true;
+                st.entryQty = snap.qty();
+                st.entryPrice = snap.entryPrice();
+                st.tp = snap.tp();
+                st.sl = snap.sl();
+                st.entryOrderId = snap.entryOrderId();
+                st.entrySide = "BUY";
+                st.entryOpenedAt = snap.openedAt();
+
+                if (changed) {
+                    log.info("[SCALPING] ♻ POSITION SYNC chatId={} symbol={} qty={} entry={} tp={} sl={} orderId={}",
+                            chatId, st.symbol, bd(st.entryQty), bd(st.entryPrice), bd(st.tp), bd(st.sl), st.entryOrderId);
+                }
+
+                if ((pushVisualsIfRestored || !wasInPosition) && st.symbol != null) {
+                    BigDecimal priceLine = st.entryPrice != null ? st.entryPrice : st.lastPrice;
+                    if (priceLine != null) {
+                        safeLive(() -> live.pushPriceLine(chatId, StrategyType.SCALPING, st.symbol, "ENTRY", priceLine));
+                    }
+                    if (st.tp != null && st.sl != null) {
+                        safeLive(() -> live.pushTpSl(chatId, StrategyType.SCALPING, st.symbol, st.tp, st.sl));
+                    }
+                }
+                return;
+            }
+
+            if (st.inPosition) {
+                log.warn("[SCALPING] 🧹 PositionStore empty, clearing local position chatId={} symbol={} qty={} entry={}",
+                        chatId, st.symbol, bd(st.entryQty), bd(st.entryPrice));
+                clearLocalPosition(st);
+                if (st.symbol != null) {
+                    safeLive(() -> live.clearTpSl(chatId, StrategyType.SCALPING, st.symbol));
+                    safeLive(() -> live.clearPriceLines(chatId, StrategyType.SCALPING, st.symbol));
+                }
+            }
+        } catch (Exception e) {
+            log.debug("[SCALPING] position sync skipped chatId={} symbol={} err={}", chatId, st.symbol, e.toString());
+        }
+    }
+
+    private void clearLocalPosition(LocalState st) {
+        if (st == null) return;
+        st.inPosition = false;
+        st.isLong = false;
+        st.entryPrice = null;
+        st.tp = null;
+        st.sl = null;
+        st.entryQty = null;
+        st.entryOrderId = null;
+        st.entrySide = null;
+        st.entryOpenedAt = null;
     }
 
     private void buildAndPushSeries(Long chatId, LocalState st) {
@@ -689,7 +764,7 @@ public class ScalpingStrategyV4 implements TradingStrategy, AiStrategyOrchestrat
                                  ScalpingFeatureSnapshot features) {
         log.info("[SCALPING] ⚡ ENTRY try chatId={} symbol={} price={} features={}", chatId, symbol, bd(price), features.toMlFeatures());
         try {
-            Object res = invokeTradeEntry(chatId, symbol, price, features.score(), cfg, time, strategy);
+            Object res = invokeTradeEntry(chatId, symbol, price, resolveEntryDiffPct(features), cfg, time, strategy);
             if (!invokeBoolean(res, "executed", "isExecuted")) {
                 String reason = invokeString(res, "reason", "getReason", "message", "getMessage");
                 if (reason == null || reason.isBlank()) reason = "entry_blocked";
@@ -747,12 +822,24 @@ public class ScalpingStrategyV4 implements TradingStrategy, AiStrategyOrchestrat
 
         Exception lastError = null;
         Method[] methods = tradeExecutionService.getClass().getMethods();
+        java.util.Arrays.sort(methods, Comparator
+                .comparingInt(Method::getParameterCount)
+                .reversed());
+
         for (Method method : methods) {
             if (!"executeEntry".equals(method.getName())) continue;
             try {
                 Object[] args = buildExecuteEntryArgs(method, chatId, symbol, price, diffPct, tpPct, slPct, time, strategy);
                 if (args == null) continue;
-                return method.invoke(tradeExecutionService, args);
+
+                Object result = method.invoke(tradeExecutionService, args);
+                if (shouldSkipEntryResult(result)) {
+                    lastError = new IllegalStateException(
+                            "executeEntry(chatId,type,symbol,price,diffPct,time,ss) запрещён: TP/SL должны приходить из таблицы конкретной стратегии. Используй executeEntry(..., tpPct, slPct)."
+                    );
+                    continue;
+                }
+                return result;
             } catch (InvocationTargetException ite) {
                 Throwable cause = ite.getCause() != null ? ite.getCause() : ite;
                 String msg = rootMessage(cause);
@@ -772,6 +859,14 @@ public class ScalpingStrategyV4 implements TradingStrategy, AiStrategyOrchestrat
 
         if (lastError != null) throw lastError;
         throw new IllegalStateException("Подходящий executeEntry overload не найден");
+    }
+
+    private boolean shouldSkipEntryResult(Object result) {
+        if (result == null) return false;
+        if (invokeBoolean(result, "executed", "isExecuted")) return false;
+
+        String reason = invokeString(result, "reason", "getReason", "message", "getMessage");
+        return reason != null && reason.contains("TP/SL должны приходить");
     }
 
     private Object[] buildExecuteEntryArgs(Method method,
@@ -831,7 +926,7 @@ public class ScalpingStrategyV4 implements TradingStrategy, AiStrategyOrchestrat
 
     private void tryClosePosition(Long chatId, LocalState st, String symbol, BigDecimal price, Instant time) {
         try {
-            Object ex = tradeExecutionService.executeExitIfHit(chatId, StrategyType.SCALPING, symbol, price, time, st.isLong, st.entryQty, st.tp, st.sl);
+            Object ex = tradeExecutionService.executeExitIfHit(chatId, StrategyType.SCALPING, symbol, price, time, st.isLong, st.entryQty, st.tp, st.sl, st.exchange, st.network);
             if (!invokeBoolean(ex, "executed", "isExecuted")) return;
 
             BigDecimal pnlPct = invokeBigDecimal(ex, "pnlPct", "getPnlPct", "realizedPnlPct", "getRealizedPnlPct");
@@ -869,8 +964,8 @@ public class ScalpingStrategyV4 implements TradingStrategy, AiStrategyOrchestrat
     private String evaluateEntryBlockReason(ScalpingStrategySettings cfg, ScalpingFeatureSnapshot f) {
         if (cfg == null || f == null) return "no_features";
 
-        double minImpulsePct = Math.max(0.005d, normalizePercentThreshold(cfg.getMinImpulsePct()));
-        double emaDiffThreshold = Math.max(0.0005d, normalizeEmaThreshold(cfg.getEmaDiffThreshold()));
+        double minImpulsePct = Math.max(0.0010d, normalizePercentThreshold(cfg.getMinImpulsePct()));
+        double emaDiffThreshold = Math.max(0.0002d, normalizeEmaThreshold(cfg.getEmaDiffThreshold()));
         double spreadLimitPct = Math.max(0.02d, normalizePercentThreshold(cfg.getSpreadLimitPct()));
         double atrLimitPct = Math.max(0.10d, normalizePercentThreshold(cfg.getAtrPctRange()));
         double volumeRatio = nz(cfg.getVolumeRatio(), 1.0d);
@@ -880,51 +975,94 @@ public class ScalpingStrategyV4 implements TradingStrategy, AiStrategyOrchestrat
         if (f.spreadPct().doubleValue() > spreadLimitPct) return "spread_too_wide";
         if (f.atrPct().doubleValue() > atrLimitPct) return "atr_too_high";
         if (f.riskRewardRatio().doubleValue() < rrMin) return "risk_reward_low";
-        if (f.rsi().doubleValue() >= 82.0d) return "rsi_too_hot";
+        if (f.rsi().doubleValue() >= 84.0d) return "rsi_too_hot";
 
-        double commonVolumeNeed = Math.max(0.82d, Math.min(volumeRatio, 1.10d));
-        double breakoutDistance = Math.max(0.06d, f.windowRange().doubleValue() * 0.35d);
-        double reboundDistance = Math.max(0.10d, f.windowRange().doubleValue() * 0.30d);
+        double commonVolumeNeed = Math.max(0.35d, Math.min(volumeRatio, 1.00d));
+        double breakoutDistance = Math.max(0.10d, f.windowRange().doubleValue() * 0.50d);
+        double reboundDistance = Math.max(0.18d, f.windowRange().doubleValue() * 0.45d);
 
-        double momentumRsiMin = Math.max(40.0d, rsiFilter - 2.0d);
-        double reboundRsiMin = Math.max(18.0d, rsiFilter - 22.0d);
-        double reboundRsiMax = Math.min(48.0d, Math.max(rsiFilter + 6.0d, 44.0d));
+        double momentumRsiMin = Math.max(37.0d, rsiFilter - 5.0d);
+        double reboundRsiMin = Math.max(12.0d, rsiFilter - 28.0d);
+        double reboundRsiMax = Math.min(58.0d, Math.max(rsiFilter + 14.0d, 50.0d));
 
-        double momentumImpulseNeed = minImpulsePct;
-        double reboundImpulseNeed = Math.max(0.005d, minImpulsePct * 0.55d);
-        double reboundEmaNeed = Math.max(0.0005d, emaDiffThreshold * 0.65d);
+        double momentumImpulseNeed = Math.max(0.0015d, minImpulsePct * 0.55d);
+        double reboundImpulseNeed = Math.max(0.0008d, minImpulsePct * 0.20d);
+        double reboundEmaNeed = Math.max(0.0002d, emaDiffThreshold * 0.35d);
+        double scoreOverride = Math.max(3.2d, rrMin * 2.2d);
 
         boolean liquidEnough = f.volumeToAverage().doubleValue() >= commonVolumeNeed;
+        boolean insideBreakoutZone = f.priceFromWindowHigh().doubleValue() <= breakoutDistance;
+        boolean insideReboundZone = f.priceFromWindowLow().doubleValue() <= reboundDistance;
 
         boolean momentumSetup =
                 liquidEnough
+                        && insideBreakoutZone
                         && f.priceChangePct().doubleValue() >= momentumImpulseNeed
                         && f.emaDiff().doubleValue() >= emaDiffThreshold
-                        && f.rsi().doubleValue() >= momentumRsiMin
-                        && f.priceFromWindowHigh().doubleValue() <= breakoutDistance;
+                        && f.rsi().doubleValue() >= momentumRsiMin;
 
         boolean reboundSetup =
                 liquidEnough
-                        && f.priceFromWindowLow().doubleValue() <= reboundDistance
+                        && insideReboundZone
                         && f.rsi().doubleValue() >= reboundRsiMin
                         && f.rsi().doubleValue() <= reboundRsiMax
                         && (f.priceChangePct().doubleValue() >= reboundImpulseNeed
                         || f.emaDiff().doubleValue() >= reboundEmaNeed);
 
-        if (momentumSetup || reboundSetup) return null;
+        boolean scoreOverrideSetup =
+                liquidEnough
+                        && insideReboundZone
+                        && f.score().doubleValue() >= scoreOverride
+                        && f.rsi().doubleValue() >= Math.max(10.0d, reboundRsiMin - 6.0d)
+                        && f.rsi().doubleValue() <= Math.min(62.0d, reboundRsiMax + 6.0d)
+                        && (f.emaDiff().doubleValue() >= reboundEmaNeed * 0.70d
+                        || f.priceChangePct().doubleValue() >= reboundImpulseNeed * 0.55d);
+
+        boolean microReboundSetup =
+                liquidEnough
+                        && insideReboundZone
+                        && f.priceFromWindowLow().doubleValue() <= reboundDistance * 0.75d
+                        && f.emaDiff().doubleValue() >= reboundEmaNeed
+                        && f.rsi().doubleValue() >= Math.max(10.0d, reboundRsiMin - 4.0d)
+                        && f.rsi().doubleValue() <= Math.min(60.0d, reboundRsiMax + 4.0d);
+
+        if (momentumSetup || reboundSetup || scoreOverrideSetup || microReboundSetup) return null;
 
         if (!liquidEnough) return "volume_ratio_low";
-        if (f.priceChangePct().doubleValue() < reboundImpulseNeed) return "impulse_below_min";
+        if (f.priceChangePct().doubleValue() < reboundImpulseNeed && f.emaDiff().doubleValue() < reboundEmaNeed) return "impulse_below_min";
         if (f.emaDiff().doubleValue() < reboundEmaNeed) return "ema_trend_weak";
 
-        boolean farFromBreakout = f.priceFromWindowHigh().doubleValue() > breakoutDistance;
-        boolean farFromRebound = f.priceFromWindowLow().doubleValue() > reboundDistance;
+        boolean farFromBreakout = !insideBreakoutZone;
+        boolean farFromRebound = !insideReboundZone;
         if (farFromBreakout && farFromRebound) return "outside_entry_zone";
 
         if (f.rsi().doubleValue() < reboundRsiMin) return "rsi_too_cold";
         if (f.rsi().doubleValue() > reboundRsiMax && f.rsi().doubleValue() < momentumRsiMin) return "rsi_filter_block";
 
         return "setup_not_ready";
+    }
+
+    private BigDecimal resolveEntryDiffPct(ScalpingFeatureSnapshot features) {
+        if (features == null) {
+            return new BigDecimal("0.000001");
+        }
+
+        BigDecimal momentum = positive(features.priceChangePct());
+        if (momentum != null) {
+            return momentum;
+        }
+
+        BigDecimal emaDiff = positive(features.emaDiff());
+        if (emaDiff != null) {
+            return emaDiff;
+        }
+
+        BigDecimal score = positive(features.score());
+        if (score != null) {
+            return score;
+        }
+
+        return new BigDecimal("0.000001");
     }
 
     private void refreshSettingsIfNeeded(Long chatId, LocalState st, Instant now) {
@@ -1194,3 +1332,4 @@ public class ScalpingStrategyV4 implements TradingStrategy, AiStrategyOrchestrat
         return String.valueOf(value);
     }
 }
+

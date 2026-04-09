@@ -1,24 +1,22 @@
-package com.chicu.aitradebot.service.impl;
+package com.chicu.aitradebot.exchange.service;
 
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.journal.TradeIntentEvent;
-import com.chicu.aitradebot.journal.TradeIntentJournalService;
-import com.chicu.aitradebot.journal.TradeOrderLinkService;
 import com.chicu.aitradebot.service.TradeJournalGateway;
-import lombok.RequiredArgsConstructor;
-import org.springframework.context.annotation.Primary;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.util.UUID;
 
-@Primary
-@Service("tradeJournalGatewayImpl")
-@RequiredArgsConstructor
-public class TradeJournalGatewayImpl implements TradeJournalGateway {
-
-    private final TradeIntentJournalService intentService;
-    private final TradeOrderLinkService linkService;
+/**
+ * Заглушка для журнала.
+ * ВАЖНО: не должна перехватывать бин, если есть реальная реализация.
+ */
+@Service
+@ConditionalOnMissingBean(TradeJournalGateway.class)
+public class NoopTradeJournalGateway implements TradeJournalGateway {
 
     @Override
     public String recordIntent(Long chatId,
@@ -36,29 +34,12 @@ public class TradeJournalGatewayImpl implements TradeJournalGateway {
                                String modelVersion,
                                String effectiveSettingsJson,
                                String featuresJson) {
-
-        return intentService.recordIntent(
-                chatId,
-                strategyType,
-                exchangeName,
-                networkType,
-                symbol,
-                timeframe,
-                signal,
-                decision,
-                reasonCode,
-                confidence,
-                expectedReturn,
-                uncertainty,
-                modelVersion,
-                effectiveSettingsJson,
-                featuresJson
-        );
+        return UUID.randomUUID().toString().replace("-", "");
     }
 
     @Override
     public void attachClientOrderId(String correlationId, String clientOrderId) {
-        intentService.attachClientOrderId(correlationId, clientOrderId);
+        // noop
     }
 
     @Override
@@ -71,18 +52,6 @@ public class TradeJournalGatewayImpl implements TradeJournalGateway {
                                 String correlationId,
                                 String clientOrderId,
                                 String role) {
-
-        linkService.link(
-                chatId,
-                strategyType,
-                exchangeName,
-                networkType,
-                symbol,
-                timeframe,
-                correlationId,
-                clientOrderId,
-                role
-        );
+        // noop
     }
 }
-

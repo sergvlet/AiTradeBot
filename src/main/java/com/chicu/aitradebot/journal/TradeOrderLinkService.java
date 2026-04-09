@@ -5,6 +5,8 @@ import com.chicu.aitradebot.common.enums.StrategyType;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
@@ -20,7 +22,7 @@ public class TradeOrderLinkService {
     /**
      * Вызывать в момент, когда ты УЖЕ знаешь clientOrderId (перед отправкой на биржу или сразу после).
      */
-    @Transactional
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void link(
             Long chatId,
             StrategyType strategyType,
@@ -59,8 +61,12 @@ public class TradeOrderLinkService {
                 .createdAt(Instant.now())
                 .build();
 
-        repo.save(link);
-
-        log.debug("🔗 Link: cid={} clientOrderId={} role={}", correlationId, clientOrderId, role);
+        try {
+            repo.saveAndFlush(link);
+            log.debug("🔗 Link: cid={} clientOrderId={} role={}", correlationId, clientOrderId, role);
+        } catch (DataIntegrityViolationException e) {
+            log.debug("🔗 Link already exists: clientOrderId={} cid={}", clientOrderId, correlationId);
+        }
     }
 }
+

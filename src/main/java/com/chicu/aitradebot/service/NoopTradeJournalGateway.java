@@ -3,21 +3,18 @@ package com.chicu.aitradebot.service;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.journal.TradeIntentEvent;
-import org.springframework.context.annotation.Primary;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
 import java.util.UUID;
 
 /**
- * Заглушка для журнала.
- * Нужна чтобы проект компилился/стартовал, даже если journaling ещё не внедрён полностью.
- *
- * ⚠️ Если у тебя уже есть реальный TradeJournalGatewayImpl — удали этот класс
- * или убери @Primary, иначе он будет перехватывать бин.
+ * Fallback-заглушка для журнала.
+ * Регистрируется только если реальный TradeJournalGateway отсутствует.
  */
-@Service
-@Primary
+@Service("serviceNoopTradeJournalGateway")
+@ConditionalOnMissingBean(TradeJournalGateway.class)
 public class NoopTradeJournalGateway implements TradeJournalGateway {
 
     @Override
@@ -36,8 +33,6 @@ public class NoopTradeJournalGateway implements TradeJournalGateway {
                                String modelVersion,
                                String effectiveSettingsJson,
                                String featuresJson) {
-
-        // Возвращаем корреляцию, чтобы OrderService мог связать clientOrderId
         return UUID.randomUUID().toString().replace("-", "");
     }
 
