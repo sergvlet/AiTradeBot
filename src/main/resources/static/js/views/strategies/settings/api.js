@@ -194,17 +194,18 @@ window.SettingsApi = (function () {
             throw new Error(prettifyError(resp.status, body));
         }
 
-        // ✅ если вернулся JSON — отдадим его (и попробуем применить как UI-state)
+        // ✅ если вернулся JSON — отдадим его. Повторный GET делаем только если это НЕ ui-state.
         if (body.kind === "json") {
             const json = body.json;
-            tryPublishState(json);
-            // если это не state — всё равно попробуем подтянуть state отдельным запросом
-            await refreshUiStateIfConfig(url, data);
+            const published = tryPublishState(json);
+            if (!published) {
+                await refreshUiStateIfConfig(url, data, { lite: true });
+            }
             return json;
         }
 
         // ✅ если HTML/пусто — считаем успехом
-        await refreshUiStateIfConfig(url, data);
+        await refreshUiStateIfConfig(url, data, { lite: true });
         return { ok: true };
     }
 
@@ -284,22 +285,36 @@ window.SettingsApi = (function () {
         }
     }
 
-    function buildStateUrl(ctx) {
+    function buildStateUrl(ctx, opts) {
         if (!ctx) return null;
+        const options = opts || {};
         const params = new URLSearchParams();
         params.set("chatId", String(ctx.chatId));
         if (ctx.exchange) params.set("exchange", String(ctx.exchange));
         if (ctx.network)  params.set("network", String(ctx.network));
+        if (options.lite !== false) params.set("lite", "true");
+        if (options.withBalance) params.set("balance", "true");
         return `/strategies/${encodeURIComponent(ctx.type)}/config/state?${params.toString()}`;
     }
 
-    async function refreshUiStateIfConfig(url, data) {
+    const uiStateRefreshTracker = new Map();
+    const UI_STATE_REFRESH_MIN_GAP_MS = 1500;
+
+    async function refreshUiStateIfConfig(url, data, opts) {
         ensureStore();
         const ctx = parseConfigCtx(url, data);
         if (!ctx) return;
 
-        const stateUrl = buildStateUrl(ctx);
+        const stateUrl = buildStateUrl(ctx, opts);
         if (!stateUrl) return;
+
+        const refreshKey = `${ctx.type}|${ctx.chatId}|${ctx.exchange}|${ctx.network}`;
+        const now = Date.now();
+        const last = uiStateRefreshTracker.get(refreshKey) || 0;
+        if (now - last < UI_STATE_REFRESH_MIN_GAP_MS) {
+            return;
+        }
+        uiStateRefreshTracker.set(refreshKey, now);
 
         try {
             const state = await getJson(stateUrl);
@@ -312,3 +327,5 @@ window.SettingsApi = (function () {
 
     return { getJson, postForm, postJson };
 })();
+
+

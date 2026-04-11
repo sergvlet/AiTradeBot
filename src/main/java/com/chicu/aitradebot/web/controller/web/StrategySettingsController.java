@@ -35,6 +35,8 @@ import org.springframework.web.bind.annotation.*;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.util.*;
@@ -205,7 +207,9 @@ public class StrategySettingsController {
             @RequestParam("chatId") long chatId,
             @RequestParam(value = "exchange", required = false) String exchangeParam,
             @RequestParam(value = "network", required = false) String networkParam,
-            @RequestParam(value = "diagnostics", required = false, defaultValue = "false") boolean diagnostics
+            @RequestParam(value = "diagnostics", required = false, defaultValue = "false") boolean diagnostics,
+            @RequestParam(value = "lite", required = false, defaultValue = "true") boolean lite,
+            @RequestParam(value = "balance", required = false, defaultValue = "false") boolean balance
     ) {
         StrategyType strategyType = parseStrategyType(typeRaw);
 
@@ -222,7 +226,8 @@ public class StrategySettingsController {
         String ex = resolveExchange(exchangeParam, s);
         NetworkType net = resolveNetwork(networkParam, s);
 
-        StrategyUiState state = buildUiState(chatId, strategyType, s, ex, net, diagnostics);
+        boolean includeBalance = balance || !lite;
+        StrategyUiState state = buildUiState(chatId, strategyType, s, ex, net, diagnostics, includeBalance, false, null, null);
         return ResponseEntity.ok(state);
     }
 
@@ -259,6 +264,7 @@ public class StrategySettingsController {
         s = applySaveScope(chatId, strategyType, exchange, network, saveScope, params, s);
 
         CtxSnap after = snap(s);
+        boolean contextChanged = ctxChanged(before, after);
 
         settingsCache.invalidate(chatId, strategyType);
 
@@ -266,7 +272,18 @@ public class StrategySettingsController {
         scheduleRefreshRuntimeAfterCommitIfNeeded(chatId, strategyType, before, after, exchange, network);
 
         boolean includeDiagnostics = "network".equalsIgnoreCase(saveScope) || "keys".equalsIgnoreCase(saveScope);
-        StrategyUiState state = buildUiState(chatId, strategyType, s, exchange, network, includeDiagnostics);
+        StrategyUiState state = buildUiState(
+                chatId,
+                strategyType,
+                s,
+                exchange,
+                network,
+                includeDiagnostics,
+                true,
+                contextChanged,
+                buildConfigPageUrl(strategyType, chatId, s, params.getOrDefault("tab", "network")),
+                buildDashboardPageUrl(strategyType, chatId, s)
+        );
 
         return ResponseEntity.ok(state);
     }
@@ -772,7 +789,16 @@ public class StrategySettingsController {
         }
     }
 
-    private StrategyUiState buildUiState(long chatId, StrategyType type, StrategySettings s, String ex, NetworkType net, boolean diagnostics) {
+    private StrategyUiState buildUiState(long chatId,
+                                         StrategyType type,
+                                         StrategySettings s,
+                                         String ex,
+                                         NetworkType net,
+                                         boolean diagnostics,
+                                         boolean includeBalance,
+                                         boolean contextChanged,
+                                         String redirectConfigUrl,
+                                         String redirectDashboardUrl) {
 
         ex = normalizeExchange(ex);
         net = (net != null) ? net : (s.getNetworkType() != null ? s.getNetworkType() : NetworkType.TESTNET);
@@ -780,11 +806,13 @@ public class StrategySettingsController {
         boolean active = orchestrator.isRunning(chatId, type, ex, net);
 
         String selectedAsset = normalizeAsset(s.getAccountAsset());
-        AccountBalanceSnapshot snap = fetchSnapshotCompat(chatId, type, ex, net, selectedAsset);
+        AccountBalanceSnapshot snap = includeBalance ? fetchSnapshotCompat(chatId, type, ex, net, selectedAsset) : null;
 
-        selectedAsset = resolveSelectedAsset(selectedAsset, snap);
-        AccountBalanceSnapshot.AssetBalance ab = resolveAssetBalance(snap, selectedAsset);
-        List<String> assets = resolveAvailableAssets(snap, selectedAsset);
+        selectedAsset = includeBalance ? resolveSelectedAsset(selectedAsset, snap) : normalizeAsset(selectedAsset);
+        AccountBalanceSnapshot.AssetBalance ab = includeBalance ? resolveAssetBalance(snap, selectedAsset) : null;
+        List<String> assets = includeBalance
+                ? resolveAvailableAssets(snap, selectedAsset)
+                : (selectedAsset != null ? new ArrayList<>(List.of(selectedAsset)) : new ArrayList<>());
 
         ExchangeSettings es = null;
         try {
@@ -802,7 +830,7 @@ public class StrategySettingsController {
         Boolean connectionOk = (snap != null) ? snap.isConnectionOk() : null;
         AccountFees fees = null;
 
-        if (diagnostics && isDiagnosticsSupported(ex) && es != null && es.hasBaseKeys()) {
+        if (includeBalance && diagnostics && isDiagnosticsSupported(ex) && es != null && es.hasBaseKeys()) {
             try {
                 ApiKeyDiagnostics d = exchangeSettingsService.testConnectionDetailed(es);
                 connectionOk = (d != null && d.isOk());
@@ -837,7 +865,10 @@ public class StrategySettingsController {
                 balance,
                 hasKeys,
                 connectionOk,
-                fees
+                fees,
+                contextChanged,
+                redirectConfigUrl,
+                redirectDashboardUrl
         );
     }
 
@@ -861,7 +892,10 @@ public class StrategySettingsController {
             AssetBalance selectedBalance,
             Boolean hasKeys,
             Boolean connectionOk,
-            AccountFees accountFees
+            AccountFees accountFees,
+            boolean contextChanged,
+            String redirectConfigUrl,
+            String redirectDashboardUrl
     ) {
         public record AssetBalance(String asset, BigDecimal free, BigDecimal locked) {
         }
@@ -1237,6 +1271,41 @@ public class StrategySettingsController {
         return "BINANCE".equals(ex) || "BYBIT".equals(ex);
     }
 
+
+    private String buildConfigPageUrl(StrategyType type, long chatId, StrategySettings s, String tab) {
+        String ex = normalizeExchange(s != null ? s.getExchangeName() : null);
+        NetworkType net = (s != null && s.getNetworkType() != null) ? s.getNetworkType() : NetworkType.TESTNET;
+        String safeTab = (tab == null || tab.isBlank()) ? "network" : tab.trim();
+        return "/strategies/" + type.name()
+               + "/config?chatId=" + chatId
+               + "&exchange=" + enc(ex)
+               + "&network=" + enc(net.name())
+               + "&tab=" + enc(safeTab);
+    }
+
+    private String buildDashboardPageUrl(StrategyType type, long chatId, StrategySettings s) {
+        String ex = normalizeExchange(s != null ? s.getExchangeName() : null);
+        NetworkType net = (s != null && s.getNetworkType() != null) ? s.getNetworkType() : NetworkType.TESTNET;
+        String symbol = normalizeSymbol(s != null ? s.getSymbol() : null);
+        String timeframe = normalizeTimeframe(s != null ? s.getTimeframe() : null);
+
+        StringBuilder url = new StringBuilder();
+        url.append("/strategies/")
+                .append(type.name())
+                .append("/dashboard")
+                .append("?chatId=").append(chatId)
+                .append("&exchange=").append(enc(ex))
+                .append("&network=").append(enc(net.name()));
+
+        if (symbol != null) {
+            url.append("&symbol=").append(enc(symbol));
+        }
+        if (timeframe != null) {
+            url.append("&timeframe=").append(enc(timeframe));
+        }
+        return url.toString();
+    }
+
     private String buildRedirect(StrategyType type, long chatId, String exchange, NetworkType network, String tab) {
         return "redirect:/strategies/" + type.name() +
                "/config?chatId=" + chatId +
@@ -1338,6 +1407,10 @@ public class StrategySettingsController {
         return NetworkType.TESTNET;
     }
 
+    private String enc(String s) {
+        return URLEncoder.encode(String.valueOf(s), StandardCharsets.UTF_8);
+    }
+
     private static String safe(String s) {
         if (s == null) return "";
         String x = s.trim();
@@ -1420,4 +1493,6 @@ public class StrategySettingsController {
         }
     }
 }
+
+
 

@@ -23,20 +23,18 @@ $Manifest    = Join-Path $ExportDir "manifest.txt"
 #    "app.py"
 # =========================================================
 $FileNamesToPack = @(
+    "AccessLogFilter.java",
+    "MarketDataStreamService.java",
+    "MarketStreamServiceImpl.java",
+    "MlHttpClient.java",
     "ScalpingStrategyV4.java",
-    "ScalpingStrategySettings.java",
-    "ScalpingStrategySettingsService.java",
-    "ScalpingStrategySettingsServiceImpl.java",
-    "ScalpingStrategySettingsRepository.java",
-    "TradeExecutionServiceImpl.java",
-    "OrderService.java",
-    "OrderServiceImpl.java",
-    "InMemoryPositionStoreImpl.java",
-    "PositionStore.java",
-    "TradingStrategy.java",
-    "StrategySettings.java",
-    "StrategySettingsCommandService.java",
-    "MarketDataStreamService.java"
+    "ScalpingMlGate.java",
+    "AdaptiveRuntimeController.java",
+    "AutoTunerOrchestrator.java",
+    "StrategyRegistry.java",
+    "StrategyBindingProcessor.java",
+    "strategy-dashboard.js",
+    "app.js"
 )
 # =========================================================
 # 3) ПОДГОТОВКА ПАПКИ РЕЗУЛЬТАТА

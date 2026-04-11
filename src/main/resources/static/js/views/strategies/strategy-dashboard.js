@@ -113,6 +113,9 @@ document.addEventListener("DOMContentLoaded", () => {
     let lastLogAt = 0;
     let hadSuccessfulConnect = false;
     let initialSnapshotLoaded = false;
+    let contextSyncTimer = null;
+    let contextSyncInFlight = false;
+    let lastContextFingerprint = `${exchange}|${network}|${symbolUpper}|${chartCtrl.timeframe}`;
 
     const journalState = {
         limit: 100,
@@ -195,6 +198,106 @@ document.addEventListener("DOMContentLoaded", () => {
     function setJournalLoading(text = "Загрузка…") {
         if (!tradeJournalBody) return;
         tradeJournalBody.innerHTML = `<tr><td colspan="5" class="text-center text-secondary py-3">${escapeHtml(text)}</td></tr>`;
+    }
+
+
+    function normalizeExchangeValue(v) {
+        return String(v || "").trim().toUpperCase();
+    }
+
+    function normalizeNetworkValue(v) {
+        return String(v || "").trim().toUpperCase();
+    }
+
+    function normalizeTimeframeValue(v) {
+        return String(v || "").trim().toLowerCase();
+    }
+
+    function buildConfigStateUrl() {
+        return `/strategies/${encodeURIComponent(type)}/config/state?chatId=${encodeURIComponent(chatId)}&lite=true&_ts=${Date.now()}`;
+    }
+
+    function buildDashboardUrl(next) {
+        const q = new URLSearchParams();
+        q.set("chatId", String(chatId));
+        q.set("exchange", String(next.exchange));
+        q.set("network", String(next.network));
+        if (next.symbol) q.set("symbol", String(next.symbol));
+        if (next.timeframe) q.set("timeframe", String(next.timeframe));
+        return `/strategies/${encodeURIComponent(type)}/dashboard?${q.toString()}`;
+    }
+
+    function extractNextContextFromState(state) {
+        if (!state || typeof state !== "object") return null;
+
+        const nextExchange = normalizeExchangeValue(state.exchange);
+        const nextNetwork = normalizeNetworkValue(state.network?.name || state.network);
+        const nextSymbol = normalizeSymbol(state.symbol);
+        const nextTimeframe = normalizeTimeframeValue(state.timeframe);
+
+        if (!nextExchange || !nextNetwork || !nextSymbol || !nextTimeframe) {
+            return null;
+        }
+
+        return {
+            exchange: nextExchange,
+            network: nextNetwork,
+            symbol: nextSymbol,
+            timeframe: nextTimeframe,
+            fingerprint: `${nextExchange}|${nextNetwork}|${nextSymbol}|${nextTimeframe}`
+        };
+    }
+
+    function shouldReloadToContext(next, force = false) {
+        if (!next) return false;
+        if (force && next.fingerprint !== lastContextFingerprint) return true;
+        return next.exchange !== exchange
+            || next.network !== network
+            || next.symbol !== symbolUpper
+            || next.timeframe !== normalizeTimeframeValue(chartCtrl.timeframe || timeframe || "1m");
+    }
+
+    async function fetchCurrentUiState() {
+        const url = buildConfigStateUrl();
+        const response = await fetch(url, {
+            method: "GET",
+            credentials: "same-origin",
+            headers: {
+                "Accept": "application/json",
+                "X-Requested-With": "fetch"
+            },
+            cache: "no-store"
+        });
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+        return await response.json();
+    }
+
+    async function syncDashboardContext(force = false) {
+        if (contextSyncInFlight) return false;
+        contextSyncInFlight = true;
+        try {
+            const state = await fetchCurrentUiState();
+            const next = extractNextContextFromState(state);
+            if (!next) return false;
+
+            if (shouldReloadToContext(next, force)) {
+                lastContextFingerprint = next.fingerprint;
+                console.warn("🔄 Dashboard context changed, reload to new state:", next);
+                setWsStatus(false);
+                window.location.replace(buildDashboardUrl(next));
+                return true;
+            }
+
+            lastContextFingerprint = next.fingerprint;
+            return false;
+        } catch (err) {
+            console.warn("⚠ Dashboard context sync failed", err);
+            return false;
+        } finally {
+            contextSyncInFlight = false;
+        }
     }
 
     function detectQuoteAsset(sym) {
@@ -634,6 +737,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
         chartCtrl.adjustBarSpacing();
         initialSnapshotLoaded = true;
+        syncDashboardContext(false).catch(() => {});
     }
 
     fetch(snapshotUrl)
@@ -768,6 +872,18 @@ document.addEventListener("DOMContentLoaded", () => {
 
     connectWs(false);
 
+    // Фоновый polling контекста убран.
+    // Дашборд синхронизируется по focus/visibility и после загрузки snapshot.
+    window.addEventListener("focus", () => {
+        syncDashboardContext(true).catch(() => {});
+    });
+
+    document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible") {
+            syncDashboardContext(true).catch(() => {});
+        }
+    });
+
     window.addEventListener("resize", () => {
         try {
             chartCtrl.chart.applyOptions({ width: container.clientWidth });
@@ -777,9 +893,14 @@ document.addEventListener("DOMContentLoaded", () => {
 
     window.addEventListener("beforeunload", () => {
         try { if (_persistTimer) clearTimeout(_persistTimer); } catch (_) {}
+        try { if (contextSyncTimer) clearInterval(contextSyncTimer); } catch (_) {}
         cleanupWs();
     });
 
     chartCtrl.adjustBarSpacing();
     console.log("📊 Strategy Dashboard INITIALIZED");
 });
+
+
+
+

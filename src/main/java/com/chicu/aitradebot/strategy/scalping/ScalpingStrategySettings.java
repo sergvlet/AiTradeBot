@@ -32,63 +32,223 @@ public class ScalpingStrategySettings {
     @Column(name = "chat_id", nullable = false)
     private Long chatId;
 
+    // -------------------------------------------------
+    // legacy / technical compatibility
+    // -------------------------------------------------
     @Builder.Default
     @Column(nullable = false)
-    private Integer windowSize = 60;
-
-    /**
-     * Минимальный импульс в процентах.
-     * Пример: 0.08 = 0.08%
-     */
-    @Builder.Default
-    @Column(nullable = false)
-    private Double minImpulsePct = 0.08d;
-
-    /**
-     * emaDiff = (emaFast - emaSlow) / price * 100
-     */
-    @Builder.Default
-    @Column(nullable = false)
-    private Double emaDiffThreshold = 0.05d;
+    private Integer windowSize = 36;
 
     @Builder.Default
     @Column(nullable = false)
-    private Double volumeRatio = 1.00d;
+    private Double minImpulsePct = 0.035d;
 
     @Builder.Default
     @Column(nullable = false)
-    private Double spreadLimitPct = 0.35d;
+    private Double emaDiffThreshold = 0.018d;
 
     @Builder.Default
     @Column(nullable = false)
-    private Double atrPctRange = 0.90d;
+    private Double volumeRatio = 0.90d;
 
-    /**
-     * Базовый нижний RSI-фильтр.
-     * Должен быть мягким для частых входов.
-     */
+    @Builder.Default
+    @Column(nullable = false)
+    private Double spreadLimitPct = 0.12d;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Double atrPctRange = 0.80d;
+
     @Builder.Default
     @Column(nullable = false)
     private Double rsiFilter = 38.0d;
 
     @Builder.Default
     @Column(nullable = false)
-    private Double riskRewardMin = 1.10d;
+    private Double riskRewardMin = 1.05d;
 
     @Builder.Default
     @Column(nullable = false)
     private Double orderVolume = 20.0d;
 
-    /**
-     * Для скальпинга TP должен быть маленьким.
-     */
     @Builder.Default
     @Column(nullable = false)
     private Double takeProfitPct = 0.28d;
 
     @Builder.Default
     @Column(nullable = false)
-    private Double stopLossPct = 0.18d;
+    private Double stopLossPct = 0.16d;
+
+    // -------------------------------------------------
+    // regime block
+    // -------------------------------------------------
+    @Builder.Default
+    @Column(nullable = false)
+    private Boolean regimeAutoEnabled = true;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Boolean allowTrendTrades = true;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Boolean allowRangeTrades = true;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Boolean allowBreakoutTrades = true;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Boolean allowCounterTrendTrades = false;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Double chaosBlockThreshold = 70.0d;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Double squeezeThreshold = 78.0d;
+
+    // -------------------------------------------------
+    // trend pullback block
+    // -------------------------------------------------
+    @Builder.Default
+    @Column(nullable = false)
+    private Double trendMinScore = 58.0d;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Double pullbackMaxDepthPct = 0.90d;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Double pullbackEntryBufferPct = 0.30d;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Double trendTpPct = 0.28d;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Double trendSlPct = 0.16d;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Double trendBreakEvenPct = 0.12d;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Integer trendMaxHoldSec = 420;
+
+    // -------------------------------------------------
+    // range block
+    // -------------------------------------------------
+    @Builder.Default
+    @Column(nullable = false)
+    private Double rangeMinScore = 52.0d;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Double rangeEntryFromLowPct = 0.55d;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Double rangeExitToMidPct = 0.50d;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Double rangeTpPct = 0.16d;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Double rangeSlPct = 0.12d;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Integer rangeMaxHoldSec = 180;
+
+    // -------------------------------------------------
+    // breakout block
+    // -------------------------------------------------
+    @Builder.Default
+    @Column(nullable = false)
+    private Double breakoutMinScore = 58.0d;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Double breakoutVolumeFactor = 1.10d;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Double breakoutTpPct = 0.34d;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Double breakoutSlPct = 0.18d;
+
+    // -------------------------------------------------
+    // execution block
+    // -------------------------------------------------
+    @Builder.Default
+    @Column(nullable = false)
+    private Double maxSpreadPct = 0.15d;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Double minAtrPct = 0.02d;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Double maxAtrPct = 0.80d;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Double minVolumeRatio = 0.60d;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Double minRiskReward = 1.05d;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Integer cooldownAfterStopSec = 45;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Integer cooldownAfterExitSec = 12;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Integer maxConsecutiveStops = 3;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Integer reentryLockSec = 18;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Boolean emergencyChaosExitEnabled = true;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Boolean partialExitEnabled = true;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Double partialExitPct = 0.50d;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Double partialExitTriggerPct = 0.18d;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Boolean useIntrabarConfirmation = true;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private Integer microWindowSize = 8;
 
     @Builder.Default
     @Column(nullable = false, length = 32)
@@ -100,7 +260,7 @@ public class ScalpingStrategySettings {
 
     @Builder.Default
     @Column(nullable = false)
-    private Integer cachedCandlesLimit = 1000;
+    private Integer cachedCandlesLimit = 1200;
 
     @Builder.Default
     @Column(nullable = false)
@@ -116,12 +276,8 @@ public class ScalpingStrategySettings {
     @PrePersist
     public void prePersist() {
         Instant now = Instant.now();
-        if (createdAt == null) {
-            createdAt = now;
-        }
-        if (updatedAt == null) {
-            updatedAt = now;
-        }
+        if (createdAt == null) createdAt = now;
+        if (updatedAt == null) updatedAt = now;
         normalize();
     }
 
@@ -132,88 +288,89 @@ public class ScalpingStrategySettings {
     }
 
     public void normalize() {
-        if (windowSize == null || windowSize < 6) {
-            windowSize = 60;
-        } else if (windowSize > 120) {
-            windowSize = 120;
-        }
+        windowSize = clampInt(windowSize, 8, 240, 36);
+        microWindowSize = clampInt(microWindowSize, 4, 64, 8);
+        cachedCandlesLimit = clampInt(cachedCandlesLimit, 80, 5000, 1200);
 
-        if (minImpulsePct == null || minImpulsePct <= 0) {
-            minImpulsePct = 0.08d;
-        } else if (minImpulsePct > 5.0d) {
-            minImpulsePct = 5.0d;
-        }
+        minImpulsePct = clampDouble(minImpulsePct, 0.001d, 10.0d, 0.035d);
+        emaDiffThreshold = clampDouble(emaDiffThreshold, 0.001d, 10.0d, 0.018d);
+        volumeRatio = clampDouble(volumeRatio, 0.10d, 10.0d, 0.90d);
+        spreadLimitPct = clampDouble(spreadLimitPct, 0.01d, 10.0d, 0.12d);
+        atrPctRange = clampDouble(atrPctRange, 0.01d, 10.0d, 0.80d);
+        rsiFilter = clampDouble(rsiFilter, 1.0d, 99.0d, 38.0d);
+        riskRewardMin = clampDouble(riskRewardMin, 0.10d, 20.0d, 1.05d);
+        orderVolume = clampDouble(orderVolume, 1.0d, 1_000_000.0d, 20.0d);
+        takeProfitPct = clampDouble(takeProfitPct, 0.01d, 20.0d, 0.28d);
+        stopLossPct = clampDouble(stopLossPct, 0.01d, 20.0d, 0.16d);
 
-        if (emaDiffThreshold == null || emaDiffThreshold < 0) {
-            emaDiffThreshold = 0.05d;
-        } else if (emaDiffThreshold > 5.0d) {
-            emaDiffThreshold = 5.0d;
-        }
+        chaosBlockThreshold = clampDouble(chaosBlockThreshold, 1.0d, 100.0d, 70.0d);
+        squeezeThreshold = clampDouble(squeezeThreshold, 1.0d, 100.0d, 78.0d);
+        trendMinScore = clampDouble(trendMinScore, 1.0d, 100.0d, 58.0d);
+        pullbackMaxDepthPct = clampDouble(pullbackMaxDepthPct, 0.05d, 5.0d, 0.90d);
+        pullbackEntryBufferPct = clampDouble(pullbackEntryBufferPct, 0.01d, 5.0d, 0.30d);
+        trendTpPct = clampDouble(trendTpPct, 0.01d, 20.0d, 0.28d);
+        trendSlPct = clampDouble(trendSlPct, 0.01d, 20.0d, 0.16d);
+        trendBreakEvenPct = clampDouble(trendBreakEvenPct, 0.01d, 20.0d, 0.12d);
+        trendMaxHoldSec = clampInt(trendMaxHoldSec, 10, 86_400, 420);
 
-        if (volumeRatio == null || volumeRatio <= 0) {
-            volumeRatio = 1.00d;
-        } else if (volumeRatio > 10.0d) {
-            volumeRatio = 10.0d;
-        }
+        rangeMinScore = clampDouble(rangeMinScore, 1.0d, 100.0d, 52.0d);
+        rangeEntryFromLowPct = clampDouble(rangeEntryFromLowPct, 0.01d, 5.0d, 0.55d);
+        rangeExitToMidPct = clampDouble(rangeExitToMidPct, 0.01d, 5.0d, 0.50d);
+        rangeTpPct = clampDouble(rangeTpPct, 0.01d, 20.0d, 0.16d);
+        rangeSlPct = clampDouble(rangeSlPct, 0.01d, 20.0d, 0.12d);
+        rangeMaxHoldSec = clampInt(rangeMaxHoldSec, 10, 86_400, 180);
 
-        if (spreadLimitPct == null || spreadLimitPct <= 0) {
-            spreadLimitPct = 0.35d;
-        } else if (spreadLimitPct > 10.0d) {
-            spreadLimitPct = 10.0d;
-        }
+        breakoutMinScore = clampDouble(breakoutMinScore, 1.0d, 100.0d, 58.0d);
+        breakoutVolumeFactor = clampDouble(breakoutVolumeFactor, 0.10d, 10.0d, 1.10d);
+        breakoutTpPct = clampDouble(breakoutTpPct, 0.01d, 20.0d, 0.34d);
+        breakoutSlPct = clampDouble(breakoutSlPct, 0.01d, 20.0d, 0.18d);
 
-        if (atrPctRange == null || atrPctRange <= 0) {
-            atrPctRange = 0.90d;
-        } else if (atrPctRange > 10.0d) {
-            atrPctRange = 10.0d;
-        }
+        maxSpreadPct = clampDouble(maxSpreadPct, 0.01d, 20.0d, 0.15d);
+        minAtrPct = clampDouble(minAtrPct, 0.001d, 20.0d, 0.02d);
+        maxAtrPct = clampDouble(maxAtrPct, 0.01d, 20.0d, 0.80d);
+        minVolumeRatio = clampDouble(minVolumeRatio, 0.10d, 10.0d, 0.60d);
+        minRiskReward = clampDouble(minRiskReward, 0.10d, 20.0d, 1.05d);
+        cooldownAfterStopSec = clampInt(cooldownAfterStopSec, 0, 86_400, 45);
+        cooldownAfterExitSec = clampInt(cooldownAfterExitSec, 0, 86_400, 12);
+        maxConsecutiveStops = clampInt(maxConsecutiveStops, 1, 100, 3);
+        reentryLockSec = clampInt(reentryLockSec, 0, 86_400, 18);
+        partialExitPct = clampDouble(partialExitPct, 0.05d, 0.95d, 0.50d);
+        partialExitTriggerPct = clampDouble(partialExitTriggerPct, 0.01d, 20.0d, 0.18d);
 
-        if (rsiFilter == null || rsiFilter < 1 || rsiFilter > 99) {
-            rsiFilter = 38.0d;
-        }
+        regimeAutoEnabled = bool(regimeAutoEnabled, true);
+        allowTrendTrades = bool(allowTrendTrades, true);
+        allowRangeTrades = bool(allowRangeTrades, true);
+        allowBreakoutTrades = bool(allowBreakoutTrades, true);
+        allowCounterTrendTrades = bool(allowCounterTrendTrades, false);
+        emergencyChaosExitEnabled = bool(emergencyChaosExitEnabled, true);
+        partialExitEnabled = bool(partialExitEnabled, true);
+        useIntrabarConfirmation = bool(useIntrabarConfirmation, true);
+        active = bool(active, false);
 
-        if (riskRewardMin == null || riskRewardMin <= 0) {
-            riskRewardMin = 1.10d;
-        } else if (riskRewardMin > 20.0d) {
-            riskRewardMin = 20.0d;
-        }
+        if (symbol == null || symbol.isBlank()) symbol = "BTCUSDT";
+        symbol = symbol.trim().toUpperCase();
+        if (timeframe == null || timeframe.isBlank()) timeframe = "1m";
+        timeframe = timeframe.trim().toLowerCase();
+    }
 
-        if (orderVolume == null || orderVolume <= 0) {
-            orderVolume = 20.0d;
-        }
+    private static Integer clampInt(Integer value, int min, int max, int fallback) {
+        if (value == null) return fallback;
+        if (value < min) return min;
+        if (value > max) return max;
+        return value;
+    }
 
-        if (takeProfitPct == null || takeProfitPct <= 0) {
-            takeProfitPct = 0.28d;
-        } else if (takeProfitPct > 10.0d) {
-            takeProfitPct = 10.0d;
-        }
+    private static Double clampDouble(Double value, double min, double max, double fallback) {
+        if (value == null) return fallback;
+        if (value < min) return min;
+        if (value > max) return max;
+        return value;
+    }
 
-        if (stopLossPct == null || stopLossPct <= 0) {
-            stopLossPct = 0.18d;
-        } else if (stopLossPct > 10.0d) {
-            stopLossPct = 10.0d;
-        }
-
-        if (symbol == null || symbol.isBlank()) {
-            symbol = "BTCUSDT";
-        } else {
-            symbol = symbol.trim().toUpperCase();
-        }
-
-        if (timeframe == null || timeframe.isBlank()) {
-            timeframe = "1m";
-        } else {
-            timeframe = timeframe.trim().toLowerCase();
-        }
-
-        if (cachedCandlesLimit == null || cachedCandlesLimit < 50) {
-            cachedCandlesLimit = 1000;
-        } else if (cachedCandlesLimit > 5000) {
-            cachedCandlesLimit = 5000;
-        }
-
-        if (active == null) {
-            active = false;
-        }
+    private static Boolean bool(Boolean value, boolean fallback) {
+        return value == null ? fallback : value;
     }
 }
+
+
+

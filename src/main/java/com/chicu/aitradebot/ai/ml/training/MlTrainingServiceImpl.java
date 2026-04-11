@@ -314,6 +314,7 @@ public class MlTrainingServiceImpl implements MlTrainingService {
      * Первый запуск: обучаемся не по ml_samples, а прямо по выбранным свечам.
      * Используется для WINDOW_SCALPING / FIBONACCI_GRID / SCALPING.
      */
+    @Override
     public MlTrainingResult trainOnSelectedCandles(Long chatId,
                                                    StrategyType type,
                                                    String exchangeOverride,
@@ -430,6 +431,34 @@ public class MlTrainingServiceImpl implements MlTrainingService {
             params.put("distancePct", cfg.distancePct);
             params.put("tpPct", cfg.takeProfitPct);
             params.put("slPct", cfg.stopLossPct);
+        } else if (type == StrategyType.SCALPING) {
+            ScalpingTrainingConfig cfg = resolveScalpingTrainingConfig(chatId, exchange, network, symbol, timeframe);
+            featureSchema = List.of(
+                    "windowSize",
+                    "price",
+                    "lastPrice",
+                    "low",
+                    "high",
+                    "range",
+                    "rangePct",
+                    "impulsePct",
+                    "emaFastRel",
+                    "emaSlowRel",
+                    "emaDiffPct",
+                    "ret1Pct",
+                    "ret3Pct",
+                    "ret5Pct",
+                    "volatilityPct",
+                    "positionInRange01",
+                    "distanceFromLowPct",
+                    "distanceFromHighPct"
+            );
+            rows = buildScalpingRowsFromCandles(candles, cfg, candlesLimit, chatId, symbol, exchange, networkName, timeframe);
+            params.put("datasetSource", "selected_candles");
+            params.put("windowSize", cfg.windowSize);
+            params.put("tpPct", cfg.takeProfitPct);
+            params.put("slPct", cfg.stopLossPct);
+            params.put("minImpulsePct", cfg.minImpulsePct);
         } else {
             WindowTrainingConfig cfg = resolveWindowTrainingConfig(chatId, exchange, network, symbol, timeframe);
             featureSchema = List.of(
@@ -1880,6 +1909,7 @@ private double calcCloseReturnPct(List<CandlePoint> points, int index, int back)
 
     private record Context(String symbol, String timeframe, String exchange, String network) {}
 }
+
 
 
 

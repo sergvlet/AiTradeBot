@@ -261,12 +261,12 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
 
         boolean paperBlocksNow = paperMode && paperBlocksRealOrders && net == NetworkType.MAINNET;
 
-        MlGateDecision mlGate = evaluateMlGate(ss);
+        MlGateDecision mlGate = evaluateMlGate(ss, strategyType);
 
         if (mlGate.bypassed()) {
             String logKey = buildMlGateLogKey(chatId, strategyType, ex, net, sym) + ":bypass";
             if (shouldLogNow(logKey, ML_GATE_LOG_THROTTLE_MS)) {
-                log.info("⚠️ [Вход] ML gate пропущен в fail-open режиме | reason={} | conf={} minProb={} | chatId={} {} {} ex={} net={}",
+                log.info("⚠️ [Вход] ML-фильтр пропущен | reason={} | conf={} minProb={} | chatId={} {} {} ex={} net={}",
                         mlGate.reason(),
                         QtyMath.strip(mlGate.confidence()),
                         QtyMath.strip(mlGate.minProb()),
@@ -277,7 +277,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         if (mlGate.reject()) {
             String logKey = buildMlGateLogKey(chatId, strategyType, ex, net, sym);
             if (shouldLogNow(logKey, ML_GATE_LOG_THROTTLE_MS)) {
-                log.info("⛔ [Вход] ML gate отклонил вход | reason={} | conf={} < minProb={} | chatId={} {} {} ex={} net={}",
+                log.info("⛔ [Вход] ML-фильтр отклонил вход | reason={} | conf={} < minProb={} | chatId={} {} {} ex={} net={}",
                         mlGate.reason(),
                         QtyMath.strip(mlGate.confidence()),
                         QtyMath.strip(mlGate.minProb()),
@@ -289,7 +289,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                     strategyType,
                     sym,
                     null,
-                    Signal.hold("ML gate: вероятность ниже порога")
+                    Signal.hold("ML-фильтр: вероятность ниже порога")
             ));
             return EntryResult.fail("ml_gate_reject");
         }
@@ -1965,9 +1965,20 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                 || "PARTIALLYFILLEDCANCELED".equals(status);
     }
 
-    private MlGateDecision evaluateMlGate(StrategySettings ss) {
+    private MlGateDecision evaluateMlGate(StrategySettings ss, StrategyType strategyType) {
         if (ss == null) {
             return MlGateDecision.pass(BigDecimal.ZERO, BigDecimal.ZERO);
+        }
+
+        // Для SCALPING ML-фильтр уже применяется внутри самой стратегии
+        // с учётом режима рынка и адаптации риска. Повторная проверка здесь
+        // только дублирует veto и режет нормальные входы.
+        if (strategyType == StrategyType.SCALPING) {
+            return MlGateDecision.bypass(
+                    normalizeProb(ss.getMlConfidence()),
+                    normalizeProb(ss.getGateMinProb()),
+                    "ml_runtime_gate_already_checked"
+            );
         }
 
         BigDecimal confidenceRaw = ss.getMlConfidence();
@@ -3206,5 +3217,6 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         }
     }
 }
+
 
 

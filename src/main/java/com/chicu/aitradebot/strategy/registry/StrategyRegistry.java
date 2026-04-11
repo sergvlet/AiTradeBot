@@ -52,10 +52,55 @@ public class StrategyRegistry {
         ));
 
         fields.put(StrategyType.SCALPING, List.of(
+                new FieldMeta("symbol", "Символ", "text"),
+                new FieldMeta("timeframe", "Таймфрейм", "text"),
+                new FieldMeta("cachedCandlesLimit", "Свечей в кэше", "number"),
                 new FieldMeta("windowSize", "Окно анализа", "number"),
-                new FieldMeta("priceChangeThreshold", "Порог движения (%)", "number"),
-                new FieldMeta("spreadThreshold", "Макс спред (%)", "number"),
-                new FieldMeta("orderVolume", "Объём ордера", "number")
+                new FieldMeta("microWindowSize", "Микро-окно", "number"),
+                new FieldMeta("orderVolume", "Объём ордера", "number"),
+
+                new FieldMeta("regimeAutoEnabled", "Авто-режим рынка", "checkbox"),
+                new FieldMeta("allowTrendTrades", "Разрешить trend", "checkbox"),
+                new FieldMeta("allowRangeTrades", "Разрешить range", "checkbox"),
+                new FieldMeta("allowBreakoutTrades", "Разрешить breakout", "checkbox"),
+                new FieldMeta("allowCounterTrendTrades", "Разрешить counter-trend", "checkbox"),
+                new FieldMeta("chaosBlockThreshold", "Порог CHAOS", "number"),
+                new FieldMeta("squeezeThreshold", "Порог SQUEEZE", "number"),
+
+                new FieldMeta("trendMinScore", "Trend min score", "number"),
+                new FieldMeta("pullbackMaxDepthPct", "Глубина отката (%)", "number"),
+                new FieldMeta("pullbackEntryBufferPct", "Буфер входа pullback (%)", "number"),
+                new FieldMeta("trendTpPct", "Trend TP (%)", "number"),
+                new FieldMeta("trendSlPct", "Trend SL (%)", "number"),
+                new FieldMeta("trendBreakEvenPct", "Trend break-even (%)", "number"),
+                new FieldMeta("trendMaxHoldSec", "Trend max hold (sec)", "number"),
+
+                new FieldMeta("rangeMinScore", "Range min score", "number"),
+                new FieldMeta("rangeEntryFromLowPct", "Вход от низа range (%)", "number"),
+                new FieldMeta("rangeExitToMidPct", "Выход к середине range (%)", "number"),
+                new FieldMeta("rangeTpPct", "Range TP (%)", "number"),
+                new FieldMeta("rangeSlPct", "Range SL (%)", "number"),
+                new FieldMeta("rangeMaxHoldSec", "Range max hold (sec)", "number"),
+
+                new FieldMeta("breakoutMinScore", "Breakout min score", "number"),
+                new FieldMeta("breakoutVolumeFactor", "Фактор объёма breakout", "number"),
+                new FieldMeta("breakoutTpPct", "Breakout TP (%)", "number"),
+                new FieldMeta("breakoutSlPct", "Breakout SL (%)", "number"),
+
+                new FieldMeta("maxSpreadPct", "Макс. спред (%)", "number"),
+                new FieldMeta("minAtrPct", "Мин. ATR (%)", "number"),
+                new FieldMeta("maxAtrPct", "Макс. ATR (%)", "number"),
+                new FieldMeta("minVolumeRatio", "Мин. volume ratio", "number"),
+                new FieldMeta("minRiskReward", "Мин. risk/reward", "number"),
+                new FieldMeta("cooldownAfterStopSec", "Кулдаун после стопа (sec)", "number"),
+                new FieldMeta("cooldownAfterExitSec", "Кулдаун после выхода (sec)", "number"),
+                new FieldMeta("maxConsecutiveStops", "Макс. стопов подряд", "number"),
+                new FieldMeta("reentryLockSec", "Блок повторного входа (sec)", "number"),
+                new FieldMeta("emergencyChaosExitEnabled", "Emergency chaos exit", "checkbox"),
+                new FieldMeta("partialExitEnabled", "Частичный выход", "checkbox"),
+                new FieldMeta("partialExitPct", "Частичный выход доля", "number"),
+                new FieldMeta("partialExitTriggerPct", "Триггер частичного выхода (%)", "number"),
+                new FieldMeta("useIntrabarConfirmation", "Intrabar confirmation", "checkbox")
         ));
 
         fields.put(StrategyType.FIBONACCI_GRID, List.of(
@@ -152,3 +197,4 @@ public class StrategyRegistry {
         return Map.copyOf(strategies);
     }
 }
+

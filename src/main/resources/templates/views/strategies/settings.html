@@ -4,7 +4,13 @@
         data-chat-id=${chatId},
         data-type=${type},
         data-exchange=${selectedExchange},
-        data-network=${selectedNetwork != null ? selectedNetwork.name() : 'TESTNET'}
+        data-network=${selectedNetwork != null ? selectedNetwork.name() : 'TESTNET'},
+        data-symbol=${strategy != null and strategy.symbol != null ? strategy.symbol : ''},
+        data-timeframe=${strategy != null and strategy.timeframe != null ? strategy.timeframe : ''},
+        data-account-asset=${selectedAsset != null ? #strings.toUpperCase(selectedAsset) : ''},
+        data-config-state-url=@{|/strategies/${type}/config/state?chatId=${chatId}|},
+        data-dashboard-url=@{|/strategies/${type}/dashboard?chatId=${chatId}&exchange=${selectedExchange}&network=${selectedNetwork != null ? selectedNetwork.name() : 'TESTNET'}|},
+        data-backtest-url=@{|/strategies/${type}/backtest?chatId=${chatId}&exchange=${selectedExchange}&network=${selectedNetwork != null ? selectedNetwork.name() : 'TESTNET'}|}
      ">
 
     <link rel="stylesheet" th:href="@{/css/views/strategies/settings.css}"/>
@@ -26,7 +32,8 @@
                         <span th:text="${type}">TYPE</span>
                     </h2>
 
-                    <span class="badge bg-info text-dark"
+                    <span id="settingsContextBadge"
+                          class="badge bg-info text-dark"
                           th:text="${selectedExchange + ' / ' + (selectedNetwork != null ? selectedNetwork.name() : 'TESTNET')}">
                         BINANCE / TESTNET
                     </span>
@@ -51,12 +58,14 @@
                 <i class="bi bi-arrow-left me-1"></i> Назад
             </a>
 
-            <a class="btn btn-outline-info"
+            <a id="settingsDashboardLink"
+               class="btn btn-outline-info"
                th:href="@{|/strategies/${type}/dashboard?chatId=${chatId}&exchange=${selectedExchange}&network=${selectedNetwork != null ? selectedNetwork.name() : 'TESTNET'}|}">
                 <i class="bi bi-graph-up-arrow me-1"></i> Дашборд
             </a>
 
-            <a class="btn btn-outline-warning"
+            <a id="settingsBacktestLink"
+               class="btn btn-outline-warning"
                th:href="@{|/strategies/${type}/backtest?chatId=${chatId}&exchange=${selectedExchange}&network=${selectedNetwork != null ? selectedNetwork.name() : 'TESTNET'}|}">
                 <i class="bi bi-play-circle me-1"></i> Бэктест
             </a>
@@ -1022,6 +1031,195 @@
             }, true);
 
             syncKeysCtx();
+        })();
+    </script>
+
+
+    <script>
+        (function () {
+            function byId(id) { return document.getElementById(id); }
+            function root() { return document.querySelector(".strategy-settings-page[data-chat-id][data-type]"); }
+            function upper(v) { return String(v == null ? "" : v).trim().toUpperCase(); }
+            function lower(v) { return String(v == null ? "" : v).trim().toLowerCase(); }
+            function isBlank(v) { return String(v == null ? "" : v).trim() === ""; }
+            function networkValue(v) {
+                if (v && typeof v === "object" && v.name) return upper(v.name);
+                return upper(v);
+            }
+            function safeSetValue(el, value) {
+                if (!el) return;
+                if (document.activeElement === el) return;
+                el.value = value == null ? "" : String(value);
+            }
+            function safeSetText(el, value) {
+                if (!el) return;
+                el.textContent = value == null ? "" : String(value);
+            }
+            function setBadgeState(el, active) {
+                if (!el) return;
+                el.classList.remove("bg-success", "bg-secondary");
+                el.classList.add(active ? "bg-success" : "bg-secondary");
+                el.textContent = active ? "🟢 Активна" : "⚫ Остановлена";
+            }
+            function setLinkHref(el, href) {
+                if (el && href) el.setAttribute("href", href);
+            }
+            function buildPageUrl(kind, state) {
+                const params = new URLSearchParams();
+                params.set("chatId", String(state.chatId));
+                if (state.exchange) params.set("exchange", String(state.exchange));
+                if (state.network) params.set("network", String(state.network));
+                return "/strategies/" + encodeURIComponent(String(state.type)) + "/" + kind + "?" + params.toString();
+            }
+            function syncHiddenContext(state) {
+                document.querySelectorAll('input[type="hidden"][name="exchange"]').forEach(el => el.value = state.exchange || "");
+                document.querySelectorAll('input[type="hidden"][name="network"]').forEach(el => el.value = state.network || "");
+            }
+            function applyState(state) {
+                if (!state || typeof state !== "object") return;
+
+                const r = root();
+                if (r) {
+                    r.dataset.exchange = upper(state.exchange || r.dataset.exchange || "");
+                    r.dataset.network = networkValue(state.network || r.dataset.network || "");
+                    r.dataset.symbol = upper(state.symbol || r.dataset.symbol || "");
+                    r.dataset.timeframe = lower(state.timeframe || r.dataset.timeframe || "");
+                    r.dataset.accountAsset = upper(state.accountAsset || r.dataset.accountAsset || "");
+                    if (state.redirectConfigUrl) r.dataset.configUrl = state.redirectConfigUrl;
+                    if (state.redirectDashboardUrl) r.dataset.dashboardUrl = state.redirectDashboardUrl;
+                    const backtestUrl = buildPageUrl("backtest", {
+                        chatId: state.chatId || r.dataset.chatId,
+                        type: state.type || r.dataset.type,
+                        exchange: state.exchange || r.dataset.exchange,
+                        network: networkValue(state.network || r.dataset.network)
+                    });
+                    r.dataset.backtestUrl = backtestUrl;
+                }
+
+                const exchange = upper(state.exchange);
+                const network = networkValue(state.network);
+                const symbol = upper(state.symbol);
+                const timeframe = lower(state.timeframe);
+                const accountAsset = upper(state.accountAsset);
+
+                safeSetText(byId("settingsContextBadge"), exchange && network ? (exchange + " / " + network) : "—");
+                setBadgeState(byId("strategyActiveBadge"), !!state.active);
+
+                const dashboardUrl = state.redirectDashboardUrl || buildPageUrl("dashboard", state);
+                const backtestUrl = buildPageUrl("backtest", state);
+
+                setLinkHref(byId("settingsDashboardLink"), dashboardUrl);
+                setLinkHref(byId("settingsBacktestLink"), backtestUrl);
+
+                const toggleForm = byId("strategyToggleForm");
+                if (toggleForm) {
+                    const params = new URLSearchParams();
+                    params.set("chatId", String(state.chatId || ""));
+                    params.set("exchange", exchange || "");
+                    params.set("network", network || "");
+                    toggleForm.setAttribute("action", "/strategies/" + encodeURIComponent(String(state.type || "")) + "/toggle?" + params.toString());
+                }
+
+                syncHiddenContext({ exchange, network });
+
+                safeSetValue(byId("accountAssetHidden"), accountAsset);
+                safeSetText(byId("assetInHint"), accountAsset || "—");
+                safeSetText(byId("riskAssetText"), accountAsset || "USDT");
+                safeSetValue(byId("riskSelectedAsset"), accountAsset || "USDT");
+                safeSetValue(byId("symbolHidden"), symbol);
+                safeSetText(byId("symbolLabel"), symbol || "Выберите торговую пару");
+
+                const tfSelect = byId("tradeTimeframeSelect");
+                if (tfSelect && timeframe) {
+                    const hasOpt = Array.from(tfSelect.options || []).some(opt => lower(opt.value) === timeframe);
+                    if (hasOpt) safeSetValue(tfSelect, timeframe);
+                }
+                safeSetText(byId("tradeTimeframeReadonly"), timeframe || "—");
+
+                const accountAssetSelect = byId("accountAssetSelect");
+                if (accountAssetSelect && accountAsset) {
+                    const hasOpt = Array.from(accountAssetSelect.options || []).some(opt => upper(opt.value) === accountAsset);
+                    if (hasOpt) safeSetValue(accountAssetSelect, accountAsset);
+                }
+
+                if (state.selectedBalance) {
+                    const free = state.selectedBalance.free != null ? String(state.selectedBalance.free) : "—";
+                    const locked = state.selectedBalance.locked != null ? String(state.selectedBalance.locked) : "—";
+                    safeSetText(byId("assetFreeView"), free);
+                    safeSetText(byId("assetLockedView"), locked);
+                    if (state.selectedBalance.free != null && state.selectedBalance.locked != null) {
+                        const total = Number(state.selectedBalance.free) + Number(state.selectedBalance.locked);
+                        safeSetText(byId("assetTotalView"), Number.isFinite(total) ? String(total) : "—");
+                    } else {
+                        safeSetText(byId("assetTotalView"), "—");
+                    }
+                    safeSetText(byId("riskFreeBalanceText"), free);
+                    safeSetValue(byId("riskFreeBalanceValue"), state.selectedBalance.free != null ? String(state.selectedBalance.free) : "");
+                }
+
+                window.StrategySettingsContext = Object.assign({}, window.StrategySettingsContext || {}, {
+                    chatId: String(state.chatId || ""),
+                    type: String(state.type || ""),
+                    exchange: exchange,
+                    network: network,
+                    symbol: symbol,
+                    timeframe: timeframe,
+                    accountAsset: accountAsset,
+                    baseUrl: window.location.pathname
+                });
+
+                if (window.StrategySettingsStore && typeof window.StrategySettingsStore.set === "function") {
+                    try { window.StrategySettingsStore.set(state); } catch (_) {}
+                }
+
+                try {
+                    document.dispatchEvent(new CustomEvent("strategy-settings-state-applied", { detail: state }));
+                } catch (_) {}
+            }
+
+            async function fetchState() {
+                const r = root();
+                if (!r) return null;
+                const base = r.dataset.configStateUrl
+                    || ("/strategies/" + encodeURIComponent(String(r.dataset.type || "")) + "/config/state?chatId=" + encodeURIComponent(String(r.dataset.chatId || "")));
+                const url = new URL(base, window.location.origin);
+                if (!url.searchParams.get("exchange") && r.dataset.exchange) url.searchParams.set("exchange", r.dataset.exchange);
+                if (!url.searchParams.get("network") && r.dataset.network) url.searchParams.set("network", r.dataset.network);
+                url.searchParams.set("_ts", String(Date.now()));
+                const resp = await fetch(url.toString(), {
+                    method: "GET",
+                    credentials: "same-origin",
+                    headers: { "Accept": "application/json", "X-Requested-With": "fetch" },
+                    cache: "no-store"
+                });
+                if (!resp.ok) throw new Error("HTTP " + resp.status);
+                return await resp.json();
+            }
+
+            let inFlight = false;
+            async function syncNow() {
+                if (inFlight) return;
+                inFlight = true;
+                try {
+                    const state = await fetchState();
+                    applyState(state);
+                } catch (e) {
+                    console.debug("settings sync skipped", e);
+                } finally {
+                    inFlight = false;
+                }
+            }
+
+            document.addEventListener("visibilitychange", () => {
+                if (!document.hidden) syncNow();
+            });
+            document.addEventListener("strategy-settings-state-sync", syncNow);
+            window.addEventListener("focus", syncNow);
+
+            syncNow();
+            setInterval(() => {
+                if (!document.hidden) syncNow();
+            }, 3000);
         })();
     </script>
 

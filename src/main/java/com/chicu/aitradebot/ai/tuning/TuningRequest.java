@@ -30,3 +30,5 @@ public record TuningRequest(
         // ✅ зачем вызвали тюнинг (warmup/periodic/after-close)
         String reason
 ) {}
+
+

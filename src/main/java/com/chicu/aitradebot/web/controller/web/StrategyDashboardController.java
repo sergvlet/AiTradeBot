@@ -4,6 +4,7 @@ import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
 import com.chicu.aitradebot.orchestrator.dto.StrategyRunInfo;
+import com.chicu.aitradebot.strategy.scalping.ScalpingStrategySettingsService;
 import com.chicu.aitradebot.service.StrategySettingsService;
 import com.chicu.aitradebot.web.facade.WebStrategyFacade;
 import lombok.RequiredArgsConstructor;
@@ -31,6 +32,7 @@ public class StrategyDashboardController {
 
     private final WebStrategyFacade webStrategyFacade;
     private final StrategySettingsService strategySettingsService;
+    private final ScalpingStrategySettingsService scalpingStrategySettingsService;
 
     @GetMapping("/{type}/dashboard")
     public String strategyDashboardPage(
@@ -122,6 +124,13 @@ public class StrategyDashboardController {
 
         model.addAttribute("configured", configuredMarket);
         model.addAttribute("strategy", settings);
+        if (type == StrategyType.SCALPING) {
+            try {
+                model.addAttribute("scalpingSettings", scalpingStrategySettingsService.getEffective(chatId));
+            } catch (Exception e) {
+                log.warn("⚠️ DASHBOARD: scalping settings load failed chatId={} err={}", chatId, e.toString());
+            }
+        }
 
         model.addAttribute("symbol", symbolUi);
         model.addAttribute("exchange", exchangeUi);
@@ -326,3 +335,5 @@ public class StrategyDashboardController {
         return null;
     }
 }
+
+

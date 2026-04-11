@@ -308,51 +308,57 @@
         }
 
         let hardRefreshInProgress = false;
-        let hardRefreshTimer = null;
+        let lastHardRefreshAt = 0;
+        const MIN_HARD_REFRESH_GAP_MS = 4000;
 
         function getContext() {
             return window.StrategySettingsContext || null;
         }
 
-        function buildStateUrl(ctx) {
+        function buildStateUrl(ctx, opts) {
             if (!ctx) return null;
             const q = new URLSearchParams();
             q.set("chatId", String(ctx.chatId));
             if (ctx.exchange) q.set("exchange", String(ctx.exchange));
             if (ctx.network)  q.set("network", String(ctx.network));
+            if (!opts || opts.lite !== false) q.set("lite", "true");
+            if (opts && opts.withBalance) q.set("balance", "true");
             q.set("_ts", String(Date.now()));
             return `/strategies/${encodeURIComponent(String(ctx.type))}/config/state?${q.toString()}`;
         }
 
-        function scheduleHardRefresh(delayMs) {
-            clearTimeout(hardRefreshTimer);
-            hardRefreshTimer = setTimeout(() => { hardRefreshNow(); }, Math.max(0, delayMs || 0));
+        function scheduleBackgroundRefresh() {
+            // Фоновый polling отключён намеренно.
+            // После POST state и так подтягивается через SettingsApi.refreshUiStateIfConfig(),
+            // а дополнительный таймер только создаёт лишние GET /config/state.
         }
 
-        function setStateFromServerState(serverState, opts) {
+        function setStateFromServerState(serverState) {
             try {
                 if (typeof Store.setState === "function") Store.setState(serverState);
                 else Store.set(serverState);
 
-                // ✅ единый DOM event для всех вкладок/слушателей
                 Bus.emit("strategy:state", serverState);
                 Bus.emit("ui:state", serverState);
             } catch (e) {
                 console.warn("⚠ failed to set store state:", e);
             }
-
-            if (!opts || !opts.skipHardRefresh) {
-                scheduleHardRefresh(80);
-            }
         }
 
-        async function hardRefreshNow() {
+        async function hardRefreshNow(opts) {
+            const nowMs = Date.now();
+            if (nowMs - lastHardRefreshAt < MIN_HARD_REFRESH_GAP_MS) {
+                return null;
+            }
+
+            const options = opts || {};
             const ctx = getContext();
-            const url = buildStateUrl(ctx);
+            const url = buildStateUrl(ctx, options);
             if (!url) return null;
             if (hardRefreshInProgress) return null;
 
             hardRefreshInProgress = true;
+            lastHardRefreshAt = nowMs;
             try {
                 let st = null;
 
@@ -364,7 +370,7 @@
                     st = await r.json();
                 }
 
-                if (st) setStateFromServerState(st, { skipHardRefresh: true });
+                if (st) setStateFromServerState(st);
                 return st;
             } catch (e) {
                 console.warn("⚠ hardRefreshNow failed:", e);
@@ -374,7 +380,18 @@
             }
         }
 
-        window.SettingsPageStore = { getContext, setStateFromServerState, hardRefreshNow };
+        document.addEventListener("visibilitychange", () => {
+            if (document.visibilityState === "visible") {
+                hardRefreshNow({ lite: true });
+            }
+        });
+
+        window.SettingsPageStore = {
+            getContext,
+            setStateFromServerState,
+            hardRefreshNow,
+            scheduleBackgroundRefresh
+        };
     }
 
     // =====================================================
@@ -484,7 +501,7 @@
         if (btn && window.SettingsPageStore && typeof window.SettingsPageStore.hardRefreshNow === "function") {
             btn.addEventListener("click", (e) => {
                 e.preventDefault();
-                window.SettingsPageStore.hardRefreshNow();
+                window.SettingsPageStore.hardRefreshNow({ withBalance: true, lite: false });
             });
         }
 
@@ -505,7 +522,7 @@
                     console.warn("⚠ toggle failed:", err);
                 }
                 if (window.SettingsPageStore && typeof window.SettingsPageStore.hardRefreshNow === "function") {
-                    await window.SettingsPageStore.hardRefreshNow();
+                    await window.SettingsPageStore.hardRefreshNow({ withBalance: true, lite: false });
                 }
             });
         }
@@ -616,8 +633,8 @@
         setActiveTab(initial);
         initTabOnce("tab-" + initial);
 
-        // ✅ свежий state сразу
-        try { window.SettingsPageStore?.hardRefreshNow?.(); } catch (e) {}
+        // ✅ свежий state сразу, без фонового polling
+        try { window.SettingsPageStore?.hardRefreshNow?.({ lite: true }); } catch (e) {}
     }
 
     if (document.readyState === "loading") {
@@ -626,3 +643,5 @@
         boot();
     }
 })();
+
+

@@ -14,3 +14,5 @@ public interface ScalpingStrategySettingsService {
 
     ScalpingStrategySettings getEffective(Long chatId);
 }
+
+

@@ -14,6 +14,7 @@ import org.springframework.http.MediaType;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
@@ -27,7 +28,8 @@ import java.util.Map;
 public class StrategySettingsAdvancedController {
 
     private static final String PHASE_PAPER = "PAPER";
-    private static final String PHASE_LIVE  = "LIVE";
+    private static final String PHASE_LIVE = "LIVE";
+    private static final BigDecimal DEFAULT_GATE_MIN_PROB = new BigDecimal("0.550000");
 
     private final StrategySettingsService strategySettingsService;
     private final StrategyAdvancedRegistry advancedRegistry;
@@ -52,6 +54,26 @@ public class StrategySettingsAdvancedController {
         } catch (Exception ignored) {
             return null;
         }
+    }
+
+    private String resolveExchange(String raw, StrategySettings ss) {
+        if (raw != null && !raw.isBlank()) {
+            return normalizeExchange(raw);
+        }
+        if (ss != null && ss.getExchangeName() != null && !ss.getExchangeName().isBlank()) {
+            return normalizeExchange(ss.getExchangeName());
+        }
+        return "BINANCE";
+    }
+
+    private NetworkType resolveNetwork(NetworkType raw, StrategySettings ss) {
+        if (raw != null) {
+            return raw;
+        }
+        if (ss != null && ss.getNetworkType() != null) {
+            return ss.getNetworkType();
+        }
+        return NetworkType.TESTNET;
     }
 
     private boolean syncContextIfNeeded(StrategySettings ss, String exchange, NetworkType network) {
@@ -92,13 +114,21 @@ public class StrategySettingsAdvancedController {
                 ss.setMlModelVersion(null);
             }
             case HYBRID -> {
-                ss.setAutoTuneEnabled(true);
+                ss.setAutoTuneEnabled(false);
                 ss.setMlGateEnabled(true);
+                if (ss.getGateMinProb() == null) {
+                    ss.setGateMinProb(DEFAULT_GATE_MIN_PROB);
+                }
                 ss.setRunPhase(safePhase);
             }
             case AI -> {
                 ss.setAutoTuneEnabled(true);
-                ss.setMlGateEnabled(true);
+                if (!ss.isMlGateEnabled()) {
+                    ss.setMlGateEnabled(true);
+                }
+                if (ss.getGateMinProb() == null && ss.isMlGateEnabled()) {
+                    ss.setGateMinProb(DEFAULT_GATE_MIN_PROB);
+                }
                 ss.setRunPhase(safePhase);
             }
         }
@@ -111,10 +141,10 @@ public class StrategySettingsAdvancedController {
             @RequestParam(required = false) String exchange,
             @RequestParam(required = false) NetworkType network
     ) {
-        String ex = normalizeExchange(exchange);
-        NetworkType net = (network != null ? network : NetworkType.TESTNET);
-
         StrategySettings ss = strategySettingsService.getOrCreate(chatId, type);
+
+        String ex = resolveExchange(exchange, ss);
+        NetworkType net = resolveNetwork(network, ss);
 
         boolean ctxChanged = syncContextIfNeeded(ss, ex, net);
         if (ctxChanged) {
@@ -145,15 +175,12 @@ public class StrategySettingsAdvancedController {
                 mode,
                 ss.getMlConfidence(),
                 ss.getTotalProfitPct(),
-
                 toInstant(ss.getUpdatedAt()),
                 toInstant(ss.getStartedAt()),
                 toInstant(ss.getStoppedAt()),
-
                 ss.getAccountAsset(),
                 ss.getSymbol(),
                 ss.getTimeframe(),
-
                 html,
                 ctx.canSubmit()
         );
@@ -168,15 +195,17 @@ public class StrategySettingsAdvancedController {
             @RequestParam(required = false) NetworkType network,
             @RequestParam Map<String, String> allParams
     ) {
-        String ex = normalizeExchange(exchange);
-        NetworkType net = (network != null ? network : NetworkType.TESTNET);
-
         StrategySettings ss = strategySettingsService.getOrCreate(chatId, type);
+
+        String ex = resolveExchange(exchange, ss);
+        NetworkType net = resolveNetwork(network, ss);
 
         boolean dirty = syncContextIfNeeded(ss, ex, net);
 
         AdvancedControlMode requestedMode = parseModeOrNull(allParams.get("advancedControlMode"));
-        if (requestedMode == null) requestedMode = parseModeOrNull(allParams.get("controlMode"));
+        if (requestedMode == null) {
+            requestedMode = parseModeOrNull(allParams.get("controlMode"));
+        }
 
         if (requestedMode != null && requestedMode != ss.getAdvancedControlMode()) {
             ss.setAdvancedControlMode(requestedMode);
@@ -218,11 +247,13 @@ public class StrategySettingsAdvancedController {
 
         if (dirty) {
             strategySettingsService.save(ss);
-        } else {
-            strategySettingsService.save(ss);
         }
 
-        return Map.of("ok", true);
+        return Map.of(
+                "ok", true,
+                "mode", mode.name(),
+                "canSubmit", ctx.canSubmit()
+        );
     }
 
     public record ApplyModeRequest(
@@ -237,11 +268,10 @@ public class StrategySettingsAdvancedController {
     @Transactional
     @PostMapping(value = "/apply", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
     public Map<String, Object> applyMode(@RequestBody ApplyModeRequest req) {
-
-        String ex = normalizeExchange(req.exchange());
-        NetworkType net = (req.network() != null ? req.network() : NetworkType.TESTNET);
-
         StrategySettings ss = strategySettingsService.getOrCreate(req.chatId(), req.type());
+
+        String ex = resolveExchange(req.exchange(), ss);
+        NetworkType net = resolveNetwork(req.network(), ss);
 
         boolean dirty = syncContextIfNeeded(ss, ex, net);
 

@@ -37,7 +37,8 @@
         mlGateSafe=${strategySafe != null and strategySafe.mlGateEnabled},
         candlesSafe=${strategySafe != null ? strategySafe.cachedCandlesLimit : null},
         capitalModeSafe=${strategySafe != null ? strategySafe.capitalMode : null},
-        capitalValueSafe=${strategySafe != null ? strategySafe.capitalValue : null}
+        capitalValueSafe=${strategySafe != null ? strategySafe.capitalValue : null},
+        scalpingSafe=${scalpingSettings}
      ">
 
     <div id="strategy-root"
@@ -48,7 +49,9 @@
             data-exchange=${exchangeSafe},
             data-network=${networkSafe},
             data-timeframe=${tfSafe},
-            data-pnl-asset=${pnlAssetSafe != null ? pnlAssetSafe : ''}
+            data-pnl-asset=${pnlAssetSafe != null ? pnlAssetSafe : ''},
+            data-config-state-url=@{|/strategies/${typeSafe}/config/state?chatId=${chatIdSafe}|},
+            data-dashboard-url=@{|/strategies/${typeSafe}/dashboard?chatId=${chatIdSafe}&exchange=${exchangeSafe}&network=${networkSafe}|}
          ">
     </div>
 
@@ -85,40 +88,40 @@
             </h2>
 
             <div class="text-secondary small d-flex flex-wrap gap-3">
-                <span>Chat ID: <b th:text="${chatIdSafe}">1</b></span>
-                <span>Символ: <b th:text="${hasSymbol ? symbolSafe : '— не настроено —'}">BTCUSDT</b></span>
-                <span>ТФ: <b th:text="${tfSafe}">1m</b></span>
-                <span>Биржа: <b th:text="${exchangeSafe}">BINANCE</b></span>
-                <span>Сеть: <b th:text="${networkSafe}">MAINNET</b></span>
-                <span th:if="${pnlAssetSafe != null}">Главный актив журнала: <b th:text="${pnlAssetSafe}">USDT</b></span>
+                <span>Chat ID: <b id="dashboardChatIdValue" th:text="${chatIdSafe}">1</b></span>
+                <span>Символ: <b id="dashboardSymbolValue" th:text="${hasSymbol ? symbolSafe : '— не настроено —'}">BTCUSDT</b></span>
+                <span>ТФ: <b id="dashboardTimeframeValue" th:text="${tfSafe}">1m</b></span>
+                <span>Биржа: <b id="dashboardExchangeValue" th:text="${exchangeSafe}">BINANCE</b></span>
+                <span>Сеть: <b id="dashboardNetworkValue" th:text="${networkSafe}">MAINNET</b></span>
+                <span th:if="${pnlAssetSafe != null}">Главный актив журнала: <b id="dashboardPnlAssetValue" th:text="${pnlAssetSafe}">USDT</b></span>
             </div>
         </div>
 
         <div class="d-flex align-items-center gap-2 flex-wrap">
 
-            <span class="badge px-3 py-2"
+            <span id="dashboardActiveBadge" class="badge px-3 py-2"
                   th:classappend="${activeSafe ? ' bg-success' : ' bg-danger'}"
                   th:text="${activeSafe ? '🟢 Работает' : '🔴 Остановлена'}">
                 —
             </span>
 
-            <span class="badge bg-info text-dark px-3 py-2"
+            <span id="dashboardModeBadge" class="badge bg-info text-dark px-3 py-2"
                   th:text="${modeSafe}">
                 MANUAL
             </span>
 
-            <span class="badge bg-dark px-3 py-2"
+            <span id="dashboardPhaseBadge" class="badge bg-dark px-3 py-2"
                   th:text="${phaseSafe}">
                 LIVE
             </span>
 
-            <span class="badge px-3 py-2"
+            <span id="dashboardAutoTuneBadge" class="badge px-3 py-2"
                   th:classappend="${autoTuneSafe ? ' bg-primary' : ' bg-secondary'}"
                   th:text="${autoTuneSafe ? 'AUTO-TUNE ON' : 'AUTO-TUNE OFF'}">
                 AUTO-TUNE OFF
             </span>
 
-            <span class="badge px-3 py-2"
+            <span id="dashboardMlGateBadge" class="badge px-3 py-2"
                   th:classappend="${mlGateSafe ? ' bg-primary' : ' bg-secondary'}"
                   th:text="${mlGateSafe ? 'ML GATE ON' : 'ML GATE OFF'}">
                 ML GATE OFF
@@ -233,6 +236,50 @@
         </div>
     </div>
 
+
+    <div class="row g-4 mb-4" th:if="${typeSafe.name() == 'SCALPING' and scalpingSafe != null}">
+        <div class="col-xl-3 col-md-6">
+            <div class="card card-theme p-3 h-100">
+                <div class="small-label">Режимы</div>
+                <div class="fw-bold small">
+                    auto=<span th:text="${scalpingSafe.regimeAutoEnabled}">true</span> |
+                    trend=<span th:text="${scalpingSafe.allowTrendTrades}">true</span> |
+                    range=<span th:text="${scalpingSafe.allowRangeTrades}">true</span> |
+                    breakout=<span th:text="${scalpingSafe.allowBreakoutTrades}">true</span>
+                </div>
+                <div class="text-secondary small">Автоопределение рынка и разрешённые модули входа</div>
+            </div>
+        </div>
+        <div class="col-xl-3 col-md-6">
+            <div class="card card-theme p-3 h-100">
+                <div class="small-label">Trend TP / SL</div>
+                <div class="fs-5 fw-bold">
+                    <span th:text="${scalpingSafe.trendTpPct}">0.28</span>% /
+                    <span th:text="${scalpingSafe.trendSlPct}">0.16</span>%
+                </div>
+                <div class="text-secondary small">BE: <span th:text="${scalpingSafe.trendBreakEvenPct}">0.12</span>% · hold: <span th:text="${scalpingSafe.trendMaxHoldSec}">420</span>s</div>
+            </div>
+        </div>
+        <div class="col-xl-3 col-md-6">
+            <div class="card card-theme p-3 h-100">
+                <div class="small-label">Range TP / SL</div>
+                <div class="fs-5 fw-bold">
+                    <span th:text="${scalpingSafe.rangeTpPct}">0.16</span>% /
+                    <span th:text="${scalpingSafe.rangeSlPct}">0.12</span>%
+                </div>
+                <div class="text-secondary small">entryFromLow: <span th:text="${scalpingSafe.rangeEntryFromLowPct}">0.55</span>% · hold: <span th:text="${scalpingSafe.rangeMaxHoldSec}">180</span>s</div>
+            </div>
+        </div>
+        <div class="col-xl-3 col-md-6">
+            <div class="card card-theme p-3 h-100">
+                <div class="small-label">Execution guard</div>
+                <div class="fw-bold small">spread ≤ <span th:text="${scalpingSafe.maxSpreadPct}">0.12</span>%</div>
+                <div class="fw-bold small">ATR: <span th:text="${scalpingSafe.minAtrPct}">0.03</span>% → <span th:text="${scalpingSafe.maxAtrPct}">0.8</span>%</div>
+                <div class="text-secondary small">vol ≥ <span th:text="${scalpingSafe.minVolumeRatio}">0.75</span> · RR ≥ <span th:text="${scalpingSafe.minRiskReward}">1.05</span></div>
+            </div>
+        </div>
+    </div>
+
     <div class="row g-4 mb-4">
         <div class="col-lg-8">
             <div class="card card-theme p-3" id="chart-card">
@@ -247,10 +294,10 @@
 
                         <div class="small text-secondary">
                             Контекст:
-                            <b th:text="${exchangeSafe}">BINANCE</b> /
-                            <b th:text="${networkSafe}">MAINNET</b> /
-                            <b th:text="${hasSymbol ? symbolSafe : '—'}">BTCUSDT</b> /
-                            <b th:text="${tfSafe}">1m</b>
+                            <b id="chartContextExchange" th:text="${exchangeSafe}">BINANCE</b> /
+                            <b id="chartContextNetwork" th:text="${networkSafe}">MAINNET</b> /
+                            <b id="chartContextSymbol" th:text="${hasSymbol ? symbolSafe : '—'}">BTCUSDT</b> /
+                            <b id="chartContextTimeframe" th:text="${tfSafe}">1m</b>
                         </div>
 
                         <button class="btn btn-sm btn-outline-secondary" id="btn-fullscreen" type="button" title="На весь экран">⛶</button>
@@ -284,19 +331,19 @@
             <div class="card card-theme p-3 h-100">
                 <h5 class="mb-3"><i class="bi bi-info-square me-2"></i>Сводка стратегии</h5>
                 <ul class="list-unstyled small mb-0">
-                    <li class="mb-2">Статус: <b th:text="${activeSafe ? 'Работает' : 'Остановлена'}">—</b></li>
+                    <li class="mb-2">Статус: <b id="summaryStatusValue" th:text="${activeSafe ? 'Работает' : 'Остановлена'}">—</b></li>
                     <li class="mb-2">Тип: <b th:text="${typeSafe}">WINDOW_SCALPING</b></li>
-                    <li class="mb-2">Биржа: <b th:text="${exchangeSafe}">BINANCE</b></li>
-                    <li class="mb-2">Сеть: <b th:text="${networkSafe}">MAINNET</b></li>
-                    <li class="mb-2">Пара: <b th:text="${hasSymbol ? symbolSafe : '—'}">BTCUSDT</b></li>
-                    <li class="mb-2">Таймфрейм: <b th:text="${tfSafe}">1m</b></li>
-                    <li class="mb-2">Режим: <b th:text="${modeSafe}">MANUAL</b></li>
-                    <li class="mb-2">Фаза: <b th:text="${phaseSafe}">LIVE</b></li>
-                    <li class="mb-2">Candles limit: <b th:text="${candlesSafe != null ? candlesSafe : '—'}">—</b></li>
+                    <li class="mb-2">Биржа: <b id="summaryExchangeValue" th:text="${exchangeSafe}">BINANCE</b></li>
+                    <li class="mb-2">Сеть: <b id="summaryNetworkValue" th:text="${networkSafe}">MAINNET</b></li>
+                    <li class="mb-2">Пара: <b id="summarySymbolValue" th:text="${hasSymbol ? symbolSafe : '—'}">BTCUSDT</b></li>
+                    <li class="mb-2">Таймфрейм: <b id="summaryTimeframeValue" th:text="${tfSafe}">1m</b></li>
+                    <li class="mb-2">Режим: <b id="summaryModeValue" th:text="${modeSafe}">MANUAL</b></li>
+                    <li class="mb-2">Фаза: <b id="summaryPhaseValue" th:text="${phaseSafe}">LIVE</b></li>
+                    <li class="mb-2">Candles limit: <b id="summaryCandlesValue" th:text="${candlesSafe != null ? candlesSafe : '—'}">—</b></li>
                     <li class="mb-2">Capital mode: <b th:text="${capitalModeSafe != null ? capitalModeSafe : '—'}">—</b></li>
                     <li class="mb-2">Capital value: <b th:text="${capitalValueSafe != null ? capitalValueSafe : '—'}">—</b></li>
-                    <li class="mb-2">ML gate: <b th:text="${mlGateSafe ? 'ON' : 'OFF'}">OFF</b></li>
-                    <li class="mb-2">Auto-tune: <b th:text="${autoTuneSafe ? 'ON' : 'OFF'}">OFF</b></li>
+                    <li class="mb-2">ML gate: <b id="summaryMlGateValue" th:text="${mlGateSafe ? 'ON' : 'OFF'}">OFF</b></li>
+                    <li class="mb-2">Auto-tune: <b id="summaryAutoTuneValue" th:text="${autoTuneSafe ? 'ON' : 'OFF'}">OFF</b></li>
                 </ul>
 
                 <a class="btn btn-outline-primary w-100 mt-3"
@@ -421,7 +468,156 @@
         })();
     </script>
 
+
+    <script>
+        (function () {
+            function byId(id) { return document.getElementById(id); }
+            function upper(v) { return String(v == null ? "" : v).trim().toUpperCase(); }
+            function lower(v) { return String(v == null ? "" : v).trim().toLowerCase(); }
+            function text(id, value) {
+                const el = byId(id);
+                if (el) el.textContent = value == null || value === "" ? "—" : String(value);
+            }
+            function setActiveBadge(active) {
+                const badge = byId("dashboardActiveBadge");
+                if (!badge) return;
+                badge.classList.remove("bg-success", "bg-danger");
+                badge.classList.add(active ? "bg-success" : "bg-danger");
+                badge.textContent = active ? "🟢 Работает" : "🔴 Остановлена";
+                text("summaryStatusValue", active ? "Работает" : "Остановлена");
+            }
+            function setBinaryBadge(id, enabled, onText, offText) {
+                const el = byId(id);
+                if (!el) return;
+                el.classList.remove("bg-primary", "bg-secondary");
+                el.classList.add(enabled ? "bg-primary" : "bg-secondary");
+                el.textContent = enabled ? onText : offText;
+            }
+            function buildDashboardUrl(state) {
+                const params = new URLSearchParams();
+                params.set("chatId", String(state.chatId || ""));
+                params.set("exchange", String(state.exchange || ""));
+                params.set("network", String((state.network && state.network.name) ? state.network.name : state.network || ""));
+                if (state.symbol) params.set("symbol", String(state.symbol));
+                if (state.timeframe) params.set("timeframe", String(state.timeframe));
+                return "/strategies/" + encodeURIComponent(String(state.type || "")) + "/dashboard?" + params.toString();
+            }
+            function normalizeNetwork(v) {
+                return upper(v && typeof v === "object" && v.name ? v.name : v);
+            }
+            function applyState(state) {
+                if (!state || typeof state !== "object") return;
+                const root = byId("strategy-root");
+                const exchange = upper(state.exchange);
+                const network = normalizeNetwork(state.network);
+                const symbol = upper(state.symbol);
+                const timeframe = lower(state.timeframe);
+
+                if (root) {
+                    if (exchange) root.dataset.exchange = exchange;
+                    if (network) root.dataset.network = network;
+                    if (symbol) root.dataset.symbol = symbol;
+                    if (timeframe) root.dataset.timeframe = timeframe;
+                    root.dataset.dashboardUrl = state.redirectDashboardUrl || buildDashboardUrl(state);
+                }
+
+                text("dashboardExchangeValue", exchange);
+                text("dashboardNetworkValue", network);
+                text("dashboardSymbolValue", symbol);
+                text("dashboardTimeframeValue", timeframe);
+
+                text("chartContextExchange", exchange);
+                text("chartContextNetwork", network);
+                text("chartContextSymbol", symbol);
+                text("chartContextTimeframe", timeframe);
+
+                text("summaryExchangeValue", exchange);
+                text("summaryNetworkValue", network);
+                text("summarySymbolValue", symbol);
+                text("summaryTimeframeValue", timeframe);
+                text("summaryModeValue", state.advancedControlMode || "MANUAL");
+                text("summaryPhaseValue", state.runPhase || "—");
+                text("summaryCandlesValue", state.cachedCandlesLimit != null ? state.cachedCandlesLimit : "—");
+                text("summaryMlGateValue", state.mlGateEnabled ? "ON" : "OFF");
+                text("summaryAutoTuneValue", state.autoTuneEnabled ? "ON" : "OFF");
+
+                text("dashboardModeBadge", state.advancedControlMode || "MANUAL");
+                text("dashboardPhaseBadge", state.runPhase || "—");
+                setBinaryBadge("dashboardAutoTuneBadge", !!state.autoTuneEnabled, "AUTO-TUNE ON", "AUTO-TUNE OFF");
+                setBinaryBadge("dashboardMlGateBadge", !!state.mlGateEnabled, "ML GATE ON", "ML GATE OFF");
+                setActiveBadge(!!state.active);
+            }
+
+            async function fetchState() {
+                const root = byId("strategy-root");
+                if (!root) return null;
+                const base = root.dataset.configStateUrl
+                    || ("/strategies/" + encodeURIComponent(String(root.dataset.type || "")) + "/config/state?chatId=" + encodeURIComponent(String(root.dataset.chatId || "")));
+                const url = new URL(base, window.location.origin);
+                if (!url.searchParams.get("exchange") && root.dataset.exchange) url.searchParams.set("exchange", root.dataset.exchange);
+                if (!url.searchParams.get("network") && root.dataset.network) url.searchParams.set("network", root.dataset.network);
+                url.searchParams.set("_ts", String(Date.now()));
+                const resp = await fetch(url.toString(), {
+                    method: "GET",
+                    credentials: "same-origin",
+                    headers: { "Accept": "application/json", "X-Requested-With": "fetch" },
+                    cache: "no-store"
+                });
+                if (!resp.ok) throw new Error("HTTP " + resp.status);
+                return await resp.json();
+            }
+
+            let inFlight = false;
+            async function syncDashboardState() {
+                if (inFlight) return;
+                inFlight = true;
+                try {
+                    const state = await fetchState();
+                    if (!state) return;
+                    const root = byId("strategy-root");
+                    const currentExchange = upper(root?.dataset.exchange);
+                    const currentNetwork = normalizeNetwork(root?.dataset.network);
+                    const currentSymbol = upper(root?.dataset.symbol);
+                    const currentTimeframe = lower(root?.dataset.timeframe);
+                    const nextExchange = upper(state.exchange);
+                    const nextNetwork = normalizeNetwork(state.network);
+                    const nextSymbol = upper(state.symbol);
+                    const nextTimeframe = lower(state.timeframe);
+
+                    const changed = !!(nextExchange && nextNetwork && nextSymbol && nextTimeframe) &&
+                        (currentExchange !== nextExchange ||
+                            currentNetwork !== nextNetwork ||
+                            currentSymbol !== nextSymbol ||
+                            currentTimeframe !== nextTimeframe);
+
+                    if (changed) {
+                        window.location.replace(state.redirectDashboardUrl || buildDashboardUrl(state));
+                        return;
+                    }
+
+                    applyState(state);
+                } catch (e) {
+                    console.debug("dashboard sync skipped", e);
+                } finally {
+                    inFlight = false;
+                }
+            }
+
+            document.addEventListener("visibilitychange", () => {
+                if (!document.hidden) syncDashboardState();
+            });
+            window.addEventListener("focus", syncDashboardState);
+
+            syncDashboardState();
+            setInterval(() => {
+                if (!document.hidden) syncDashboardState();
+            }, 3000);
+        })();
+    </script>
+
 </div>
 
 </body>
 </html>
+
+

@@ -17,3 +17,5 @@ public record TuningResult(
         Map<String, Object> oldParams,   // слепок параметров (ключ->значение)
         Map<String, Object> newParams
 ) {}
+
+
