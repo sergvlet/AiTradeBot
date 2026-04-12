@@ -28,9 +28,12 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Instant;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.stream.Collectors;
 
@@ -40,6 +43,8 @@ public class OrderServiceImpl implements OrderService {
 
     private static final int QTY_SCALE = 8;
     private static final BigDecimal BUY_BUDGET_EPS = new BigDecimal("1.0005");
+    private static final long TRADE_SYNC_LOOKBACK_MS = 86_400_000L;
+    private static final int TRADE_SYNC_LIMIT = 1000;
 
     private final OrderRepository orderRepository;
     private final StrategyLivePublisher livePublisher;
@@ -542,8 +547,116 @@ public class OrderServiceImpl implements OrderService {
         }
 
         closeMissingLocalOpenOrders(chatId, symbol, exchangeName, networkType, actualOpenKeys);
+        enrichOrdersFromExchangeTrades(chatId, symbol, exchangeName, networkType);
 
         return result;
+    }
+
+    private void enrichOrdersFromExchangeTrades(Long chatId,
+                                                String symbol,
+                                                String exchangeName,
+                                                NetworkType networkType) {
+        try {
+            ExchangeClient client = resolveClientOrThrow(exchangeName);
+            long endMs = System.currentTimeMillis();
+            long startMs = Math.max(0L, endMs - TRADE_SYNC_LOOKBACK_MS);
+            List<ExchangeClient.TradeFill> fills = client.getMyTrades(chatId, networkType, symbol, startMs, endMs, TRADE_SYNC_LIMIT);
+            if (fills == null || fills.isEmpty()) {
+                return;
+            }
+
+            Map<String, FillAggregate> byOrderId = new HashMap<>();
+            for (ExchangeClient.TradeFill fill : fills) {
+                if (fill == null) continue;
+                String orderId = trimToNull(fill.orderId());
+                if (orderId == null) continue;
+                byOrderId.computeIfAbsent(orderId, ignored -> new FillAggregate()).accept(fill);
+            }
+
+            if (byOrderId.isEmpty()) {
+                return;
+            }
+
+            List<OrderEntity> rows = new ArrayList<>(orderRepository.findByChatIdAndSymbolOrderByTimestampAsc(chatId, symbol));
+            for (Map.Entry<String, FillAggregate> entry : byOrderId.entrySet()) {
+                String orderId = entry.getKey();
+                FillAggregate agg = entry.getValue();
+                if (!agg.hasExecuted()) {
+                    continue;
+                }
+
+                OrderEntity entity = rows.stream()
+                        .filter(row -> orderId.equals(trimToNull(row.getExchangeOrderId())))
+                        .findFirst()
+                        .orElseGet(() -> {
+                            OrderEntity created = new OrderEntity();
+                            created.setChatId(chatId);
+                            created.setUserId(chatId);
+                            created.setSymbol(symbol);
+                            created.setExchangeName(exchangeName);
+                            created.setNetworkType(networkType != null ? networkType.name() : null);
+                            created.setStrategyType("UNKNOWN");
+                            created.setOrderType("UNKNOWN");
+                            created.setCreatedAt(LocalDateTime.now());
+                            created.setTimestamp(agg.eventTimeMs > 0 ? agg.eventTimeMs : System.currentTimeMillis());
+                            rows.add(created);
+                            return created;
+                        });
+
+                entity.setExchangeOrderId(orderId);
+                if (entity.getSide() == null && agg.side != null) {
+                    entity.setSide(agg.side);
+                }
+                if (entity.getOrderType() == null) {
+                    entity.setOrderType("MARKET");
+                }
+                entity.setExecutedQty(agg.executedQty);
+                entity.setExecutedQuoteQty(agg.executedQuoteQty.signum() > 0 ? agg.executedQuoteQty : null);
+                entity.setFeeTotal(agg.feeTotal.signum() > 0 ? agg.feeTotal : null);
+                entity.setFeeAsset(agg.feeAsset);
+
+                BigDecimal avgPrice = agg.resolveAvgPrice();
+                if (avgPrice.signum() > 0) {
+                    entity.setAvgExecutedPrice(avgPrice);
+                    if (positiveOrZero(entity.getPrice()).signum() <= 0) {
+                        entity.setPrice(avgPrice);
+                    }
+                }
+
+                BigDecimal quantity = positiveOrZero(entity.getQuantity());
+                if (quantity.signum() <= 0 || agg.executedQty.compareTo(quantity) > 0) {
+                    entity.setQuantity(agg.executedQty);
+                    quantity = agg.executedQty;
+                }
+
+                if (positiveOrZero(entity.getRequestedQty()).signum() <= 0) {
+                    entity.setRequestedQty(quantity);
+                }
+
+                if (quantity.signum() > 0) {
+                    BigDecimal totalPrice = positiveOrZero(entity.getPrice());
+                    if (totalPrice.signum() > 0) {
+                        entity.setTotal(quantity.multiply(totalPrice));
+                    }
+                }
+
+                boolean fullyFilled = agg.executedQty.compareTo(quantity) >= 0;
+                entity.setStatus(fullyFilled ? "FILLED" : "PARTIALLY_FILLED");
+                entity.setExchangeStatus(fullyFilled ? "FILLED" : "PARTIALLY_FILLED");
+                entity.setFilled(fullyFilled);
+                entity.setUpdatedAt(LocalDateTime.now());
+                if (entity.getTimestamp() == null || entity.getTimestamp() <= 0) {
+                    entity.setTimestamp(agg.eventTimeMs > 0 ? agg.eventTimeMs : System.currentTimeMillis());
+                }
+
+                orderRepository.save(entity);
+            }
+        } catch (UnsupportedOperationException e) {
+            log.debug("ℹ️ [TRADE_SYNC] {} не поддерживает getMyTrades, пропускаю trade-enrichment", exchangeName);
+        } catch (Exception e) {
+            log.warn("⚠️ [TRADE_SYNC] Не удалось синхронизировать fills | chatId={} ex={} net={} sym={} err={}",
+                    chatId, exchangeName, networkType, symbol, e.toString());
+        }
     }
 
     private java.util.Optional<OrderEntity> findLocalOrderForExchangeSnapshot(Long chatId,
@@ -637,6 +750,55 @@ public class OrderServiceImpl implements OrderService {
         if (value == null) return null;
         String v = value.trim();
         return v.isEmpty() ? null : v;
+    }
+
+    private static final class FillAggregate {
+        private BigDecimal executedQty = BigDecimal.ZERO;
+        private BigDecimal executedQuoteQty = BigDecimal.ZERO;
+        private BigDecimal feeTotal = BigDecimal.ZERO;
+        private String feeAsset;
+        private String side;
+        private long eventTimeMs;
+
+        private void accept(ExchangeClient.TradeFill fill) {
+            BigDecimal qty = positiveOrZero(fill.qty());
+            BigDecimal quote = positiveOrZero(fill.quoteQty());
+            BigDecimal fee = positiveOrZero(fill.commission());
+
+            executedQty = executedQty.add(qty);
+            executedQuoteQty = executedQuoteQty.add(quote);
+            feeTotal = feeTotal.add(fee);
+
+            String nextSide = trimToNull(fill.side());
+            if (side == null && nextSide != null) {
+                side = nextSide.trim().toUpperCase(Locale.ROOT);
+            }
+
+            String nextFeeAsset = trimToNull(fill.commissionAsset());
+            if (nextFeeAsset != null) {
+                nextFeeAsset = nextFeeAsset.toUpperCase(Locale.ROOT);
+                if (feeAsset == null) {
+                    feeAsset = nextFeeAsset;
+                } else if (!feeAsset.equals(nextFeeAsset)) {
+                    feeAsset = "MIXED";
+                }
+            }
+
+            if (fill.timeMs() > eventTimeMs) {
+                eventTimeMs = fill.timeMs();
+            }
+        }
+
+        private boolean hasExecuted() {
+            return executedQty.signum() > 0;
+        }
+
+        private BigDecimal resolveAvgPrice() {
+            if (executedQty.signum() <= 0 || executedQuoteQty.signum() <= 0) {
+                return BigDecimal.ZERO;
+            }
+            return executedQuoteQty.divide(executedQty, 12, RoundingMode.HALF_UP);
+        }
     }
     private String resolveExchangeForSymbol(Long chatId, String symbol) {
         List<OrderEntity> rows = orderRepository.findByChatIdAndSymbolOrderByTimestampAsc(chatId, symbol);
@@ -1428,7 +1590,6 @@ public class OrderServiceImpl implements OrderService {
         return guard != null ? guard.minNotional() : null;
     }
 }
-
 
 
 
