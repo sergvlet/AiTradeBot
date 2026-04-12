@@ -509,7 +509,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             return EntryResult.fail("min_notional");
         }
         if (commissionPct != null && commissionPct.signum() > 0) {
-            BigDecimal minTpToNotLose = resolveMinHealthyTpPct(chatId, ex, net, slPct);
+            BigDecimal minTpToNotLose = resolveMinHealthyTpPct(chatId, strategyType, ex, net, slPct);
             BigDecimal roundTripFeePct = estimateRoundTripFeePct(chatId, ex, net);
             if (tpPct.compareTo(minTpToNotLose) < 0) {
                 BigDecimal maxAutoPct = sanitizePctConfig(maxAutoBumpedTpPct, "5.00");
@@ -3080,6 +3080,40 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         return value;
     }
 
+    private BigDecimal effectiveEntryEdgePct(StrategyType strategyType) {
+        if (strategyType == StrategyType.SCALPING) {
+            BigDecimal configured = sanitizePctConfig(minNetEdgePct, "0.01");
+            BigDecimal cap = new BigDecimal("0.01");
+            return configured.min(cap).setScale(6, RoundingMode.HALF_UP).stripTrailingZeros();
+        }
+        return sanitizePctConfig(minNetEdgePct, "0.24").setScale(6, RoundingMode.HALF_UP).stripTrailingZeros();
+    }
+
+    private BigDecimal effectiveTpFeeBufferPct(StrategyType strategyType) {
+        if (strategyType == StrategyType.SCALPING) {
+            return new BigDecimal("0.01");
+        }
+        return TP_FEE_BUFFER_PCT;
+    }
+
+    private BigDecimal effectiveFastExitExtraBufferPct(StrategyType strategyType) {
+        if (strategyType == StrategyType.SCALPING) {
+            BigDecimal configured = sanitizePctConfig(fastExitExtraBufferPct, "0.005");
+            BigDecimal cap = new BigDecimal("0.005");
+            return configured.min(cap).setScale(6, RoundingMode.HALF_UP).stripTrailingZeros();
+        }
+        return sanitizePctConfig(fastExitExtraBufferPct, "0.05").setScale(6, RoundingMode.HALF_UP).stripTrailingZeros();
+    }
+
+    private BigDecimal effectiveFastExitMinNetProfitPct(StrategyType strategyType) {
+        if (strategyType == StrategyType.SCALPING) {
+            BigDecimal configured = sanitizePctConfig(fastExitMinNetProfitPct, "0.001");
+            BigDecimal cap = new BigDecimal("0.001");
+            return configured.min(cap).setScale(6, RoundingMode.HALF_UP).stripTrailingZeros();
+        }
+        return sanitizePctConfig(fastExitMinNetProfitPct, "0.01").setScale(6, RoundingMode.HALF_UP).stripTrailingZeros();
+    }
+
     private void markWalletBaseSyncGrace(String entryKey, Instant now) {
         if (entryKey == null) return;
         long graceMs = Math.max(1500L, walletBaseSyncGraceMs);
@@ -3103,11 +3137,23 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                                              String exchange,
                                              NetworkType network,
                                              BigDecimal slPct) {
+        return resolveMinHealthyTpPct(chatId, null, exchange, network, slPct);
+    }
+
+    public BigDecimal resolveMinHealthyTpPct(Long chatId,
+                                             StrategyType strategyType,
+                                             String exchange,
+                                             NetworkType network,
+                                             BigDecimal slPct) {
         BigDecimal roundTripFeePct = estimateRoundTripFeePct(chatId, exchange, network);
-        BigDecimal edgePct = sanitizePctConfig(minNetEdgePct, "0.24");
+        BigDecimal edgePct = effectiveEntryEdgePct(strategyType);
         BigDecimal netRewardRisk = sanitizePctConfig(minNetRewardRisk, "1.35");
 
-        BigDecimal minTp = resolveMinProfitableTpPct(chatId, exchange, network).add(edgePct);
+        BigDecimal minTp = resolveMinProfitableTpPct(chatId, strategyType, exchange, network).add(edgePct);
+
+        if (strategyType == StrategyType.SCALPING) {
+            return minTp.setScale(6, RoundingMode.HALF_UP).stripTrailingZeros();
+        }
 
         if (QtyMath.isPositive(slPct) && QtyMath.isPositive(roundTripFeePct)) {
             BigDecimal netLossPct = slPct.add(roundTripFeePct);
@@ -3137,11 +3183,19 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
     public BigDecimal resolveMinProfitableTpPct(Long chatId,
                                                 String exchange,
                                                 NetworkType network) {
+        return resolveMinProfitableTpPct(chatId, null, exchange, network);
+    }
+
+    public BigDecimal resolveMinProfitableTpPct(Long chatId,
+                                                StrategyType strategyType,
+                                                String exchange,
+                                                NetworkType network) {
         BigDecimal roundTripFeePct = estimateRoundTripFeePct(chatId, exchange, network);
+        BigDecimal feeBufferPct = effectiveTpFeeBufferPct(strategyType);
         if (!QtyMath.isPositive(roundTripFeePct)) {
-            return TP_FEE_BUFFER_PCT;
+            return feeBufferPct.setScale(6, RoundingMode.HALF_UP).stripTrailingZeros();
         }
-        return roundTripFeePct.add(TP_FEE_BUFFER_PCT).setScale(6, RoundingMode.HALF_UP).stripTrailingZeros();
+        return roundTripFeePct.add(feeBufferPct).setScale(6, RoundingMode.HALF_UP).stripTrailingZeros();
     }
 
     public BigDecimal resolveMinRestorableNotional(String exchange,
@@ -3343,7 +3397,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             }
         }
 
-        BigDecimal extraBufferPct = sanitizePctConfig(fastExitExtraBufferPct, "0.05");
+        BigDecimal extraBufferPct = effectiveFastExitExtraBufferPct(strategyType);
         conservative = conservative.subtract(extraBufferPct);
 
         return conservative.setScale(6, RoundingMode.HALF_UP);
@@ -3371,7 +3425,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             return false;
         }
 
-        BigDecimal minNetProfitPct = sanitizePctConfig(fastExitMinNetProfitPct, "0.01");
+        BigDecimal minNetProfitPct = effectiveFastExitMinNetProfitPct(strategyType);
         return conservativeNetPnlPct.compareTo(minNetProfitPct) >= 0;
     }
 

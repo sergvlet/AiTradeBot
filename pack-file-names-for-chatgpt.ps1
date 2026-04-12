@@ -16,7 +16,9 @@ $Manifest    = Join-Path $ExportDir "manifest.txt"
 # =========================================================
 # 2) ВСТАВЛЯЙ СЮДА ИМЕНА ФАЙЛОВ
 #    ТОЛЬКО ИМЕНА ФАЙЛОВ, БЕЗ ПУТЕЙ
-#
+#    Запуск в повершел
+#    .\pack-file-names-for-chatgpt.ps1
+
 #    Пример:
 #    "MlClient.java",
 #    "TradeExecutionServiceImpl.java",
@@ -25,71 +27,9 @@ $Manifest    = Join-Path $ExportDir "manifest.txt"
 $FileNamesToPack = @(
     "ScalpingStrategyV4.java",
     "ScalpingPositionManager.java",
-    "TradeExecutionServiceImpl.java",
-    "InMemoryPositionStoreImpl.java",
-
-    "TradeExecutionService.java",
-    "PositionStore.java",
-    "EntryResult.java",
-    "ExitResult.java",
-    "TradeFailCooldownService.java",
-    "TradeClosedEvent.java",
-
-    "OrderEntity.java",
-    "OrderRepository.java",
-    "OrderService.java",
-    "Order.java",
-    "OrderSide.java",
-
-    "StrategySettings.java",
-    "StrategySettingsService.java",
-    "StrategyType.java",
-    "NetworkType.java",
-    "AdvancedControlMode.java",
-
-    "AccountBalanceService.java",
-    "AccountBalanceSnapshot.java",
-    "AccountFees.java",
-    "MarketSymbolService.java",
-    "SymbolDescriptor.java",
-    "QtyMath.java",
-
-    "StrategyLivePublisher.java",
     "AiStrategyOrchestrator.java",
-    "AdaptiveRuntimeController.java",
-    "TradingStrategy.java",
-    "Signal.java",
-    "StrategyBinding.java",
-
-    "MlTrainingServiceImpl.java",
-    "MlTrainingResult.java",
-
-    "MarketDataStreamService.java",
-    "Candle.java",
-    "UnifiedKline.java",
-
-    "ScalpingStrategySettings.java",
-    "ScalpingStrategySettingsService.java",
-    "ScalpingRuntimeState.java",
-    "ScalpingFeatureCalculator.java",
-    "ScalpingFeatureSnapshot.java",
-    "ScalpingMarketRegime.java",
-    "ScalpingMarketRegimeSnapshot.java",
-    "ScalpingMarketRegimeDetector.java",
-    "ScalpingExecutionGuard.java",
-    "ScalpingRiskProfile.java",
-    "ScalpingRiskProfileResolver.java",
-    "ScalpingMlGate.java",
-    "EntryDecision.java",
-    "ScalpingSetupType.java",
-    "TrendPullbackEntryEngine.java",
-    "RangeBounceEntryEngine.java",
-    "BreakoutContinuationEntryEngine.java",
-
-    "StrategyPositionEntity.java",
-    "StrategyPositionRepository.java",
-    "StrategyPositionSource.java",
-    "StrategyPositionStatus.java"
+    "BybitMarketStreamAdapter.java",
+    "TradeExecutionServiceImpl.java"
 )
 # =========================================================
 # 3) ПОДГОТОВКА ПАПКИ РЕЗУЛЬТАТА
