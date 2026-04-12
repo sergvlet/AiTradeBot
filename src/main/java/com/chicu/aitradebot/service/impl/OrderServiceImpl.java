@@ -43,7 +43,7 @@ public class OrderServiceImpl implements OrderService {
 
     private static final int QTY_SCALE = 8;
     private static final BigDecimal BUY_BUDGET_EPS = new BigDecimal("1.0005");
-    private static final long TRADE_SYNC_LOOKBACK_MS = 86_400_000L;
+    private static final long TRADE_SYNC_LOOKBACK_MS = 604_800_000L;
     private static final int TRADE_SYNC_LIMIT = 1000;
 
     private final OrderRepository orderRepository;
@@ -559,7 +559,7 @@ public class OrderServiceImpl implements OrderService {
         try {
             ExchangeClient client = resolveClientOrThrow(exchangeName);
             long endMs = System.currentTimeMillis();
-            long startMs = Math.max(0L, endMs - TRADE_SYNC_LOOKBACK_MS);
+            long startMs = resolveTradeSyncStartMs(chatId, symbol, endMs);
             List<ExchangeClient.TradeFill> fills = client.getMyTrades(chatId, networkType, symbol, startMs, endMs, TRADE_SYNC_LIMIT);
             if (fills == null || fills.isEmpty()) {
                 return;
@@ -657,6 +657,25 @@ public class OrderServiceImpl implements OrderService {
             log.warn("⚠️ [TRADE_SYNC] Не удалось синхронизировать fills | chatId={} ex={} net={} sym={} err={}",
                     chatId, exchangeName, networkType, symbol, e.toString());
         }
+    }
+
+    private long resolveTradeSyncStartMs(Long chatId, String symbol, long endMs) {
+        long defaultStart = Math.max(0L, endMs - TRADE_SYNC_LOOKBACK_MS);
+        List<OrderEntity> rows = orderRepository.findByChatIdAndSymbolOrderByTimestampAsc(chatId, symbol);
+        if (rows == null || rows.isEmpty()) {
+            return defaultStart;
+        }
+        Long oldestTrackedTs = null;
+        for (OrderEntity row : rows) {
+            if (row == null || row.getTimestamp() == null || row.getTimestamp() <= 0) continue;
+            if (oldestTrackedTs == null || row.getTimestamp() < oldestTrackedTs) {
+                oldestTrackedTs = row.getTimestamp();
+            }
+        }
+        if (oldestTrackedTs == null) {
+            return defaultStart;
+        }
+        return Math.max(0L, Math.min(defaultStart, oldestTrackedTs - 3_600_000L));
     }
 
     private java.util.Optional<OrderEntity> findLocalOrderForExchangeSnapshot(Long chatId,
@@ -1590,7 +1609,6 @@ public class OrderServiceImpl implements OrderService {
         return guard != null ? guard.minNotional() : null;
     }
 }
-
 
 
 

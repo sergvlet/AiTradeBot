@@ -2853,6 +2853,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         return true;
     }
 
+    @Override
     public BigDecimal resolveMinHealthyTpPct(Long chatId,
                                              String exchange,
                                              NetworkType network,
@@ -2878,6 +2879,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
 
 
 
+    @Override
     public BigDecimal estimateRoundTripFeePct(Long chatId,
                                               String exchange,
                                               NetworkType network) {
@@ -3217,6 +3219,5 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         }
     }
 }
-
 
 

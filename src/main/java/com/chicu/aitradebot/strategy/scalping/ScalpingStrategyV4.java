@@ -369,6 +369,10 @@ public class ScalpingStrategyV4 implements TradingStrategy,
             pushHold(chatId, state, "net_edge_low", "Сделка пропущена: ожидаемая прибыль после спреда слишком мала", now);
             return;
         }
+        if (!passesFeeFloor(chatId, state, decision)) {
+            pushHold(chatId, state, "fee_floor_block", "Сделка пропущена: TP не перекрывает комиссии биржи", now);
+            return;
+        }
 
         BigDecimal diffPct = features.priceChangePct() != null && features.priceChangePct().signum() > 0
                 ? features.priceChangePct()
@@ -644,6 +648,7 @@ public class ScalpingStrategyV4 implements TradingStrategy,
             case "cooldown_after_exit" -> "Слишком рано после прошлого выхода";
             case "max_consecutive_stops" -> "Слишком много стопов подряд, временно не торгую";
             case "net_edge_low" -> "Ожидаемая прибыль после спреда слишком мала";
+            case "fee_floor_block" -> "TP не перекрывает комиссии биржи";
             default -> guard.message() != null ? guard.message() : guard.code();
         };
     }
@@ -664,6 +669,19 @@ public class ScalpingStrategyV4 implements TradingStrategy,
 
         BigDecimal netTpPct = decision.tpPct().subtract(spreadCostPct);
         return netTpPct.compareTo(decision.slPct()) > 0;
+    }
+
+    private boolean passesFeeFloor(Long chatId, ScalpingRuntimeState state, EntryDecision decision) {
+        if (chatId == null || state == null || decision == null || decision.tpPct() == null || decision.slPct() == null) {
+            return false;
+        }
+        BigDecimal minHealthyTp = tradeExecutionService.resolveMinHealthyTpPct(
+                chatId,
+                state.getExchange(),
+                state.getNetwork(),
+                decision.slPct()
+        );
+        return decision.tpPct().compareTo(minHealthyTp) >= 0;
     }
 
     private static BigDecimal positive(BigDecimal value) {
@@ -703,6 +721,5 @@ public class ScalpingStrategyV4 implements TradingStrategy,
         return current.getMessage() != null && !current.getMessage().isBlank() ? current.getMessage() : throwable.getClass().getSimpleName();
     }
 }
-
 
 

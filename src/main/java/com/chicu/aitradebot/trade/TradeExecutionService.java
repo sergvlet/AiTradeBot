@@ -67,7 +67,25 @@ public interface TradeExecutionService {
                                 BigDecimal sl,
                                 String exchange,
                                 NetworkType network);
-}
 
+    /**
+     * Минимальный TP% для входа с учётом round-trip fee, edge и net RR.
+     */
+    default BigDecimal resolveMinHealthyTpPct(Long chatId,
+                                              String exchange,
+                                              NetworkType network,
+                                              BigDecimal slPct) {
+        return BigDecimal.ZERO;
+    }
+
+    /**
+     * Оценка round-trip fee% (в процентах, не в долях).
+     */
+    default BigDecimal estimateRoundTripFeePct(Long chatId,
+                                               String exchange,
+                                               NetworkType network) {
+        return BigDecimal.ZERO;
+    }
+}
 
 
