@@ -1,13 +1,17 @@
 package com.chicu.aitradebot.exchange.model;
 
+import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
-import lombok.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
 
 import java.math.BigDecimal;
 
 /**
- * 💹 DTO ордера — используется между стратегиями, API и графиком.
- * ❗ НЕ Entity
+ * DTO ордера между стратегиями, сервисами и UI.
+ * Не является JPA Entity.
  */
 @Data
 @Builder
@@ -15,20 +19,22 @@ import java.math.BigDecimal;
 @AllArgsConstructor
 public class Order {
 
-    // ===== Идентификаторы =====
-
-    /** id ордера в локальной БД (если есть) */
+    /** id ордера в локальной БД */
     private Long id;
 
     /** id ордера на бирже */
     private String orderId;
 
+    private String exchangeTradeId;
+    private String clientOrderId;
+    private String positionUid;
+    private String correlationId;
+    private String intent;
+
     /** chatId пользователя */
     private Long chatId;
 
-    // ===== Основные поля =====
-
-    /** Символ, например BTCUSDT */
+    /** Торговая пара, например BTCUSDT */
     private String symbol;
 
     /** BUY / SELL */
@@ -37,18 +43,12 @@ public class Order {
     /** MARKET / LIMIT / OCO */
     private String type;
 
-    /**
-     * Старое поле количества (legacy).
-     */
     @Deprecated
     private BigDecimal qty;
 
-    /**
-     * Новое поле количества.
-     */
     private BigDecimal quantity;
 
-    /** Цена ордера (limit) или ожидаемая */
+    /** Цена ордера или фактическая цена исполнения */
     private BigDecimal price;
 
     /** Средняя цена исполнения */
@@ -57,29 +57,27 @@ public class Order {
     /** Фактически исполненное количество */
     private BigDecimal executedQty;
 
-    /** Статус: NEW / FILLED / PARTIALLY_FILLED / CANCELED */
+    private BigDecimal executedQuoteQty;
+    private BigDecimal requestedQty;
+    private BigDecimal requestedPrice;
+
+    /** Реальная комиссия исполнения */
+    private BigDecimal feeTotal;
+    private String feeAsset;
+
+    /** Статус ордера */
     private String status;
 
-    /**
-     * Старое поле времени (ms).
-     */
     @Deprecated
     private Long timestamp;
 
-    /**
-     * Новое поле времени (ms).
-     */
     private Long time;
 
-    /** Исполнен ли полностью */
     private boolean filled;
 
-    /** Стратегия-инициатор */
     private StrategyType strategyType;
-
-    // =====================================================
-    // Legacy sync
-    // =====================================================
+    private String exchangeName;
+    private NetworkType networkType;
 
     public BigDecimal getQuantity() {
         return quantity != null ? quantity : qty;
@@ -99,10 +97,6 @@ public class Order {
         this.timestamp = time;
     }
 
-    // =====================================================
-    // Safety helpers (НЕ ЛОМАЮТ старый код)
-    // =====================================================
-
     public String getSideUpper() {
         return side != null ? side.toUpperCase() : null;
     }
@@ -111,31 +105,28 @@ public class Order {
         return type != null ? type.toUpperCase() : null;
     }
 
-    // =====================================================
-    // Factory — РЕКОМЕНДУЕМО для стратегий
-    // =====================================================
-
-    public static Order market(
-            Long chatId,
-            String symbol,
-            String side,
-            BigDecimal quantity,
-            BigDecimal executionPrice,
-            StrategyType strategyType
-    ) {
-        Order o = new Order();
-        o.chatId = chatId;
-        o.symbol = symbol;
-        o.side = side.toUpperCase();
-        o.type = "MARKET";
-        o.setQuantity(quantity);
-        o.price = executionPrice;
-        o.avgPrice = executionPrice;
-        o.executedQty = quantity;
-        o.status = "FILLED";
-        o.filled = true;
-        o.time = System.currentTimeMillis();
-        o.strategyType = strategyType;
-        return o;
+    public static Order market(Long chatId,
+                               String symbol,
+                               String side,
+                               BigDecimal quantity,
+                               BigDecimal executionPrice,
+                               StrategyType strategyType) {
+        Order order = new Order();
+        order.chatId = chatId;
+        order.symbol = symbol;
+        order.side = side != null ? side.toUpperCase() : null;
+        order.type = "MARKET";
+        order.setQuantity(quantity);
+        order.requestedQty = quantity;
+        order.requestedPrice = executionPrice;
+        order.price = executionPrice;
+        order.avgPrice = executionPrice;
+        order.executedQty = quantity;
+        order.executedQuoteQty = executionPrice != null && quantity != null ? executionPrice.multiply(quantity) : null;
+        order.status = "FILLED";
+        order.filled = true;
+        order.time = System.currentTimeMillis();
+        order.strategyType = strategyType;
+        return order;
     }
 }

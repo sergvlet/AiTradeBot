@@ -2,9 +2,9 @@ package com.chicu.aitradebot.ai.tuning.eval;
 
 import com.chicu.aitradebot.common.enums.StrategyType;
 import lombok.Builder;
-import org.jetbrains.annotations.Contract;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Instant;
 import java.util.Map;
 
@@ -38,29 +38,66 @@ public record BacktestMetrics(
 ) {
 
     // -----------------------------------------------------
-    // ✅ Совместимость со старым кодом (get*/is*)
+    // ✅ Совместимость (get*/is*)
     // -----------------------------------------------------
 
-    @Contract(pure = true)
-    public boolean isOk() {
-        return ok;
+    public boolean isOk() { return ok; }
+
+    public String getReason() { return reason; }
+
+    public String getFailReason() { return reason; }
+
+    public Long getChatId() { return chatId; }
+
+    public StrategyType getType() { return type; }
+
+    public String getSymbol() { return symbol; }
+
+    public String getTimeframe() { return timeframe; }
+
+    public Instant getStartAt() { return startAt; }
+
+    public Instant getEndAt() { return endAt; }
+
+    public BigDecimal getProfitPct() { return profitPct; }
+
+    public BigDecimal getMaxDrawdownPct() { return maxDrawdownPct; }
+
+    public Integer getTradesCount() { return trades; }
+
+    public Integer getTrades() { return trades; }
+
+    public Integer getWins() { return wins; }
+
+    public Integer getLosses() { return losses; }
+
+    public BigDecimal getWinRatePct() { return winRatePct; }
+
+    // -----------------------------------------------------
+    // ✅ SCORE для тюнеров
+    // score = profitPct - (maxDrawdownPct * 0.50)
+    // trades == 0 -> жёсткий штраф (NO_TRADES)
+    // -----------------------------------------------------
+
+    public BigDecimal score() { return getScore(); }
+
+    public BigDecimal getScore() {
+        BigDecimal p = nz(profitPct);
+        BigDecimal dd = nz(maxDrawdownPct);
+
+        BigDecimal penalty = dd.multiply(new BigDecimal("0.50"));
+        BigDecimal s = p.subtract(penalty);
+
+        if (trades <= 0) {
+            s = s.subtract(new BigDecimal("10.000"));
+        }
+
+        return s.setScale(6, RoundingMode.HALF_UP);
     }
 
-    public String getFailReason() {
-        return reason;
-    }
+    public BigDecimal scoreTotal() { return getScoreTotal(); }
 
-    public BigDecimal getProfitPct() {
-        return profitPct;
-    }
-
-    public BigDecimal getMaxDrawdownPct() {
-        return maxDrawdownPct;
-    }
-
-    public Integer getTradesCount() {
-        return trades;
-    }
+    public BigDecimal getScoreTotal() { return getScore(); }
 
     // -----------------------------------------------------
     // ✅ Factories

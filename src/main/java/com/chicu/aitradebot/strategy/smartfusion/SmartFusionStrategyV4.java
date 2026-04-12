@@ -5,6 +5,8 @@ package com.chicu.aitradebot.strategy.smartfusion;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
+import com.chicu.aitradebot.market.model.UnifiedKline;
+import com.chicu.aitradebot.orchestrator.AiStrategyOrchestrator;
 import com.chicu.aitradebot.service.StrategySettingsService;
 import com.chicu.aitradebot.strategy.core.CandleProvider;
 import com.chicu.aitradebot.strategy.core.TradingStrategy;
@@ -42,7 +44,7 @@ import java.util.concurrent.ConcurrentHashMap;
 @Component
 @RequiredArgsConstructor
 @StrategyBinding(StrategyType.SMART_FUSION)
-public class SmartFusionStrategyV4 implements TradingStrategy {
+public class SmartFusionStrategyV4 implements TradingStrategy, AiStrategyOrchestrator.CandleCloseAware {
 
     private static final Duration SETTINGS_REFRESH_EVERY = Duration.ofSeconds(10);
     private static final long LOG_EVERY_TICKS = 300;
@@ -92,6 +94,11 @@ public class SmartFusionStrategyV4 implements TradingStrategy {
 
     @Override
     public void start(Long chatId, String ignored) {
+        start(chatId, ignored, null, null);
+    }
+
+    @Override
+    public void start(Long chatId, String ignored, String exchange, NetworkType network) {
 
         StrategySettings ss = loadStrategySettings(chatId);
         SmartFusionStrategySettings cfg = sfSettingsService.getOrCreate(chatId);
@@ -103,8 +110,8 @@ public class SmartFusionStrategyV4 implements TradingStrategy {
         st.cfg = cfg;
 
         st.symbol = safeUpper(ss.getSymbol());
-        st.exchange = ss.getExchangeName();
-        st.network = ss.getNetworkType();
+        st.exchange = safeUpper(exchange) != null ? safeUpper(exchange) : ss.getExchangeName();
+        st.network = network != null ? network : ss.getNetworkType();
 
         st.lastSettingsLoadAt = Instant.now();
         st.lastFingerprint = buildFingerprint(ss, cfg);
@@ -123,6 +130,11 @@ public class SmartFusionStrategyV4 implements TradingStrategy {
 
     @Override
     public void stop(Long chatId, String ignored) {
+        stop(chatId, ignored, null, null);
+    }
+
+    @Override
+    public void stop(Long chatId, String ignored, String exchange, NetworkType network) {
 
         LocalState st = states.remove(chatId);
         if (st == null) return;
@@ -149,6 +161,60 @@ public class SmartFusionStrategyV4 implements TradingStrategy {
     public Instant getStartedAt(Long chatId) {
         LocalState st = states.get(chatId);
         return st != null ? st.startedAt : null;
+    }
+
+
+    @Override
+    public void onCandleClosed(long chatId,
+                               StrategyType type,
+                               String symbol,
+                               String timeframe,
+                               UnifiedKline kline,
+                               String exchange,
+                               NetworkType network) {
+        if (type != StrategyType.SMART_FUSION || kline == null) return;
+        LocalState st = states.get(chatId);
+        if (st == null || !st.active) return;
+
+        String expectedSymbol = safeUpper(st.symbol);
+        String actualSymbol = safeUpper(symbol);
+        if (expectedSymbol != null && actualSymbol != null && !expectedSymbol.equals(actualSymbol)) return;
+
+        if (exchange != null && st.exchange != null && !st.exchange.equalsIgnoreCase(exchange)) return;
+        if (network != null && st.network != null && st.network != network) return;
+
+        BigDecimal close = null;
+        try {
+            if (kline.getClose() != null) {
+                close = new BigDecimal(String.valueOf(kline.getClose()));
+            }
+        } catch (Exception ignored) {
+        }
+        if (close == null || close.signum() <= 0) return;
+
+        Instant candleTs = null;
+        try {
+            Long closeTime = kline.getCloseTime();
+            if (closeTime != null && closeTime > 0) candleTs = Instant.ofEpochMilli(closeTime);
+        } catch (Exception ignored) {
+        }
+        if (candleTs == null) candleTs = Instant.now();
+
+        final String symFinal = expectedSymbol != null ? expectedSymbol : actualSymbol;
+        final String tfFinal = timeframe != null && !timeframe.isBlank() ? timeframe : (st.ss != null ? st.ss.getTimeframe() : null);
+        final BigDecimal openBd = bdToPrice(kline.getOpen());
+        final BigDecimal highBd = bdToPrice(kline.getHigh());
+        final BigDecimal lowBd = bdToPrice(kline.getLow());
+        final BigDecimal closeBd = close;
+        final BigDecimal volumeBd = bdToPrice(kline.getVolume());
+        final Instant candleTsFinal = candleTs;
+        try {
+            safeLive(() -> live.pushCandleOhlc(chatId, StrategyType.SMART_FUSION, symFinal, tfFinal,
+                    openBd, highBd, lowBd, closeBd, volumeBd, candleTsFinal));
+        } catch (Exception ignored) {
+        }
+
+        onPriceUpdate(chatId, symFinal, closeBd, candleTsFinal);
     }
 
     // =====================================================
@@ -524,7 +590,7 @@ public class SmartFusionStrategyV4 implements TradingStrategy {
 
     private StrategySettings loadStrategySettings(Long chatId) {
         return strategySettingsService
-                .findAllByChatId(chatId, null, null)
+                .findAllByChatId(chatId)
                 .stream()
                 .filter(s -> s.getType() == StrategyType.SMART_FUSION).max(Comparator
                         .comparing(StrategySettings::getUpdatedAt, Comparator.nullsLast(Comparator.naturalOrder()))
@@ -560,6 +626,18 @@ public class SmartFusionStrategyV4 implements TradingStrategy {
     // =====================================================
     // UTILS
     // =====================================================
+
+
+    private static BigDecimal bdToPrice(Object value) {
+        if (value == null) return null;
+        if (value instanceof BigDecimal bd) return bd;
+        if (value instanceof Number n) return BigDecimal.valueOf(n.doubleValue());
+        try {
+            return new BigDecimal(String.valueOf(value));
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
 
     private static String safe(String s) {
         return s == null ? "null" : s.trim();
@@ -608,3 +686,4 @@ public class SmartFusionStrategyV4 implements TradingStrategy {
         return String.format(java.util.Locale.US, "%.2f", d);
     }
 }
+

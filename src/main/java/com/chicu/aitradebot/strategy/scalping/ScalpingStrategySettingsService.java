@@ -2,61 +2,17 @@ package com.chicu.aitradebot.strategy.scalping;
 
 import com.chicu.aitradebot.strategy.core.SettingsSnapshot;
 
-/**
- * Сервис работы с настройками скальпинговой стратегии для конкретного chatId.
- *
- * 🔒 КЛЮЧЕВОЕ ПРАВИЛО:
- * - UI / Telegram обновляют настройки ТОЛЬКО ЧАСТИЧНО (по TAB-ам)
- * - Стратегия работает ТОЛЬКО с immutable snapshot
- * - Никакого "сохранить всё из формы"
- */
 public interface ScalpingStrategySettingsService {
 
-    // =====================================================
-    // JPA / UI / TELEGRAM
-    // =====================================================
-
-    /**
-     * Найти настройки по chatId или создать дефолтные, если записи ещё нет.
-     * Используется UI, Telegram и стратегией.
-     */
     ScalpingStrategySettings getOrCreate(Long chatId);
 
-    /**
-     * Низкоуровневое сохранение сущности.
-     *
-     * ⚠️ НЕ ИСПОЛЬЗОВАТЬ напрямую из UI.
-     * Используется внутри сервиса после корректного частичного update.
-     */
     ScalpingStrategySettings save(ScalpingStrategySettings settings);
 
-    /**
-     * Частичное обновление настроек.
-     *
-     * ❗ dto содержит ТОЛЬКО поля одного TAB-а
-     * ❗ null-поля игнорируются (не затирают данные)
-     * ❗ универсальное обновление запрещено
-     *
-     * Пример:
-     * - Trade TAB → symbol, timeframe, cachedCandlesLimit
-     * - Risk TAB  → stopLossPct, takeProfitPct, riskPerTradePct
-     */
     ScalpingStrategySettings update(Long chatId, ScalpingStrategySettings dto);
 
-    // =====================================================
-    // V4 STRATEGY RUNTIME
-    // =====================================================
-
-    /**
-     * Immutable snapshot настроек для исполнения стратегии.
-     *
-     * ❗ НЕ JPA
-     * ❗ НЕ mutable
-     * ❗ БЕЗ EntityManager
-     * ❗ Используется ТОЛЬКО стратегией во время торговли
-     */
     SettingsSnapshot getSnapshot(long chatId);
 
     ScalpingStrategySettings getEffective(Long chatId);
-
 }
+
+

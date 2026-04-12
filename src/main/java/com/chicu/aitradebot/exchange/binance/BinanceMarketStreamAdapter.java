@@ -1,178 +1,255 @@
 package com.chicu.aitradebot.exchange.binance;
 
-import com.chicu.aitradebot.market.MarketStreamService;
+import com.chicu.aitradebot.common.enums.NetworkType;
+import com.chicu.aitradebot.exchange.parser.BinanceKlineParser;
 import com.chicu.aitradebot.market.model.UnifiedKline;
 import com.chicu.aitradebot.market.stream.MarketStreamRouter;
-import com.chicu.aitradebot.market.stream.Tick;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import okhttp3.*;
-import org.jetbrains.annotations.NotNull;
 import org.json.JSONObject;
 import org.springframework.stereotype.Component;
 
-import java.math.BigDecimal;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
 @Component
 @RequiredArgsConstructor
 public class BinanceMarketStreamAdapter {
 
+    // ✅ MAINNET
+    private static final String WS_MAIN_STREAM_TEMPLATE =
+            "wss://stream.binance.com:9443/stream?streams=%s";
+
+    // ✅ TESTNET
+    private static final String WS_TEST_STREAM_TEMPLATE =
+            "wss://stream.testnet.binance.vision/stream?streams=%s";
+
     private final MarketStreamRouter router;
-    private final MarketStreamService marketStreamService;
+    private final BinanceKlineParser klineParser;
 
+    // отдельный клиент на класс — ок под прод
     private final OkHttpClient client = new OkHttpClient();
-    private WebSocket ws;
 
-    private final AtomicInteger msgId = new AtomicInteger(1);
+    /**
+     * key = BINANCE:NET:SYMBOL
+     */
+    private final Map<String, WebSocket> sockets = new ConcurrentHashMap<>();
 
-    // ============================================================
-    // 🔌 CONNECT / DISCONNECT / STATE
-    // ============================================================
+    /**
+     * key = BINANCE:NET:SYMBOL -> set(streams)
+     */
+    private final Map<String, Set<String>> subscriptions = new ConcurrentHashMap<>();
 
-    public synchronized void connect() {
-        if (ws != null) {
-            log.info("🔁 Binance WS уже подключён");
-            return;
+    // =====================================================
+    // Legacy API (как было) — оставляем MAINNET
+    // =====================================================
+
+    public void connect(String symbol, List<String> streams) {
+        connect(NetworkType.MAINNET, symbol, streams);
+    }
+
+    public void disconnect(String symbol) {
+        disconnect(NetworkType.MAINNET, symbol);
+    }
+
+    public void subscribeTicker(String symbol) {
+        subscribeTicker(NetworkType.MAINNET, symbol);
+    }
+
+    public void subscribeKline(String symbol, String interval) {
+        subscribeKline(NetworkType.MAINNET, symbol, interval);
+    }
+
+    public void unsubscribeTicker(String symbol) {
+        unsubscribeTicker(NetworkType.MAINNET, symbol);
+    }
+
+    public void unsubscribeKline(String symbol, String interval) {
+        unsubscribeKline(NetworkType.MAINNET, symbol, interval);
+    }
+
+    // =====================================================
+    // ✅ New overloads with NetworkType
+    // =====================================================
+
+    public void connect(NetworkType network, String symbol, List<String> streams) {
+        NetworkType net = (network != null) ? network : NetworkType.MAINNET;
+
+        String sym = normalizeSymbolOrThrow(symbol).toLowerCase(Locale.ROOT);
+        String key = key(net, sym);
+
+        Set<String> set = subscriptions.computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet());
+        if (streams != null) set.addAll(streams);
+
+        if (sockets.containsKey(key)) return;
+
+        List<String> safeStreams = new ArrayList<>(set);
+        if (safeStreams.isEmpty()) {
+            safeStreams.add(sym + "@kline_1m");
         }
 
-        Request req = new Request.Builder()
-                .url("wss://stream.binance.com:9443/ws")
-                .build();
+        String url = buildWsUrl(net, String.join("/", safeStreams));
+        Request request = new Request.Builder().url(url).build();
 
-        ws = client.newWebSocket(req, new BinanceListener());
-        log.info("🔌 Binance WS connected");
-    }
+        log.info("🔌 WS CONNECT BINANCE(legacy) net={} symbol={} url={}", net, sym.toUpperCase(Locale.ROOT), url);
 
-    public synchronized void disconnect() {
-        if (ws != null) {
-            ws.close(1000, "shutdown");
-            ws = null;
-            log.info("🔌 Binance WS disconnected");
-        }
-    }
+        WebSocket ws = client.newWebSocket(request, new WebSocketListener() {
 
-    public boolean isConnected() {
-        return ws != null;
-    }
-
-    // ============================================================
-    // 📡 SUBSCRIBE
-    // ============================================================
-
-    public synchronized void subscribeTicker(String symbol) {
-        String s = normalize(symbol);
-        send("""
-             {"method":"SUBSCRIBE","params":["%s@ticker"],"id":%d}
-             """.formatted(s, msgId.getAndIncrement()));
-    }
-
-    public synchronized void subscribeKline(String symbol, String timeframe) {
-        String s = normalize(symbol);
-        send("""
-             {"method":"SUBSCRIBE","params":["%s@kline_%s"],"id":%d}
-             """.formatted(s, timeframe, msgId.getAndIncrement()));
-    }
-
-    // ============================================================
-    // 🔕 UNSUBSCRIBE
-    // ============================================================
-
-    public synchronized void unsubscribeTicker(String symbol) {
-        String s = normalize(symbol);
-
-        if (ws == null) {
-            log.warn("⚠ Binance WS unsubscribeTicker skipped — ws == null");
-            return;
-        }
-
-        String msg = """
-            {"method":"UNSUBSCRIBE","params":["%s@ticker"],"id":%d}
-            """.formatted(s, msgId.getAndIncrement());
-
-        ws.send(msg);
-
-        log.info("🔌 Binance UNSUBSCRIBE ticker {}", s);
-    }
-
-    // ============================================================
-    // 📨 SEND
-    // ============================================================
-
-    private void send(String msg) {
-        if (ws == null) {
-            log.warn("⚠ Binance WS send skipped — ws == null");
-            return;
-        }
-        ws.send(msg);
-    }
-
-    private String normalize(String symbol) {
-        return symbol.replace("/", "").trim().toLowerCase();
-    }
-
-    private String exchange() {
-        return "BINANCE";
-    }
-
-    // ============================================================
-    // 🧠 LISTENER
-    // ============================================================
-
-    private class BinanceListener extends WebSocketListener {
-
-        @Override
-        public void onOpen(@NotNull WebSocket webSocket, @NotNull Response response) {
-            log.info("🟢 Binance WS onOpen");
-        }
-
-        @Override
-        public void onMessage(@NotNull WebSocket webSocket, @NotNull String msg) {
-            try {
-                JSONObject json = new JSONObject(msg);
-
-                // TICKER
-                if (json.has("s") && json.has("c")) {
-                    router.route(new Tick(
-                            exchange(),
-                            json.getString("s"),
-                            new BigDecimal(json.getString("c")),
-                            System.currentTimeMillis()
-                    ));
-                    return;
-                }
-
-                // KLINE
-                if ("kline".equals(json.optString("e"))) {
-
-                    JSONObject k = json.getJSONObject("k");
-
-                    UnifiedKline uk = UnifiedKline.builder()
-                            .symbol(k.getString("s"))
-                            .timeframe(k.getString("i"))
-                            .openTime(k.getLong("t"))
-                            .open(new BigDecimal(k.getString("o")))
-                            .high(new BigDecimal(k.getString("h")))
-                            .low(new BigDecimal(k.getString("l")))
-                            .close(new BigDecimal(k.getString("c")))
-                            .volume(new BigDecimal(k.getString("v")))
-                            .build();
-
-                    marketStreamService.onKline(uk);
-                }
-
-            } catch (Exception e) {
-                log.error("❌ Binance WS parse error", e);
+            @Override
+            public void onOpen(WebSocket webSocket, Response response) {
+                log.info("✅ WS OPEN BINANCE(legacy) key={}", key);
             }
-        }
 
-        @Override
-        public void onFailure(@NotNull WebSocket webSocket,
-                              @NotNull Throwable t,
-                              Response response) {
-            log.error("❌ Binance WS failure", t);
-            ws = null;
+            @Override
+            public void onMessage(WebSocket webSocket, String text) {
+                handleMessage(sym, text);
+            }
+
+            @Override
+            public void onClosed(WebSocket webSocket, int code, String reason) {
+                log.warn("❌ WS CLOSED BINANCE(legacy) key={} code={} reason={}", key, code, reason);
+                cleanup(key);
+            }
+
+            @Override
+            public void onFailure(WebSocket webSocket, Throwable t, Response response) {
+                String resp = (response != null) ? (response.code() + " " + response.message()) : "no-response";
+                log.error("💥 WS FAIL BINANCE(legacy) key={} resp={} err={}", key, resp, t.toString());
+                cleanup(key);
+            }
+        });
+
+        sockets.put(key, ws);
+    }
+
+    public void disconnect(NetworkType network, String symbol) {
+        NetworkType net = (network != null) ? network : NetworkType.MAINNET;
+
+        String sym = normalizeSymbolOrThrow(symbol).toLowerCase(Locale.ROOT);
+        String key = key(net, sym);
+
+        WebSocket ws = sockets.remove(key);
+        if (ws != null) {
+            try { ws.close(1000, "disconnect"); } catch (Exception ignored) {}
         }
+        subscriptions.remove(key);
+
+        log.info("🔌 WS DISCONNECT BINANCE(legacy) key={}", key);
+    }
+
+    public void subscribeTicker(NetworkType network, String symbol) {
+        NetworkType net = (network != null) ? network : NetworkType.MAINNET;
+
+        String sym = normalizeSymbolOrThrow(symbol).toLowerCase(Locale.ROOT);
+        String key = key(net, sym);
+
+        subscriptions.computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet())
+                .add(sym + "@trade");
+
+        connect(net, sym, List.of(sym + "@trade"));
+    }
+
+    public void subscribeKline(NetworkType network, String symbol, String interval) {
+        NetworkType net = (network != null) ? network : NetworkType.MAINNET;
+
+        String sym = normalizeSymbolOrThrow(symbol).toLowerCase(Locale.ROOT);
+        String tf = normalizeIntervalOrThrow(interval);
+
+        String key = key(net, sym);
+
+        subscriptions.computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet())
+                .add(sym + "@kline_" + tf);
+
+        connect(net, sym, List.of(sym + "@kline_" + tf));
+    }
+
+    public void unsubscribeTicker(NetworkType network, String symbol) {
+        NetworkType net = (network != null) ? network : NetworkType.MAINNET;
+
+        String sym = normalizeSymbolOrThrow(symbol).toLowerCase(Locale.ROOT);
+        String key = key(net, sym);
+
+        Set<String> set = subscriptions.get(key);
+        if (set != null) set.remove(sym + "@trade");
+
+        maybeDisconnectIfNoSubs(key, net, sym);
+    }
+
+    public void unsubscribeKline(NetworkType network, String symbol, String interval) {
+        NetworkType net = (network != null) ? network : NetworkType.MAINNET;
+
+        String sym = normalizeSymbolOrThrow(symbol).toLowerCase(Locale.ROOT);
+        String tf = normalizeIntervalOrThrow(interval);
+
+        String key = key(net, sym);
+
+        Set<String> set = subscriptions.get(key);
+        if (set != null) set.remove(sym + "@kline_" + tf);
+
+        maybeDisconnectIfNoSubs(key, net, sym);
+    }
+
+    // =====================================================
+    // INTERNAL
+    // =====================================================
+
+    private void maybeDisconnectIfNoSubs(String key, NetworkType network, String sym) {
+        Set<String> set = subscriptions.get(key);
+        boolean empty = (set == null || set.isEmpty());
+        if (empty) disconnect(network, sym);
+    }
+
+    private void cleanup(String key) {
+        sockets.remove(key);
+        // subscriptions оставляем — intent подписок
+    }
+
+    private String buildWsUrl(NetworkType network, String streamsJoined) {
+        String tpl = (network == NetworkType.TESTNET) ? WS_TEST_STREAM_TEMPLATE : WS_MAIN_STREAM_TEMPLATE;
+        return String.format(tpl, streamsJoined);
+    }
+
+    private String key(NetworkType network, String symLower) {
+        return "BINANCE:" + network + ":" + symLower;
+    }
+
+    private void handleMessage(String symLower, String raw) {
+        try {
+            JSONObject root = new JSONObject(raw);
+            JSONObject data = root.has("data") ? root.getJSONObject("data") : root;
+
+            String eventType = data.optString("e", "");
+
+            // ✅ Тики игнорируем (router.routeTicker у тебя нет)
+            if ("trade".equalsIgnoreCase(eventType)) {
+                return;
+            }
+
+            if ("kline".equalsIgnoreCase(eventType)) {
+                UnifiedKline kline = klineParser.parse(data);
+                if (kline == null) return;
+
+                router.routeKline(symLower.toUpperCase(Locale.ROOT), kline);
+            }
+
+        } catch (Exception e) {
+            if (log.isDebugEnabled()) log.debug("WS legacy parse error: {}", e.toString());
+        }
+    }
+
+    private static String normalizeSymbolOrThrow(String symbol) {
+        if (symbol == null) throw new IllegalArgumentException("symbol is null");
+        String s = symbol.trim().toUpperCase(Locale.ROOT).replace("/", "");
+        if (s.isEmpty()) throw new IllegalArgumentException("symbol is blank");
+        return s;
+    }
+
+    private static String normalizeIntervalOrThrow(String interval) {
+        if (interval == null) throw new IllegalArgumentException("interval is null");
+        String s = interval.trim().toLowerCase(Locale.ROOT);
+        if (s.isEmpty()) throw new IllegalArgumentException("interval is blank");
+        return s;
     }
 }

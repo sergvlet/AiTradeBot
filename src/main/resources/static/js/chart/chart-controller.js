@@ -1,5 +1,16 @@
 "use strict";
 
+/**
+ * ChartController (LIVE FIX v3)
+ * =============================
+ * Что исправлено:
+ * 1) candlesData / _candlesByTime всегда синхронизированы
+ * 2) время нормализуется в bucket таймфрейма
+ * 3) candle event остаётся источником истины по OHLC
+ * 4) price event теперь тоже двигает текущую свечу в реальном времени
+ * 5) старые price events не переписывают уже закрытую историю
+ */
+
 export class ChartController {
     constructor(container) {
         this.container = container;
@@ -30,323 +41,341 @@ export class ChartController {
             }
         });
 
-        this.chart.timeScale().applyOptions({ rightOffset: 20 });
-
         this.candles = this.chart.addCandlestickSeries({
             upColor: "#26a69a",
             downColor: "#ef5350",
             wickUpColor: "#26a69a",
             wickDownColor: "#ef5350",
-            borderVisible: false,
-            priceLineVisible: false,
-            lastValueVisible: false
+            borderVisible: false
         });
 
-        // ✅ ДОБАВЛЕНО: ссылка на LayerRenderer
-        this.layerRenderer = null;
-
-        // timeframe + data
-        this.timeframeSec = 60;
-        this.lastBar = null;
-        this.candlesData = [];
-
-        // meta
         this.symbol = null;
-        this.timeframe = null;
+        this.timeframe = "1m";
 
-        // === PRICE LINE (создаём 1 раз) ==================================
-        this.lastPrice = null;
-        this.priceLine = this.candles.createPriceLine({
-            price: 0,
-            color: "#888",
-            lineWidth: 1,
-            lineStyle: 2,
-            axisLabelVisible: true
-        });
-
-        // ✅ ДОБАВЛЕНО: управление автоскроллом (иначе историю “не видно”, т.к. live постоянно тащит вправо)
-        this.autoScroll = true;
-        this.historyLoaded = false;
-
-        // если пользователь взаимодействует с графиком — отключаем автоскролл
-        const stopAuto = () => { this.autoScroll = false; };
-        container.addEventListener("wheel", stopAuto, { passive: true });
-        container.addEventListener("mousedown", stopAuto);
-        container.addEventListener("touchstart", stopAuto, { passive: true });
-
-        this.applyTheme("dark");
-        this.adjustBarSpacing();
-        window.addEventListener("resize", () => this.adjustBarSpacing());
-
-        console.log("✅ ChartController created", {
-            w: clientWidth,
-            h: clientHeight,
-            timeframeSec: this.timeframeSec
-        });
+        this.candlesData = [];
+        this._candlesByTime = new Map();
+        this._lastCandle = null;
+        this._lastWarnAt = 0;
+        this._lastPrice = null;
     }
 
-    // ✅ ДОБАВЛЕНО: привязка LayerRenderer к текущему chart/series
-    attachLayerRenderer(layerRenderer) {
-        this.layerRenderer = layerRenderer || null;
+    // =====================================================
+    // Time helpers
+    // =====================================================
 
-        // если у LayerRenderer есть bind() (как я давал) — используем
-        if (this.layerRenderer?.bind) {
-            this.layerRenderer.bind(this.chart, this.candles);
-        }
-        // иначе просто держим ссылку
-    }
-
-    /* ====================================================================== */
-    /* 🧠 TIME HELPERS                                                         */
-    /* ====================================================================== */
-
-    setTimeframe(tf) {
-        this.timeframe = tf;
-        this.timeframeSec = ChartController.parseTimeframeSec(tf);
-        console.log("⏱️ setTimeframe:", tf, "=>", this.timeframeSec, "sec");
-    }
-
-    static parseTimeframeSec(tf) {
+    timeframeToSeconds(tf) {
         const s = String(tf || "1m").trim().toLowerCase();
-        const m = s.match(/^(\d+)(s|m|h|d)$/);
+        const m = s.match(/^(\d+)\s*([smhd])$/);
         if (!m) return 60;
-        const n = Number(m[1]);
-        const mult = m[2] === "s" ? 1 : m[2] === "m" ? 60 : m[2] === "h" ? 3600 : 86400;
-        return Math.max(1, n * mult);
+
+        const n = parseInt(m[1], 10);
+        const u = m[2];
+
+        if (u === "s") return n;
+        if (u === "m") return n * 60;
+        if (u === "h") return n * 60 * 60;
+        if (u === "d") return n * 60 * 60 * 24;
+
+        return 60;
     }
 
-    normalizeLiveTime(raw) {
-        let t = Number(raw);
-        if (!Number.isFinite(t)) return null;
-        if (t > 1e12) t = Math.floor(t / 1000);
-        const step = this.timeframeSec || 60;
-        return Math.floor(t / step) * step;
-    }
+    getTimeSeconds(rawTime) {
+        if (rawTime === null || rawTime === undefined) return null;
 
-    normalizeTimeToBucket(rawTime, index = null, total = null) {
-        let t = Number(rawTime);
-
-        if (Number.isFinite(t) && t > 1e12) {
-            t = Math.floor(t / 1000);
+        if (typeof rawTime === "number") {
+            if (rawTime > 4_000_000_000) return Math.floor(rawTime / 1000);
+            return Math.floor(rawTime);
         }
 
-        if (Number.isFinite(t) && t >= 1e9) {
-            const step = this.timeframeSec || 60;
-            return Math.floor(t / step) * step;
-        }
+        if (typeof rawTime === "string") {
+            const t = rawTime.trim();
+            if (!t) return null;
 
-        if (typeof index === "number" && typeof total === "number") {
-            const now = Math.floor(Date.now() / 1000);
-            const step = this.timeframeSec || 60;
-            const distance = total - index - 1;
-            const restored = now - distance * step;
-            return Math.floor(restored / step) * step;
+            if (/^\d+$/.test(t)) {
+                const n = Number(t);
+                if (!Number.isFinite(n)) return null;
+                return this.getTimeSeconds(n);
+            }
+
+            const ms = Date.parse(t);
+            if (Number.isFinite(ms)) return Math.floor(ms / 1000);
         }
 
         return null;
     }
 
-    /* ====================================================================== */
-    /* 📦 HISTORY                                                              */
-    /* ====================================================================== */
+    normalizeTimeToBucket(rawTime) {
+        const sec = this.getTimeSeconds(rawTime);
+        if (sec === null) return null;
 
-    setHistory(candles) {
-        // ✅ если история уже была загружена — не даём “пустому ответу” стереть/сломать отображение
-        if (!Array.isArray(candles) || candles.length === 0) {
-            if (this.historyLoaded) {
-                console.warn("⚠️ Empty history ignored (already loaded)");
-                return;
-            }
-            console.warn("⚠️ Empty candles history");
-            return;
-        }
-
-        const safe = [];
-        const total = candles.length;
-
-        for (let i = 0; i < total; i++) {
-            const c = candles[i];
-
-            const time = this.normalizeTimeToBucket(c?.time, i, total);
-
-            const open   = Number(c?.open);
-            const high   = Number(c?.high);
-            const low    = Number(c?.low);
-            const close  = Number(c?.close);
-            const volume = Number(c?.volume);
-
-            if (!Number.isFinite(time)) continue;
-            if (![open, high, low, close].every(Number.isFinite)) continue;
-
-            safe.push({ time, open, high, low, close, volume });
-        }
-
-        if (!safe.length) {
-            console.error("❌ All candles invalid (history)");
-            return;
-        }
-
-        // сортировка + дедуп по времени
-        safe.sort((a, b) => a.time - b.time);
-
-        const map = new Map();
-        for (const c of safe) map.set(c.time, c);
-        const unique = [...map.values()].sort((a, b) => a.time - b.time);
-
-        // 1) в график
-        this.candles.setData(unique);
-
-        // ✅ ПОСЛЕ setData показываем весь контент — иначе визуально виден только “хвост”
-        this.historyLoaded = true;
-        requestAnimationFrame(() => {
-            try { this.chart.timeScale().fitContent(); } catch (e) {}
-        });
-
-        // 2) ✅ ВАЖНО: НЕ переassign this.candlesData (чтобы ссылки в layers/feature не ломались)
-        if (!Array.isArray(this.candlesData)) this.candlesData = [];
-        this.candlesData.length = 0;
-        this.candlesData.push(...unique);
-
-        // meta
-        this.lastBar = this.candlesData.at(-1) || null;
-
-        if (this.lastBar) this.updatePriceLine(this.lastBar.close);
-
-        console.log("📦 History loaded", this.candlesData.length);
-
-        // детект таймфрейма — можно по unique или по this.candlesData (одно и то же)
-        this.detectTimeframe(this.candlesData);
+        const bucket = this.timeframeToSeconds(this.timeframe);
+        return Math.floor(sec / bucket) * bucket;
     }
 
+    // =====================================================
+    // Parse helpers
+    // =====================================================
 
-    detectTimeframe(unique) {
-        if (unique.length > 1) {
-            const dt = unique[1].time - unique[0].time;
-            if (dt > 0 && dt !== this.timeframeSec) {
-                this.timeframeSec = dt;
-                console.info("🧠 Detected timeframe", dt + "s");
-            }
-        }
+    parseNum(v) {
+        if (v === null || v === undefined) return null;
+        if (typeof v === "number") return Number.isFinite(v) ? v : null;
+
+        const s = String(v).trim();
+        if (!s) return null;
+
+        const n = Number(s);
+        return Number.isFinite(n) ? n : null;
     }
 
-    /* ====================================================================== */
-    /* 🔥 WS MESSAGE (важно!)                                                  */
-    /* ====================================================================== */
-
-    onWsMessage(msg) {
-        if (!msg || typeof msg !== "object") return;
-
-        if (msg.price !== null && msg.price !== undefined) {
-            const p = Number(msg.price);
-            if (Number.isFinite(p) && p > 0) {
-                this.updatePriceLine(p);
-            }
-        }
-
-        if (msg.type === "candle") {
-            this.onCandle(msg);
-        }
+    getNestedKline(ev) {
+        return ev?.kline || ev?.k || ev?.data?.k || null;
     }
 
-    /* ====================================================================== */
-    /* 🔴 LIVE CANDLE                                                          */
-    /* ====================================================================== */
+    extractCandle(ev) {
+        if (!ev) return null;
 
-    onCandle(ev) {
-        // ✅ чтобы не было “рисует только стартовые”, ждём историю (или хотя бы не автоскроллим до неё)
-        if (!this.historyLoaded) return;
+        if (ev.time !== undefined && (ev.open !== undefined || ev.close !== undefined)) {
+            return {
+                time: ev.time,
+                open: ev.open,
+                high: ev.high,
+                low: ev.low,
+                close: ev.close
+            };
+        }
 
-        const k = (ev && ev.kline && typeof ev.kline === "object") ? ev.kline : ev;
+        const k = this.getNestedKline(ev);
+        if (!k) return null;
 
         const rawTime =
-            ev?.time ?? ev?.openTime ?? ev?.timestamp ?? ev?.t ??
-            k?.time ?? k?.openTime ?? k?.timestamp ?? k?.t;
+            k.openTime ?? k.open_time ?? k.t ??
+            k.startTime ?? k.start_time ??
+            ev.time ?? ev.t ?? ev.T ??
+            null;
 
-        const time = this.normalizeLiveTime(rawTime);
-        if (!Number.isFinite(time)) return;
+        const o = (k.open ?? k.o);
+        const h = (k.high ?? k.h);
+        const l = (k.low  ?? k.l);
+        const c = (k.close ?? k.c);
 
-        const open   = Number(k?.open);
-        const high   = Number(k?.high);
-        const low    = Number(k?.low);
-        const close  = Number(k?.close);
-        const volume = Number(k?.volume);
+        return { time: rawTime, open: o, high: h, low: l, close: c };
+    }
 
-        if (![open, high, low, close].every(Number.isFinite)) return;
+    extractPriceTick(ev) {
+        if (!ev || ev.type !== "price") return null;
 
-        const bar = {
-            time,
-            open,
-            high: Math.max(high, open, close),
-            low:  Math.min(low, open, close),
-            close,
-            volume
-        };
+        const price = this.parseNum(ev.price);
+        const time = ev.time;
 
-        const last = this.candlesData.at(-1);
+        if (price === null || time === null || time === undefined) return null;
 
-        if (last && last.time === bar.time) {
-            this.candles.update(bar);
-            this.candlesData[this.candlesData.length - 1] = bar;
-        } else if (!last || bar.time > last.time) {
-            this.candles.update(bar);
-            this.candlesData.push(bar);
+        return { time, price };
+    }
 
-            // ✅ автоскроллим только если включено
-            if (this.autoScroll) {
-                this.chart.timeScale().scrollToRealTime();
-            }
+    // =====================================================
+    // History
+    // =====================================================
+
+    setHistory(candles) {
+        if (!Array.isArray(candles)) return;
+
+        const map = new Map();
+
+        for (const c of candles) {
+            const t = this.normalizeTimeToBucket(c?.time ?? c?.t ?? c?.T);
+            if (t === null) continue;
+
+            const o  = this.parseNum(c.open  ?? c.o);
+            const h  = this.parseNum(c.high  ?? c.h);
+            const l  = this.parseNum(c.low   ?? c.l);
+            const cl = this.parseNum(c.close ?? c.c);
+
+            if (o === null || h === null || l === null || cl === null) continue;
+
+            const hi = Math.max(h, o, cl);
+            const lo = Math.min(l, o, cl);
+
+            map.set(t, { time: t, open: o, high: hi, low: lo, close: cl });
+        }
+
+        const times = Array.from(map.keys()).sort((a, b) => a - b);
+        const out = times.map(t => map.get(t));
+
+        this.candlesData = out;
+        this._candlesByTime = map;
+        this._lastCandle = out.length ? out[out.length - 1] : null;
+        this._lastPrice = this._lastCandle ? this._lastCandle.close : null;
+
+        this.candles.setData(out);
+
+        console.log("📦 History loaded", out.length);
+    }
+
+    // =====================================================
+    // Core upsert
+    // =====================================================
+
+    upsertCandle(partial) {
+        const t = this.normalizeTimeToBucket(partial?.time);
+        if (t === null) return;
+
+        const prev = this._candlesByTime.get(t) || null;
+
+        let o = this.parseNum(partial.open);
+        let h = this.parseNum(partial.high);
+        let l = this.parseNum(partial.low);
+        let c = this.parseNum(partial.close);
+
+        if (prev) {
+            if (o === null) o = prev.open;
+            if (c === null) c = prev.close;
+            if (h === null) h = prev.high;
+            if (l === null) l = prev.low;
+        }
+
+        if (!prev) {
+            if (o === null && c !== null) o = c;
+            if (c === null && o !== null) c = o;
+        }
+
+        if (o === null || c === null) return;
+
+        if (h === null) h = Math.max(o, c);
+        if (l === null) l = Math.min(o, c);
+
+        h = Math.max(h, o, c);
+        l = Math.min(l, o, c);
+
+        const candle = { time: t, open: o, high: h, low: l, close: c };
+
+        const existed = this._candlesByTime.has(t);
+        this._candlesByTime.set(t, candle);
+
+        if (!this._lastCandle || t >= this._lastCandle.time) {
+            this._lastCandle = candle;
+            this._lastPrice = candle.close;
+        }
+
+        if (!this.candlesData || this.candlesData.length === 0) {
+            this.candlesData = [candle];
         } else {
+            const last = this.candlesData[this.candlesData.length - 1];
+
+            if (last.time === t) {
+                this.candlesData[this.candlesData.length - 1] = candle;
+            } else if (last.time < t) {
+                this.candlesData.push(candle);
+            } else {
+                let loIdx = 0;
+                let hiIdx = this.candlesData.length - 1;
+                let idx = -1;
+
+                while (loIdx <= hiIdx) {
+                    const mid = (loIdx + hiIdx) >> 1;
+                    const mt = this.candlesData[mid].time;
+
+                    if (mt === t) {
+                        idx = mid;
+                        break;
+                    }
+                    if (mt < t) loIdx = mid + 1;
+                    else hiIdx = mid - 1;
+                }
+
+                if (idx >= 0) this.candlesData[idx] = candle;
+                else this.candlesData.splice(loIdx, 0, candle);
+            }
+        }
+
+        this.candles.update(candle);
+
+        if (!existed) this.adjustBarSpacing();
+    }
+
+    // =====================================================
+    // Live price -> current candle
+    // =====================================================
+
+    applyPriceTick(tick) {
+        if (!tick) return;
+
+        const t = this.normalizeTimeToBucket(tick.time);
+        const price = this.parseNum(tick.price);
+
+        if (t === null || price === null) return;
+
+        this._lastPrice = price;
+
+        if (this._lastCandle && t < this._lastCandle.time) {
             return;
         }
 
-        this.lastBar = bar;
-        this.updatePriceLine(bar.close);
-    }
-
-    /* ====================================================================== */
-    /* 💲 PRICE LINE                                                           */
-    /* ====================================================================== */
-
-    updatePriceLine(price) {
-        const p = Number(price);
-        if (!Number.isFinite(p) || p <= 0) return;
-
-        const prev = this.lastPrice;
-        if (prev === p) return;
-
-        this.lastPrice = p;
-
-        let color = "#888";
-        if (prev != null) {
-            color = p > prev ? "#26a69a" : p < prev ? "#ef5350" : "#888";
+        const sameBucket = this._candlesByTime.get(t);
+        if (sameBucket) {
+            this.upsertCandle({
+                time: t,
+                open: sameBucket.open,
+                high: Math.max(sameBucket.high, price),
+                low: Math.min(sameBucket.low, price),
+                close: price
+            });
+            return;
         }
 
-        this.priceLine.applyOptions({ price: p, color });
+        const prevClose =
+            this._lastCandle && Number.isFinite(this._lastCandle.close)
+                ? this._lastCandle.close
+                : price;
 
+        const open = prevClose;
+        const high = Math.max(open, price);
+        const low = Math.min(open, price);
+
+        this.upsertCandle({
+            time: t,
+            open,
+            high,
+            low,
+            close: price
+        });
     }
 
-    /* ====================================================================== */
-    /* 🧩 UI                                                                    */
-    /* ====================================================================== */
+    // =====================================================
+    // WS entry
+    // =====================================================
+
+    onWsMessage(ev) {
+        if (!ev) return;
+
+        const priceTick = this.extractPriceTick(ev);
+        if (priceTick) {
+            this.applyPriceTick(priceTick);
+            return;
+        }
+
+        const candle = this.extractCandle(ev);
+        if (candle) {
+            this.upsertCandle(candle);
+        }
+    }
+
+    // =====================================================
+    // UX
+    // =====================================================
 
     adjustBarSpacing() {
-        const w = this.container.clientWidth;
-        this.chart.applyOptions({
-            timeScale: { barSpacing: w < 400 ? 4 : w < 800 ? 6 : 8 }
-        });
-    }
+        try {
+            const len = this.candlesData?.length || 0;
+            if (len < 50) return;
 
-    applyTheme(kind = "dark") {
-        const dark = kind === "dark";
-        this.chart.applyOptions({
-            layout: {
-                background: { color: dark ? "#0e0f11" : "#fff" },
-                textColor:   dark ? "#e0e0e0" : "#000"
-            },
-            grid: {
-                vertLines: { color: dark ? "#444" : "#ccc" },
-                horzLines: { color: dark ? "#444" : "#ccc" }
+            const bs = Math.max(2, Math.min(10, Math.floor(1200 / Math.sqrt(len))));
+            this.chart.timeScale().applyOptions({ barSpacing: bs });
+        } catch (e) {
+            const now = Date.now();
+            if (now - this._lastWarnAt > 3000) {
+                this._lastWarnAt = now;
+                console.warn("⚠ adjustBarSpacing failed", e);
             }
-        });
+        }
     }
 }

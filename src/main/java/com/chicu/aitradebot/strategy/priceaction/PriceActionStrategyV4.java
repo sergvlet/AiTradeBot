@@ -285,14 +285,7 @@ public class PriceActionStrategyV4 implements TradingStrategy {
             // =====================================================
             if (!st.inPosition && st.aboveHighConfirm >= needConfirm) {
 
-                Integer cooldown = ss != null ? ss.getCooldownSeconds() : null;
-                if (cooldown != null && cooldown > 0 && st.lastTradeClosedAt != null) {
-                    long passed = Duration.between(st.lastTradeClosedAt, time).getSeconds();
-                    if (passed < cooldown) {
-                        pushHoldThrottled(chatId, sym, st, "cooldown", time);
-                        return;
-                    }
-                }
+
 
                 // score 0..100: насколько далеко ушли за уровень пробоя
                 double overPct = price.subtract(upBreak)
@@ -474,7 +467,6 @@ public class PriceActionStrategyV4 implements TradingStrategy {
         String net    = ss != null ? String.valueOf(ss.getNetworkType()) : "null";
         String tf     = ss != null ? safe(ss.getTimeframe()) : "null";
         String candles = ss != null && ss.getCachedCandlesLimit() != null ? String.valueOf(ss.getCachedCandlesLimit()) : "null";
-        String cooldown = ss != null && ss.getCooldownSeconds() != null ? String.valueOf(ss.getCooldownSeconds()) : "null";
 
         String w = cfg != null ? String.valueOf(cfg.getWindowSize()) : "null";
         String minR = cfg != null ? String.valueOf(cfg.getMinRangePct()) : "null";
@@ -483,8 +475,7 @@ public class PriceActionStrategyV4 implements TradingStrategy {
         String c = cfg != null ? String.valueOf(cfg.getConfirmTicks()) : "null";
         String en = cfg != null ? String.valueOf(cfg.isEnabled()) : "null";
 
-        return symbol + "|" + ex + "|" + net + "|" + tf + "|" + candles + "|" + cooldown
-                + "|" + w + "|" + minR + "|" + br + "|" + wick + "|" + c + "|" + en;
+        return symbol + "|" + ex + "|" + net + "|" + tf + "|" + candles + "|"  + w + "|" + minR + "|" + br + "|" + wick + "|" + c + "|" + en;
     }
 
     // =====================================================
@@ -493,7 +484,7 @@ public class PriceActionStrategyV4 implements TradingStrategy {
 
     private StrategySettings loadStrategySettings(Long chatId) {
         return strategySettingsService
-                .findAllByChatId(chatId, null, null)
+                .findAllByChatId(chatId)
                 .stream()
                 .filter(s -> s.getType() == StrategyType.PRICE_ACTION)
                 .sorted(

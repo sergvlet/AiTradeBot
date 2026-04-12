@@ -28,6 +28,16 @@ public class BinanceMarketInfoProvider implements MarketInfoProvider {
     private static final String MAIN = "https://api.binance.com";
     private static final String TEST = "https://testnet.binance.vision";
 
+    /**
+     * Возвращаем внутренний канонический формат таймфреймов,
+     * который понимает весь бот: 1m/1h/1d/1w/1mo.
+     */
+    private static final List<String> BINANCE_TIMEFRAMES = List.of(
+            "1m", "3m", "5m", "15m", "30m",
+            "1h", "2h", "4h", "6h", "8h", "12h",
+            "1d", "3d", "1w", "1mo"
+    );
+
     private final RestTemplate http = new RestTemplate();
 
     // ================================================================
@@ -65,7 +75,7 @@ public class BinanceMarketInfoProvider implements MarketInfoProvider {
 
         return MarketOverviewDto.builder()
                 .symbols(m.symbols)
-                .timeframes(getBinanceTimeframes())
+                .timeframes(BINANCE_TIMEFRAMES)
                 .lastUpdate(m.lastUpdate)
                 .build();
     }
@@ -74,14 +84,14 @@ public class BinanceMarketInfoProvider implements MarketInfoProvider {
     public List<SymbolInfoDto> searchSymbols(NetworkType network, String query) {
 
         CachedMarket m = loadCached(network);
-        final String q = (query == null ? "" : query.trim().toUpperCase());
+        final String q = (query == null ? "" : query.trim().toUpperCase(Locale.ROOT));
 
         if (q.isEmpty()) {
             return m.symbols.stream().limit(20).collect(Collectors.toList());
         }
 
         return m.symbols.stream()
-                .filter(s -> s.getSymbol().toUpperCase().contains(q))
+                .filter(s -> s.getSymbol().toUpperCase(Locale.ROOT).contains(q))
                 .sorted(Comparator.comparing(SymbolInfoDto::getVolume).reversed())
                 .limit(20)
                 .collect(Collectors.toList());
@@ -187,6 +197,9 @@ public class BinanceMarketInfoProvider implements MarketInfoProvider {
             JSONArray arr = new JSONObject(response.getBody()).optJSONArray("symbols");
 
             Map<String, String> out = new LinkedHashMap<>();
+            if (arr == null) {
+                return out;
+            }
 
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject o = arr.getJSONObject(i);
@@ -222,10 +235,5 @@ public class BinanceMarketInfoProvider implements MarketInfoProvider {
             log.error("❌ ticker/24hr error: {}", e.getMessage());
             return Collections.emptyMap();
         }
-    }
-
-    private List<String> getBinanceTimeframes() {
-        return List.of("1m", "3m", "5m", "15m", "30m",
-                "1h", "2h", "4h", "1d", "1w", "1M");
     }
 }

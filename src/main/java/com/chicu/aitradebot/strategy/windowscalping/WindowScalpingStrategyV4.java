@@ -1,35 +1,57 @@
 package com.chicu.aitradebot.strategy.windowscalping;
 
+import com.chicu.aitradebot.ai.ml.MlGateway;
+import com.chicu.aitradebot.ai.ml.dataset.MlSampleEntity;
+import com.chicu.aitradebot.ai.ml.dataset.MlSampleIngestService;
+import com.chicu.aitradebot.ai.ml.dto.MlPredictResponse;
+import com.chicu.aitradebot.ai.ml.training.MlTrainingResult;
+import com.chicu.aitradebot.ai.ml.training.MlTrainingService;
+import com.chicu.aitradebot.ai.ml.training.MlTrainingServiceImpl;
+import com.chicu.aitradebot.ai.tuning.AutoTunerOrchestrator;
+import com.chicu.aitradebot.ai.tuning.TuningRequest;
+import com.chicu.aitradebot.ai.tuning.TuningResult;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
+import com.chicu.aitradebot.domain.enums.AdvancedControlMode;
+import com.chicu.aitradebot.events.StrategySettingsUpdatedEvent;
+import com.chicu.aitradebot.events.WindowScalpingSettingsUpdatedEvent;
+import com.chicu.aitradebot.market.model.UnifiedKline;
+import com.chicu.aitradebot.orchestrator.AiStrategyOrchestrator;
 import com.chicu.aitradebot.service.StrategySettingsService;
 import com.chicu.aitradebot.strategy.core.TradingStrategy;
 import com.chicu.aitradebot.strategy.core.signal.Signal;
 import com.chicu.aitradebot.strategy.live.StrategyLivePublisher;
 import com.chicu.aitradebot.strategy.registry.StrategyBinding;
+import com.chicu.aitradebot.trade.TradeExecutionServiceImpl;
+import com.chicu.aitradebot.trade.PositionStore;
 import com.chicu.aitradebot.trade.TradeExecutionService;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.ArrayDeque;
-import java.util.Deque;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Objects;
+import java.time.ZoneId;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 @StrategyBinding(StrategyType.WINDOW_SCALPING)
 @Slf4j
 @Component
 @RequiredArgsConstructor
-public class WindowScalpingStrategyV4 implements TradingStrategy {
+public class WindowScalpingStrategyV4 implements
+        TradingStrategy,
+        AiStrategyOrchestrator.PriceUpdateAware,
+        AiStrategyOrchestrator.CandleCloseAware,
+        AiStrategyOrchestrator.PrepareStartAware {
 
     @Value("${strategy.window.settingsRefreshSeconds:10}")
     private long settingsRefreshSeconds;
@@ -40,12 +62,392 @@ public class WindowScalpingStrategyV4 implements TradingStrategy {
     @Value("${strategy.window.holdThrottleMs:2500}")
     private long holdThrottleMs;
 
+    @Value("${strategy.window.entryBlockLogThrottleMs:30000}")
+    private long entryBlockLogThrottleMs;
+
+    @Value("${strategy.window.entryBlockSummaryLogThrottleMs:120000}")
+    private long entryBlockSummaryLogThrottleMs;
+
+    @Value("${strategy.window.restoreRetryCooldownMs:5000}")
+    private long restoreRetryCooldownMs;
+
+    @Value("${strategy.window.dustRestoreLogThrottleMs:60000}")
+    private long dustRestoreLogThrottleMs;
+
+    @Value("${strategy.window.positionSyncMinIntervalMs:10000}")
+    private long positionSyncMinIntervalMs;
+
+    @Value("${strategy.window.zoneExitEnabled:true}")
+    private boolean zoneExitEnabled;
+
+    @Value("${strategy.window.zoneExitMinNetProfitPct:0.05}")
+    private double zoneExitMinNetProfitPct;
+
+    @Value("${strategy.window.zoneExitMinHoldMs:1500}")
+    private long zoneExitMinHoldMs;
+
+    @Value("${strategy.window.zoneExitRequireMomentumFade:false}")
+    private boolean zoneExitRequireMomentumFade;
+
+    @Value("${strategy.window.zoneExitMomentumCeilingPct:0.03}")
+    private double zoneExitMomentumCeilingPct;
+
+
+    @Value("${strategy.defaults.exchange:BINANCE}")
+    private String defaultExchange;
+
+    @Value("${strategy.defaults.network:TESTNET}")
+    private String defaultNetwork;
+
+    @Value("${strategy.defaults.symbol:BTCUSDT}")
+    private String defaultSymbol;
+
+    @Value("${strategy.defaults.timeframe:1m}")
+    private String defaultTimeframe;
+
+    @Value("${strategy.window.prepareOnStartEnabled:true}")
+    private boolean prepareOnStartEnabled;
+
+    @Value("${strategy.window.prepareStrictAiMode:true}")
+    private boolean prepareStrictAiMode;
+
+    @Value("${strategy.window.prepareValidationSplitPct:30}")
+    private int prepareValidationSplitPct;
+
+    @Value("${strategy.window.prepareMinCandles:150}")
+    private int prepareMinCandles;
+
+    // =====================================================
+    // AUTO MIN-RANGE
+    // =====================================================
+
+    @Value("${strategy.window.autoMinRangeEnabled:true}")
+    private boolean autoMinRangeEnabled;
+
+    @Value("${strategy.window.autoMinRangeEverySeconds:60}")
+    private long autoMinRangeEverySeconds;
+
+    @Value("${strategy.window.autoMinRangeSampleSize:360}")
+    private int autoMinRangeSampleSize;
+
+    @Value("${strategy.window.autoMinRangeQuantile:0.30}")
+    private double autoMinRangeQuantile;
+
+    @Value("${strategy.window.autoMinRangeMarginFactor:0.90}")
+    private double autoMinRangeMarginFactor;
+
+    @Value("${strategy.window.autoMinRangeMinFloorPct:0.002}")
+    private double autoMinRangeMinFloorPct;
+
+    @Value("${strategy.window.autoMinRangeMaxCapPct:0.50}")
+    private double autoMinRangeMaxCapPct;
+
+    @Value("${strategy.window.autoMinRangeMinSamples:60}")
+    private int autoMinRangeMinSamples;
+
+    @Value("${strategy.window.autoMinRangeMinDelta:0.0003}")
+    private double autoMinRangeMinDelta;
+
+    // =====================================================
+    // ML gate
+    // =====================================================
+
+    @Value("${strategy.window.mlEnabled:true}")
+    private boolean mlEnabled;
+
+    @Value("${strategy.window.mlFailOpen:true}")
+    private boolean mlFailOpen;
+
+    @Value("${strategy.window.mlMinProba:0.28}")
+    private double mlMinProba;
+
+    @Value("${strategy.window.mlPredictThrottleMs:1200}")
+    private long mlPredictThrottleMs;
+
+    @Value("${strategy.window.mlLogThrottleMs:30000}")
+    private long mlLogThrottleMs;
+
+    @Value("${strategy.window.mlBelowThresholdCooldownMs:2500}")
+    private long mlBelowThresholdCooldownMs;
+
+    @Value("${strategy.window.mlRecheckMinPriceMovePct:0.03}")
+    private double mlRecheckMinPriceMovePct;
+
+    @Value("${strategy.window.adaptiveMlGateEnabled:true}")
+    private boolean adaptiveMlGateEnabled;
+
+    @Value("${strategy.window.adaptiveMlGateOnlyHybrid:false}")
+    private boolean adaptiveMlGateOnlyHybrid;
+
+    @Value("${strategy.window.adaptiveMlGateSampleSize:64}")
+    private int adaptiveMlGateSampleSize;
+
+    @Value("${strategy.window.adaptiveMlGateQuantile:0.70}")
+    private double adaptiveMlGateQuantile;
+
+    @Value("${strategy.window.adaptiveMlGateMarginPct:0.015}")
+    private double adaptiveMlGateMarginPct;
+
+    @Value("${strategy.window.adaptiveMlGateFloor:0.08}")
+    private double adaptiveMlGateFloor;
+
+    @Value("${strategy.window.adaptiveMlGateMaxThresholdDrop:0.44}")
+    private double adaptiveMlGateMaxThresholdDrop;
+
+    @Value("${strategy.window.adaptiveMlGateMinStrongScore:18.0}")
+    private double adaptiveMlGateMinStrongScore;
+
+    @Value("${strategy.window.mlAutoTuneOnLowConfidence:false}")
+    private boolean mlAutoTuneOnLowConfidence;
+
+    @Value("${strategy.window.mlAutoTuneLowConfidenceAfter:8}")
+    private int mlAutoTuneLowConfidenceAfter;
+
+    @Value("${strategy.window.mlFailOpenOnUltraLowConfidence:true}")
+    private boolean mlFailOpenOnUltraLowConfidence;
+
+    @Value("${strategy.window.mlUltraLowConfidencePct:0.02}")
+    private double mlUltraLowConfidencePct;
+
+    @Value("${strategy.window.mlUltraLowConfidenceAfter:2}")
+    private int mlUltraLowConfidenceAfter;
+
+    @Value("${strategy.window.mlFailOpenScoreFloor:28.0}")
+    private double mlFailOpenScoreFloor;
+
+    // =====================================================
+    // AUTO-TUNE ON HOLD
+    // =====================================================
+
+    @Value("${strategy.window.autoTuneOnHold:false}")
+    private boolean autoTuneOnHold;
+
+    @Value("${strategy.window.autoTuneHoldCooldownSeconds:60}")
+    private long autoTuneHoldCooldownSeconds;
+
+    @Value("${strategy.window.autoTuneHoldReasons:range_too_small,windowSize<5,no_settings,window_invalid,range_zero,pos_invalid,no_room_to_high,ml_below_threshold,predict_failed}")
+    private String autoTuneHoldReasons;
+
+    // =====================================================
+    // COARSE-ADJUST
+    // =====================================================
+
+    @Value("${strategy.window.coarseAdjustEnabled:true}")
+    private boolean coarseAdjustEnabled;
+
+    @Value("${strategy.window.coarseAdjustAfterConsecutive:6}")
+    private int coarseAdjustAfterConsecutive;
+
+    @Value("${strategy.window.coarseAdjustCooldownSeconds:120}")
+    private long coarseAdjustCooldownSeconds;
+
+    @Value("${strategy.window.coarseAdjustFactor:0.85}")
+    private double coarseAdjustFactor;
+
+    @Value("${strategy.window.coarseAdjustMinFloorPct:0.002}")
+    private double coarseAdjustMinFloorPct;
+
+    // =====================================================
+    // NOISE FILTER / RISK
+    // =====================================================
+
+    @Value("${strategy.window.noiseFilterEnabled:true}")
+    private boolean noiseFilterEnabled;
+
+    @Value("${strategy.window.entryBounceMinPosPctOfRange:1.8}")
+    private double entryBounceMinPosPctOfRange;
+
+    @Value("${strategy.window.minMomentum1Pct:0.002}")
+    private double minMomentum1Pct;
+
+    @Value("${strategy.window.minVolatilityPct:0.006}")
+    private double minVolatilityPct;
+
+    @Value("${strategy.window.minWindowReturnPct:-0.12}")
+    private double minWindowReturnPct;
+
+    @Value("${strategy.window.minEntryScoreToEnter:5.0}")
+    private double minEntryScoreToEnter;
+
+    @Value("${strategy.window.minEntryScoreWithoutMl:7.0}")
+    private double minEntryScoreWithoutMl;
+
+    @Value("${strategy.window.rangeTooSmallBypassFactor:0.72}")
+    private double rangeTooSmallBypassFactor;
+
+    @Value("${strategy.window.rangeTooSmallBypassAbsoluteGapPct:0.012}")
+    private double rangeTooSmallBypassAbsoluteGapPct;
+
+    @Value("${strategy.window.lowZoneExpandInMicroRangeFactor:1.55}")
+    private double lowZoneExpandInMicroRangeFactor;
+
+    @Value("${strategy.window.lowZoneExpandInMicroRangeMaxPct:32.0}")
+    private double lowZoneExpandInMicroRangeMaxPct;
+
+    @Value("${strategy.window.minRoomToWindowHighPct:0.015}")
+    private double minRoomToWindowHighPct;
+
+    @Value("${strategy.window.tpRoomUsagePct:0.985}")
+    private double tpRoomUsagePct;
+
+    @Value("${strategy.window.minRoomNetRewardRisk:0.22}")
+    private double minRoomNetRewardRisk;
+
+    @Value("${strategy.window.dynamicTpEnabled:true}")
+    private boolean dynamicTpEnabled;
+
+    @Value("${strategy.window.dynamicTpMinPct:0.08}")
+    private double dynamicTpMinPct;
+
+    @Value("${strategy.window.dynamicTpMaxPct:0.65}")
+    private double dynamicTpMaxPct;
+
+    @Value("${strategy.window.dynamicSlMinPct:0.03}")
+    private double dynamicSlMinPct;
+
+    @Value("${strategy.window.dynamicSlMaxPct:0.18}")
+    private double dynamicSlMaxPct;
+
+    @Value("${strategy.window.dynamicTpFromRangeFactor:0.72}")
+    private double dynamicTpFromRangeFactor;
+
+    @Value("${strategy.window.dynamicSlFromRangeFactor:0.28}")
+    private double dynamicSlFromRangeFactor;
+
+    @Value("${strategy.window.dynamicMinRiskReward:1.10}")
+    private double dynamicMinRiskReward;
+
+    @Value("${strategy.window.minProfitAfterFeesPct:0.01}")
+    private double minProfitAfterFeesPct;
+
+    @Value("${strategy.window.breakEvenEnabled:true}")
+    private boolean breakEvenEnabled;
+
+    @Value("${strategy.window.breakEvenTriggerToTpRatio:0.30}")
+    private double breakEvenTriggerToTpRatio;
+
+    @Value("${strategy.window.breakEvenOffsetPct:0.06}")
+    private double breakEvenOffsetPct;
+
+    @Value("${strategy.window.breakEvenFeeCoverBufferPct:0.08}")
+    private double breakEvenFeeCoverBufferPct;
+
+    @Value("${strategy.window.breakEvenProtectedNetBufferPct:0.03}")
+    private double breakEvenProtectedNetBufferPct;
+
+    @Value("${strategy.window.postSlCooldownMs:90000}")
+    private long postSlCooldownMs;
+
+    @Value("${strategy.window.postSlCooldownCandles:2}")
+    private int postSlCooldownCandles;
+
+    @Value("${strategy.window.postTpCooldownMs:5000}")
+    private long postTpCooldownMs;
+
+    @Value("${strategy.window.autoMinRangeProtectRaiseSeconds:180}")
+    private long autoMinRangeProtectRaiseSeconds;
+
+    @Value("${strategy.window.lowZoneDescendingLookback:4}")
+    private int lowZoneDescendingLookback;
+
+    @Value("${strategy.window.minReboundAfterLowTouchPct:0.005}")
+    private double minReboundAfterLowTouchPct;
+
+    @Value("${strategy.window.autoMinRangeBlockRaiseOnEntryRejectSeconds:180}")
+    private long autoMinRangeBlockRaiseOnEntryRejectSeconds;
+
+    @Value("${strategy.window.autoMinRangeMaxRaiseStepRatio:0.08}")
+    private double autoMinRangeMaxRaiseStepRatio;
+
+    @Value("${strategy.window.windowHighProjectionPctOfRange:1.80}")
+    private double windowHighProjectionPctOfRange;
+
+    @Value("${strategy.window.minNetRewardRiskForMarket:1.02}")
+    private double minNetRewardRiskForMarket;
+
     private final StrategyLivePublisher live;
     private final WindowScalpingStrategySettingsService windowSettingsService;
     private final StrategySettingsService strategySettingsService;
     private final TradeExecutionService tradeExecutionService;
+    private final PositionStore positionStore;
+    private final MlSampleIngestService mlSampleIngestService;
+    private final ObjectMapper objectMapper;
+
+    private final ObjectProvider<MlGateway> mlGatewayProvider;
+    private final ObjectProvider<AiStrategyOrchestrator> orchestratorProvider;
+    private final ObjectProvider<MlTrainingService> mlTrainingServiceProvider;
+    private final ObjectProvider<AutoTunerOrchestrator> autoTunerProvider;
+
+    private MlGateway ml() {
+        return mlGatewayProvider != null ? mlGatewayProvider.getIfAvailable() : null;
+    }
+
+    private AiStrategyOrchestrator orch() {
+        return orchestratorProvider != null ? orchestratorProvider.getIfAvailable() : null;
+    }
+
+    private MlTrainingService trainingService() {
+        return mlTrainingServiceProvider != null ? mlTrainingServiceProvider.getIfAvailable() : null;
+    }
+
+    private MlTrainingResult trainPrepareOnSelectedCandles(long chatId,
+                                                           String exchange,
+                                                           NetworkType network,
+                                                           String symbol,
+                                                           String timeframe,
+                                                           int candlesLimit) {
+        MlTrainingService trainingService = trainingService();
+        if (trainingService == null) {
+            return null;
+        }
+
+        if (trainingService instanceof MlTrainingServiceImpl impl) {
+            return impl.trainOnSelectedCandles(
+                    chatId,
+                    StrategyType.WINDOW_SCALPING,
+                    exchange,
+                    network,
+                    symbol,
+                    timeframe,
+                    candlesLimit,
+                    "prepare_start_train"
+            );
+        }
+
+        return trainingService.trainNow(chatId, StrategyType.WINDOW_SCALPING, "prepare_start_train");
+    }
+
+    private AutoTunerOrchestrator autoTuner() {
+        return autoTunerProvider != null ? autoTunerProvider.getIfAvailable() : null;
+    }
+
+    private TradeExecutionServiceImpl tradeExecImpl() {
+        return (tradeExecutionService instanceof TradeExecutionServiceImpl impl) ? impl : null;
+    }
+
+    private BigDecimal resolveMinRestorableNotional(String exchange, NetworkType network, String symbol) {
+        TradeExecutionServiceImpl exec = tradeExecImpl();
+        if (exec != null) {
+            try {
+                BigDecimal resolved = exec.resolveMinRestorableNotional(exchange, network, symbol);
+                BigDecimal positive = positiveOrNull(resolved);
+                if (positive != null) {
+                    return positive.stripTrailingZeros();
+                }
+            } catch (Exception e) {
+                log.debug("[WINDOW] resolveMinRestorableNotional skipped ex={} net={} sym={} err={}",
+                        exchange, network, symbol, e.toString());
+            }
+        }
+        return DEFAULT_MIN_RESTORABLE_NOTIONAL;
+    }
+
+    private static final BigDecimal DEFAULT_MIN_RESTORABLE_NOTIONAL = new BigDecimal("5.00");
 
     private final Map<Long, LocalState> states = new ConcurrentHashMap<>();
+
+    private volatile String cachedHoldReasonsRaw;
+    private volatile Set<String> cachedHoldReasonsSet;
 
     private static class LocalState {
         boolean active;
@@ -55,6 +457,7 @@ public class WindowScalpingStrategyV4 implements TradingStrategy {
         WindowScalpingStrategySettings cfg;
 
         String symbol;
+        String timeframe;
         String exchange;
         NetworkType network;
 
@@ -62,6 +465,8 @@ public class WindowScalpingStrategyV4 implements TradingStrategy {
         String lastFingerprint;
 
         Deque<BigDecimal> window = new ArrayDeque<>();
+        Deque<BigDecimal> tickWindow = new ArrayDeque<>();
+        Instant lastTickAt;
 
         boolean inPosition;
         boolean isLong;
@@ -73,6 +478,17 @@ public class WindowScalpingStrategyV4 implements TradingStrategy {
         Long entryOrderId;
 
         Instant lastTradeClosedAt;
+        Instant reentryBlockedUntil;
+        String reentryBlockReason;
+        Instant lastEntryAt;
+        Long entryCandleOpenTimeMs;
+        String entryCandleTimeframe;
+
+        Instant lastRestoreProbeAt;
+        Instant lastRestoreMissAt;
+        Instant lastDustRestoreLogAt;
+        String lastDustRestoreLogKey;
+        Instant lastPositionSyncAt;
 
         long ticks;
         long warmups;
@@ -81,6 +497,637 @@ public class WindowScalpingStrategyV4 implements TradingStrategy {
 
         String lastHoldReason;
         Instant lastHoldAt;
+
+        Instant lastDiagAt;
+        Instant lastAutoTuneRequestAt;
+
+        int consecutiveRangeTooSmall;
+        Instant lastCoarseAdjustAt;
+
+        Instant lastMlConfidenceSaveAt;
+        Double lastMlConfidenceSaved;
+
+        double[] rangePctSamples;
+        int rangePctPtr;
+        int rangePctCount;
+
+        Instant lastAutoMinRangeAt;
+        Double lastAutoMinRangeApplied;
+        Instant lastAutoMinRangeRaisedAt;
+        Double lastAutoMinRangeRaisedFrom;
+        Double lastAutoMinRangeRaisedTo;
+
+        BigDecimal lastWindowHigh;
+        BigDecimal lastWindowLow;
+        BigDecimal lastBuyZoneTop;
+        Instant lastZonePublishedAt;
+
+        Instant lastMlPredictAt;
+        BigDecimal lastMlPredictPrice;
+        Prediction lastMlPrediction;
+
+        Instant lastMlBelowThresholdAt;
+        BigDecimal lastMlBelowThresholdPrice;
+        Double lastMlBelowThresholdProba;
+        Double lastMlBelowThresholdThreshold;
+        int consecutiveMlBelowThreshold;
+        int consecutiveUltraLowMlProba;
+
+        double[] mlProbaSamples;
+        int mlProbaPtr;
+        int mlProbaCount;
+        Double lastAdaptiveMlThreshold;
+        Instant lastAdaptiveMlLogAt;
+
+        Instant lastMlWarnAt;
+        String lastMlWarnReason;
+
+        Instant lastEntryBlockedAt;
+        String lastEntryBlockedReason;
+        Instant lastEntryBlockedSummaryAt;
+        String lastEntryBlockedSummaryReason;
+        long lastEntryBlockedRepeatCount;
+
+        Map<String, Object> pendingMlFeatures;
+        Instant pendingMlFeatureTs;
+        String pendingMlSymbol;
+        String pendingMlExchange;
+        String pendingMlNetwork;
+        String pendingMlTimeframe;
+        BigDecimal pendingMlEntryPrice;
+        Double pendingMlProba;
+        String pendingMlModelKey;
+        boolean pendingMlFailOpen;
+    }
+
+    private static class Prediction {
+        final boolean ok;
+        final String modelKey;
+        final String modelVersion;
+        final String schemaHash;
+        final double proba;
+        final String reason;
+
+        private Prediction(boolean ok,
+                           String modelKey,
+                           String modelVersion,
+                           String schemaHash,
+                           double proba,
+                           String reason) {
+            this.ok = ok;
+            this.modelKey = modelKey;
+            this.modelVersion = modelVersion;
+            this.schemaHash = schemaHash;
+            this.proba = proba;
+            this.reason = reason;
+        }
+
+        static Prediction ok(String modelKey, String modelVersion, String schemaHash, double proba) {
+            return new Prediction(true, modelKey, modelVersion, schemaHash, proba, null);
+        }
+
+        static Prediction fail(String reason) {
+            return new Prediction(false, null, null, null, 0.0, reason);
+        }
+    }
+
+    private record EntryRisk(BigDecimal tpPct, BigDecimal slPct, String source) {}
+
+    private record WindowView(Deque<BigDecimal> prices,
+                              BigDecimal low,
+                              BigDecimal high,
+                              BigDecimal range,
+                              double rangePct,
+                              boolean tickBased,
+                              boolean fallbackUsed) {}
+
+
+    private record PrepareRange(Instant startAt, Instant validationStartAt, Instant endAt, int candlesLimit) {}
+
+    @Override
+    public AiStrategyOrchestrator.PreparationResult prepareStart(long chatId,
+                                                                 StrategyType type,
+                                                                 String symbol,
+                                                                 String timeframe,
+                                                                 String exchange,
+                                                                 NetworkType network) {
+        if (type != StrategyType.WINDOW_SCALPING) {
+            return AiStrategyOrchestrator.PreparationResult.ok("unsupported_strategy_type");
+        }
+        if (!prepareOnStartEnabled) {
+            return AiStrategyOrchestrator.PreparationResult.ok("prepare_disabled");
+        }
+
+        StrategySettings ss = loadStrategySettingsAuto(chatId, exchange, network);
+        if (ss == null) {
+            return AiStrategyOrchestrator.PreparationResult.fail("settings_missing");
+        }
+
+        AdvancedControlMode mode = modeOrManual(ss);
+        if (mode == AdvancedControlMode.MANUAL) {
+            switchRunPhaseSafely(ss, derivedLivePhase(network != null ? network : ss.getNetworkType()));
+            return AiStrategyOrchestrator.PreparationResult.ok("manual_mode_skip_prepare");
+        }
+
+        String ex = firstNonBlankExchange(exchange, ss.getExchangeName(), defaultExchange);
+        NetworkType net = firstNonNullNetwork(network, ss.getNetworkType(), parseNetworkOrNull(defaultNetwork));
+        String sym = firstNonBlankSymbol(symbol, ss.getSymbol(), defaultSymbol);
+        String tf = firstNonBlankTimeframe(timeframe, ss.getTimeframe(), defaultTimeframe);
+
+        if (sym == null || tf == null || ex == null || net == null) {
+            return AiStrategyOrchestrator.PreparationResult.fail("prepare_context_incomplete");
+        }
+
+        syncStrategyContextIfNeeded(ss, ex, net, sym, tf);
+
+        WindowScalpingStrategySettings cfg = sanitizeRuntimeConfig(windowSettingsService.getOrCreate(chatId, ex, net, sym, tf));
+        if (cfg == null) {
+            return AiStrategyOrchestrator.PreparationResult.fail("settings_missing");
+        }
+
+        PrepareRange range = buildPrepareRange(tf, ss.getCachedCandlesLimit());
+        if (range == null) {
+            return strictPrepareFailure(mode, "prepare_range_invalid");
+        }
+        if (range.candlesLimit() < Math.max(50, prepareMinCandles)) {
+            return strictPrepareFailure(mode, "prepare_not_enough_candles:" + range.candlesLimit());
+        }
+
+        String originalPhase = safeNullable(ss.getRunPhase());
+        switchRunPhaseSafely(ss, "PREPARE");
+
+        MlTrainingResult trainRes = null;
+        TuningResult tuneRes = null;
+        try {
+            trainRes = trainPrepareOnSelectedCandles(
+                    chatId,
+                    ex,
+                    net,
+                    sym,
+                    tf,
+                    range.candlesLimit()
+            );
+
+            AutoTunerOrchestrator tuner = autoTuner();
+            if (tuner != null) {
+                TuningRequest req = TuningRequest.builder()
+                        .chatId(chatId)
+                        .strategyType(StrategyType.WINDOW_SCALPING)
+                        .exchange(ex)
+                        .network(net)
+                        .symbol(sym)
+                        .timeframe(tf)
+                        .candlesLimit(range.candlesLimit())
+                        .startAt(range.validationStartAt())
+                        .endAt(range.endAt())
+                        .reason("prepare_start_validate")
+                        .build();
+                tuneRes = tuner.tune(req);
+            }
+
+            if (isFatalTrainResult(mode, trainRes)) {
+                restorePhaseAfterPrepare(ss, originalPhase, net);
+                return AiStrategyOrchestrator.PreparationResult.fail("prepare_train_failed:" + trainingError(trainRes));
+            }
+
+            if (isFatalTuneResult(mode, tuneRes)) {
+                restorePhaseAfterPrepare(ss, originalPhase, net);
+                return AiStrategyOrchestrator.PreparationResult.fail("prepare_tune_failed:" + tuningReason(tuneRes));
+            }
+
+            if (shouldApplyLiveSafeFallbackAfterPrepare(tuneRes)) {
+                try {
+                    WindowScalpingStrategySettings safeCfg = applyLiveSafeFallbackForContext(chatId, ex, net, sym, tf);
+                    if (safeCfg != null) {
+                        cfg = safeCfg;
+                    }
+                } catch (Exception e) {
+                    log.warn("[WINDOW] ⚠ PREPARE fallback apply failed chatId={} ex={} net={} sym={} tf={} err={}",
+                            chatId, ex, net, sym, tf, e.toString());
+                }
+            } else if (shouldApplyTradeRecoveryFallbackAfterPrepare(tuneRes)) {
+                try {
+                    WindowScalpingStrategySettings relaxedCfg = applyTradeRecoveryFallbackForContext(chatId, ex, net, sym, tf);
+                    if (relaxedCfg != null) {
+                        cfg = relaxedCfg;
+                    }
+                } catch (Exception e) {
+                    log.warn("[WINDOW] ⚠ PREPARE trade-recovery fallback failed chatId={} ex={} net={} sym={} tf={} err={}",
+                            chatId, ex, net, sym, tf, e.toString());
+                }
+            }
+
+            StrategySettings refreshed = loadStrategySettingsAuto(chatId, ex, net);
+            if (refreshed != null) {
+                ss = refreshed;
+                syncStrategyContextIfNeeded(ss, ex, net, sym, tf);
+            }
+            switchRunPhaseSafely(ss, derivedLivePhase(net));
+
+            return AiStrategyOrchestrator.PreparationResult.ok(
+                    "prepare_ok train=" + trainingStatus(trainRes) + " tune=" + tuningStatus(tuneRes)
+            );
+        } catch (Exception e) {
+            restorePhaseAfterPrepare(ss, originalPhase, net);
+            log.error("[WINDOW] ❌ PREPARE failed chatId={} ex={} net={} sym={} tf={}", chatId, ex, net, sym, tf, e);
+            return AiStrategyOrchestrator.PreparationResult.fail("prepare_exception:" + e.getClass().getSimpleName());
+        }
+    }
+
+    private AiStrategyOrchestrator.PreparationResult strictPrepareFailure(AdvancedControlMode mode, String message) {
+        if (mode == AdvancedControlMode.AI && prepareStrictAiMode) {
+            return AiStrategyOrchestrator.PreparationResult.fail(message);
+        }
+        return AiStrategyOrchestrator.PreparationResult.ok(message);
+    }
+
+    private PrepareRange buildPrepareRange(String timeframe, Integer candlesLimitRaw) {
+        long tfMs = timeframeToMillis(timeframe);
+        if (tfMs <= 0L) return null;
+
+        int candlesLimit = (candlesLimitRaw != null && candlesLimitRaw > 0) ? candlesLimitRaw : 0;
+        if (candlesLimit <= 0) return null;
+
+        Instant endAt = Instant.now();
+        long totalMs = tfMs * (long) candlesLimit;
+        if (totalMs <= 0L) return null;
+
+        Instant startAt = endAt.minusMillis(totalMs);
+
+        int validationPct = prepareValidationSplitPct;
+        if (validationPct < 10) validationPct = 10;
+        if (validationPct > 50) validationPct = 50;
+
+        long validationOffsetMs = Math.round(totalMs * ((100.0d - validationPct) / 100.0d));
+        if (validationOffsetMs <= 0L || validationOffsetMs >= totalMs) {
+            validationOffsetMs = Math.max(tfMs, totalMs / 2L);
+        }
+
+        Instant validationStartAt = startAt.plusMillis(validationOffsetMs);
+        if (!validationStartAt.isBefore(endAt)) {
+            validationStartAt = endAt.minusMillis(Math.max(tfMs, totalMs / 3L));
+        }
+
+        return new PrepareRange(startAt, validationStartAt, endAt, candlesLimit);
+    }
+
+    private boolean isFatalTrainResult(AdvancedControlMode mode, MlTrainingResult res) {
+        if (mode != AdvancedControlMode.AI || !prepareStrictAiMode) {
+            return false;
+        }
+        if (res == null) return true;
+        if (!res.ok()) return true;
+        return !res.applied();
+    }
+
+    private boolean isFatalTuneResult(AdvancedControlMode mode, TuningResult res) {
+        if (mode != AdvancedControlMode.AI || !prepareStrictAiMode) {
+            return false;
+        }
+        if (res == null) {
+            return false;
+        }
+        String reason = tuningReason(res);
+        if (reason == null) return false;
+        String normalized = reason.trim().toLowerCase(Locale.ROOT);
+        if (normalized.isEmpty()) return false;
+
+        // Для live-start у WINDOW_SCALPING нехватка сделок и отсутствие улучшения
+        // не должны ронять prepare целиком: ниже уже есть live-safe fallback.
+        return normalized.contains("error")
+                || normalized.contains("failed")
+                || normalized.contains("backtest")
+                || normalized.contains("env_missing")
+                || normalized.contains("no_settings");
+    }
+
+    private String trainingError(MlTrainingResult res) {
+        if (res == null) return "train_result_null";
+        return safeNullable(res.error());
+    }
+
+    private String trainingStatus(MlTrainingResult res) {
+        if (res == null) return "null";
+        return "ok=" + res.ok() + ",applied=" + res.applied() + ",error=" + safeNullable(res.error());
+    }
+
+    private String tuningStatus(TuningResult res) {
+        if (res == null) return "null";
+        return "applied=" + res.applied() + ",reason=" + tuningReason(res);
+    }
+
+    private String tuningReason(TuningResult res) {
+        if (res == null) return "null";
+        return safeNullable(res.reason());
+    }
+
+    private boolean shouldApplyLiveSafeFallbackAfterPrepare(TuningResult res) {
+        if (res == null || res.applied()) return false;
+        String reason = safeNullable(res.reason());
+        if (reason == null) return false;
+        String normalized = reason.trim().toLowerCase(Locale.ROOT);
+
+        // Для prepare-start fallback нужен не только при полном no_trades,
+        // но и при too_few_trades: стратегия уже почти не торгует,
+        // а боевой старт иначе уходит в пустой runtime без сделок.
+        if (normalized.contains("no_trades")) {
+            return true;
+        }
+
+        if (normalized.contains("too_few_trades")) {
+            return true;
+        }
+
+        // На обычное no_improvement fallback не накатываем,
+        // чтобы не перетирать уже рабочий пользовательский конфиг.
+        return false;
+    }
+
+    private boolean shouldApplyTradeRecoveryFallbackAfterPrepare(TuningResult res) {
+        if (res == null || res.applied()) return false;
+        String reason = safeNullable(res.reason());
+        if (reason == null) return false;
+        String normalized = reason.trim().toLowerCase(Locale.ROOT);
+
+        // ВАЖНО:
+        // если тюнер вернул no_trades / too_few_trades / no_improvement,
+        // он уже мог сам сделать coarse-adjust и сохранить ослабленные фильтры.
+        // Поверх этого нельзя накатывать strategy-level fallback,
+        // иначе мы сразу затираем результат тюнера и снова ломаем старт.
+        if (normalized.contains("too_few_trades")
+                || normalized.contains("no_trades")
+                || normalized.contains("no_improvement")) {
+            return false;
+        }
+
+        return normalized.contains("negative_score_");
+    }
+
+    private WindowScalpingStrategySettings applyTradeRecoveryFallbackForContext(Long chatId,
+                                                                                String exchange,
+                                                                                NetworkType network,
+                                                                                String symbol,
+                                                                                String timeframe) {
+        if (chatId == null || chatId <= 0 || exchange == null || network == null || symbol == null || timeframe == null) {
+            return null;
+        }
+
+        WindowScalpingStrategySettings current = sanitizeRuntimeConfig(windowSettingsService.getOrCreate(chatId, exchange, network, symbol, timeframe));
+        if (current == null) {
+            return null;
+        }
+
+        int relaxedWindow = current.getWindowSize() != null ? current.getWindowSize() : 5;
+        if (relaxedWindow < 5) relaxedWindow = 5;
+        if (relaxedWindow > 8) relaxedWindow = 8;
+
+        double currentMinRange = current.getMinRangePct() != null ? current.getMinRangePct() : 0.018;
+        if (!Double.isFinite(currentMinRange) || currentMinRange <= 0.0) currentMinRange = 0.018;
+        double relaxedMinRange = clampPct(Math.min(currentMinRange * 0.65d, 0.028d), 0.0035d, 0.028d);
+
+        double currentEntryLow = current.getEntryFromLowPct() != null ? current.getEntryFromLowPct() : 42.0;
+        if (!Double.isFinite(currentEntryLow) || currentEntryLow <= 0.0) currentEntryLow = 42.0;
+        double relaxedEntryLow = clampPct(Math.max(currentEntryLow, 48.0d), 32.0d, 62.0d);
+
+        double currentEntryHigh = current.getEntryFromHighPct() != null ? current.getEntryFromHighPct() : 16.0;
+        if (!Double.isFinite(currentEntryHigh) || currentEntryHigh <= 0.0) currentEntryHigh = 16.0;
+        double relaxedEntryHigh = clampPct(Math.max(currentEntryHigh, 18.0d), 8.0d, 26.0d);
+
+        double currentMaxSpread = current.getMaxSpreadPct() != null ? current.getMaxSpreadPct() : 0.35;
+        if (!Double.isFinite(currentMaxSpread) || currentMaxSpread <= 0.0) currentMaxSpread = 0.35;
+        double relaxedMaxSpread = clampPct(Math.max(currentMaxSpread, 0.08d), 0.03d, 0.80d);
+
+        current.setWindowSize(relaxedWindow);
+        current.setMinRangePct(relaxedMinRange);
+        current.setEntryFromLowPct(relaxedEntryLow);
+        current.setEntryFromHighPct(relaxedEntryHigh);
+        current.setMaxSpreadPct(relaxedMaxSpread);
+
+        WindowScalpingStrategySettings patch = WindowScalpingStrategySettings.builder()
+                .chatId(chatId)
+                .exchangeName(exchange)
+                .networkType(network)
+                .symbol(symbol)
+                .timeframe(timeframe)
+                .windowSize(relaxedWindow)
+                .minRangePct(relaxedMinRange)
+                .entryFromLowPct(relaxedEntryLow)
+                .entryFromHighPct(relaxedEntryHigh)
+                .maxSpreadPct(relaxedMaxSpread)
+                .build();
+
+        WindowScalpingStrategySettings updated = windowSettingsService.update(
+                chatId,
+                exchange,
+                network,
+                symbol,
+                timeframe,
+                patch
+        );
+        if (updated == null) {
+            try {
+                updated = windowSettingsService.update(chatId, current);
+            } catch (Exception ignored) {
+                updated = null;
+            }
+        }
+
+        WindowScalpingStrategySettings effective = updated != null
+                ? sanitizeRuntimeConfig(updated)
+                : sanitizeRuntimeConfig(windowSettingsService.getOrCreate(chatId, exchange, network, symbol, timeframe));
+
+        if (effective != null) {
+            log.warn("[WINDOW] 🛠 PREPARE trade-recovery fallback applied chatId={} ex={} net={} sym={} tf={} window={} minRange={} entryLow={} entryHigh={} spread={}",
+                    chatId,
+                    exchange,
+                    network,
+                    symbol,
+                    timeframe,
+                    effective.getWindowSize(),
+                    fmt(effective.getMinRangePct() != null ? effective.getMinRangePct() : 0.0),
+                    fmt(effective.getEntryFromLowPct() != null ? effective.getEntryFromLowPct() : 0.0),
+                    fmt(effective.getEntryFromHighPct() != null ? effective.getEntryFromHighPct() : 0.0),
+                    fmt(effective.getMaxSpreadPct() != null ? effective.getMaxSpreadPct() : 0.0)
+            );
+        }
+
+        return effective;
+    }
+
+    private WindowScalpingStrategySettings applyLiveSafeFallbackForContext(Long chatId,
+                                                                           String exchange,
+                                                                           NetworkType network,
+                                                                           String symbol,
+                                                                           String timeframe) {
+        if (chatId == null || chatId <= 0 || exchange == null || network == null || symbol == null || timeframe == null) {
+            return null;
+        }
+
+        WindowScalpingStrategySettings current = sanitizeRuntimeConfig(windowSettingsService.getOrCreate(chatId, exchange, network, symbol, timeframe));
+        if (current == null) {
+            return null;
+        }
+
+        int safeWindow = current.getWindowSize() != null ? current.getWindowSize() : 5;
+        if (safeWindow < 5) safeWindow = 5;
+        if (safeWindow > 10) safeWindow = 10;
+
+        double safeMinRange = current.getMinRangePct() != null ? current.getMinRangePct() : 0.008;
+        if (!Double.isFinite(safeMinRange) || safeMinRange <= 0.0) safeMinRange = 0.008;
+        safeMinRange = clampPct(safeMinRange, 0.003, 0.030);
+
+        double safeEntryLow = current.getEntryFromLowPct() != null ? current.getEntryFromLowPct() : 42.0;
+        if (!Double.isFinite(safeEntryLow) || safeEntryLow <= 0.0) safeEntryLow = 42.0;
+        safeEntryLow = clampPct(safeEntryLow, 28.0, 48.0);
+
+        double safeEntryHigh = current.getEntryFromHighPct() != null ? current.getEntryFromHighPct() : 16.0;
+        if (!Double.isFinite(safeEntryHigh) || safeEntryHigh <= 0.0) safeEntryHigh = 16.0;
+        safeEntryHigh = clampPct(safeEntryHigh, 8.0, 18.0);
+
+        double safeMaxSpread = current.getMaxSpreadPct() != null ? current.getMaxSpreadPct() : 0.35;
+        if (!Double.isFinite(safeMaxSpread) || safeMaxSpread <= 0.0) safeMaxSpread = 0.35;
+        safeMaxSpread = clampPct(safeMaxSpread, 0.03, 0.60);
+
+        current.setWindowSize(safeWindow);
+        current.setMinRangePct(safeMinRange);
+        current.setEntryFromLowPct(safeEntryLow);
+        current.setEntryFromHighPct(safeEntryHigh);
+        current.setMaxSpreadPct(safeMaxSpread);
+        current.setTakeProfitPct(pctBd(0.12));
+        current.setStopLossPct(pctBd(0.06));
+        current.setAutoTpSlEnabled(Boolean.TRUE);
+        current.setAutoTpFromRangeFactor(pctBd(0.92));
+        current.setAutoSlFromRangeFactor(pctBd(0.42));
+        current.setAutoMinRiskReward(pctBd(0.20));
+        current.setAutoTpMinPct(pctBd(0.04));
+        current.setAutoTpMaxPct(pctBd(0.25));
+        current.setAutoSlMinPct(pctBd(0.02));
+        current.setAutoSlMaxPct(pctBd(0.12));
+        current.setAutoTpMlBoostFactor(pctBd(1.04));
+        current.setAutoTpWeakSignalFactor(pctBd(0.96));
+
+        WindowScalpingStrategySettings patch = WindowScalpingStrategySettings.builder()
+                .chatId(chatId)
+                .exchangeName(exchange)
+                .networkType(network)
+                .symbol(symbol)
+                .timeframe(timeframe)
+                .windowSize(safeWindow)
+                .minRangePct(safeMinRange)
+                .entryFromLowPct(safeEntryLow)
+                .entryFromHighPct(safeEntryHigh)
+                .maxSpreadPct(safeMaxSpread)
+                .takeProfitPct(pctBd(0.12))
+                .stopLossPct(pctBd(0.06))
+                .autoTpSlEnabled(Boolean.TRUE)
+                .autoTpFromRangeFactor(pctBd(0.92))
+                .autoSlFromRangeFactor(pctBd(0.42))
+                .autoMinRiskReward(pctBd(0.20))
+                .autoTpMinPct(pctBd(0.04))
+                .autoTpMaxPct(pctBd(0.25))
+                .autoSlMinPct(pctBd(0.02))
+                .autoSlMaxPct(pctBd(0.12))
+                .autoTpMlBoostFactor(pctBd(1.04))
+                .autoTpWeakSignalFactor(pctBd(0.96))
+                .build();
+
+        WindowScalpingStrategySettings updated = windowSettingsService.update(
+                chatId,
+                exchange,
+                network,
+                symbol,
+                timeframe,
+                patch
+        );
+        if (updated == null) {
+            try {
+                updated = windowSettingsService.update(chatId, current);
+            } catch (Exception ignored) {
+                updated = null;
+            }
+        }
+
+        WindowScalpingStrategySettings effective = updated != null
+                ? sanitizeRuntimeConfig(updated)
+                : sanitizeRuntimeConfig(windowSettingsService.getOrCreate(chatId, exchange, network, symbol, timeframe));
+
+        if (effective != null) {
+            log.warn("[WINDOW] 🛟 PREPARE LIVE-SAFE fallback applied chatId={} ex={} net={} sym={} tf={} window={} minRange={} tp={} sl={} entryLow={} entryHigh={} spread={}",
+                    chatId,
+                    exchange,
+                    network,
+                    symbol,
+                    timeframe,
+                    effective.getWindowSize(),
+                    fmt(effective.getMinRangePct() != null ? effective.getMinRangePct() : 0.0),
+                    fmtBd(effective.getTakeProfitPct()),
+                    fmtBd(effective.getStopLossPct()),
+                    fmt(effective.getEntryFromLowPct() != null ? effective.getEntryFromLowPct() : 0.0),
+                    fmt(effective.getEntryFromHighPct() != null ? effective.getEntryFromHighPct() : 0.0),
+                    fmt(effective.getMaxSpreadPct() != null ? effective.getMaxSpreadPct() : 0.0)
+            );
+        }
+
+        return effective;
+    }
+
+    private void restorePhaseAfterPrepare(StrategySettings ss, String originalPhase, NetworkType net) {
+        if (ss == null) return;
+        String phase = (originalPhase != null && !"null".equalsIgnoreCase(originalPhase))
+                ? originalPhase
+                : derivedLivePhase(net);
+        switchRunPhaseSafely(ss, phase);
+    }
+
+    private String derivedLivePhase(NetworkType network) {
+        return network == NetworkType.TESTNET ? "PAPER" : "LIVE";
+    }
+
+    private void syncStrategyContextIfNeeded(StrategySettings ss,
+                                             String exchange,
+                                             NetworkType network,
+                                             String symbol,
+                                             String timeframe) {
+        if (ss == null) return;
+
+        boolean changed = false;
+        String ex = normalizeExchangeOrNull(exchange);
+        String sym = normalizeSymbolOrNull(symbol);
+        String tf = normalizeTimeframeOrNull(timeframe);
+
+        if (ex != null && !Objects.equals(normalizeExchangeOrNull(ss.getExchangeName()), ex)) {
+            ss.setExchangeName(ex);
+            changed = true;
+        }
+        if (network != null && ss.getNetworkType() != network) {
+            ss.setNetworkType(network);
+            changed = true;
+        }
+        if (sym != null && !Objects.equals(normalizeSymbolOrNull(ss.getSymbol()), sym)) {
+            ss.setSymbol(sym);
+            changed = true;
+        }
+        if (tf != null && !Objects.equals(normalizeTimeframeOrNull(ss.getTimeframe()), tf)) {
+            ss.setTimeframe(tf);
+            changed = true;
+        }
+
+        if (changed) {
+            strategySettingsService.save(ss);
+        }
+    }
+
+    private void switchRunPhaseSafely(StrategySettings ss, String phase) {
+        if (ss == null) return;
+        String normalized = (phase == null || phase.isBlank()) ? null : phase.trim().toUpperCase(Locale.ROOT);
+        String current = (ss.getRunPhase() == null || ss.getRunPhase().isBlank())
+                ? null
+                : ss.getRunPhase().trim().toUpperCase(Locale.ROOT);
+        if (Objects.equals(current, normalized)) {
+            return;
+        }
+        ss.setRunPhase(normalized);
+        strategySettingsService.save(ss);
     }
 
     // =====================================================
@@ -94,58 +1141,172 @@ public class WindowScalpingStrategyV4 implements TradingStrategy {
 
     @Override
     public void start(Long chatId, String symbolHint, String exchange, NetworkType network) {
-
         String hintEx = normalizeExchangeOrNull(exchange);
 
-        // ✅ строго по env
-        StrategySettings ss = loadStrategySettingsStrict(chatId, hintEx, network);
-
-        WindowScalpingStrategySettings cfg = windowSettingsService.getOrCreate(chatId);
+        StrategySettings ss = loadStrategySettingsAuto(chatId, hintEx, network);
 
         LocalState st = new LocalState();
         st.active = true;
         st.startedAt = Instant.now();
 
         st.ss = ss;
-        st.cfg = cfg;
 
-        st.exchange = ss.getExchangeName();
-        st.network  = ss.getNetworkType();
-
-        // symbol берём из ss, hint — запасной
-        String sym = normalizeSymbolOrNull(ss.getSymbol());
-        if (sym == null) sym = normalizeSymbolOrNull(symbolHint);
-        st.symbol = sym;
-
-        st.lastSettingsLoadAt = Instant.now();
-        st.lastFingerprint = buildFingerprint(ss, cfg);
-
-        states.put(chatId, st);
-
-        log.info("[WINDOW] 🎯 selected StrategySettings id={} active={} ex={} net={} symbol={} updatedAt={}",
-                ss.getId(),
-                ss.isActive(),
-                ss.getExchangeName(),
-                ss.getNetworkType(),
-                ss.getSymbol(),
-                ss.getUpdatedAt()
+        st.exchange = firstNonBlankExchange(
+                hintEx,
+                ss != null ? ss.getExchangeName() : null,
+                defaultExchange
+        );
+        st.network = firstNonNullNetwork(
+                network,
+                ss != null ? ss.getNetworkType() : null,
+                parseNetworkOrNull(defaultNetwork)
         );
 
-        log.info("[WINDOW] ▶ START chatId={} ex={} net={} symbol={} windowSize={} entryLowPct={} minRangePct={} tpPct={} slPct={}",
+        String sym = firstNonBlankSymbol(
+                symbolHint,
+                ss != null ? ss.getSymbol() : null,
+                defaultSymbol
+        );
+        st.symbol = sym;
+
+        st.timeframe = firstNonBlankTimeframe(
+                ss != null ? ss.getTimeframe() : null,
+                defaultTimeframe
+        );
+
+        st.cfg = sanitizeRuntimeConfig(windowSettingsService.getOrCreate(
                 chatId,
                 st.exchange,
                 st.network,
                 st.symbol,
-                cfg != null ? cfg.getWindowSize() : null,
-                cfg != null ? cfg.getEntryFromLowPct() : null,
-                cfg != null ? cfg.getMinRangePct() : null,
-                cfg != null ? cfg.getTakeProfitPct() : null,
-                cfg != null ? cfg.getStopLossPct() : null
+                st.timeframe
+        ));
+
+        st.lastSettingsLoadAt = Instant.now();
+        st.lastFingerprint = buildFingerprint(ss, st.cfg);
+
+        st.window.clear();
+        st.tickWindow.clear();
+        st.lastTickAt = null;
+
+        st.inPosition = false;
+        st.isLong = true;
+
+        st.entryPrice = null;
+        st.tp = null;
+        st.sl = null;
+        st.entryQty = null;
+        st.entryOrderId = null;
+
+        st.lastTradeClosedAt = null;
+        st.reentryBlockedUntil = null;
+        st.reentryBlockReason = null;
+        st.lastEntryAt = null;
+        st.entryCandleOpenTimeMs = null;
+        st.entryCandleTimeframe = null;
+        st.lastRestoreProbeAt = null;
+        st.lastRestoreMissAt = null;
+        st.lastDustRestoreLogAt = null;
+        st.lastDustRestoreLogKey = null;
+        st.lastPositionSyncAt = null;
+
+        st.lastHoldReason = null;
+        st.lastHoldAt = null;
+
+        st.lastDiagAt = null;
+        st.lastAutoTuneRequestAt = null;
+
+        st.consecutiveRangeTooSmall = 0;
+        st.lastCoarseAdjustAt = null;
+
+        st.lastMlConfidenceSaveAt = null;
+        st.lastMlConfidenceSaved = null;
+
+        int cap = Math.max(50, autoMinRangeSampleSize);
+        st.rangePctSamples = new double[cap];
+        st.rangePctPtr = 0;
+        st.rangePctCount = 0;
+        st.lastAutoMinRangeAt = Instant.EPOCH;
+        st.lastAutoMinRangeApplied = null;
+
+        st.lastWindowHigh = null;
+        st.lastWindowLow = null;
+        st.lastBuyZoneTop = null;
+        st.lastZonePublishedAt = null;
+
+        resetMlCache(st);
+        clearPendingMlSample(st);
+        clearMlBelowThreshold(st);
+        resetAdaptiveMlGateState(st);
+        st.lastMlWarnAt = null;
+        st.lastMlWarnReason = null;
+        st.lastEntryBlockedAt = null;
+        st.lastEntryBlockedReason = null;
+
+        states.put(chatId, st);
+
+        ensureRuntimeContext(st, ss);
+
+        AdvancedControlMode mode = modeOrManual(ss);
+        boolean effectiveAutoTuneForLog = ss != null
+                && mode != AdvancedControlMode.MANUAL
+                && (ss.isAutoTuneEnabled() || mode == AdvancedControlMode.HYBRID);
+        boolean effectiveMlGateForLog = ss != null
+                && mode != AdvancedControlMode.MANUAL
+                && (ss.isMlGateEnabled() || mode == AdvancedControlMode.HYBRID);
+        BigDecimal thrBd = (ss != null ? ss.getGateMinProb() : null);
+        double effectiveGateThreshold = resolveEffectiveMlThreshold(ss, st, adaptiveMlGateMinStrongScore + 100.0d);
+
+        log.info("[WINDOW] ▶ Старт chatId={} ex={} net={} symbol={} tf={} mode={} autoTune={} mlGate={} gateMinProbRaw={} gateEffective={} modelVer={} window={} minRange%={} TP%={} SL%={} mlEnabled={} failOpen={} mlMinFallback={} coarseAdjust={} autoMinRange={}",
+                chatId,
+                fmtEnumOrString(ss != null ? ss.getExchangeName() : st.exchange),
+                fmtEnumOrString(ss != null ? ss.getNetworkType() : st.network),
+                st.symbol,
+                st.timeframe,
+                mode,
+                effectiveAutoTuneForLog,
+                effectiveMlGateForLog,
+                (thrBd != null ? thrBd.stripTrailingZeros().toPlainString() : "null"),
+                fmt(effectiveGateThreshold),
+                (ss != null ? safeNullable(ss.getMlModelVersion()) : "null"),
+                st.cfg != null ? st.cfg.getWindowSize() : null,
+                (effectiveMinRangePct(st, st.cfg) > 0.0 ? fmt(effectiveMinRangePct(st, st.cfg)) : "null"),
+                st.cfg != null ? st.cfg.getTakeProfitPct() : null,
+                st.cfg != null ? st.cfg.getStopLossPct() : null,
+                mlEnabled,
+                mlFailOpen,
+                fmt(mlMinProba),
+                coarseAdjustEnabled,
+                autoMinRangeEnabled
         );
 
+        if (adaptiveMlGateEnabled && effectiveMlGateForLog) {
+            log.info("[WINDOW] 🤖 Adaptive ML gate enabled chatId={} sym={} baseThreshold={} floor={} quantile={} margin={} strongScore>= {}",
+                    chatId,
+                    st.symbol,
+                    (thrBd != null ? thrBd.stripTrailingZeros().toPlainString() : fmt(mlMinProba)),
+                    fmt(adaptiveMlGateFloor),
+                    fmt(adaptiveMlGateQuantile),
+                    fmt(adaptiveMlGateMarginPct),
+                    fmt(adaptiveMlGateMinStrongScore));
+        }
+
         if (st.symbol != null) {
-            safeLive(() -> live.pushState(chatId, StrategyType.WINDOW_SCALPING, st.symbol, true));
-            safeLive(() -> live.pushSignal(chatId, StrategyType.WINDOW_SCALPING, st.symbol, null, Signal.hold("started")));
+            final String symFinal = st.symbol;
+            safeLive(() -> live.pushState(chatId, StrategyType.WINDOW_SCALPING, symFinal, true));
+            safeLive(() -> live.pushSignal(chatId, StrategyType.WINDOW_SCALPING, symFinal, null,
+                    Signal.hold("Стратегия запущена")));
+        }
+
+        if (st.symbol != null) {
+            synchronized (st) {
+                Instant now = Instant.now();
+                maybeRestorePositionFromStore(chatId, st, st.symbol, now);
+                if (st.inPosition && st.exchange != null && st.network != null && shouldSyncRuntimePosition(st, now)) {
+                    syncRuntimePositionWithExchangeBalance(chatId, st, st.exchange, st.network, st.symbol, now);
+                    st.lastPositionSyncAt = now;
+                }
+            }
         }
     }
 
@@ -156,20 +1317,27 @@ public class WindowScalpingStrategyV4 implements TradingStrategy {
 
     @Override
     public void stop(Long chatId, String ignored, String exchange, NetworkType network) {
-
         LocalState st = states.remove(chatId);
         if (st == null) return;
+
+        ensureRuntimeContext(st, st.ss);
+        st.lastEntryAt = null;
+        st.entryCandleOpenTimeMs = null;
+        st.entryCandleTimeframe = null;
+        clearPendingMlSample(st);
 
         final String sym = st.symbol;
 
         if (sym != null) {
             safeLive(() -> live.clearTpSl(chatId, StrategyType.WINDOW_SCALPING, sym));
             safeLive(() -> live.clearPriceLines(chatId, StrategyType.WINDOW_SCALPING, sym));
+            safeLive(() -> live.clearTradeZone(chatId, StrategyType.WINDOW_SCALPING, sym));
+            safeLive(() -> live.clearWindowZone(chatId, StrategyType.WINDOW_SCALPING, sym));
             safeLive(() -> live.pushState(chatId, StrategyType.WINDOW_SCALPING, sym, false));
         }
 
-        log.info("[WINDOW] ⏹ STOP chatId={} ex={} net={} symbol={} ticks={} warmups={} entries={} exits={} inPos={}",
-                chatId, st.exchange, st.network, sym, st.ticks, st.warmups, st.entries, st.exits, st.inPosition);
+        log.info("[WINDOW] ⏹ Стоп chatId={} ex={} net={} symbol={} tf={} ticks={} warmups={} entries={} exits={} inPos={}",
+                chatId, st.exchange, st.network, sym, st.timeframe, st.ticks, st.warmups, st.entries, st.exits, st.inPosition);
     }
 
     @Override
@@ -185,31 +1353,57 @@ public class WindowScalpingStrategyV4 implements TradingStrategy {
     }
 
     // =====================================================
-    // PRICE UPDATE
+    // ORCHESTRATOR HOOKS
     // =====================================================
 
     @Override
-    public void onPriceUpdate(Long chatId, String symbolFromTick, BigDecimal price, Instant ts) {
+    public void onPriceUpdate(long chatId,
+                              StrategyType type,
+                              String symbol,
+                              String timeframe,
+                              BigDecimal price,
+                              long tradeTsMs,
+                              String exchange,
+                              NetworkType network) {
+
+        if (type != StrategyType.WINDOW_SCALPING) return;
 
         LocalState st = states.get(chatId);
         if (st == null || !st.active) return;
 
         st.ticks++;
 
+        long logEvery = Math.max(1, tickLogEveryTicks);
+        long holdMs = Math.max(200, holdThrottleMs);
+
         if (price == null || price.signum() <= 0) {
-            if (st.ticks % tickLogEveryTicks == 0) {
-                log.warn("[WINDOW] ⚠ invalid price chatId={} price={}", chatId, price);
+            if (st.ticks % logEvery == 0) {
+                log.warn("[WINDOW] ⚠ Некорректная цена chatId={} price={}", chatId, price);
             }
             return;
         }
 
-        Instant time = ts != null ? ts : Instant.now();
+        Instant time = (tradeTsMs > 0) ? Instant.ofEpochMilli(tradeTsMs) : Instant.now();
 
-        String tickSymbol = normalizeSymbolOrNull(symbolFromTick);
-        String cfgSymbol  = normalizeSymbolOrNull(st.symbol);
+        String ex = normalizeExchangeOrNull(exchange);
+        if (ex != null) st.exchange = ex;
+        if (network != null) st.network = network;
 
-        if (cfgSymbol != null && tickSymbol != null && !cfgSymbol.equals(tickSymbol)) return;
-        if (cfgSymbol == null && tickSymbol != null) st.symbol = tickSymbol;
+        String tf = normalizeTimeframeOrNull(timeframe);
+        if (tf != null) st.timeframe = tf;
+
+        String incoming = normalizeSymbolOrNull(symbol);
+        String current = normalizeSymbolOrNull(st.symbol);
+
+        if (current == null && incoming != null) {
+            st.symbol = incoming;
+        } else if (current != null && incoming != null && !current.equals(incoming)) {
+            if (st.ticks % logEvery == 0) {
+                log.warn("[WINDOW] ⚠ Пропуск price event из-за несовпадения символа chatId={} currentSym={} incomingSym={} ex={} net={}",
+                        chatId, current, incoming, ex, network);
+            }
+            return;
+        }
 
         final String symLive = normalizeSymbolOrNull(st.symbol);
         if (symLive != null) {
@@ -217,7 +1411,6 @@ public class WindowScalpingStrategyV4 implements TradingStrategy {
         }
 
         synchronized (st) {
-
             refreshSettingsIfNeeded(chatId, st, time);
 
             StrategySettings ss = st.ss;
@@ -225,198 +1418,171 @@ public class WindowScalpingStrategyV4 implements TradingStrategy {
             String sym = normalizeSymbolOrNull(st.symbol);
 
             if (sym == null || cfg == null || ss == null) {
-                pushHoldThrottled(chatId, sym, st, "no_settings", time);
+                pushHoldThrottled(chatId, sym, st, "no_settings", time, holdMs);
                 return;
             }
 
-            Integer windowSizeObj = cfg.getWindowSize();
-            int windowSize = windowSizeObj != null ? windowSizeObj : 0;
-            if (windowSize < 5) {
-                pushHoldThrottled(chatId, sym, st, "windowSize<5", time);
-                return;
-            }
+            ensureRuntimeContext(st, ss);
 
-            st.window.addLast(price);
-            while (st.window.size() > windowSize) st.window.removeFirst();
+            maybeRestorePositionFromStore(chatId, st, sym, time);
 
-            if (st.window.size() < windowSize) {
-                st.warmups++;
-                pushHoldThrottled(chatId, sym, st, "warming_up", time);
-                return;
-            }
-
-            BigDecimal high = null;
-            BigDecimal low = null;
-            for (BigDecimal p : st.window) {
-                if (p == null) continue;
-                high = (high == null) ? p : high.max(p);
-                low  = (low == null) ? p : low.min(p);
-            }
-
-            if (high == null || low == null || low.signum() <= 0) {
-                pushHoldThrottled(chatId, sym, st, "window_invalid", time);
-                return;
-            }
-
-            BigDecimal range = high.subtract(low);
-            if (range.signum() <= 0) {
-                pushHoldThrottled(chatId, sym, st, "range_zero", time);
-                return;
-            }
-
-            double rangePct = range
-                    .divide(low, 10, RoundingMode.HALF_UP)
-                    .multiply(BigDecimal.valueOf(100))
-                    .doubleValue();
-
-            double minRangePct = cfg.getMinRangePct() != null ? cfg.getMinRangePct() : 0.0;
-            if (rangePct < minRangePct) {
-                if (log.isDebugEnabled() && st.ticks % tickLogEveryTicks == 0) {
-                    log.debug("[WINDOW] range too small chatId={} sym={} rangePct={} minRangePct={}",
-                            chatId, sym, fmt(rangePct), fmt(minRangePct));
+            if (st.inPosition && st.exchange != null && st.network != null && shouldSyncRuntimePosition(st, time)) {
+                syncRuntimePositionWithExchangeBalance(chatId, st, st.exchange, st.network, sym, time);
+                st.lastPositionSyncAt = time;
+                if (!st.inPosition || st.entryQty == null || st.entryPrice == null) {
+                    pushHoldThrottled(chatId, sym, st, "post_restore_sync", time, holdMs);
+                    return;
                 }
-                pushHoldThrottled(chatId, sym, st, "range_too_small", time);
-                return;
             }
 
-            // pos в диапазоне [0..1]
-            double pos = price.subtract(low)
-                    .divide(range, 10, RoundingMode.HALF_UP)
-                    .doubleValue();
+            updateTickWindow(st, price, cfg);
 
-            if (Double.isNaN(pos) || Double.isInfinite(pos)) {
-                pushHoldThrottled(chatId, sym, st, "pos_invalid", time);
-                return;
-            }
+            if (st.inPosition && st.entryQty != null && st.tp != null && st.sl != null) {
 
-            double entryLowPct  = cfg.getEntryFromLowPct()  != null ? cfg.getEntryFromLowPct()  : 0.0;
-            double entryHighPct = cfg.getEntryFromHighPct() != null ? cfg.getEntryFromHighPct() : 0.0;
-
-            double lowZone  = clamp01(entryLowPct / 100.0);
-            double highZone = clamp01(1.0 - (entryHighPct / 100.0));
-
-            if (log.isDebugEnabled() && st.ticks % tickLogEveryTicks == 0) {
-                log.debug("[WINDOW] tick chatId={} sym={} price={} low={} high={} rangePct={} posPct={}",
-                        chatId,
-                        sym,
-                        price.stripTrailingZeros().toPlainString(),
-                        low.stripTrailingZeros().toPlainString(),
-                        high.stripTrailingZeros().toPlainString(),
-                        fmt(rangePct),
-                        fmt(pos * 100.0));
-            }
-
-            // =====================================================
-            // ENTRY (SPOT LONG) - вход у низа
-            // =====================================================
-            if (!st.inPosition && pos <= lowZone) {
-
-                Integer cooldown = ss.getCooldownSeconds();
-                if (cooldown != null && cooldown > 0 && st.lastTradeClosedAt != null) {
-                    long passed = Duration.between(st.lastTradeClosedAt, time).getSeconds();
-                    if (passed < cooldown) {
-                        pushHoldThrottled(chatId, sym, st, "cooldown", time);
-                        return;
-                    }
-                }
-
-                // ✅ score только для UI
-                final double score = clamp01(
-                        (lowZone <= 0.000001) ? 1.0 : (1.0 - (pos / lowZone))
-                ) * 100.0;
-
-                // ✅ diffPct (для TradeExecution) = насколько близко к low: чем ниже pos, тем выше "плюс"
-                // (внутри TradeExecution у тебя SPOT-ограничение diffPct>0)
-                BigDecimal diffPctForEntry = BigDecimal.valueOf(Math.max(0.000001, (lowZone - pos) * 100.0));
-
-                BigDecimal tpPct = cfg.getTakeProfitPct();
-                BigDecimal slPct = cfg.getStopLossPct();
-                if (tpPct == null || tpPct.signum() <= 0 || slPct == null || slPct.signum() <= 0) {
-                    pushHoldThrottled(chatId, sym, st, "tp_sl_pct_invalid", time);
+                if (isSameCandleAsEntry(st, time)) {
+                    pushHoldThrottled(chatId, sym, st, "same_candle_exit_blocked", time, holdMs);
                     return;
                 }
 
-                log.info("[WINDOW] ⚡ ENTRY try chatId={} ex={} net={} sym={} price={} posPct={} rangePct={} tpPct={} slPct={}",
-                        chatId, st.exchange, st.network, sym,
-                        price.stripTrailingZeros().toPlainString(),
-                        fmt(pos * 100.0),
-                        fmt(rangePct),
-                        tpPct.stripTrailingZeros().toPlainString(),
-                        slPct.stripTrailingZeros().toPlainString()
-                );
+                if (st.lastEntryAt != null && Duration.between(st.lastEntryAt, time).toMillis() < 500) {
+                    return;
+                }
+
+                maybeMoveStopToBreakEven(chatId, st, sym, price, time);
+
+                ensureRuntimeContext(st, ss);
+                if (st.exchange == null || st.network == null) {
+                    pushHoldThrottled(chatId, sym, st, "no_settings", time, holdMs);
+                    return;
+                }
 
                 try {
-                    var res = tradeExecutionService.executeEntry(
-                            chatId,
-                            StrategyType.WINDOW_SCALPING,
-                            sym,
-                            price,
-                            diffPctForEntry,
-                            time,
-                            ss,
-                            tpPct,
-                            slPct
-                    );
+                    var zoneExit = evaluateHighZoneExit(chatId, st, sym, price, time);
+                    TradeExecutionServiceImpl execImpl = tradeExecImpl();
 
-                    if (!res.executed()) {
-                        pushHoldThrottled(chatId, sym, st, res.reason(), time);
+                    String executedExitMode = null;
+                    var exRes = (zoneExit.shouldExit() && execImpl != null)
+                            ? execImpl.executeExitNow(
+                                    chatId,
+                                    StrategyType.WINDOW_SCALPING,
+                                    sym,
+                                    price,
+                                    time,
+                                    st.entryQty,
+                                    st.tp,
+                                    st.sl,
+                                    st.exchange,
+                                    st.network,
+                                    zoneExit.reason()
+                            )
+                            : tradeExecutionService.executeExitIfHit(
+                                    chatId,
+                                    StrategyType.WINDOW_SCALPING,
+                                    sym,
+                                    price,
+                                    time,
+                                    true,
+                                    st.entryQty,
+                                    st.tp,
+                                    st.sl,
+                                    st.exchange,
+                                    st.network
+                            );
+
+                    if (zoneExit.shouldExit() && execImpl != null) {
+                        executedExitMode = zoneExit.reason();
+                    }
+
+                    String exitReasonCode = safeNullable(exRes.reason());
+
+                    if (!exRes.executed() && (
+                            "sell_not_fully_filled".equals(exitReasonCode)
+                            || "partial_exit".equals(exitReasonCode)
+                            || "sell_not_filled".equals(exitReasonCode)
+                            || "balance".equals(exitReasonCode)
+                            || "position_sync_mismatch".equals(exitReasonCode)
+                    )) {
+                        log.warn("[WINDOW] ⚠ Выход не завершил полное закрытие chatId={} sym={} reason={} oldQty={} -> восстанавливаю позицию из PositionStore",
+                                chatId,
+                                sym,
+                                exitReasonCode,
+                                fmtBd(st.entryQty));
+
+                        clearLocalPosition(st);
+                        maybeRestorePositionFromStore(chatId, st, sym, time);
+                        resetMlCache(st);
+
+                        String holdCode = "partial_exit".equals(exitReasonCode)
+                                ? "sell_not_fully_filled"
+                                : exitReasonCode;
+                        pushHoldThrottled(chatId, sym, st, holdCode, time, holdMs);
                         return;
                     }
 
-                    st.entries++;
-                    st.inPosition = true;
-                    st.isLong = true;
+                    if (!exRes.executed() && (
+                            "dust_position".equals(exitReasonCode)
+                            || "min_notional".equals(exitReasonCode)
+                            || "lot_step".equals(exitReasonCode)
+                    )) {
+                        log.warn("[WINDOW] 🧹 Очищаю локальную позицию после невосстанавливаемого EXIT chatId={} sym={} reason={} qty={} entry={} tp={} sl={}",
+                                chatId,
+                                sym,
+                                exitReasonCode,
+                                fmtBd(st.entryQty),
+                                fmtBd(st.entryPrice),
+                                fmtBd(st.tp),
+                                fmtBd(st.sl));
 
-                    st.entryPrice = res.entryPrice();
-                    st.tp = res.tp();
-                    st.sl = res.sl();
-                    st.entryQty = res.qty();
-                    st.entryOrderId = res.orderId();
+                        clearLocalPosition(st);
+                        clearPendingMlSample(st);
+                        st.lastTradeClosedAt = time;
+                        st.reentryBlockedUntil = time.plusMillis(Math.max(1_500L, postTpCooldownMs));
+                        st.reentryBlockReason = "post_exit_cooldown";
+                        st.lastEntryAt = null;
+                        st.entryCandleOpenTimeMs = null;
+                        st.entryCandleTimeframe = null;
+                        resetMlCache(st);
 
-                    // ✅ рисуем линии TP/SL
-                    if (st.tp != null && st.sl != null) {
-                        safeLive(() -> live.pushTpSl(chatId, StrategyType.WINDOW_SCALPING, sym, st.tp, st.sl));
+                        safeLive(() -> live.clearTpSl(chatId, StrategyType.WINDOW_SCALPING, sym));
+                        safeLive(() -> live.clearPriceLines(chatId, StrategyType.WINDOW_SCALPING, sym));
+
+                        pushHoldThrottled(chatId, sym, st, "restored_dust_position", time, holdMs);
+                        return;
                     }
 
-                    safeLive(() -> live.pushSignal(chatId, StrategyType.WINDOW_SCALPING, sym, null,
-                            Signal.buy(score, "window_low")));
-
-                    st.window.clear();
-                    st.lastHoldReason = null;
-
-                } catch (Exception e) {
-                    log.error("[WINDOW] ❌ ENTRY failed chatId={} sym={} err={}", chatId, sym, e.getMessage(), e);
-                    pushHoldThrottled(chatId, sym, st, "entry_failed", time);
-                }
-            }
-
-            // =====================================================
-            // EXIT: TP/SL
-            // =====================================================
-            if (st.inPosition && st.entryQty != null && st.tp != null && st.sl != null) {
-
-                try {
-                    var ex = tradeExecutionService.executeExitIfHit(
-                            chatId,
-                            StrategyType.WINDOW_SCALPING,
-                            sym,
-                            price,
-                            time,
-                            true,
-                            st.entryQty,
-                            st.tp,
-                            st.sl
-                    );
-
-                    if (ex.executed()) {
+                    if (exRes.executed()) {
                         st.exits++;
 
-                        log.info("[WINDOW] ✅ EXIT OK chatId={} ex={} net={} sym={} price={} (tp={} sl={})",
-                                chatId, st.exchange, st.network, sym,
-                                price.stripTrailingZeros().toPlainString(),
-                                st.tp.stripTrailingZeros().toPlainString(),
-                                st.sl.stripTrailingZeros().toPlainString()
+                        if (executedExitMode == null) {
+                            executedExitMode = exRes.slHit() ? "SL" : "TP";
+                        }
+
+                        BigDecimal actualExitPrice = positiveOrNull(exRes.exitPrice());
+                        if (actualExitPrice == null) {
+                            actualExitPrice = price;
+                        }
+
+                        BigDecimal realizedPnlPct = exRes.pnlPct();
+
+                        persistClosedTradeSample(
+                                chatId,
+                                st,
+                                sym,
+                                actualExitPrice,
+                                realizedPnlPct,
+                                time
                         );
+
+                        BigDecimal tradePriceForUi = actualExitPrice;
+                        safeLive(() -> live.pushTrade(
+                                chatId,
+                                StrategyType.WINDOW_SCALPING,
+                                sym,
+                                "SELL",
+                                tradePriceForUi,
+                                st.entryQty,
+                                time
+                        ));
 
                         st.inPosition = false;
                         st.entryQty = null;
@@ -426,23 +1592,1130 @@ public class WindowScalpingStrategyV4 implements TradingStrategy {
                         st.sl = null;
 
                         st.lastTradeClosedAt = time;
+                        long extraCooldownMs = exRes.slHit() ? resolvePostSlCooldownMs(st) : Math.max(1_500L, postTpCooldownMs);
+                        st.reentryBlockedUntil = time.plusMillis(extraCooldownMs);
+                        st.reentryBlockReason = exRes.slHit()
+                                ? "post_sl_cooldown"
+                                : ("ZONE_HIGH_EXIT".equals(executedExitMode) ? "post_zone_exit_cooldown" : "post_exit_cooldown");
+                        st.lastEntryAt = null;
+                        st.entryCandleOpenTimeMs = null;
+                        st.entryCandleTimeframe = null;
+
+                        resetMlCache(st);
+                        ensureRuntimeContext(st, ss);
+
+                        if (st.exchange != null && st.network != null && isAutoTuneAllowed(ss)) {
+                            AiStrategyOrchestrator o = orch();
+                            if (o != null) {
+                                o.onPositionClosed(chatId, StrategyType.WINDOW_SCALPING, st.exchange, st.network);
+                            }
+                        }
 
                         safeLive(() -> live.clearTpSl(chatId, StrategyType.WINDOW_SCALPING, sym));
                         safeLive(() -> live.clearPriceLines(chatId, StrategyType.WINDOW_SCALPING, sym));
 
-                        safeLive(() -> live.pushSignal(chatId, StrategyType.WINDOW_SCALPING, sym, null,
-                                Signal.sell(1.0, "tp_sl_exit")));
-                    } else {
-                        if (pos >= highZone) {
-                            pushHoldThrottled(chatId, sym, st, "in_high_zone_wait_tp", time);
-                        }
+                        String signalText = "ZONE_HIGH_EXIT".equals(executedExitMode)
+                                ? "Выход по верхней зоне окна"
+                                : (exRes.slHit() ? "Выход по SL" : "Выход по TP");
+
+                        safeLive(() -> live.pushSignal(
+                                chatId,
+                                StrategyType.WINDOW_SCALPING,
+                                sym,
+                                null,
+                                Signal.sell(1.0, signalText)
+                        ));
                     }
 
-                } catch (Exception e) {
-                    log.error("[WINDOW] ❌ EXIT failed chatId={} sym={} err={}", chatId, sym, e.getMessage(), e);
+                } catch (Exception e2) {
+                    log.error("[WINDOW] ❌ Ошибка выхода chatId={} sym={} err={}", chatId, sym, e2.getMessage(), e2);
+                }
+
+                return;
+            }
+
+            evaluateEntryOnTick(chatId, st, sym, price, time, holdMs);
+        }
+    }
+
+    @Override
+    public void onPriceUpdate(Long chatId, String symbolFromTick, BigDecimal price, Instant ts) {
+        if (chatId == null) return;
+        long tsMs = (ts != null) ? ts.toEpochMilli() : 0L;
+
+        onPriceUpdate(
+                chatId.longValue(),
+                StrategyType.WINDOW_SCALPING,
+                symbolFromTick,
+                null,
+                price,
+                tsMs,
+                null,
+                null
+        );
+    }
+
+
+    private WindowView selectWindowView(LocalState st, WindowScalpingStrategySettings cfg) {
+        if (st == null || cfg == null) return null;
+
+        int windowSize = (cfg.getWindowSize() != null ? cfg.getWindowSize() : 0);
+        if (windowSize < 5) return null;
+
+        WindowView tickView = buildWindowView(st.tickWindow, windowSize, true, false);
+        WindowView candleView = buildWindowView(st.window, windowSize, false, false);
+
+        if (tickView == null) {
+            return candleView;
+        }
+        if (candleView == null) {
+            return tickView;
+        }
+
+        double minRangePct = cfg.getMinRangePct() != null ? cfg.getMinRangePct() : 0.0;
+        double flatFloorPct = Math.max(0.0020, minRangePct * 0.18);
+        flatFloorPct = Math.min(flatFloorPct, 0.0500);
+
+        boolean tickTooFlat = !Double.isFinite(tickView.rangePct())
+                || tickView.rangePct() <= 0.0
+                || tickView.rangePct() + 1e-12 < flatFloorPct;
+
+        double relativeFloor = candleView.rangePct() * 0.18;
+        if (!tickTooFlat && Double.isFinite(relativeFloor) && relativeFloor > 0.0) {
+            tickTooFlat = tickView.rangePct() + 1e-12 < relativeFloor;
+        }
+
+        if (tickTooFlat && candleView.rangePct() > tickView.rangePct() + 1e-12) {
+            return buildWindowView(candleView.prices(), windowSize, false, true);
+        }
+
+        return tickView;
+    }
+
+    private WindowView buildWindowView(Deque<BigDecimal> source,
+                                       int windowSize,
+                                       boolean tickBased,
+                                       boolean fallbackUsed) {
+        if (source == null || source.isEmpty() || windowSize < 2) return null;
+
+        ArrayDeque<BigDecimal> tail = new ArrayDeque<>();
+        int skip = Math.max(0, source.size() - windowSize);
+        int i = 0;
+        for (BigDecimal p : source) {
+            if (i++ < skip) continue;
+            if (p == null || p.signum() <= 0) continue;
+            tail.addLast(p);
+        }
+
+        if (tail.size() < windowSize) return null;
+
+        BigDecimal high = null;
+        BigDecimal low = null;
+        for (BigDecimal p : tail) {
+            high = (high == null) ? p : high.max(p);
+            low = (low == null) ? p : low.min(p);
+        }
+
+        if (high == null || low == null || low.signum() <= 0) return null;
+
+        BigDecimal range = high.subtract(low);
+        double rangePct = Double.NaN;
+        if (range.signum() > 0) {
+            try {
+                rangePct = range
+                        .divide(low, 10, RoundingMode.HALF_UP)
+                        .multiply(BigDecimal.valueOf(100))
+                        .doubleValue();
+            } catch (Exception ignore) {
+                rangePct = Double.NaN;
+            }
+        }
+
+        return new WindowView(tail, low, high, range, rangePct, tickBased, fallbackUsed);
+    }
+
+    private WindowView buildWindowView(Deque<BigDecimal> prices,
+                                       int windowSize,
+                                       boolean tickBased) {
+        return buildWindowView(prices, windowSize, tickBased, false);
+    }
+
+    private void logWindowFallbackIfNeeded(Long chatId,
+                                           LocalState st,
+                                           String sym,
+                                           WindowView view,
+                                           Instant now) {
+        if (chatId == null || st == null || sym == null || view == null || now == null) return;
+        if (!view.fallbackUsed()) return;
+
+        long throttle = Math.max(15_000L, holdThrottleMs * 4L);
+        if (st.lastDiagAt != null) {
+            long age = Duration.between(st.lastDiagAt, now).toMillis();
+            if (age >= 0 && age < throttle) {
+                return;
+            }
+        }
+
+        st.lastDiagAt = now;
+        log.info("[WINDOW] ↪ WINDOW-FALLBACK chatId={} sym={} tf={} source={} rangePct={} tickWindow={} candleWindow={}",
+                chatId,
+                sym,
+                st.timeframe,
+                view.tickBased() ? "tick" : "candle",
+                fmt(view.rangePct()),
+                st.tickWindow != null ? st.tickWindow.size() : 0,
+                st.window != null ? st.window.size() : 0);
+    }
+
+    private void evaluateEntryOnTick(Long chatId,
+                                     LocalState st,
+                                     String sym,
+                                     BigDecimal price,
+                                     Instant time,
+                                     long holdMs) {
+
+        if (chatId == null || st == null || sym == null || price == null || price.signum() <= 0) return;
+        if (st.inPosition) return;
+
+        StrategySettings ss = st.ss;
+        WindowScalpingStrategySettings cfg = st.cfg;
+
+        if (ss == null || cfg == null) {
+            pushHoldThrottled(chatId, sym, st, "no_settings", time, holdMs);
+            return;
+        }
+
+        int windowSize = (cfg.getWindowSize() != null ? cfg.getWindowSize() : 0);
+        if (windowSize < 5) {
+            pushHoldThrottled(chatId, sym, st, "windowSize<5", time, holdMs);
+            return;
+        }
+
+        boolean tickWarm = st.tickWindow != null && st.tickWindow.size() >= windowSize;
+        boolean candleWarm = st.window != null && st.window.size() >= windowSize;
+        if (!tickWarm && !candleWarm) {
+            st.warmups++;
+            pushHoldThrottled(chatId, sym, st, "warming_up", time, holdMs);
+            return;
+        }
+
+        WindowView windowView = selectWindowView(st, cfg);
+        if (windowView == null) {
+            pushHoldThrottled(chatId, sym, st, "window_invalid", time, holdMs);
+            return;
+        }
+
+        logWindowFallbackIfNeeded(chatId, st, sym, windowView, time);
+
+        BigDecimal low = windowView.low();
+        BigDecimal high = windowView.high();
+        BigDecimal range = windowView.range();
+        double rangePct = windowView.rangePct();
+
+        if (!Double.isFinite(rangePct) || low == null || high == null || range == null) {
+            pushHoldThrottled(chatId, sym, st, "window_invalid", time, holdMs);
+            return;
+        }
+
+        if (range.signum() <= 0) {
+            pushHoldThrottled(chatId, sym, st, "range_zero", time, holdMs);
+            return;
+        }
+
+        recordRangePctSample(st, rangePct);
+        maybeAutoAdjustMinRange(chatId, sym, st, time);
+
+        cfg = st.cfg != null ? st.cfg : cfg;
+
+        double minRangePct = effectiveMinRangePct(st, cfg);
+        boolean rangeTooSmallBypass = false;
+        if (rangePct + 1e-12 < minRangePct) {
+            double bypassFactor = Double.isFinite(rangeTooSmallBypassFactor) ? rangeTooSmallBypassFactor : 0.72;
+            if (bypassFactor <= 0.0 || bypassFactor > 1.0) bypassFactor = 0.72;
+
+            double absGapPct = Math.max(0.0, minRangePct - rangePct);
+            double maxGapPct = Double.isFinite(rangeTooSmallBypassAbsoluteGapPct)
+                    ? Math.max(0.0, rangeTooSmallBypassAbsoluteGapPct)
+                    : 0.012;
+
+            boolean preparedAi = isAiMode(ss) && hasPreparedMlContext(ss);
+            boolean nearThreshold = (minRangePct > 0.0 && (rangePct / minRangePct) + 1e-12 >= bypassFactor)
+                    || absGapPct <= maxGapPct;
+
+            if (!preparedAi || !nearThreshold) {
+                pushHoldThrottled(chatId, sym, st, "range_too_small", time, holdMs);
+                return;
+            }
+
+            rangeTooSmallBypass = true;
+            log.info("[WINDOW] ↪ RANGE-BYPASS chatId={} sym={} tf={} rangePct={} minRangePct={} rel={} gap={}",
+                    chatId,
+                    sym,
+                    st.timeframe,
+                    fmt(rangePct),
+                    fmt(minRangePct),
+                    fmt(minRangePct > 0.0 ? (rangePct / minRangePct) : 0.0),
+                    fmt(absGapPct));
+        }
+
+        st.consecutiveRangeTooSmall = 0;
+
+        BigDecimal clampedPrice = price;
+        if (clampedPrice.compareTo(low) < 0) clampedPrice = low;
+        if (clampedPrice.compareTo(high) > 0) clampedPrice = high;
+
+        double pos = clampedPrice.subtract(low)
+                .divide(range, 10, RoundingMode.HALF_UP)
+                .doubleValue();
+
+        if (!Double.isFinite(pos)) {
+            pushHoldThrottled(chatId, sym, st, "pos_invalid", time, holdMs);
+            return;
+        }
+
+        double entryLowPct = (cfg.getEntryFromLowPct() != null ? cfg.getEntryFromLowPct() : 0.0);
+        double entryHighPct = (cfg.getEntryFromHighPct() != null ? cfg.getEntryFromHighPct() : 0.0);
+
+        double baseLowZone = clamp01(entryLowPct / 100.0);
+        double lowZone = baseLowZone;
+        double highZone = clamp01(1.0 - (entryHighPct / 100.0));
+
+        if (rangeTooSmallBypass || (minRangePct > 0.0 && rangePct + 1e-12 < minRangePct * 1.15)) {
+            double expandFactor = Double.isFinite(lowZoneExpandInMicroRangeFactor)
+                    ? lowZoneExpandInMicroRangeFactor
+                    : 1.55;
+            if (expandFactor < 1.0) expandFactor = 1.0;
+            if (expandFactor > 2.4) expandFactor = 2.4;
+
+            double expandMaxPct = Double.isFinite(lowZoneExpandInMicroRangeMaxPct)
+                    ? lowZoneExpandInMicroRangeMaxPct
+                    : 32.0;
+            expandMaxPct = Math.max(8.0, Math.min(45.0, expandMaxPct));
+
+            double expanded = Math.min(expandMaxPct / 100.0, baseLowZone * expandFactor);
+            if (expanded > lowZone) {
+                lowZone = clamp01(expanded);
+            }
+        }
+
+        publishZonesThrottled(chatId, st, sym, low, high, range, lowZone, time);
+
+        Deque<BigDecimal> src = windowView.prices();
+
+        double retWindowPct = calcWindowReturnPct(src);
+        double momentum1 = calcMomentum1Pct(src, price);
+        double volatilityPct = calcVolatilityPct(st);
+
+        if (st.reentryBlockedUntil != null) {
+            if (time.isBefore(st.reentryBlockedUntil)) {
+                String holdReason = safeNullable(st.reentryBlockReason);
+                if (holdReason == null) holdReason = "post_exit_cooldown";
+                pushHoldThrottled(chatId, sym, st, holdReason, time, holdMs);
+                return;
+            }
+            st.reentryBlockedUntil = null;
+            st.reentryBlockReason = null;
+        }
+
+        if (st.lastTradeClosedAt != null) {
+            long ms = Duration.between(st.lastTradeClosedAt, time).toMillis();
+            if (ms >= 0 && ms < 1200) {
+                pushHoldThrottled(chatId, sym, st, "post_exit_cooldown", time, holdMs);
+                return;
+            }
+        }
+
+        if (st.lastEntryAt != null) {
+            long ms = Duration.between(st.lastEntryAt, time).toMillis();
+            if (ms >= 0 && ms < 1200) {
+                pushHoldThrottled(chatId, sym, st, "post_entry_cooldown", time, holdMs);
+                return;
+            }
+        }
+
+        if (pos <= lowZone) {
+
+            double minBouncePos = Math.min(
+                    lowZone * 0.45,
+                    Math.max(0.005, entryBounceMinPosPctOfRange / 100.0)
+            );
+
+            if (noiseFilterEnabled) {
+                if (pos < minBouncePos) {
+                    pushHoldThrottled(chatId, sym, st, "falling_knife", time, holdMs);
+                    return;
+                }
+
+                if (momentum1 < minMomentum1Pct) {
+                    pushHoldThrottled(chatId, sym, st, "negative_micro_momentum", time, holdMs);
+                    return;
+                }
+
+                if (retWindowPct < minWindowReturnPct) {
+                    pushHoldThrottled(chatId, sym, st, "trend_down_too_strong", time, holdMs);
+                    return;
+                }
+
+                if (volatilityPct < minVolatilityPct) {
+                    pushHoldThrottled(chatId, sym, st, "micro_chop", time, holdMs);
+                    return;
+                }
+            }
+
+            final double score = clamp01(
+                    (lowZone <= 0.000001) ? 1.0 : (1.0 - (pos / lowZone))
+            ) * 100.0;
+
+            BigDecimal diffPctForEntry = BigDecimal.valueOf(Math.max(0.000001, (lowZone - pos) * 100.0));
+
+            if (noiseFilterEnabled && isWeakLowZoneRebound(src, price)) {
+                double reboundPct = calcReboundFromRecentLowPct(src, price, Math.max(2, lowZoneDescendingLookback));
+                double effectiveMinRebound = Math.min(
+                        Math.max(0.003, minReboundAfterLowTouchPct),
+                        0.006
+                );
+                if (reboundPct + 1e-12 < effectiveMinRebound) {
+                    logEntryBlockedThrottled(
+                            chatId,
+                            sym,
+                            st,
+                            "weak_low_zone_rebound",
+                            price,
+                            diffPctForEntry,
+                            time
+                    );
+                    pushHoldThrottled(chatId, sym, st, "weak_low_zone_rebound", time, holdMs);
+                    return;
+                }
+            }
+
+            double effectiveMinEntryScore = minEntryScoreToEnter;
+            if (Double.isFinite(effectiveMinEntryScore) && effectiveMinEntryScore > 0.0) {
+                double relaxFactor = (volatilityPct >= Math.max(minVolatilityPct * 0.65, 0.0035) ? 0.42 : 0.55);
+                if (pos <= Math.max(0.03, lowZone * 0.75)) {
+                    relaxFactor = Math.min(relaxFactor, 0.28);
+                }
+                if (isAiMode(ss) && hasPreparedMlContext(ss)) {
+                    relaxFactor = Math.min(relaxFactor, 0.20);
+                }
+                effectiveMinEntryScore = Math.max(1.2, effectiveMinEntryScore * relaxFactor);
+                if (pos <= Math.max(0.015, lowZone * 0.45)) {
+                    effectiveMinEntryScore = Math.min(effectiveMinEntryScore, 0.9);
+                }
+            }
+
+            boolean allowWeakTouchBypass = isAiMode(ss)
+                    && hasPreparedMlContext(ss)
+                    && score + 1e-12 >= Math.max(0.8, effectiveMinEntryScore * 0.45);
+
+            if (Double.isFinite(effectiveMinEntryScore) && score + 1e-12 < effectiveMinEntryScore && !allowWeakTouchBypass) {
+                logEntryBlockedThrottled(
+                        chatId,
+                        sym,
+                        st,
+                        "weak_low_zone_touch",
+                        price,
+                        diffPctForEntry,
+                        time
+                );
+                pushHoldThrottled(chatId, sym, st, "weak_low_zone_touch", time, holdMs);
+                return;
+            }
+
+            BigDecimal tpPct;
+            BigDecimal slPct;
+
+            TradeExecutionServiceImpl execImpl = tradeExecImpl();
+            if (execImpl != null) {
+                TradeExecutionServiceImpl.EntryPrecheckResult precheck = execImpl.precheckEntryFast(
+                        chatId,
+                        StrategyType.WINDOW_SCALPING,
+                        sym,
+                        price,
+                        ss,
+                        time
+                );
+
+                if (!precheck.allowed()) {
+                    logEntryBlockedThrottled(
+                            chatId,
+                            sym,
+                            st,
+                            precheck.code(),
+                            price,
+                            diffPctForEntry,
+                            time
+                    );
+                    pushHoldThrottled(chatId, sym, st, precheck.code(), time, holdMs);
+                    return;
+                }
+            }
+
+            if (isMlGateAllowed(ss) && shouldSkipMlRecheckAfterBelowThreshold(st, price, time)) {
+                pushHoldThrottled(chatId, sym, st, "ml_below_threshold", time, holdMs);
+                return;
+            }
+
+            Map<String, Object> entryFeatures = buildMlFeatures(
+                    chatId, st, sym, price, time,
+                    low, high, range, rangePct, pos,
+                    lowZone, highZone, windowSize, diffPctForEntry
+            );
+
+            Prediction pred = null;
+            boolean mlBypassForThisEntry = false;
+            BigDecimal previousMlConfidence = ss.getMlConfidence();
+
+            if (isMlGateAllowed(ss)) {
+                Map<String, Object> feats = entryFeatures;
+
+                pred = getPredictionThrottled(chatId, sym, st, feats, price, time);
+
+                if (!pred.ok) {
+                    String reason = normalizeMlFailureReason(pred.reason);
+
+                    if (!isMlFailOpenAllowed(ss, reason)) {
+                        logMlBlockedThrottled(chatId, sym, st, ss, reason, time);
+                        pushHoldThrottled(chatId, sym, st, mapMlFailureToHoldReason(ss, reason), time, holdMs);
+                        return;
+                    }
+
+                    mlBypassForThisEntry = true;
+                    logMlFailureThrottled(chatId, sym, st, ss, reason, time);
+
+                    double effectiveFailOpenScore = Double.isFinite(minEntryScoreWithoutMl)
+                            ? Math.max(3.0, minEntryScoreWithoutMl * 0.35)
+                            : minEntryScoreWithoutMl;
+
+                    if (Double.isFinite(effectiveFailOpenScore) && score + 1e-12 < effectiveFailOpenScore) {
+                        logEntryBlockedThrottled(
+                                chatId,
+                                sym,
+                                st,
+                                "weak_low_zone_touch_fail_open",
+                                price,
+                                diffPctForEntry,
+                                time
+                        );
+                        pushHoldThrottled(chatId, sym, st, "weak_low_zone_touch_fail_open", time, holdMs);
+                        return;
+                    }
+                } else {
+                    maybePersistMlConfidence(st, ss, pred.proba, time);
+                    recordMlProbaSample(st, pred.proba);
+
+                    double threshold = resolveEffectiveMlThreshold(ss, st, score);
+
+                    if (pred.proba + 1e-12 < threshold) {
+                        rememberMlBelowThreshold(st, price, pred.proba, threshold, time);
+                        st.consecutiveMlBelowThreshold++;
+
+                        if (isUltraLowMlPrediction(pred.proba, threshold)) {
+                            st.consecutiveUltraLowMlProba++;
+                        } else {
+                            st.consecutiveUltraLowMlProba = 0;
+                        }
+
+                        boolean failOpenUltraLow = shouldFailOpenUltraLowConfidence(ss, st, pred, score, threshold);
+                        if (!failOpenUltraLow && isAiMode(ss) && hasPreparedMlContext(ss)
+                                && st.consecutiveUltraLowMlProba >= 1
+                                && score + 1e-12 >= 6.0) {
+                            failOpenUltraLow = true;
+                        }
+
+                        if (!failOpenUltraLow) {
+                            maybeRequestAutoTuneOnLowConfidence(chatId, sym, st, ss, pred.proba, threshold, time);
+                            logMlBelowThresholdThrottled(chatId, sym, st, pred, threshold, time);
+                            pushHoldThrottled(chatId, sym, st, "ml_below_threshold", time, holdMs);
+                            return;
+                        }
+
+                        mlBypassForThisEntry = true;
+                        logMlUltraLowConfidenceFailOpenThrottled(chatId, sym, st, pred, threshold, score, time);
+                    } else {
+                        clearMlBelowThreshold(st);
+                        st.consecutiveMlBelowThreshold = 0;
+                        st.consecutiveUltraLowMlProba = 0;
+                    }
+                }
+            }
+
+            EntryRisk entryRisk = resolveEntryRisk(st, rangePct, score, pred);
+            if (entryRisk == null || entryRisk.tpPct() == null || entryRisk.slPct() == null) {
+                pushHoldThrottled(chatId, sym, st, "tp_sl_pct_invalid", time, holdMs);
+                return;
+            }
+
+            entryRisk = alignRiskToWindowRoom(chatId, st, price, high, entryRisk);
+            if (entryRisk == null || entryRisk.tpPct() == null || entryRisk.slPct() == null) {
+                logEntryBlockedThrottled(
+                        chatId,
+                        sym,
+                        st,
+                        "no_room_to_high",
+                        price,
+                        diffPctForEntry,
+                        time
+                );
+                pushHoldThrottled(chatId, sym, st, "no_room_to_high", time, holdMs);
+                return;
+            }
+
+            tpPct = entryRisk.tpPct();
+            slPct = entryRisk.slPct();
+
+            try {
+                if (isMlGateAllowed(ss)) {
+                    if (pred != null && pred.ok) {
+                        ss.setMlConfidence(BigDecimal.valueOf(pred.proba));
+                    } else {
+                        ss.setMlConfidence(null);
+                    }
+                }
+
+                var res = tradeExecutionService.executeEntry(
+                        chatId,
+                        StrategyType.WINDOW_SCALPING,
+                        sym,
+                        price,
+                        diffPctForEntry,
+                        time,
+                        ss,
+                        tpPct,
+                        slPct
+                );
+
+                if (!res.executed()) {
+                    logEntryBlockedThrottled(
+                            chatId,
+                            sym,
+                            st,
+                            safeNullable(res.reason()),
+                            price,
+                            diffPctForEntry,
+                            time
+                    );
+                    pushHoldThrottled(chatId, sym, st, res.reason(), time, holdMs);
+                    return;
+                }
+
+                st.entries++;
+                st.inPosition = true;
+                st.isLong = true;
+
+                st.entryPrice = res.entryPrice();
+                st.tp = res.tp();
+                st.sl = res.sl();
+                st.entryQty = res.qty();
+                st.entryOrderId = res.orderId();
+
+                st.lastEntryAt = time;
+                rememberEntryCandle(st, time);
+                st.lastPositionSyncAt = time;
+                resetMlCache(st);
+
+                ensureRuntimeContext(st, ss);
+
+                rememberPendingMlSample(
+                        st,
+                        entryFeatures,
+                        time,
+                        sym,
+                        st.exchange,
+                        st.network,
+                        st.timeframe,
+                        st.entryPrice != null ? st.entryPrice : price,
+                        (pred != null && pred.ok) ? pred.proba : null,
+                        (pred != null && pred.ok) ? pred.modelKey : null,
+                        mlBypassForThisEntry
+                );
+
+                publishPositionLines(chatId, sym, st);
+
+                safeLive(() -> live.pushTrade(
+                        chatId,
+                        StrategyType.WINDOW_SCALPING,
+                        sym,
+                        "BUY",
+                        st.entryPrice != null ? st.entryPrice : price,
+                        st.entryQty,
+                        time
+                ));
+
+                safeLive(() -> live.pushSignal(
+                        chatId,
+                        StrategyType.WINDOW_SCALPING,
+                        sym,
+                        null,
+                        Signal.buy(score, "Вход у нижней границы окна (по тику)")
+                ));
+
+                log.info("[WINDOW] ✅ Вход chatId={} sym={} price={} qty={} tp={} sl={} tpPct={} slPct={} riskSource={} score={} mlProba={} modelKey={} modelVer={} schemaHash={}{}",
+                        chatId,
+                        sym,
+                        fmtBd(st.entryPrice != null ? st.entryPrice : price),
+                        fmtBd(st.entryQty),
+                        fmtBd(st.tp),
+                        fmtBd(st.sl),
+                        fmtBd(tpPct),
+                        fmtBd(slPct),
+                        entryRisk.source(),
+                        fmt(score),
+                        (pred != null && pred.ok) ? fmt(pred.proba) : "null",
+                        (pred != null && pred.ok) ? safeNullable(pred.modelKey) : null,
+                        (pred != null && pred.ok) ? safeNullable(pred.modelVersion) : null,
+                        (pred != null && pred.ok) ? safeNullable(pred.schemaHash) : null,
+                        (mlBypassForThisEntry ? " mlBypass=true" : "")
+                );
+
+                st.lastHoldReason = null;
+                st.consecutiveRangeTooSmall = 0;
+                return;
+
+            } catch (Exception e3) {
+                log.error("[WINDOW] ❌ Ошибка входа chatId={} sym={} err={}", chatId, sym, e3.getMessage(), e3);
+                pushHoldThrottled(chatId, sym, st, "entry_failed", time, holdMs);
+                return;
+            } finally {
+                if (isMlGateAllowed(ss)) {
+                    ss.setMlConfidence(previousMlConfidence);
                 }
             }
         }
+
+        if (pos >= highZone) {
+            pushHoldThrottled(chatId, sym, st, "in_high_zone_wait_tp", time, holdMs);
+        }
+    }
+
+    @Override
+    public void onCandleClosed(long chatId,
+                               StrategyType type,
+                               String symbol,
+                               String timeframe,
+                               UnifiedKline kline,
+                               String exchange,
+                               NetworkType network) {
+
+        if (type != StrategyType.WINDOW_SCALPING) return;
+        if (kline == null) return;
+
+        BigDecimal close = kline.getClose();
+        if (close == null || close.signum() <= 0) return;
+
+        long tsMs = (kline.getCloseTime() > 0 ? kline.getCloseTime() : kline.getOpenTime());
+        Instant time = (tsMs > 0) ? Instant.ofEpochMilli(tsMs) : Instant.now();
+
+        LocalState st = states.get(chatId);
+        if (st == null || !st.active) return;
+
+        long logEvery = Math.max(1, tickLogEveryTicks);
+        long holdMs = Math.max(200, holdThrottleMs);
+
+        if (shouldRunCandleClosePriceFallback(st, time, timeframe)) {
+            try {
+                onPriceUpdate(
+                        chatId,
+                        StrategyType.WINDOW_SCALPING,
+                        symbol,
+                        timeframe,
+                        close,
+                        tsMs,
+                        exchange,
+                        network
+                );
+            } catch (Exception e) {
+                log.warn("[WINDOW] ⚠ Ошибка candle-close fallback chatId={} sym={} tf={} err={}",
+                        chatId,
+                        normalizeSymbolOrNull(symbol),
+                        normalizeTimeframeOrNull(timeframe),
+                        e.getMessage());
+            }
+        }
+
+        String ex = normalizeExchangeOrNull(exchange);
+        if (ex != null) st.exchange = ex;
+        if (network != null) st.network = network;
+
+        String tf = normalizeTimeframeOrNull(timeframe);
+        if (tf != null) st.timeframe = tf;
+
+        String incoming = normalizeSymbolOrNull(symbol);
+        String current = normalizeSymbolOrNull(st.symbol);
+
+        if (current == null && incoming != null) {
+            st.symbol = incoming;
+        } else if (current != null && incoming != null && !current.equals(incoming)) {
+            if (st.ticks % logEvery == 0) {
+                log.warn("[WINDOW] ⚠ Пропуск candle event из-за несовпадения символа chatId={} currentSym={} incomingSym={} ex={} net={}",
+                        chatId, current, incoming, ex, network);
+            }
+            return;
+        }
+
+        synchronized (st) {
+            refreshSettingsIfNeeded(chatId, st, time);
+
+            StrategySettings ss = st.ss;
+            WindowScalpingStrategySettings cfg = st.cfg;
+            String sym = normalizeSymbolOrNull(st.symbol);
+
+            if (sym == null || cfg == null || ss == null) {
+                pushHoldThrottled(chatId, sym, st, "no_settings", time, holdMs);
+                return;
+            }
+
+            ensureRuntimeContext(st, ss);
+            maybeRestorePositionFromStore(chatId, st, sym, time);
+
+            int windowSize = (cfg.getWindowSize() != null ? cfg.getWindowSize() : 0);
+            if (windowSize < 5) {
+                pushHoldThrottled(chatId, sym, st, "windowSize<5", time, holdMs);
+                return;
+            }
+
+            st.window.addLast(close);
+            while (st.window.size() > windowSize) st.window.removeFirst();
+
+            if (st.tickWindow == null) {
+                st.tickWindow = new ArrayDeque<>();
+            }
+            if (st.tickWindow.size() < windowSize) {
+                st.tickWindow.addLast(close);
+                while (st.tickWindow.size() > windowSize) st.tickWindow.removeFirst();
+            }
+
+            if (st.window.size() < windowSize) {
+                st.warmups++;
+                pushHoldThrottled(chatId, sym, st, "warming_up", time, holdMs);
+                return;
+            }
+
+            BigDecimal high = null;
+            BigDecimal low = null;
+            for (BigDecimal p : st.window) {
+                if (p == null) continue;
+                high = (high == null) ? p : high.max(p);
+                low = (low == null) ? p : low.min(p);
+            }
+
+            if (high == null || low == null || low.signum() <= 0) {
+                pushHoldThrottled(chatId, sym, st, "window_invalid", time, holdMs);
+                return;
+            }
+
+            BigDecimal range = high.subtract(low);
+            if (range.signum() <= 0) {
+                pushHoldThrottled(chatId, sym, st, "range_zero", time, holdMs);
+                return;
+            }
+
+            double rangePct = range
+                    .divide(low, 10, RoundingMode.HALF_UP)
+                    .multiply(BigDecimal.valueOf(100))
+                    .doubleValue();
+
+            recordRangePctSample(st, rangePct);
+            maybeAutoAdjustMinRange(chatId, sym, st, time);
+
+            cfg = st.cfg != null ? st.cfg : cfg;
+
+            double entryLowPct = (cfg.getEntryFromLowPct() != null ? cfg.getEntryFromLowPct() : 0.0);
+            double lowZone = clamp01(entryLowPct / 100.0);
+
+            publishZonesThrottled(chatId, st, sym, low, high, range, lowZone, time);
+
+            if (st.ticks % logEvery == 0) {
+                log.info("[WINDOW] 🕯 Свеча chatId={} sym={} tf={} close={} window={} tickWindow={} rangePct={} minRangePct={}",
+                        chatId,
+                        sym,
+                        st.timeframe,
+                        fmtBd(close),
+                        st.window.size(),
+                        st.tickWindow != null ? st.tickWindow.size() : 0,
+                        fmt(rangePct),
+                        fmt(effectiveMinRangePct(st, cfg)));
+            }
+        }
+    }
+
+    private void updateTickWindow(LocalState st,
+                                  BigDecimal price,
+                                  WindowScalpingStrategySettings cfg) {
+        if (st == null || price == null || price.signum() <= 0 || cfg == null) return;
+
+        int windowSize = (cfg.getWindowSize() != null ? cfg.getWindowSize() : 0);
+        if (windowSize < 5) return;
+
+        if (st.tickWindow == null) {
+            st.tickWindow = new ArrayDeque<>();
+        }
+
+        st.tickWindow.addLast(price);
+        while (st.tickWindow.size() > windowSize) {
+            st.tickWindow.removeFirst();
+        }
+
+        st.lastTickAt = Instant.now();
+    }
+
+    private boolean shouldRunCandleClosePriceFallback(LocalState st, Instant now, String timeframe) {
+        if (st == null || now == null) {
+            return false;
+        }
+
+        Instant lastTick = st.lastTickAt;
+        if (lastTick == null) {
+            return true;
+        }
+
+        long ageMs;
+        try {
+            ageMs = Math.max(0L, Duration.between(lastTick, Instant.now()).toMillis());
+        } catch (Exception e) {
+            ageMs = Long.MAX_VALUE;
+        }
+
+        return ageMs >= resolveCandleCloseFallbackThresholdMs(timeframe != null ? timeframe : st.timeframe);
+    }
+
+    private long resolveCandleCloseFallbackThresholdMs(String timeframe) {
+        long tfMs = parseTimeframeToMs(normalizeTimeframeOrNull(timeframe));
+        if (tfMs <= 0L) {
+            return 2_500L;
+        }
+        return Math.max(1_500L, Math.min(10_000L, tfMs / 8L));
+    }
+
+    private long parseTimeframeToMs(String timeframe) {
+        if (timeframe == null || timeframe.isBlank()) {
+            return -1L;
+        }
+
+        String tf = timeframe.trim().toLowerCase(Locale.ROOT);
+        if (tf.isEmpty()) {
+            return -1L;
+        }
+
+        try {
+            long value = Long.parseLong(tf.substring(0, tf.length() - 1));
+            char unit = tf.charAt(tf.length() - 1);
+            return switch (unit) {
+                case 's' -> value * 1_000L;
+                case 'm' -> value * 60_000L;
+                case 'h' -> value * 3_600_000L;
+                case 'd' -> value * 86_400_000L;
+                case 'w' -> value * 604_800_000L;
+                default -> -1L;
+            };
+        } catch (Exception e) {
+            return -1L;
+        }
+    }
+
+    private record ZoneExitDecision(boolean shouldExit,
+                                    String reason,
+                                    BigDecimal netPnlPct,
+                                    double pos,
+                                    double highZone) {
+        private static ZoneExitDecision no() {
+            return new ZoneExitDecision(false, null, null, Double.NaN, Double.NaN);
+        }
+
+        private static ZoneExitDecision yes(String reason,
+                                            BigDecimal netPnlPct,
+                                            double pos,
+                                            double highZone) {
+            return new ZoneExitDecision(true, reason, netPnlPct, pos, highZone);
+        }
+    }
+
+    private ZoneExitDecision evaluateHighZoneExit(Long chatId,
+                                                  LocalState st,
+                                                  String sym,
+                                                  BigDecimal price,
+                                                  Instant time) {
+        if (!zoneExitEnabled) return ZoneExitDecision.no();
+        if (chatId == null || st == null || sym == null || price == null || time == null) return ZoneExitDecision.no();
+        if (!st.inPosition) return ZoneExitDecision.no();
+        if (st.entryPrice == null || st.entryPrice.signum() <= 0) return ZoneExitDecision.no();
+        if (st.exchange == null || st.network == null) return ZoneExitDecision.no();
+        if (st.tp != null && price.compareTo(st.tp) >= 0) return ZoneExitDecision.no();
+
+        long minHoldMs = Math.max(500L, zoneExitMinHoldMs);
+        if (st.lastEntryAt != null) {
+            long heldMs = Duration.between(st.lastEntryAt, time).toMillis();
+            if (heldMs >= 0 && heldMs < minHoldMs) {
+                return ZoneExitDecision.no();
+            }
+        }
+
+        WindowScalpingStrategySettings cfg = st.cfg;
+        if (cfg == null) return ZoneExitDecision.no();
+
+        int windowSize = (cfg.getWindowSize() != null ? cfg.getWindowSize() : 0);
+        if (windowSize < 5) return ZoneExitDecision.no();
+
+        WindowView windowView = selectWindowView(st, cfg);
+        if (windowView == null) return ZoneExitDecision.no();
+
+        BigDecimal high = windowView.high();
+        BigDecimal low = windowView.low();
+        BigDecimal range = windowView.range();
+
+        if (high == null || low == null || low.signum() <= 0) return ZoneExitDecision.no();
+        if (range == null || range.signum() <= 0) return ZoneExitDecision.no();
+
+        BigDecimal clampedPrice = price;
+        if (clampedPrice.compareTo(low) < 0) clampedPrice = low;
+        if (clampedPrice.compareTo(high) > 0) clampedPrice = high;
+
+        double pos = clampedPrice.subtract(low)
+                .divide(range, 10, RoundingMode.HALF_UP)
+                .doubleValue();
+        if (!Double.isFinite(pos)) return ZoneExitDecision.no();
+
+        double entryHighPct = (cfg.getEntryFromHighPct() != null ? cfg.getEntryFromHighPct() : 0.0);
+        double highZone = clamp01(1.0 - (entryHighPct / 100.0));
+        if (pos + 1e-12 < highZone) return ZoneExitDecision.no();
+
+        TradeExecutionServiceImpl exec = tradeExecImpl();
+        if (exec == null) return ZoneExitDecision.no();
+
+        BigDecimal netPnlPct = exec.estimateNetPnlPct(chatId, st.exchange, st.network, st.entryPrice, price);
+        if (netPnlPct == null || netPnlPct.signum() <= 0) return ZoneExitDecision.no();
+
+        BigDecimal minNetProfitPct = pctBd(Math.max(0.0, zoneExitMinNetProfitPct));
+        if (netPnlPct.compareTo(minNetProfitPct) < 0) return ZoneExitDecision.no();
+
+        if (zoneExitRequireMomentumFade) {
+            Deque<BigDecimal> src = windowView.prices();
+            double momentum1 = calcMomentum1Pct(src, price);
+            if (momentum1 > zoneExitMomentumCeilingPct) {
+                return ZoneExitDecision.no();
+            }
+        }
+
+        return ZoneExitDecision.yes("ZONE_HIGH_EXIT", netPnlPct, pos, highZone);
+    }
+
+    private void publishZonesThrottled(Long chatId,
+                                       LocalState st,
+                                       String sym,
+                                       BigDecimal low,
+                                       BigDecimal high,
+                                       BigDecimal range,
+                                       double lowZone01,
+                                       Instant now) {
+
+        if (chatId == null || st == null || sym == null) return;
+        if (low == null || high == null) return;
+
+        if (st.lastZonePublishedAt != null) {
+            long ms = Duration.between(st.lastZonePublishedAt, now).toMillis();
+            if (ms >= 0 && ms < 400) return;
+        }
+
+        boolean sameWindow =
+                st.lastWindowHigh != null && st.lastWindowLow != null &&
+                st.lastWindowHigh.compareTo(high) == 0 &&
+                st.lastWindowLow.compareTo(low) == 0;
+
+        BigDecimal buyTop = null;
+        if (range != null && range.signum() > 0) {
+            buyTop = low.add(range.multiply(BigDecimal.valueOf(clamp01(lowZone01))))
+                    .setScale(Math.max(2, safeScale(low)), RoundingMode.HALF_UP);
+        }
+
+        boolean sameBuyTop =
+                st.lastBuyZoneTop != null && buyTop != null &&
+                st.lastBuyZoneTop.compareTo(buyTop) == 0;
+
+        if (sameWindow && sameBuyTop) return;
+
+        st.lastWindowHigh = high;
+        st.lastWindowLow = low;
+        st.lastBuyZoneTop = buyTop;
+        st.lastZonePublishedAt = now;
+
+        safeLive(() -> live.pushWindowZone(chatId, StrategyType.WINDOW_SCALPING, sym, high, low));
+
+        if (buyTop != null) {
+            BigDecimal top = buyTop.max(low);
+            BigDecimal bottom = buyTop.min(low);
+            safeLive(() -> live.pushTradeZone(chatId, StrategyType.WINDOW_SCALPING, sym, "BUY", top, bottom));
+        }
+    }
+
+    private int safeScale(BigDecimal price) {
+        try {
+            int sc = price.scale();
+            return Math.max(2, Math.min(8, sc));
+        } catch (Exception e) {
+            return 4;
+        }
+    }
+
+    private void publishPositionLines(Long chatId, String sym, LocalState st) {
+        if (chatId == null || sym == null || st == null) return;
+
+        if (st.tp != null || st.sl != null) {
+            safeLive(() -> live.pushTpSl(chatId, StrategyType.WINDOW_SCALPING, sym, st.tp, st.sl));
+        }
+
+        if (st.entryPrice != null) {
+            safeLive(() -> live.pushPriceLine(chatId, StrategyType.WINDOW_SCALPING, sym, "ENTRY", st.entryPrice));
+        }
+        if (st.tp != null) {
+            safeLive(() -> live.pushPriceLine(chatId, StrategyType.WINDOW_SCALPING, sym, "TP", st.tp));
+        }
+        if (st.sl != null) {
+            safeLive(() -> live.pushPriceLine(chatId, StrategyType.WINDOW_SCALPING, sym, "SL", st.sl));
+        }
+    }
+
+
+    private WindowScalpingStrategySettings sanitizeRuntimeConfig(WindowScalpingStrategySettings cfg) {
+        if (cfg == null) return null;
+
+        int windowSize = (cfg.getWindowSize() != null ? cfg.getWindowSize() : 5);
+        if (windowSize < 5) windowSize = 5;
+        if (windowSize > 24) windowSize = 24;
+        cfg.setWindowSize(windowSize);
+
+        double minRangeFloor = Math.max(0.0020, autoMinRangeMinFloorPct);
+        double minRangeCap = Math.max(minRangeFloor, Math.min(0.25, autoMinRangeMaxCapPct));
+        double minRange = cfg.getMinRangePct() != null ? cfg.getMinRangePct() : minRangeFloor;
+        if (!Double.isFinite(minRange) || minRange <= 0.0) minRange = minRangeFloor;
+        cfg.setMinRangePct(clampPct(minRange, minRangeFloor, minRangeCap));
+
+        double entryLow = cfg.getEntryFromLowPct() != null ? cfg.getEntryFromLowPct() : 38.0;
+        if (!Double.isFinite(entryLow) || entryLow <= 0.0) entryLow = 38.0;
+        entryLow = clampPct(entryLow, 12.0, 45.0);
+
+        double entryHigh = cfg.getEntryFromHighPct() != null ? cfg.getEntryFromHighPct() : 22.0;
+        if (!Double.isFinite(entryHigh) || entryHigh <= 0.0) entryHigh = 22.0;
+        entryHigh = clampPct(entryHigh, 8.0, 40.0);
+
+        if (entryLow + entryHigh > 85.0) {
+            double k = 85.0 / (entryLow + entryHigh);
+            entryLow *= k;
+            entryHigh *= k;
+        }
+
+        cfg.setEntryFromLowPct(entryLow);
+        cfg.setEntryFromHighPct(entryHigh);
+
+        double maxSpread = cfg.getMaxSpreadPct() != null ? cfg.getMaxSpreadPct() : 0.80;
+        if (!Double.isFinite(maxSpread) || maxSpread <= 0.0) maxSpread = 0.80;
+        cfg.setMaxSpreadPct(clampPct(maxSpread, 0.05, 2.50));
+
+        BigDecimal tp = positiveOrNull(cfg.getTakeProfitPct());
+        BigDecimal sl = positiveOrNull(cfg.getStopLossPct());
+        if (tp != null) cfg.setTakeProfitPct(pctBd(clampPct(tp.doubleValue(), 0.04, 1.20)));
+        if (sl != null) cfg.setStopLossPct(pctBd(clampPct(sl.doubleValue(), 0.02, 0.60)));
+
+        return cfg;
     }
 
     // =====================================================
@@ -450,128 +2723,2885 @@ public class WindowScalpingStrategyV4 implements TradingStrategy {
     // =====================================================
 
     private void refreshSettingsIfNeeded(Long chatId, LocalState st, Instant now) {
-
         Duration refreshEvery = Duration.ofSeconds(Math.max(1, settingsRefreshSeconds));
 
-        if (st.lastSettingsLoadAt != null &&
-            Duration.between(st.lastSettingsLoadAt, now).compareTo(refreshEvery) < 0) {
-            return;
-        }
+        boolean timeDue = (st.lastSettingsLoadAt == null) ||
+                          Duration.between(st.lastSettingsLoadAt, now).compareTo(refreshEvery) >= 0;
+
+        if (!timeDue) return;
 
         try {
-            StrategySettings loaded = (st.exchange != null && st.network != null)
-                    ? loadStrategySettingsStrict(chatId, st.exchange, st.network)
-                    : null;
-
-            WindowScalpingStrategySettings cfg = windowSettingsService.getOrCreate(chatId);
+            StrategySettings loaded = loadStrategySettingsAuto(chatId, st.exchange, st.network);
+            WindowScalpingStrategySettings cfg = sanitizeRuntimeConfig(windowSettingsService.getOrCreate(
+                    chatId,
+                    st.exchange,
+                    st.network,
+                    st.symbol,
+                    st.timeframe
+            ));
 
             String fp = buildFingerprint(loaded, cfg);
             boolean changed = st.lastFingerprint == null || !Objects.equals(st.lastFingerprint, fp);
 
             String oldSymbol = normalizeSymbolOrNull(st.symbol);
+            String oldTf = normalizeTimeframeOrNull(st.timeframe);
 
             if (loaded != null) st.ss = loaded;
             if (cfg != null) st.cfg = cfg;
 
             if (loaded != null) {
                 String loadedSymbol = normalizeSymbolOrNull(loaded.getSymbol());
-                if (loadedSymbol != null) st.symbol = loadedSymbol;
+                if (!st.inPosition && st.symbol == null && loadedSymbol != null) st.symbol = loadedSymbol;
 
-                if (loaded.getExchangeName() != null) st.exchange = loaded.getExchangeName();
-                if (loaded.getNetworkType() != null) st.network = loaded.getNetworkType();
+                String loadedTf = normalizeTimeframeOrNull(loaded.getTimeframe());
+                if (!st.inPosition && st.timeframe == null && loadedTf != null) st.timeframe = loadedTf;
+
+                if (st.exchange == null && loaded.getExchangeName() != null) {
+                    st.exchange = normalizeExchangeOrNull(loaded.getExchangeName());
+                }
+                if (st.network == null && loaded.getNetworkType() != null) {
+                    st.network = loaded.getNetworkType();
+                }
             }
+
+            ensureRuntimeContext(st, loaded);
 
             st.lastSettingsLoadAt = now;
 
             if (changed) {
                 st.lastFingerprint = fp;
 
-                log.info("[WINDOW] ⚙️ settings updated chatId={} ex={} net={} symbol={} windowSize={} entryLowPct={} minRangePct={} tpPct={} slPct={}",
-                        chatId,
-                        st.exchange,
-                        st.network,
-                        st.symbol,
-                        cfg != null ? cfg.getWindowSize() : null,
-                        cfg != null ? cfg.getEntryFromLowPct() : null,
-                        cfg != null ? cfg.getMinRangePct() : null,
-                        cfg != null ? cfg.getTakeProfitPct() : null,
-                        cfg != null ? cfg.getStopLossPct() : null
-                );
-
                 String newSymbol = normalizeSymbolOrNull(st.symbol);
-                if (oldSymbol != null && newSymbol != null && !oldSymbol.equals(newSymbol)) {
-                    st.window.clear();
-                    st.lastHoldReason = null;
+                String newTf = normalizeTimeframeOrNull(st.timeframe);
+
+                if (!st.inPosition) {
+                    boolean symChanged = oldSymbol != null && newSymbol != null && !oldSymbol.equals(newSymbol);
+                    boolean tfChanged = oldTf != null && newTf != null && !oldTf.equals(newTf);
+
+                    if (symChanged || tfChanged) {
+                        st.window.clear();
+                        st.tickWindow.clear();
+                        st.lastTickAt = null;
+
+                        st.lastHoldReason = null;
+                        st.consecutiveRangeTooSmall = 0;
+                        resetRangeSamples(st);
+                        resetMlCache(st);
+                        resetAdaptiveMlGateState(st);
+
+                        st.lastWindowHigh = null;
+                        st.lastWindowLow = null;
+                        st.lastBuyZoneTop = null;
+                        st.lastZonePublishedAt = null;
+                        resetRestoreThrottleState(st);
+
+                        log.info("[WINDOW] 🔄 Контекст изменился {}->{} tf {}->{} (вне позиции) => очищаю окна",
+                                oldSymbol, newSymbol, oldTf, newTf);
+                    }
                 }
             }
 
         } catch (Exception e) {
             st.lastSettingsLoadAt = now;
-            log.warn("[WINDOW] ⚠️ settings refresh failed chatId={} msg={}", chatId, e.toString());
+            log.warn("[WINDOW] ⚠ Не удалось обновить настройки chatId={} msg={}", chatId, e.toString());
+        }
+    }
+
+    // =====================================================
+    // FINGERPRINT
+    // =====================================================
+
+    private static String fmtEnumOrString(Object v) {
+        if (v == null) return "null";
+        if (v instanceof Enum<?> e) return e.name();
+        String s = String.valueOf(v).trim();
+        return s.isEmpty() ? "null" : s;
+    }
+
+    private static String fmtNum(Object v) {
+        if (v == null) return "null";
+        try {
+            if (v instanceof BigDecimal bd) {
+                return bd.stripTrailingZeros().toPlainString();
+            }
+            if (v instanceof Number n) {
+                double d = n.doubleValue();
+                if (Double.isNaN(d) || Double.isInfinite(d)) return "null";
+                return BigDecimal.valueOf(d).stripTrailingZeros().toPlainString();
+            }
+            String s = String.valueOf(v).trim();
+            if (s.isEmpty() || "null".equalsIgnoreCase(s)) return "null";
+            BigDecimal bd = new BigDecimal(s);
+            return bd.stripTrailingZeros().toPlainString();
+        } catch (Exception ignore) {
+            return "null";
         }
     }
 
     private String buildFingerprint(StrategySettings ss, WindowScalpingStrategySettings cfg) {
         String symbol = ss != null ? normalizeSymbolOrNull(ss.getSymbol()) : null;
-        String ex     = ss != null ? String.valueOf(ss.getExchangeName()) : "null";
-        String net    = ss != null ? String.valueOf(ss.getNetworkType()) : "null";
-        String tf     = ss != null ? safe(ss.getTimeframe()) : "null";
-        String candles = ss != null && ss.getCachedCandlesLimit() != null ? String.valueOf(ss.getCachedCandlesLimit()) : "null";
-        String cooldown = ss != null && ss.getCooldownSeconds() != null ? String.valueOf(ss.getCooldownSeconds()) : "null";
+        String ex = ss != null ? fmtEnumOrString(ss.getExchangeName()) : "null";
+        String net = ss != null ? fmtEnumOrString(ss.getNetworkType()) : "null";
+        String tf = ss != null ? safeNullable(ss.getTimeframe()) : "null";
+        String candles = (ss != null && ss.getCachedCandlesLimit() != null) ? String.valueOf(ss.getCachedCandlesLimit()) : "null";
 
-        String w = cfg != null ? String.valueOf(cfg.getWindowSize()) : "null";
-        String low = cfg != null ? String.valueOf(cfg.getEntryFromLowPct()) : "null";
-        String high = cfg != null ? String.valueOf(cfg.getEntryFromHighPct()) : "null";
-        String minR = cfg != null ? String.valueOf(cfg.getMinRangePct()) : "null";
+        String w = (cfg != null) ? fmtNum(cfg.getWindowSize()) : "null";
+        String lowPct = (cfg != null) ? fmtNum(cfg.getEntryFromLowPct()) : "null";
+        String highPct = (cfg != null) ? fmtNum(cfg.getEntryFromHighPct()) : "null";
+        String minRange = (cfg != null) ? fmtNum(cfg.getMinRangePct()) : "null";
+        String tpPct = (cfg != null) ? fmtNum(cfg.getTakeProfitPct()) : "null";
+        String slPct = (cfg != null) ? fmtNum(cfg.getStopLossPct()) : "null";
 
-        String tpPct = cfg != null && cfg.getTakeProfitPct() != null ? cfg.getTakeProfitPct().stripTrailingZeros().toPlainString() : "null";
-        String slPct = cfg != null && cfg.getStopLossPct() != null ? cfg.getStopLossPct().stripTrailingZeros().toPlainString() : "null";
-
-        return (symbol != null ? symbol : "null") + "|" + ex + "|" + net + "|" + tf + "|" + candles + "|" + cooldown
-               + "|" + w + "|" + low + "|" + high + "|" + minR
-               + "|" + tpPct + "|" + slPct;
+        return String.join("|",
+                "WINDOW_SCALPING",
+                ex, net,
+                (symbol != null ? symbol : "null"),
+                tf, candles,
+                w, lowPct, highPct, minRange, tpPct, slPct
+        );
     }
 
     // =====================================================
-    // STRICT SETTINGS LOAD (PROD)
+    // SETTINGS LOAD
     // =====================================================
 
-    private StrategySettings loadStrategySettingsStrict(Long chatId, String exchange, NetworkType network) {
-        String ex = normalizeExchangeOrNull(exchange);
-        if (ex == null || network == null) {
-            throw new IllegalStateException("exchange/network required for strict StrategySettings load (chatId=" + chatId + ")");
+    private StrategySettings loadStrategySettingsAuto(Long chatId, String exchange, NetworkType network) {
+        if (chatId == null) return null;
+
+        try {
+            return strategySettingsService.getOrCreate(chatId, StrategyType.WINDOW_SCALPING);
+        } catch (Exception e) {
+            log.warn("[WINDOW] ⚠ Не удалось загрузить StrategySettings chatId={} err={}", chatId, e.toString());
+            return null;
         }
-        return strategySettingsService.getOrCreate(chatId, StrategyType.WINDOW_SCALPING, ex, network);
     }
 
     // =====================================================
-    // LIVE HELPERS
+    // CONTEXT HELPERS
+    // =====================================================
+
+    private void ensureRuntimeContext(LocalState st, StrategySettings ss) {
+        if (st == null) return;
+
+        st.exchange = firstNonBlankExchange(
+                st.exchange,
+                ss != null ? ss.getExchangeName() : null,
+                defaultExchange
+        );
+
+        st.network = firstNonNullNetwork(
+                st.network,
+                ss != null ? ss.getNetworkType() : null,
+                parseNetworkOrNull(defaultNetwork)
+        );
+
+        st.symbol = firstNonBlankSymbol(
+                st.symbol,
+                ss != null ? ss.getSymbol() : null,
+                defaultSymbol
+        );
+
+        st.timeframe = firstNonBlankTimeframe(
+                st.timeframe,
+                ss != null ? ss.getTimeframe() : null,
+                defaultTimeframe
+        );
+    }
+
+    private static String firstNonBlankExchange(String... values) {
+        if (values == null) return null;
+        for (String v : values) {
+            String n = normalizeExchangeOrNull(v);
+            if (n != null) return n;
+        }
+        return null;
+    }
+
+    private static String firstNonBlankSymbol(String... values) {
+        if (values == null) return null;
+        for (String v : values) {
+            String n = normalizeSymbolOrNull(v);
+            if (n != null) return n;
+        }
+        return null;
+    }
+
+    private static String firstNonBlankTimeframe(String... values) {
+        if (values == null) return null;
+        for (String v : values) {
+            String n = normalizeTimeframeOrNull(v);
+            if (n != null) return n;
+        }
+        return null;
+    }
+
+    private static NetworkType firstNonNullNetwork(NetworkType... values) {
+        if (values == null) return null;
+        for (NetworkType v : values) {
+            if (v != null) return v;
+        }
+        return null;
+    }
+
+    private static NetworkType parseNetworkOrNull(String value) {
+        String s = normalizeExchangeOrNull(value);
+        if (s == null) return null;
+        try {
+            return NetworkType.valueOf(s);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    // =====================================================
+    // MODE / FLAGS
+    // =====================================================
+
+    private static AdvancedControlMode modeOrManual(StrategySettings ss) {
+        if (ss == null) return AdvancedControlMode.MANUAL;
+        AdvancedControlMode m = ss.getAdvancedControlMode();
+        return (m != null ? m : AdvancedControlMode.MANUAL);
+    }
+
+    private static boolean isManualMode(StrategySettings ss) {
+        return modeOrManual(ss) == AdvancedControlMode.MANUAL;
+    }
+
+    private static boolean isHybridMode(StrategySettings ss) {
+        return modeOrManual(ss) == AdvancedControlMode.HYBRID;
+    }
+
+    private static boolean isAiMode(StrategySettings ss) {
+        return modeOrManual(ss) == AdvancedControlMode.AI;
+    }
+
+    private boolean isAutoTuneAllowed(StrategySettings ss) {
+        return ss != null && ss.isAutoTuneEnabled() && !isManualMode(ss);
+    }
+
+    private boolean isMlGateAllowed(StrategySettings ss) {
+        if (!mlEnabled || ss == null) {
+            return false;
+        }
+        if (isManualMode(ss)) {
+            return false;
+        }
+        return ss.isMlGateEnabled();
+    }
+
+    private boolean isCoarseAdjustAllowed(StrategySettings ss) {
+        return coarseAdjustEnabled && ss != null && !isManualMode(ss);
+    }
+
+    private boolean isAutoMinRangeAllowed(StrategySettings ss) {
+        return autoMinRangeEnabled && ss != null && !isManualMode(ss);
+    }
+
+    // =====================================================
+    // AUTO MIN-RANGE
+    // =====================================================
+
+    private void resetRangeSamples(LocalState st) {
+        if (st == null) return;
+        st.rangePctPtr = 0;
+        st.rangePctCount = 0;
+        st.lastAutoMinRangeAt = Instant.EPOCH;
+        st.lastAutoMinRangeApplied = null;
+        if (st.rangePctSamples != null) {
+            Arrays.fill(st.rangePctSamples, 0.0d);
+        }
+    }
+
+    private void recordRangePctSample(LocalState st, double rangePct) {
+        if (st == null) return;
+        if (!Double.isFinite(rangePct)) return;
+        if (rangePct <= 0) return;
+        if (rangePct > 50) return;
+        if (st.rangePctSamples == null || st.rangePctSamples.length == 0) return;
+
+        int i = st.rangePctPtr;
+        st.rangePctSamples[i] = rangePct;
+        st.rangePctPtr = (i + 1) % st.rangePctSamples.length;
+        if (st.rangePctCount < st.rangePctSamples.length) st.rangePctCount++;
+    }
+
+    private double quantileFromSamples(LocalState st, double q) {
+        if (st == null) return Double.NaN;
+        if (st.rangePctCount <= 0) return Double.NaN;
+        if (st.rangePctSamples == null) return Double.NaN;
+
+        double qq = q;
+        if (!Double.isFinite(qq)) qq = 0.30;
+        if (qq < 0) qq = 0;
+        if (qq > 1) qq = 1;
+
+        int n = st.rangePctCount;
+        double[] tmp = new double[n];
+
+        int cap = st.rangePctSamples.length;
+        int start = (st.rangePctPtr - n);
+        while (start < 0) start += cap;
+
+        for (int k = 0; k < n; k++) {
+            int idx = (start + k) % cap;
+            tmp[k] = st.rangePctSamples[idx];
+        }
+
+        Arrays.sort(tmp);
+
+        int pos = (int) Math.floor(qq * (n - 1));
+        if (pos < 0) pos = 0;
+        if (pos >= n) pos = n - 1;
+        return tmp[pos];
+    }
+
+    private double resolveAutoFloor(LocalState st) {
+        double abs = autoMinRangeMinFloorPct;
+        if (!Double.isFinite(abs) || abs <= 0) abs = 0.002;
+
+        double p10 = quantileFromSamples(st, 0.10);
+        if (!Double.isFinite(p10) || p10 <= 0) return abs;
+
+        double dyn = p10 * 0.80;
+        if (!Double.isFinite(dyn) || dyn <= 0) return abs;
+
+        return Math.max(abs, dyn);
+    }
+
+    private void maybeAutoAdjustMinRange(Long chatId, String symbol, LocalState st, Instant now) {
+        if (chatId == null || st == null || now == null) return;
+        if (st.inPosition) return;
+        if (!isAutoMinRangeAllowed(st.ss)) return;
+
+        WindowScalpingStrategySettings cfg = st.cfg;
+        if (cfg == null) return;
+
+        int need = Math.max(20, autoMinRangeMinSamples);
+        if (st.rangePctCount < need) return;
+
+        long everySec = Math.max(15, autoMinRangeEverySeconds);
+        if (st.lastAutoMinRangeAt != null) {
+            long passed = Duration.between(st.lastAutoMinRangeAt, now).getSeconds();
+            if (passed < everySec) return;
+        }
+
+        double q = autoMinRangeQuantile;
+        if (!Double.isFinite(q)) q = 0.30;
+        if (q < 0.05) q = 0.05;
+        if (q > 0.80) q = 0.80;
+
+        double base = quantileFromSamples(st, q);
+        if (!Double.isFinite(base) || base <= 0) return;
+
+        double margin = autoMinRangeMarginFactor;
+        if (!Double.isFinite(margin) || margin <= 0 || margin > 1.0) margin = 0.90;
+
+        double floor = resolveAutoFloor(st);
+
+        double cap = autoMinRangeMaxCapPct;
+        if (!Double.isFinite(cap) || cap <= 0) cap = 0.50;
+        cap = Math.max(cap, floor);
+
+        double target = base * margin;
+        if (!Double.isFinite(target) || target <= 0) return;
+
+        target = Math.max(floor, Math.min(cap, target));
+
+        Double oldObj = cfg.getMinRangePct();
+        double old = (oldObj != null && Double.isFinite(oldObj) ? oldObj : 0.0);
+        if (old <= 0) old = target;
+
+        if (target > old && shouldSkipAutoRaiseAfterEntryReject(st, now)) {
+            return;
+        }
+        if (target < old && shouldFreezeMinRangeAfterNoRoomReject(st, now)) {
+            return;
+        }
+
+        double next = old * 0.70 + target * 0.30;
+        if (target > old) {
+            double stepRatio = autoMinRangeMaxRaiseStepRatio;
+            if (!Double.isFinite(stepRatio) || stepRatio <= 0.0) {
+                stepRatio = 0.08;
+            }
+            double cappedMax = old * (1.0 + stepRatio);
+            if (Double.isFinite(cappedMax) && cappedMax > 0.0) {
+                next = Math.min(next, cappedMax);
+            }
+        }
+
+        double eps = autoMinRangeMinDelta;
+        if (!Double.isFinite(eps) || eps <= 0) eps = 0.0003;
+
+        if (Math.abs(next - old) < eps) {
+            st.lastAutoMinRangeAt = now;
+            st.lastAutoMinRangeApplied = old;
+            return;
+        }
+
+        try {
+            WindowScalpingStrategySettings patch = WindowScalpingStrategySettings.builder()
+                    .chatId(chatId)
+                    .minRangePct(next)
+                    .build();
+
+            windowSettingsService.update(
+                    chatId,
+                    st.exchange,
+                    st.network,
+                    st.symbol,
+                    st.timeframe,
+                    patch
+            );
+
+            st.cfg = windowSettingsService.getOrCreate(
+                    chatId,
+                    st.exchange,
+                    st.network,
+                    st.symbol,
+                    st.timeframe
+            );
+            st.lastFingerprint = buildFingerprint(st.ss, st.cfg);
+            st.lastSettingsLoadAt = now;
+
+            st.lastAutoMinRangeAt = now;
+            st.lastAutoMinRangeApplied = next;
+
+            if (next > old + eps) {
+                st.lastAutoMinRangeRaisedAt = now;
+                st.lastAutoMinRangeRaisedFrom = old;
+                st.lastAutoMinRangeRaisedTo = next;
+            }
+
+            log.info("[WINDOW] 🧩 AUTO-MIN-RANGE chatId={} sym={} tf={} minRangePct {} -> {} (target={} baseQ{}={} floor={} cap={} n={})",
+                    chatId,
+                    symbol,
+                    st.timeframe,
+                    fmt(old),
+                    fmt(next),
+                    fmt(target),
+                    fmt(q),
+                    fmt(base),
+                    fmt(floor),
+                    fmt(cap),
+                    st.rangePctCount
+            );
+
+        } catch (Exception e) {
+            st.lastAutoMinRangeAt = now;
+            log.warn("[WINDOW] ⚠ AUTO-MIN-RANGE не выполнен chatId={} sym={} err={}", chatId, symbol, e.toString());
+        }
+    }
+
+    // =====================================================
+    // COARSE-ADJUST
+    // =====================================================
+
+    private void maybeCoarseAdjustOnRangeTooSmall(Long chatId, String symbol, LocalState st, Instant now) {
+        if (!coarseAdjustEnabled) return;
+        if (chatId == null || st == null || now == null) return;
+        if (st.inPosition) return;
+        if (!isCoarseAdjustAllowed(st.ss)) return;
+
+        WindowScalpingStrategySettings cfg = st.cfg;
+        if (cfg == null) return;
+
+        int afterN = Math.max(2, coarseAdjustAfterConsecutive);
+        if (st.consecutiveRangeTooSmall < afterN) return;
+
+        long cd = Math.max(15, coarseAdjustCooldownSeconds);
+        if (st.lastCoarseAdjustAt != null) {
+            long passed = Duration.between(st.lastCoarseAdjustAt, now).getSeconds();
+            if (passed < cd) return;
+        }
+
+        if (isProtectedAfterRecentAutoRaise(st, now)) {
+            return;
+        }
+        if (shouldFreezeMinRangeAfterNoRoomReject(st, now)) {
+            return;
+        }
+
+        double factor = coarseAdjustFactor;
+        if (!Double.isFinite(factor) || factor <= 0 || factor >= 1.0) factor = 0.85;
+
+        double floor;
+        if (autoMinRangeEnabled) {
+            floor = resolveAutoFloor(st);
+        } else {
+            floor = coarseAdjustMinFloorPct;
+            if (!Double.isFinite(floor) || floor <= 0) floor = 0.002;
+        }
+
+        Double oldMinObj = cfg.getMinRangePct();
+        double oldMin = (oldMinObj != null && Double.isFinite(oldMinObj)) ? oldMinObj : 0.0;
+        if (oldMin <= 0) oldMin = Math.max(floor, 0.10);
+
+        double newMin = Math.max(floor, oldMin * factor);
+        if (Math.abs(newMin - oldMin) < 1e-12) return;
+
+        try {
+            WindowScalpingStrategySettings patch = WindowScalpingStrategySettings.builder()
+                    .chatId(chatId)
+                    .minRangePct(newMin)
+                    .build();
+
+            windowSettingsService.update(
+                    chatId,
+                    st.exchange,
+                    st.network,
+                    st.symbol,
+                    st.timeframe,
+                    patch
+            );
+
+            st.cfg = windowSettingsService.getOrCreate(
+                    chatId,
+                    st.exchange,
+                    st.network,
+                    st.symbol,
+                    st.timeframe
+            );
+            st.lastFingerprint = buildFingerprint(st.ss, st.cfg);
+            st.lastSettingsLoadAt = now;
+
+            st.window.clear();
+            st.tickWindow.clear();
+            st.lastTickAt = null;
+
+            st.consecutiveRangeTooSmall = 0;
+            st.lastCoarseAdjustAt = now;
+            resetMlCache(st);
+
+            log.warn("[WINDOW] 🛠 COARSE-ADJUST chatId={} sym={} tf={} minRangePct {} -> {} (after={} cooldown={}s floor={})",
+                    chatId, symbol, st.timeframe, fmt(oldMin), fmt(newMin), afterN, cd, fmt(floor));
+
+        } catch (Exception e) {
+            log.warn("[WINDOW] ⚠ COARSE-ADJUST не выполнен chatId={} sym={} err={}", chatId, symbol, e.toString());
+        }
+    }
+
+    private long resolvePostSlCooldownMs(LocalState st) {
+        long baseMs = Math.max(5_000L, postSlCooldownMs);
+        int candles = Math.max(1, postSlCooldownCandles);
+
+        String tf = normalizeTimeframeOrNull(st != null ? st.timeframe : null);
+        long tfMs = timeframeToMillis(tf);
+        if (tfMs <= 0) {
+            return baseMs;
+        }
+
+        long candleBlockMs = tfMs * candles;
+        if (candleBlockMs <= 0) {
+            return baseMs;
+        }
+
+        return Math.max(baseMs, candleBlockMs);
+    }
+
+    private boolean isProtectedAfterRecentAutoRaise(LocalState st, Instant now) {
+        if (st == null || now == null) return false;
+        if (st.lastAutoMinRangeRaisedAt == null) return false;
+
+        long protectSec = Math.max(60L, autoMinRangeProtectRaiseSeconds);
+        long ageSec = Duration.between(st.lastAutoMinRangeRaisedAt, now).getSeconds();
+        if (ageSec < 0) return true;
+        if (ageSec > protectSec) return false;
+
+        double from = st.lastAutoMinRangeRaisedFrom != null ? st.lastAutoMinRangeRaisedFrom : 0.0;
+        double to = st.lastAutoMinRangeRaisedTo != null ? st.lastAutoMinRangeRaisedTo : from;
+
+        return to > from + Math.max(0.0003, autoMinRangeMinDelta);
+    }
+
+    private boolean shouldSkipAutoRaiseAfterEntryReject(LocalState st, Instant now) {
+        if (st == null || now == null) return false;
+        if (st.lastEntryBlockedAt == null || st.lastEntryBlockedReason == null) return false;
+
+        long protectSec = Math.max(60L, autoMinRangeBlockRaiseOnEntryRejectSeconds);
+        long ageSec = Duration.between(st.lastEntryBlockedAt, now).getSeconds();
+        if (ageSec < 0) return true;
+        if (ageSec > protectSec) return false;
+
+        return switch (st.lastEntryBlockedReason) {
+            case "weak_low_zone_touch",
+                 "weak_low_zone_rebound",
+                 "weak_low_zone_touch_fail_open",
+                 "no_room_to_high" -> true;
+            default -> false;
+        };
+    }
+
+    private boolean shouldFreezeMinRangeAfterNoRoomReject(LocalState st, Instant now) {
+        if (st == null || now == null) return false;
+        if (st.lastEntryBlockedAt == null) return false;
+        if (!"no_room_to_high".equalsIgnoreCase(safeNullable(st.lastEntryBlockedReason))) return false;
+
+        long protectSec = Math.max(90L, autoMinRangeBlockRaiseOnEntryRejectSeconds);
+        long ageSec = Duration.between(st.lastEntryBlockedAt, now).getSeconds();
+        return ageSec < 0 || ageSec <= protectSec;
+    }
+
+    private boolean isWeakLowZoneRebound(Deque<BigDecimal> src, BigDecimal currentPrice) {
+        if (src == null || src.size() < 3 || currentPrice == null || currentPrice.signum() <= 0) return false;
+
+        int lookback = Math.max(2, Math.min(6, lowZoneDescendingLookback));
+        if (!areLastNClosesDescending(src, lookback)) return false;
+
+        double reboundPct = calcReboundFromRecentLowPct(src, currentPrice, lookback);
+        double minBouncePct = minReboundAfterLowTouchPct;
+        if (!Double.isFinite(minBouncePct) || minBouncePct < 0.0) {
+            minBouncePct = 0.03;
+        }
+
+        return reboundPct + 1e-12 < minBouncePct;
+    }
+
+    private boolean areLastNClosesDescending(Deque<BigDecimal> src, int lookback) {
+        if (src == null || src.size() < 3) return false;
+
+        int need = Math.max(2, lookback);
+        List<BigDecimal> tail = lastNValues(src, need);
+        if (tail.size() < need) return false;
+
+        for (int i = 1; i < tail.size(); i++) {
+            BigDecimal prev = tail.get(i - 1);
+            BigDecimal cur = tail.get(i);
+            if (prev == null || cur == null) return false;
+            if (cur.compareTo(prev) >= 0) return false;
+        }
+        return true;
+    }
+
+    private double calcReboundFromRecentLowPct(Deque<BigDecimal> src, BigDecimal currentPrice, int lookback) {
+        if (src == null || currentPrice == null || currentPrice.signum() <= 0) return 0.0;
+
+        int need = Math.max(2, lookback);
+        List<BigDecimal> tail = lastNValues(src, need);
+        if (tail.isEmpty()) return 0.0;
+
+        BigDecimal recentLow = null;
+        for (BigDecimal v : tail) {
+            if (v == null || v.signum() <= 0) continue;
+            recentLow = recentLow == null ? v : recentLow.min(v);
+        }
+
+        if (recentLow == null || recentLow.signum() <= 0) return 0.0;
+
+        return currentPrice.subtract(recentLow)
+                .divide(recentLow, 10, RoundingMode.HALF_UP)
+                .multiply(BigDecimal.valueOf(100))
+                .doubleValue();
+    }
+
+    private List<BigDecimal> lastNValues(Deque<BigDecimal> src, int n) {
+        List<BigDecimal> out = new ArrayList<>(Math.max(0, n));
+        if (src == null || n <= 0) return out;
+
+        Iterator<BigDecimal> it = src.descendingIterator();
+        while (it.hasNext() && out.size() < n) {
+            out.add(it.next());
+        }
+        Collections.reverse(out);
+        return out;
+    }
+
+    // =====================================================
+    // ML
+    // =====================================================
+
+    private double resolveMlThreshold(StrategySettings ss) {
+        double threshold = mlMinProba;
+
+        if (ss != null) {
+            BigDecimal gate = ss.getGateMinProb();
+            if (gate != null) {
+                double v = gate.doubleValue();
+                if (Double.isFinite(v) && v > 0.0) {
+                    threshold = v;
+                }
+            }
+        }
+
+        if (!Double.isFinite(threshold) || threshold <= 0.0) {
+            threshold = 0.18;
+        }
+
+        if (ss != null && (isAiMode(ss) || isHybridMode(ss))) {
+            double hardCap = hasPreparedMlContext(ss) ? 0.18 : 0.24;
+            if (threshold > hardCap) {
+                threshold = hardCap;
+            }
+        }
+
+        return threshold;
+    }
+
+    private boolean requiresPreparedMlContext(StrategySettings ss) {
+        if (ss == null) return false;
+        return prepareOnStartEnabled && isAiMode(ss);
+    }
+
+    private boolean hasPreparedMlContext(StrategySettings ss) {
+        if (ss == null) return false;
+        return safeNullable(ss.getMlModelKey()) != null
+                && safeNullable(ss.getMlModelVersion()) != null;
+    }
+
+    private void resetAdaptiveMlGateState(LocalState st) {
+        if (st == null) return;
+
+        int cap = Math.max(16, adaptiveMlGateSampleSize);
+        st.mlProbaSamples = new double[cap];
+        st.mlProbaPtr = 0;
+        st.mlProbaCount = 0;
+        st.lastAdaptiveMlThreshold = null;
+        st.lastAdaptiveMlLogAt = null;
+        st.consecutiveMlBelowThreshold = 0;
+        st.consecutiveUltraLowMlProba = 0;
+    }
+
+    private void recordMlProbaSample(LocalState st, double proba) {
+        if (st == null) return;
+        if (!Double.isFinite(proba)) return;
+        if (proba < 0.0 || proba > 1.0) return;
+
+        if (st.mlProbaSamples == null || st.mlProbaSamples.length != Math.max(16, adaptiveMlGateSampleSize)) {
+            resetAdaptiveMlGateState(st);
+        }
+
+        int i = st.mlProbaPtr;
+        st.mlProbaSamples[i] = proba;
+        st.mlProbaPtr = (i + 1) % st.mlProbaSamples.length;
+        if (st.mlProbaCount < st.mlProbaSamples.length) {
+            st.mlProbaCount++;
+        }
+    }
+
+    private double quantileFromMlProbaSamples(LocalState st, double q) {
+        if (st == null || st.mlProbaSamples == null || st.mlProbaCount <= 0) return Double.NaN;
+
+        double qq = q;
+        if (!Double.isFinite(qq)) qq = 0.85;
+        if (qq < 0.0) qq = 0.0;
+        if (qq > 1.0) qq = 1.0;
+
+        int n = st.mlProbaCount;
+        double[] tmp = new double[n];
+
+        int cap = st.mlProbaSamples.length;
+        int start = st.mlProbaPtr - n;
+        while (start < 0) start += cap;
+
+        for (int k = 0; k < n; k++) {
+            int idx = (start + k) % cap;
+            tmp[k] = st.mlProbaSamples[idx];
+        }
+
+        Arrays.sort(tmp);
+        int pos = (int) Math.floor(qq * (n - 1));
+        if (pos < 0) pos = 0;
+        if (pos >= n) pos = n - 1;
+        return tmp[pos];
+    }
+
+    private double resolveEffectiveMlThreshold(StrategySettings ss, LocalState st, double score) {
+        double baseThreshold = resolveMlThreshold(ss);
+
+        if (!adaptiveMlGateEnabled || st == null) {
+            return baseThreshold;
+        }
+
+        if (adaptiveMlGateOnlyHybrid && !isHybridMode(ss)) {
+            return baseThreshold;
+        }
+
+        double strongScore = adaptiveMlGateMinStrongScore;
+        if (!Double.isFinite(strongScore)) strongScore = 18.0;
+
+        double maxDrop = adaptiveMlGateMaxThresholdDrop;
+        if (!Double.isFinite(maxDrop) || maxDrop <= 0.0) maxDrop = 0.44;
+
+        double floor = adaptiveMlGateFloor;
+        if (!Double.isFinite(floor) || floor <= 0.0) floor = 0.06;
+
+        floor = Math.max(floor, baseThreshold - maxDrop);
+        floor = Math.min(floor, baseThreshold);
+
+        boolean aiPrepared = isAiMode(ss) && hasPreparedMlContext(ss);
+
+        if (score + 1e-12 < strongScore) {
+            if (aiPrepared) {
+                double warmupAdaptive = Math.max(floor, Math.min(0.14, baseThreshold - (maxDrop * 0.96)));
+                st.lastAdaptiveMlThreshold = warmupAdaptive;
+                return warmupAdaptive;
+            }
+            return baseThreshold;
+        }
+
+        int minSamples = Math.max(6, Math.min(12, Math.max(16, adaptiveMlGateSampleSize) / 4));
+        if (st.mlProbaCount < minSamples) {
+            double warmupAdaptive = aiPrepared
+                    ? Math.max(floor, Math.min(0.12, baseThreshold - (maxDrop * 0.96)))
+                    : Math.max(floor, baseThreshold - (maxDrop * 0.82));
+            st.lastAdaptiveMlThreshold = warmupAdaptive;
+            return warmupAdaptive;
+        }
+
+        double q = adaptiveMlGateQuantile;
+        if (!Double.isFinite(q)) q = 0.75;
+        if (q < 0.35) q = 0.35;
+        if (q > 0.95) q = 0.95;
+
+        double qValue = quantileFromMlProbaSamples(st, q);
+        if (!Double.isFinite(qValue)) {
+            return baseThreshold;
+        }
+
+        double margin = adaptiveMlGateMarginPct;
+        if (!Double.isFinite(margin) || margin < 0.0) margin = 0.015;
+
+        double adaptive = qValue + margin;
+        adaptive = Math.max(floor, adaptive);
+        adaptive = Math.min(baseThreshold, adaptive);
+
+        if (aiPrepared) {
+            adaptive = Math.min(adaptive, 0.12);
+        }
+
+        if (!Double.isFinite(adaptive) || adaptive <= 0.0) {
+            return baseThreshold;
+        }
+
+        st.lastAdaptiveMlThreshold = adaptive;
+        return adaptive;
+    }
+
+    private boolean isUltraLowMlPrediction(double proba, double threshold) {
+        if (!Double.isFinite(proba) || proba < 0.0) return false;
+        double ultra = mlUltraLowConfidencePct;
+        if (!Double.isFinite(ultra) || ultra <= 0.0) ultra = 0.02;
+
+        double relative = threshold * 0.12;
+        if (!Double.isFinite(relative) || relative <= 0.0) relative = ultra;
+
+        return proba <= Math.max(ultra, relative);
+    }
+
+    private boolean shouldFailOpenUltraLowConfidence(StrategySettings ss,
+                                                     LocalState st,
+                                                     Prediction pred,
+                                                     double score,
+                                                     double threshold) {
+        if (!mlFailOpenOnUltraLowConfidence) return false;
+        if (!isAiMode(ss) && !isHybridMode(ss)) return false;
+        if (!mlFailOpen && !isHybridMode(ss)) return false;
+        if (st == null || pred == null || !pred.ok) return false;
+        if (!hasPreparedMlContext(ss) && requiresPreparedMlContext(ss)) return false;
+        if (!isUltraLowMlPrediction(pred.proba, threshold)) return false;
+
+        boolean preparedAi = isAiMode(ss) && hasPreparedMlContext(ss);
+        int need = preparedAi ? 1 : Math.max(2, mlUltraLowConfidenceAfter);
+
+        if (preparedAi && st.consecutiveUltraLowMlProba >= 1) {
+            double preparedScoreFloor = 6.0;
+            return score + 1e-12 >= preparedScoreFloor;
+        }
+
+        if (st.consecutiveUltraLowMlProba < need && score < 55.0) return false;
+
+        double scoreFloor = mlFailOpenScoreFloor;
+        if (!Double.isFinite(scoreFloor) || scoreFloor <= 0.0) scoreFloor = 12.0;
+        return score + 1e-12 >= scoreFloor;
+    }
+
+    private void logMlUltraLowConfidenceFailOpenThrottled(Long chatId,
+                                                          String sym,
+                                                          LocalState st,
+                                                          Prediction pred,
+                                                          double threshold,
+                                                          double score,
+                                                          Instant now) {
+        if (st == null || now == null || pred == null) return;
+
+        long throttle = Math.max(5000L, mlLogThrottleMs);
+        String key = "ULTRA_LOW_FAILOPEN";
+
+        if (Objects.equals(st.lastMlWarnReason, key) && st.lastMlWarnAt != null) {
+            long age = Duration.between(st.lastMlWarnAt, now).toMillis();
+            if (age >= 0 && age < throttle) return;
+        }
+
+        st.lastMlWarnReason = key;
+        st.lastMlWarnAt = now;
+
+        log.warn("[WINDOW] 🤖 ML ultra-low fail-open chatId={} sym={} mode={} proba={} threshold={} score={} streak={} modelKey={} modelVer={}",
+                chatId,
+                sym,
+                modeOrManual(st.ss),
+                fmt(pred.proba),
+                fmt(threshold),
+                fmt(score),
+                st.consecutiveUltraLowMlProba,
+                safeNullable(pred.modelKey),
+                safeNullable(pred.modelVersion));
+    }
+
+    private static final class ParsedMlPredictResponse {
+        final boolean ok;
+        final Double proba;
+        final String error;
+        final String modelKey;
+        final String modelVersion;
+        final String schemaHash;
+
+        private ParsedMlPredictResponse(boolean ok,
+                                        Double proba,
+                                        String error,
+                                        String modelKey,
+                                        String modelVersion,
+                                        String schemaHash) {
+            this.ok = ok;
+            this.proba = proba;
+            this.error = error;
+            this.modelKey = modelKey;
+            this.modelVersion = modelVersion;
+            this.schemaHash = schemaHash;
+        }
+    }
+
+    private Prediction tryPredict(Long chatId,
+                                  String symbol,
+                                  Instant now,
+                                  Map<String, Object> features) {
+        try {
+            MlGateway gw = ml();
+            if (gw == null) return Prediction.fail("ml_gateway_missing");
+            if (!mlEnabled) return Prediction.fail("ml_disabled_by_strategy");
+
+            MlPredictResponse r = gw.predict(
+                    StrategyType.WINDOW_SCALPING,
+                    chatId,
+                    symbol,
+                    features,
+                    now
+            );
+
+            if (r == null) return Prediction.fail("predict_null");
+
+            ParsedMlPredictResponse parsed = parsePredictResponse(r);
+
+            if (!parsed.ok) {
+                return Prediction.fail(parsed.error != null ? parsed.error : "predict_not_ok");
+            }
+
+            Double p = parsed.proba;
+            if (p == null || !Double.isFinite(p)) {
+                return Prediction.fail("no_proba");
+            }
+
+            double proba = Math.max(0.0, Math.min(1.0, p));
+            String mk = firstNonBlank(parsed.modelKey, parsed.modelVersion, "unknown");
+            String mv = blankToNull(parsed.modelVersion);
+            String sh = blankToNull(parsed.schemaHash);
+
+            return Prediction.ok(mk, mv, sh, proba);
+
+        } catch (Exception e) {
+            return Prediction.fail("predict_exception:" + e.getClass().getSimpleName());
+        }
+    }
+
+    private ParsedMlPredictResponse parsePredictResponse(Object raw) {
+        JsonNode node;
+        try {
+            node = objectMapper.valueToTree(raw);
+        } catch (Exception e) {
+            return new ParsedMlPredictResponse(false, null, "predict_response_unreadable", null, null, null);
+        }
+
+        Boolean ok = findBoolean(node, "ok", "success");
+        Double proba = findDouble(node, "proba", "pWin", "pwin", "probability", "confidence", "score", "prob", "p");
+        String error = findString(node, "error", "reason", "message", "detail");
+        String modelKey = findString(node, "modelKey", "model_key", "key", "modelId", "model");
+        String modelVersion = findString(node, "modelVersion", "model_version", "version");
+        String schemaHash = findString(node, "schemaHash", "schema_hash", "featureOrderHash", "feature_order_hash");
+
+        if (ok == null) {
+            ok = (proba != null && (error == null || error.isBlank()));
+        }
+
+        return new ParsedMlPredictResponse(Boolean.TRUE.equals(ok), proba, blankToNull(error), blankToNull(modelKey), blankToNull(modelVersion), blankToNull(schemaHash));
+    }
+
+    private JsonNode findNode(JsonNode root, String... names) {
+        if (root == null || names == null) return null;
+        for (String name : names) {
+            if (name == null || name.isBlank()) continue;
+            JsonNode node = root.findValue(name);
+            if (node != null && !node.isNull() && !node.isMissingNode()) {
+                return node;
+            }
+        }
+        return null;
+    }
+
+    private Boolean findBoolean(JsonNode root, String... names) {
+        JsonNode node = findNode(root, names);
+        if (node == null) return null;
+
+        if (node.isBoolean()) {
+            return node.booleanValue();
+        }
+        if (node.isNumber()) {
+            return node.intValue() != 0;
+        }
+        if (node.isTextual()) {
+            String s = node.asText();
+            if (s == null) return null;
+            s = s.trim().toLowerCase(Locale.ROOT);
+            if (s.isEmpty()) return null;
+            if ("true".equals(s) || "ok".equals(s) || "success".equals(s) || "1".equals(s)) return true;
+            if ("false".equals(s) || "fail".equals(s) || "failed".equals(s) || "0".equals(s)) return false;
+        }
+        return null;
+    }
+
+    private Double findDouble(JsonNode root, String... names) {
+        JsonNode node = findNode(root, names);
+        if (node == null) return null;
+
+        if (node.isNumber()) {
+            double v = node.doubleValue();
+            return Double.isFinite(v) ? v : null;
+        }
+        if (node.isTextual()) {
+            try {
+                double v = Double.parseDouble(node.asText().trim());
+                return Double.isFinite(v) ? v : null;
+            } catch (Exception ignored) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private String findString(JsonNode root, String... names) {
+        JsonNode node = findNode(root, names);
+        if (node == null) return null;
+        if (node.isContainerNode()) return null;
+        return blankToNull(node.asText());
+    }
+
+    private String firstNonBlank(String... values) {
+        if (values == null) return null;
+        for (String v : values) {
+            String s = blankToNull(v);
+            if (s != null) return s;
+        }
+        return null;
+    }
+
+    private String blankToNull(String s) {
+        if (s == null) return null;
+        String t = s.trim();
+        return t.isEmpty() ? null : t;
+    }
+
+    private Prediction getPredictionThrottled(Long chatId,
+                                              String symbol,
+                                              LocalState st,
+                                              Map<String, Object> features,
+                                              BigDecimal currentPrice,
+                                              Instant now) {
+        if (st == null || now == null) {
+            return Prediction.fail("state_invalid");
+        }
+
+        long throttle = Math.max(200L, mlPredictThrottleMs);
+
+        if (st.lastMlPrediction != null && st.lastMlPredictAt != null) {
+            long ageMs = Duration.between(st.lastMlPredictAt, now).toMillis();
+            if (ageMs >= 0 && ageMs < throttle && isAlmostSamePrice(st.lastMlPredictPrice, currentPrice)) {
+                return st.lastMlPrediction;
+            }
+        }
+
+        Prediction pred = tryPredict(chatId, symbol, now, features);
+
+        st.lastMlPredictAt = now;
+        st.lastMlPredictPrice = currentPrice;
+        st.lastMlPrediction = pred;
+
+        return pred;
+    }
+
+    private boolean isAlmostSamePrice(BigDecimal a, BigDecimal b) {
+        if (a == null || b == null) return false;
+        if (a.signum() <= 0 || b.signum() <= 0) return false;
+
+        BigDecimal base = a.abs().max(BigDecimal.ONE);
+        BigDecimal diffPct = a.subtract(b).abs()
+                .divide(base, 10, RoundingMode.HALF_UP)
+                .multiply(BigDecimal.valueOf(100));
+
+        return diffPct.compareTo(BigDecimal.valueOf(0.02)) <= 0;
+    }
+
+    private String normalizeMlFailureReason(String reason) {
+        if (reason == null) return "predict_failed";
+        String s = reason.trim();
+        return s.isEmpty() ? "predict_failed" : s;
+    }
+
+    private boolean isHardMlFailureReason(String reason) {
+        String s = normalizeMlFailureReason(reason).toLowerCase(Locale.ROOT);
+
+        return s.contains("featureorder_hash_mismatch")
+               || s.contains("feature_order_hash_mismatch")
+               || s.contains("feature_hash_mismatch")
+               || s.contains("schema_mismatch")
+               || s.contains("feature_schema")
+               || s.contains("feature_spec")
+               || s.contains("missing_feature")
+               || s.contains("unknown_feature")
+               || s.contains("model_schema")
+               || s.contains("column_mismatch");
+    }
+
+    private boolean isMlFailOpenAllowed(StrategySettings ss, String reason) {
+        String normalized = normalizeMlFailureReason(reason);
+
+        if ("no_model".equalsIgnoreCase(normalized)) {
+            return true;
+        }
+
+        if (!mlFailOpen) return false;
+        if (!isHybridMode(ss)) return false;
+        return !isHardMlFailureReason(normalized);
+    }
+
+    private String mapMlFailureToHoldReason(StrategySettings ss, String reason) {
+        if (isHardMlFailureReason(reason)) {
+            return "ml_schema_mismatch";
+        }
+        if (isAiMode(ss)) {
+            return "ml_required_ai_mode";
+        }
+        return "predict_failed";
+    }
+
+    private void logMlFailureThrottled(Long chatId,
+                                       String sym,
+                                       LocalState st,
+                                       StrategySettings ss,
+                                       String reason,
+                                       Instant now) {
+        if (st == null || now == null) return;
+
+        long throttle = Math.max(3000L, mlLogThrottleMs);
+        String key = "FAILOPEN:" + normalizeMlFailureReason(reason);
+
+        if (Objects.equals(st.lastMlWarnReason, key) && st.lastMlWarnAt != null) {
+            long age = Duration.between(st.lastMlWarnAt, now).toMillis();
+            if (age >= 0 && age < throttle) return;
+        }
+
+        st.lastMlWarnReason = key;
+        st.lastMlWarnAt = now;
+
+        log.warn("[WINDOW] 🤖 ML fail-open chatId={} sym={} mode={} reason={}",
+                chatId, sym, modeOrManual(ss), reason);
+    }
+
+    private void logMlBlockedThrottled(Long chatId,
+                                       String sym,
+                                       LocalState st,
+                                       StrategySettings ss,
+                                       String reason,
+                                       Instant now) {
+        if (st == null || now == null) return;
+
+        long throttle = Math.max(3000L, mlLogThrottleMs);
+        String key = "BLOCK:" + normalizeMlFailureReason(reason);
+
+        if (Objects.equals(st.lastMlWarnReason, key) && st.lastMlWarnAt != null) {
+            long age = Duration.between(st.lastMlWarnAt, now).toMillis();
+            if (age >= 0 && age < throttle) return;
+        }
+
+        st.lastMlWarnReason = key;
+        st.lastMlWarnAt = now;
+
+        log.warn("[WINDOW] 🤖 ML BLOCKED entry chatId={} sym={} mode={} reason={}",
+                chatId, sym, modeOrManual(ss), reason);
+    }
+
+
+    private void logEntryBlockedThrottled(Long chatId,
+                                          String sym,
+                                          LocalState st,
+                                          String reason,
+                                          BigDecimal price,
+                                          BigDecimal diffPct,
+                                          Instant now) {
+        if (st == null || now == null) return;
+
+        long throttle = Math.max(5_000L, entryBlockLogThrottleMs);
+        long summaryThrottle = Math.max(throttle, entryBlockSummaryLogThrottleMs);
+
+        if (Objects.equals(st.lastEntryBlockedReason, reason) && st.lastEntryBlockedAt != null) {
+            long age = Duration.between(st.lastEntryBlockedAt, now).toMillis();
+            st.lastEntryBlockedRepeatCount++;
+
+            if (age >= 0 && age < throttle) {
+                return;
+            }
+
+            if (age >= 0 && age < summaryThrottle) {
+                st.lastEntryBlockedAt = now;
+                return;
+            }
+
+            long repeatCount = Math.max(1L, st.lastEntryBlockedRepeatCount);
+            st.lastEntryBlockedAt = now;
+            st.lastEntryBlockedSummaryAt = now;
+            st.lastEntryBlockedSummaryReason = reason;
+            st.lastEntryBlockedRepeatCount = 0L;
+
+            log.info("[WINDOW] ⛔ Вход отклонён chatId={} sym={} reason={} repeats={} lastPrice={} lastDiffPct={}",
+                    chatId,
+                    sym,
+                    safeNullable(reason),
+                    repeatCount,
+                    fmtBd(price),
+                    fmtBd(diffPct));
+            return;
+        }
+
+        st.lastEntryBlockedReason = reason;
+        st.lastEntryBlockedAt = now;
+        st.lastEntryBlockedSummaryAt = now;
+        st.lastEntryBlockedSummaryReason = reason;
+        st.lastEntryBlockedRepeatCount = 0L;
+
+        log.info("[WINDOW] ⛔ Вход отклонён chatId={} sym={} reason={} price={} diffPct={}",
+                chatId,
+                sym,
+                safeNullable(reason),
+                fmtBd(price),
+                fmtBd(diffPct));
+    }
+
+    private void resetMlCache(LocalState st) {
+        if (st == null) return;
+        st.lastMlPredictAt = null;
+        st.lastMlPredictPrice = null;
+        st.lastMlPrediction = null;
+        clearMlBelowThreshold(st);
+    }
+
+    private void clearMlBelowThreshold(LocalState st) {
+        if (st == null) return;
+        st.lastMlBelowThresholdAt = null;
+        st.lastMlBelowThresholdPrice = null;
+        st.lastMlBelowThresholdProba = null;
+        st.lastMlBelowThresholdThreshold = null;
+    }
+
+    private void rememberMlBelowThreshold(LocalState st,
+                                          BigDecimal price,
+                                          double proba,
+                                          double threshold,
+                                          Instant now) {
+        if (st == null) return;
+        st.lastMlBelowThresholdAt = now;
+        st.lastMlBelowThresholdPrice = price;
+        st.lastMlBelowThresholdProba = proba;
+        st.lastMlBelowThresholdThreshold = threshold;
+    }
+
+    private boolean shouldSkipMlRecheckAfterBelowThreshold(LocalState st,
+                                                           BigDecimal currentPrice,
+                                                           Instant now) {
+        if (st == null || now == null) return false;
+        if (st.lastMlBelowThresholdAt == null) return false;
+
+        long cooldownMs = Math.max(300L, mlBelowThresholdCooldownMs);
+        long ageMs = Duration.between(st.lastMlBelowThresholdAt, now).toMillis();
+        if (ageMs < 0) return false;
+        if (ageMs >= cooldownMs) return false;
+
+        return !hasEnoughPriceMoveForMlRecheck(st.lastMlBelowThresholdPrice, currentPrice);
+    }
+
+    private boolean hasEnoughPriceMoveForMlRecheck(BigDecimal prevPrice, BigDecimal currentPrice) {
+        if (prevPrice == null || currentPrice == null) return true;
+        if (prevPrice.signum() <= 0 || currentPrice.signum() <= 0) return true;
+
+        double movePct = priceMovePct(prevPrice, currentPrice);
+        double minMovePct = mlRecheckMinPriceMovePct;
+        if (!Double.isFinite(minMovePct) || minMovePct <= 0.0) {
+            minMovePct = 0.03d;
+        }
+
+        return movePct >= minMovePct;
+    }
+
+    private double priceMovePct(BigDecimal a, BigDecimal b) {
+        if (a == null || b == null) return Double.POSITIVE_INFINITY;
+        if (a.signum() <= 0 || b.signum() <= 0) return Double.POSITIVE_INFINITY;
+
+        return a.subtract(b).abs()
+                .divide(a.abs().max(BigDecimal.ONE), 10, RoundingMode.HALF_UP)
+                .multiply(BigDecimal.valueOf(100))
+                .doubleValue();
+    }
+
+    private void logMlBelowThresholdThrottled(Long chatId,
+                                              String sym,
+                                              LocalState st,
+                                              Prediction pred,
+                                              double threshold,
+                                              Instant now) {
+        if (st == null || now == null) return;
+
+        long throttle = Math.max(5000L, holdThrottleMs);
+        double proba = (pred != null ? pred.proba : 0.0);
+        String probaBucket = fmt(Math.floor(proba * 100.0) / 100.0);
+        String thresholdBucket = fmt(Math.floor(threshold * 100.0) / 100.0);
+        String key = "LOWPROBA:" + probaBucket + ":" + thresholdBucket;
+
+        if (Objects.equals(st.lastMlWarnReason, key) && st.lastMlWarnAt != null) {
+            long age = Duration.between(st.lastMlWarnAt, now).toMillis();
+            if (age >= 0 && age < throttle) {
+                return;
+            }
+        }
+
+        st.lastMlWarnReason = key;
+        st.lastMlWarnAt = now;
+
+        log.info("[WINDOW] 🤖 HOLD: ML ниже порога chatId={} sym={} proba={} threshold={} adaptiveThreshold={} streak={} cooldownMs={} recheckMovePct={} modelKey={} modelVer={} schemaHash={}",
+                chatId,
+                sym,
+                fmt(proba),
+                fmt(threshold),
+                fmt(st.lastAdaptiveMlThreshold != null ? st.lastAdaptiveMlThreshold : resolveMlThreshold(st.ss)),
+                st.consecutiveMlBelowThreshold,
+                Math.max(300L, mlBelowThresholdCooldownMs),
+                fmt(mlRecheckMinPriceMovePct),
+                pred != null ? safeNullable(pred.modelKey) : null,
+                pred != null ? safeNullable(pred.modelVersion) : null,
+                pred != null ? safeNullable(pred.schemaHash) : null);
+    }
+
+    private void rememberPendingMlSample(LocalState st,
+                                         Map<String, Object> features,
+                                         Instant ts,
+                                         String symbol,
+                                         String exchange,
+                                         NetworkType network,
+                                         String timeframe,
+                                         BigDecimal entryPrice,
+                                         Double proba,
+                                         String modelKey,
+                                         boolean failOpen) {
+        if (st == null) return;
+        if (features == null || features.isEmpty()) return;
+
+        st.pendingMlFeatures = new LinkedHashMap<>(features);
+        st.pendingMlFeatureTs = ts;
+        st.pendingMlSymbol = normalizeSymbolOrNull(symbol);
+        st.pendingMlExchange = normalizeExchangeOrNull(exchange);
+        st.pendingMlNetwork = (network != null ? network.name() : null);
+        st.pendingMlTimeframe = normalizeTimeframeOrNull(timeframe);
+        st.pendingMlEntryPrice = entryPrice;
+        st.pendingMlProba = proba;
+        st.pendingMlModelKey = (modelKey != null && !modelKey.isBlank()) ? modelKey.trim() : null;
+        st.pendingMlFailOpen = failOpen;
+    }
+
+    private void clearPendingMlSample(LocalState st) {
+        if (st == null) return;
+        st.pendingMlFeatures = null;
+        st.pendingMlFeatureTs = null;
+        st.pendingMlSymbol = null;
+        st.pendingMlExchange = null;
+        st.pendingMlNetwork = null;
+        st.pendingMlTimeframe = null;
+        st.pendingMlEntryPrice = null;
+        st.pendingMlProba = null;
+        st.pendingMlModelKey = null;
+        st.pendingMlFailOpen = false;
+    }
+
+    private void persistClosedTradeSample(Long chatId,
+                                          LocalState st,
+                                          String symbol,
+                                          BigDecimal exitPrice,
+                                          BigDecimal realizedPnlPct,
+                                          Instant exitTime) {
+        if (chatId == null || st == null) return;
+        if (mlSampleIngestService == null || objectMapper == null) return;
+        if (st.pendingMlFeatures == null || st.pendingMlFeatures.isEmpty()) return;
+
+        try {
+            String sym = normalizeSymbolOrNull(symbol);
+            if (sym == null) sym = normalizeSymbolOrNull(st.pendingMlSymbol);
+            if (sym == null) {
+                clearPendingMlSample(st);
+                return;
+            }
+
+            BigDecimal entryPrice = positiveOrNull(st.pendingMlEntryPrice);
+            BigDecimal actualExit = positiveOrNull(exitPrice);
+
+            if (entryPrice == null || actualExit == null) {
+                clearPendingMlSample(st);
+                return;
+            }
+
+            String label;
+            if (realizedPnlPct != null) {
+                label = realizedPnlPct.signum() >= 0 ? "WIN" : "LOSS";
+            } else {
+                label = actualExit.compareTo(entryPrice) >= 0 ? "WIN" : "LOSS";
+            }
+
+            Map<String, Object> features = new LinkedHashMap<>(st.pendingMlFeatures);
+
+            Map<String, Object> meta = new LinkedHashMap<>();
+            meta.put("featureSpec", new ArrayList<>(features.keySet()));
+            meta.put("entryPrice", entryPrice);
+            meta.put("exitPrice", actualExit);
+            meta.put("label", label);
+            meta.put("realizedPnlPct", realizedPnlPct);
+            meta.put("closedAtMs", exitTime != null ? exitTime.toEpochMilli() : Instant.now().toEpochMilli());
+            meta.put("mlProba", st.pendingMlProba);
+            meta.put("mlModelKey", st.pendingMlModelKey);
+            meta.put("mlFailOpen", st.pendingMlFailOpen);
+            meta.put("strategyType", StrategyType.WINDOW_SCALPING.name());
+            meta.put("symbol", sym);
+            meta.put("exchange", st.pendingMlExchange);
+            meta.put("network", st.pendingMlNetwork);
+            meta.put("timeframe", st.pendingMlTimeframe);
+
+            JsonNode featuresJson = objectMapper.valueToTree(features);
+            JsonNode metaJson = objectMapper.valueToTree(meta);
+
+            MlSampleEntity sample = MlSampleEntity.builder()
+                    .chatId(chatId)
+                    .strategyType(StrategyType.WINDOW_SCALPING)
+                    .exchange(st.pendingMlExchange)
+                    .network(st.pendingMlNetwork)
+                    .symbol(sym)
+                    .timeframe(st.pendingMlTimeframe)
+                    .ts(st.pendingMlFeatureTs != null ? st.pendingMlFeatureTs : exitTime)
+                    .label(label)
+                    .target("TP_SL")
+                    .proba(st.pendingMlProba)
+                    .featuresJson(featuresJson)
+                    .metaJson(metaJson)
+                    .createdAt(Instant.now())
+                    .build();
+
+            mlSampleIngestService.saveAndMaybeTrain(sample);
+
+            log.info("[WINDOW] 🧠 ML sample saved chatId={} sym={} tf={} label={} entry={} exit={} modelKey={} failOpen={}",
+                    chatId,
+                    sym,
+                    st.pendingMlTimeframe,
+                    label,
+                    fmtBd(entryPrice),
+                    fmtBd(actualExit),
+                    safeNullable(st.pendingMlModelKey),
+                    st.pendingMlFailOpen);
+
+        } catch (Exception e) {
+            log.warn("[WINDOW] ⚠ Не удалось сохранить ML sample chatId={} sym={} err={}",
+                    chatId, symbol, e.toString(), e);
+        } finally {
+            clearPendingMlSample(st);
+        }
+    }
+
+    private Map<String, Object> buildMlFeatures(
+            Long chatId,
+            LocalState st,
+            String symbol,
+            BigDecimal price,
+            Instant ts,
+            BigDecimal low,
+            BigDecimal high,
+            BigDecimal range,
+            double rangePct,
+            double pos,
+            double lowZone,
+            double highZone,
+            int windowSize,
+            BigDecimal diffPctForEntry
+    ) {
+        Map<String, Object> f = new LinkedHashMap<>();
+
+        f.put("chatId", chatId);
+        f.put("strategyType", StrategyType.WINDOW_SCALPING.name());
+        f.put("symbol", symbol);
+        f.put("exchange", st.exchange);
+        f.put("network", st.network != null ? st.network.name() : null);
+        f.put("timeframe", st.timeframe);
+        f.put("ts", (ts != null ? ts : Instant.now()).toEpochMilli());
+
+        double lastPrice = price.doubleValue();
+
+        double volatilityPct = calcVolatilityPct(st);
+        if (!Double.isFinite(volatilityPct) || volatilityPct <= 0.0) {
+            volatilityPct = rangePct;
+        }
+
+        Deque<BigDecimal> src = (st.tickWindow != null && !st.tickWindow.isEmpty())
+                ? st.tickWindow
+                : st.window;
+
+        double retWindowPct = calcWindowReturnPct(src);
+        double momentum1 = calcMomentum1Pct(src, price);
+
+        double smaFast = calcSma(src, Math.max(3, Math.min(5, windowSize)));
+        double smaSlow = calcSma(src, Math.max(5, Math.min(10, windowSize)));
+
+        double smaFastRel = relPct(lastPrice, smaFast);
+        double smaSlowRel = relPct(lastPrice, smaSlow);
+
+        // ВАЖНО: порядок должен совпадать с MlGateway.WINDOW_SCALPING_SPEC
+        f.put("windowSize", windowSize);
+        f.put("lastPrice", lastPrice);
+        f.put("price", lastPrice);
+        f.put("low", low.doubleValue());
+        f.put("high", high.doubleValue());
+        f.put("range", range.doubleValue());
+        f.put("rangePct", rangePct);
+        f.put("volatilityPct", volatilityPct);
+        f.put("pos01", pos);
+        f.put("posPct", pos * 100.0);
+        f.put("lowZone01", lowZone);
+        f.put("highZone01", highZone);
+        f.put("diffPctForEntry", diffPctForEntry.doubleValue());
+        f.put("retWindowPct", retWindowPct);
+        f.put("momentum1", momentum1);
+        f.put("smaFastRel", smaFastRel);
+        f.put("smaSlowRel", smaSlowRel);
+
+        return f;
+    }
+
+    private double calcWindowReturnPct(Deque<BigDecimal> src) {
+        if (src == null || src.isEmpty()) return 0.0;
+
+        BigDecimal first = src.peekFirst();
+        BigDecimal last = src.peekLast();
+
+        if (first == null || last == null || first.signum() <= 0) return 0.0;
+
+        return last.subtract(first)
+                .divide(first, 10, RoundingMode.HALF_UP)
+                .multiply(BigDecimal.valueOf(100))
+                .doubleValue();
+    }
+
+    private double calcMomentum1Pct(Deque<BigDecimal> src, BigDecimal fallbackLast) {
+        if (src == null || src.isEmpty()) return 0.0;
+
+        Iterator<BigDecimal> it = src.descendingIterator();
+        BigDecimal last = it.hasNext() ? it.next() : fallbackLast;
+        BigDecimal prev = it.hasNext() ? it.next() : null;
+
+        if (last == null) last = fallbackLast;
+        if (last == null || prev == null || prev.signum() <= 0) return 0.0;
+
+        return last.subtract(prev)
+                .divide(prev, 10, RoundingMode.HALF_UP)
+                .multiply(BigDecimal.valueOf(100))
+                .doubleValue();
+    }
+
+    private double calcSma(Deque<BigDecimal> src, int period) {
+        if (src == null || src.isEmpty() || period <= 0) return 0.0;
+
+        Iterator<BigDecimal> it = src.descendingIterator();
+        BigDecimal sum = BigDecimal.ZERO;
+        int n = 0;
+
+        while (it.hasNext() && n < period) {
+            BigDecimal v = it.next();
+            if (v == null || v.signum() <= 0) continue;
+            sum = sum.add(v);
+            n++;
+        }
+
+        if (n == 0) return 0.0;
+
+        return sum.divide(BigDecimal.valueOf(n), 10, RoundingMode.HALF_UP).doubleValue();
+    }
+
+    private double calcVolatilityPct(LocalState st) {
+        Deque<BigDecimal> src = (st != null && st.tickWindow != null && !st.tickWindow.isEmpty())
+                ? st.tickWindow
+                : (st != null ? st.window : null);
+        if (src == null || src.size() < 3) return 0.0;
+
+        List<Double> values = new ArrayList<>(src.size());
+        for (BigDecimal v : src) {
+            if (v != null && v.signum() > 0) {
+                values.add(v.doubleValue());
+            }
+        }
+
+        if (values.size() < 3) return 0.0;
+
+        double mean = 0.0;
+        for (double v : values) mean += v;
+        mean /= values.size();
+
+        if (!Double.isFinite(mean) || mean <= 0.0) return 0.0;
+
+        double var = 0.0;
+        for (double v : values) {
+            double d = v - mean;
+            var += d * d;
+        }
+        var /= values.size();
+
+        double std = Math.sqrt(var);
+        if (!Double.isFinite(std) || std <= 0.0) return 0.0;
+
+        return (std / mean) * 100.0;
+    }
+
+    private double relPct(double price, double ma) {
+        if (!Double.isFinite(price) || !Double.isFinite(ma) || ma <= 0.0) return 0.0;
+        return ((price - ma) / ma) * 100.0;
+    }
+
+    // =====================================================
+    // HOLD / AUTOTUNE
     // =====================================================
 
     private void safeLive(Runnable r) {
-        try { r.run(); } catch (Exception ignored) {}
+        try {
+            r.run();
+        } catch (Exception ignored) {
+        }
     }
 
-    private void pushHoldThrottled(Long chatId, String symbol, LocalState st, String reason, Instant now) {
-        if (symbol == null) return;
+    private Set<String> parsedAutoTuneHoldReasons() {
+        String raw = (autoTuneHoldReasons == null ? "" : autoTuneHoldReasons.trim());
+        String cacheKey = raw + "|lowConf=" + mlAutoTuneOnLowConfidence;
+        if (cacheKey.equals(cachedHoldReasonsRaw) && cachedHoldReasonsSet != null) {
+            return cachedHoldReasonsSet;
+        }
+
+        try {
+            Set<String> out = new HashSet<>();
+
+            if (!raw.isEmpty()) {
+                String[] parts = raw.split(",");
+                for (String p : parts) {
+                    String v = p.trim();
+                    if (!v.isEmpty()) out.add(v);
+                }
+            }
+
+            if (mlAutoTuneOnLowConfidence) {
+                out.add("ml_below_threshold");
+                out.add("predict_failed");
+            }
+
+            cachedHoldReasonsRaw = cacheKey;
+            cachedHoldReasonsSet = Set.copyOf(out);
+            return cachedHoldReasonsSet;
+
+        } catch (Exception ignored) {
+            cachedHoldReasonsRaw = cacheKey;
+            cachedHoldReasonsSet = Set.of();
+            return cachedHoldReasonsSet;
+        }
+    }
+
+    private void maybeRequestAutoTuneOnLowConfidence(Long chatId,
+                                                     String symbol,
+                                                     LocalState st,
+                                                     StrategySettings ss,
+                                                     double proba,
+                                                     double threshold,
+                                                     Instant now) {
+        if (!mlAutoTuneOnLowConfidence) return;
+        if (st == null || ss == null || now == null) return;
+        if (st.inPosition) return;
+        if (!isAutoTuneAllowed(ss)) return;
+        if (st.exchange == null || st.network == null) return;
+
+        int after = Math.max(3, mlAutoTuneLowConfidenceAfter);
+        if (st.consecutiveMlBelowThreshold < after) return;
+
+        AiStrategyOrchestrator o = orch();
+        if (o == null) return;
+
+        long cdSec = Math.max(10, autoTuneHoldCooldownSeconds);
+        if (st.lastAutoTuneRequestAt != null) {
+            long passed = Duration.between(st.lastAutoTuneRequestAt, now).getSeconds();
+            if (passed < cdSec) return;
+        }
+
+        st.lastAutoTuneRequestAt = now;
+
+        log.warn("[WINDOW] 🧠 AUTO-TUNE(LOW-CONFIDENCE) chatId={} sym={} proba={} threshold={} streak={} cooldown={}s",
+                chatId, symbol, fmt(proba), fmt(threshold), st.consecutiveMlBelowThreshold, cdSec);
+
+        o.triggerTuneDebounced(
+                chatId,
+                StrategyType.WINDOW_SCALPING,
+                st.exchange,
+                st.network,
+                "low_confidence:proba=" + fmt(proba) + ":thr=" + fmt(threshold),
+                Duration.ofSeconds(cdSec)
+        );
+    }
+
+    private void maybeRequestAutoTuneOnHold(Long chatId, String symbol, LocalState st, String reason, Instant now) {
+        if (!autoTuneOnHold) return;
+        if (st == null) return;
+        if (st.inPosition) return;
+        if (!isAutoTuneAllowed(st.ss)) return;
+
+        ensureRuntimeContext(st, st.ss);
+
+        if (st.exchange == null || st.network == null) return;
+
+        Set<String> reasons = parsedAutoTuneHoldReasons();
+        if (!reasons.isEmpty() && !reasons.contains(reason)) return;
+
+        long cdSec = Math.max(10, autoTuneHoldCooldownSeconds);
+        if (st.lastAutoTuneRequestAt != null) {
+            long passed = Duration.between(st.lastAutoTuneRequestAt, now).getSeconds();
+            if (passed < cdSec) return;
+        }
+
+        st.lastAutoTuneRequestAt = now;
+
+        AiStrategyOrchestrator o = orch();
+        if (o == null) return;
+
+        log.warn("[WINDOW] 🧠 AUTO-TUNE(HOLD) chatId={} sym={} reason={} cooldown={}s",
+                chatId, symbol, reason, cdSec);
+
+        o.triggerTuneDebounced(
+                chatId,
+                StrategyType.WINDOW_SCALPING,
+                st.exchange,
+                st.network,
+                "hold:" + reason,
+                Duration.ofSeconds(cdSec)
+        );
+    }
+
+    private void pushHoldThrottled(Long chatId, String symbol, LocalState st, String reason, Instant now, long holdMs) {
+        if (st == null) return;
+
+        String sym = normalizeSymbolOrNull(symbol);
+        if (sym == null) sym = normalizeSymbolOrNull(st.symbol);
+
+        final String symFinal = sym;
+
+        if ("range_too_small".equals(reason)) {
+            st.consecutiveRangeTooSmall = Math.max(0, st.consecutiveRangeTooSmall) + 1;
+        } else if (!"warming_up".equals(reason)) {
+            st.consecutiveRangeTooSmall = 0;
+        }
 
         if (Objects.equals(st.lastHoldReason, reason) && st.lastHoldAt != null) {
             long ms = Duration.between(st.lastHoldAt, now).toMillis();
-            if (ms < Math.max(200, holdThrottleMs)) return;
+            if (ms < holdMs) {
+                if ("range_too_small".equals(reason)) {
+                    maybeCoarseAdjustOnRangeTooSmall(chatId, symFinal, st, now);
+                }
+                maybeRequestAutoTuneOnHold(chatId, symFinal, st, reason, now);
+                return;
+            }
         }
 
         st.lastHoldReason = reason;
         st.lastHoldAt = now;
 
-        safeLive(() -> live.pushSignal(chatId, StrategyType.WINDOW_SCALPING, symbol, null, Signal.hold(reason)));
+        String ru = holdReasonRu(reason);
+        String msg = (ru != null ? (ru + " [" + reason + "]") : ("HOLD: " + reason));
+
+        if (symFinal != null) {
+            safeLive(() -> live.pushSignal(chatId, StrategyType.WINDOW_SCALPING, symFinal, null, Signal.hold(msg)));
+        }
+
+        if ("range_too_small".equals(reason)) {
+            maybeCoarseAdjustOnRangeTooSmall(chatId, symFinal, st, now);
+        }
+
+        maybeRequestAutoTuneOnHold(chatId, symFinal, st, reason, now);
     }
 
+    private String holdReasonRu(String code) {
+        if (code == null) return null;
+
+        return switch (code) {
+            case "started" -> "Старт стратегии";
+            case "no_settings" -> "Нет настроек (StrategySettings/CFG/символ)";
+            case "windowSize<5" -> "Размер окна слишком мал (нужно минимум 5)";
+            case "warming_up" -> "Прогрев окна (недостаточно данных)";
+            case "window_invalid" -> "Не удалось корректно построить окно";
+            case "range_zero" -> "Диапазон окна нулевой";
+            case "range_too_small" -> "Диапазон слишком мал для входа";
+            case "pos_invalid" -> "Не удалось вычислить позицию цены в окне";
+            case "tp_sl_pct_invalid" -> "Некорректный TP/SL";
+            case "falling_knife" -> "Цена слишком близко к экстремуму окна — ловим нож";
+            case "negative_micro_momentum" -> "Нет микро-разворота вверх";
+            case "trend_down_too_strong" -> "Окно ещё слишком медвежье для входа";
+            case "micro_chop" -> "Слишком мелкий шум внутри окна";
+            case "weak_low_zone_rebound" -> "Нижняя зона есть, но отскок слишком слабый";
+            case "weak_low_zone_touch" -> "Касание нижней зоны слишком слабое";
+            case "weak_low_zone_touch_fail_open" -> "Без ML вход по нижней зоне слишком слабый";
+            case "no_room_to_high" -> "До верха окна недостаточно хода для безопасного TP";
+            case "same_candle_exit_blocked" -> "Выход в той же свече после входа запрещён";
+            case "predict_failed" -> "ML-прогноз недоступен";
+            case "ml_below_threshold" -> "ML-прогноз ниже порога";
+            case "ml_required_ai_mode" -> "В AI-режиме вход заблокирован: ML недоступен";
+            case "ml_schema_mismatch" -> "ML схема/порядок фичей не совпадает";
+            case "entry_failed" -> "Ошибка при входе в сделку";
+            case "open_order_exists" -> "Есть открытый ордер по этому символу — новый вход запрещён";
+            case "wallet_base_untracked_position" -> "На бирже уже есть base-актив по символу — новый вход запрещён";
+            case "in_high_zone_wait_tp" -> "Цена у верхней границы — ждём";
+            case "pos_snapshot_missing" -> "Позиция есть, но нет данных в PositionStore";
+            case "restored_dust_position" -> "Позиция слишком мала для выхода (dust, меньше minNotional)";
+            case "partial_exit", "sell_not_fully_filled" -> "SELL исполнился не полностью, позиция оставлена открытой";
+            case "sell_not_filled" -> "SELL не исполнился, позиция сохранена";
+            case "balance" -> "Недостаточно доступного base для полного закрытия, позиция сохранена";
+            case "position_sync_mismatch" -> "Размер позиции не совпадает с доступным base на бирже, полная продажа запрещена";
+            case "post_exit_cooldown" -> "Короткий cooldown после выхода";
+            case "post_sl_cooldown" -> "Пауза после стоп-лосса, чтобы не перезаходить сразу";
+            case "post_entry_cooldown" -> "Короткий cooldown после входа";
+            default -> null;
+        };
+    }
+
+    // =====================================================
+    // POSITION RESTORE
+    // =====================================================
+
+    private boolean isDustPosition(BigDecimal qty, BigDecimal entryPrice, BigDecimal minRestorableNotional) {
+        if (qty == null || entryPrice == null || minRestorableNotional == null) return false;
+        if (qty.signum() <= 0 || entryPrice.signum() <= 0 || minRestorableNotional.signum() <= 0) return false;
+
+        BigDecimal notional = qty.multiply(entryPrice);
+        return notional.compareTo(minRestorableNotional) < 0;
+    }
+
+    private void clearLocalPosition(LocalState st) {
+        if (st == null) return;
+
+        st.inPosition = false;
+        st.isLong = true;
+        st.entryPrice = null;
+        st.tp = null;
+        st.sl = null;
+        st.entryQty = null;
+        st.entryOrderId = null;
+        st.entryCandleOpenTimeMs = null;
+        st.entryCandleTimeframe = null;
+        st.lastPositionSyncAt = null;
+    }
+
+    private void resetRestoreThrottleState(LocalState st) {
+        if (st == null) return;
+        st.lastRestoreProbeAt = null;
+        st.lastRestoreMissAt = null;
+        st.lastDustRestoreLogAt = null;
+        st.lastDustRestoreLogKey = null;
+        st.lastPositionSyncAt = null;
+    }
+
+    private boolean shouldProbeRestore(LocalState st, Instant now) {
+        if (st == null || now == null) return true;
+        if (st.inPosition) return false;
+
+        if (st.lastRestoreMissAt == null) {
+            return true;
+        }
+
+        long cooldownMs = Math.max(500L, restoreRetryCooldownMs);
+        long ageMs = Duration.between(st.lastRestoreMissAt, now).toMillis();
+        return ageMs < 0 || ageMs >= cooldownMs;
+    }
+
+    private void markRestoreMiss(LocalState st, Instant now) {
+        if (st == null || now == null) return;
+        st.lastRestoreProbeAt = now;
+        st.lastRestoreMissAt = now;
+    }
+
+    private void markRestoreSuccess(LocalState st, Instant now) {
+        if (st == null || now == null) return;
+        st.lastRestoreProbeAt = now;
+        st.lastRestoreMissAt = null;
+    }
+
+    private boolean shouldLogDustRestore(LocalState st, String key, Instant now) {
+        if (st == null || now == null) return true;
+
+        long throttleMs = Math.max(1_000L, dustRestoreLogThrottleMs);
+        if (Objects.equals(st.lastDustRestoreLogKey, key) && st.lastDustRestoreLogAt != null) {
+            long ageMs = Duration.between(st.lastDustRestoreLogAt, now).toMillis();
+            if (ageMs >= 0 && ageMs < throttleMs) {
+                return false;
+            }
+        }
+
+        st.lastDustRestoreLogKey = key;
+        st.lastDustRestoreLogAt = now;
+        return true;
+    }
+
+    private String buildDustRestoreLogKey(Long chatId,
+                                          String symbol,
+                                          String exchange,
+                                          NetworkType network,
+                                          String source) {
+        return chatId + ":" +
+                safeNullable(symbol) + ":" +
+                safeNullable(exchange) + ":" +
+                safeNullable(network != null ? network.name() : null) + ":" +
+                safeNullable(source);
+    }
+
+    private void logDustRestoreSkipThrottled(Long chatId,
+                                             LocalState st,
+                                             String symbol,
+                                             String exchange,
+                                             NetworkType network,
+                                             BigDecimal qty,
+                                             BigDecimal entryPrice,
+                                             BigDecimal notional,
+                                             BigDecimal minRestorableNotional,
+                                             String source,
+                                             Instant now) {
+        String key = buildDustRestoreLogKey(chatId, symbol, exchange, network, source);
+        if (!shouldLogDustRestore(st, key, now)) {
+            return;
+        }
+
+        if ("history".equalsIgnoreCase(source)) {
+            log.warn("[WINDOW] 🧹 Не восстанавливаю dust-позицию из истории chatId={} sym={} ex={} net={} qty={} notional={} minRestorable={}",
+                    chatId,
+                    symbol,
+                    exchange,
+                    network,
+                    fmtBd(qty),
+                    fmtBd(notional),
+                    fmtBd(minRestorableNotional));
+            return;
+        }
+
+        log.warn("[WINDOW] 🧹 Пропускаю восстановление dust-позиции chatId={} sym={} ex={} net={} qty={} entry={} notional={} minRestorable={}",
+                chatId,
+                symbol,
+                exchange,
+                network,
+                fmtBd(qty),
+                fmtBd(entryPrice),
+                fmtBd(notional),
+                fmtBd(minRestorableNotional));
+    }
+
+    private void maybeRestorePositionFromStore(Long chatId, LocalState st, String symbol, Instant now) {
+        if (chatId == null || st == null || now == null) return;
+
+        // PROD: стратегия больше не занимается восстановлением позиции из истории ордеров
+        // и не синхронизирует qty по балансу сама.
+        // Единственный источник истины здесь — PositionStore.
+        if (!shouldProbeRestore(st, now)) {
+            return;
+        }
+
+        String ex = normalizeExchangeOrNull(st.exchange);
+        NetworkType net = st.network;
+        String resolvedSym = normalizeSymbolOrNull(symbol);
+        if (resolvedSym == null) resolvedSym = normalizeSymbolOrNull(st.symbol);
+        if (ex == null || net == null || resolvedSym == null) return;
+        final String sym = resolvedSym;
+
+        st.lastRestoreProbeAt = now;
+
+        Optional<PositionStore.PositionSnapshot> opt =
+                positionStore.getPosition(chatId, StrategyType.WINDOW_SCALPING, ex, net, sym);
+
+        if (opt.isEmpty()) {
+            if (st.inPosition) {
+                clearLocalPosition(st);
+                safeLive(() -> live.clearTpSl(chatId, StrategyType.WINDOW_SCALPING, sym));
+                safeLive(() -> live.clearPriceLines(chatId, StrategyType.WINDOW_SCALPING, sym));
+            }
+            markRestoreMiss(st, now);
+            return;
+        }
+
+        PositionStore.PositionSnapshot snap = opt.get();
+
+        BigDecimal restoredEntry = positiveOrNull(snap.entryPrice());
+        BigDecimal restoredQty = positiveOrNull(snap.qty());
+        BigDecimal restoredTp = positiveOrNull(snap.tp());
+        BigDecimal restoredSl = positiveOrNull(snap.sl());
+
+        if (restoredEntry == null || restoredQty == null) {
+            clearLocalPosition(st);
+            markRestoreMiss(st, now);
+            return;
+        }
+
+        BigDecimal alignedQty = alignQtyToExchangeBalance(chatId, st, ex, net, sym, restoredQty);
+        BigDecimal safeAlignedQty = positiveOrNull(alignedQty);
+        if (safeAlignedQty == null) {
+            clearLocalPosition(st);
+            try {
+                positionStore.clearPosition(chatId, StrategyType.WINDOW_SCALPING, ex, net, sym);
+            } catch (Exception ignored) {
+            }
+            markRestoreMiss(st, now);
+            return;
+        }
+
+        BigDecimal alignedNotional = restoredEntry.multiply(safeAlignedQty)
+                .setScale(8, RoundingMode.HALF_UP)
+                .stripTrailingZeros();
+        BigDecimal minRestorableNotional = resolveMinRestorableNotional(ex, net, sym);
+        if (alignedNotional.compareTo(minRestorableNotional) < 0) {
+            logDustRestoreSkipThrottled(chatId, st, sym, ex, net, safeAlignedQty, restoredEntry, alignedNotional, minRestorableNotional, "store", now);
+            clearLocalPosition(st);
+            try {
+                positionStore.clearPosition(chatId, StrategyType.WINDOW_SCALPING, ex, net, sym);
+            } catch (Exception ignored) {
+            }
+            safeLive(() -> live.clearTpSl(chatId, StrategyType.WINDOW_SCALPING, sym));
+            safeLive(() -> live.clearPriceLines(chatId, StrategyType.WINDOW_SCALPING, sym));
+            markRestoreMiss(st, now);
+            return;
+        }
+
+        if (safeAlignedQty.compareTo(restoredQty) < 0) {
+            log.warn("[WINDOW] ♻ Восстановленная позиция урезана по фактическому free base chatId={} sym={} ex={} net={} storedQty={} liveQty={} entry={}",
+                    chatId,
+                    sym,
+                    ex,
+                    net,
+                    fmtBd(restoredQty),
+                    fmtBd(safeAlignedQty),
+                    fmtBd(restoredEntry));
+            restoredQty = safeAlignedQty;
+            try {
+                positionStore.markOpened(
+                        chatId,
+                        StrategyType.WINDOW_SCALPING,
+                        ex,
+                        net,
+                        sym,
+                        restoredEntry,
+                        restoredQty,
+                        restoredTp,
+                        restoredSl,
+                        positiveOrNull(snap.quoteSpent()) != null ? snap.quoteSpent() : alignedNotional,
+                        snap.entryOrderId(),
+                        snap.openedAt()
+                );
+            } catch (Exception ignored) {
+            }
+        }
+
+        if (!isValidRestoredLongTp(restoredEntry, restoredTp) || !isValidRestoredLongSl(restoredEntry, restoredSl)) {
+            BigDecimal fixedTp = resolveTpForRestore(st, restoredEntry);
+            BigDecimal fixedSl = resolveSlForRestore(st, restoredEntry);
+
+            if (isValidRestoredLongTp(restoredEntry, fixedTp) && isValidRestoredLongSl(restoredEntry, fixedSl)) {
+                restoredTp = fixedTp;
+                restoredSl = fixedSl;
+                try {
+                    positionStore.markOpened(
+                            chatId,
+                            StrategyType.WINDOW_SCALPING,
+                            ex,
+                            net,
+                            sym,
+                            restoredEntry,
+                            restoredQty,
+                            restoredTp,
+                            restoredSl,
+                            positiveOrNull(snap.quoteSpent()) != null
+                                    ? snap.quoteSpent()
+                                    : restoredEntry.multiply(restoredQty),
+                            snap.entryOrderId(),
+                            snap.openedAt()
+                    );
+                } catch (Exception ignored) {
+                }
+            } else {
+                clearLocalPosition(st);
+                markRestoreMiss(st, now);
+                return;
+            }
+        }
+
+        st.inPosition = true;
+        st.isLong = true;
+        st.entryPrice = restoredEntry;
+        st.entryQty = restoredQty;
+        st.tp = restoredTp;
+        st.sl = restoredSl;
+        st.entryOrderId = snap.entryOrderId();
+        st.lastEntryAt = (snap.openedAt() != null ? snap.openedAt() : now);
+        rememberEntryCandle(st, st.lastEntryAt);
+        markRestoreSuccess(st, now);
+        publishPositionLines(chatId, sym, st);
+    }
+
+    private BigDecimal alignQtyToExchangeBalance(Long chatId,
+                                               LocalState st,
+                                               String exchange,
+                                               NetworkType network,
+                                               String symbol,
+                                               BigDecimal qty) {
+        BigDecimal safeQty = positiveOrNull(qty);
+        if (safeQty == null) {
+            return qty;
+        }
+
+        if (tradeExecutionService instanceof com.chicu.aitradebot.trade.TradeExecutionServiceImpl execImpl) {
+            try {
+                BigDecimal aligned = execImpl.alignPositionQtyToExchangeBalance(
+                        chatId,
+                        StrategyType.WINDOW_SCALPING,
+                        exchange,
+                        network,
+                        symbol,
+                        safeQty
+                );
+
+                BigDecimal normalized = positiveOrNull(aligned);
+                if (normalized != null) {
+                    return normalized;
+                }
+            } catch (Exception e) {
+                log.debug("[WINDOW] alignQtyToExchangeBalance skipped chatId={} sym={} ex={} net={} err={}",
+                        chatId, symbol, exchange, network, e.toString());
+            }
+        }
+
+        return safeQty;
+    }
+
+    private boolean shouldSyncRuntimePosition(LocalState st, Instant now) {
+        if (st == null || now == null) return false;
+
+        long minIntervalMs = Math.max(1_000L, positionSyncMinIntervalMs);
+
+        if (st.lastEntryAt != null) {
+            long sinceEntryMs = Duration.between(st.lastEntryAt, now).toMillis();
+            if (sinceEntryMs >= 0 && sinceEntryMs < minIntervalMs) {
+                return false;
+            }
+        }
+
+        if (st.lastPositionSyncAt == null) {
+            return true;
+        }
+
+        long ageMs = Duration.between(st.lastPositionSyncAt, now).toMillis();
+        return ageMs < 0 || ageMs >= minIntervalMs;
+    }
+
+    private void syncRuntimePositionWithExchangeBalance(Long chatId,
+                                                        LocalState st,
+                                                        String exchange,
+                                                        NetworkType network,
+                                                        String symbol,
+                                                        Instant now) {
+        if (chatId == null || st == null || exchange == null || network == null || symbol == null) {
+            return;
+        }
+
+        BigDecimal entryPrice = positiveOrNull(st.entryPrice);
+        BigDecimal currentQty = positiveOrNull(st.entryQty);
+        if (entryPrice == null || currentQty == null) {
+            return;
+        }
+
+        BigDecimal alignedQty = alignQtyToExchangeBalance(chatId, st, exchange, network, symbol, currentQty);
+        BigDecimal safeAlignedQty = positiveOrNull(alignedQty);
+        if (safeAlignedQty == null) {
+            return;
+        }
+
+        if (safeAlignedQty.compareTo(currentQty) >= 0) {
+            return;
+        }
+
+        BigDecimal notional = entryPrice.multiply(safeAlignedQty).setScale(8, RoundingMode.HALF_UP).stripTrailingZeros();
+        BigDecimal minRestorableNotional = resolveMinRestorableNotional(exchange, network, symbol);
+        if (notional.compareTo(minRestorableNotional) < 0) {
+            logDustRestoreSkipThrottled(chatId, st, symbol, exchange, network, safeAlignedQty, entryPrice, notional, minRestorableNotional, "store", now);
+            clearLocalPosition(st);
+            try {
+                positionStore.clearPosition(chatId, StrategyType.WINDOW_SCALPING, exchange, network, symbol);
+            } catch (Exception ignored) {
+            }
+            safeLive(() -> live.clearTpSl(chatId, StrategyType.WINDOW_SCALPING, symbol));
+            safeLive(() -> live.clearPriceLines(chatId, StrategyType.WINDOW_SCALPING, symbol));
+            return;
+        }
+
+        log.warn("[WINDOW] ♻ Синхронизирую локальную позицию по фактическому free base chatId={} sym={} ex={} net={} oldQty={} newQty={} entry={}",
+                chatId,
+                symbol,
+                exchange,
+                network,
+                fmtBd(currentQty),
+                fmtBd(safeAlignedQty),
+                fmtBd(entryPrice));
+
+        st.entryQty = safeAlignedQty;
+        try {
+            positionStore.markOpened(
+                    chatId,
+                    StrategyType.WINDOW_SCALPING,
+                    exchange,
+                    network,
+                    symbol,
+                    entryPrice,
+                    safeAlignedQty,
+                    st.tp,
+                    st.sl,
+                    notional,
+                    st.entryOrderId,
+                    st.lastEntryAt != null ? st.lastEntryAt : now
+            );
+        } catch (Exception ignored) {
+        }
+    }
+
+
+    private boolean isValidRestoredLongTp(BigDecimal entryPrice, BigDecimal tp) {
+        return positiveOrNull(entryPrice) != null
+                && positiveOrNull(tp) != null
+                && tp.compareTo(entryPrice) > 0;
+    }
+
+    private boolean isValidRestoredLongSl(BigDecimal entryPrice, BigDecimal sl) {
+        return positiveOrNull(entryPrice) != null
+                && positiveOrNull(sl) != null
+                && sl.compareTo(entryPrice) < 0;
+    }
+
+    private BigDecimal resolveTpForRestore(LocalState st, BigDecimal entryPrice) {
+        if (st == null || entryPrice == null || entryPrice.signum() <= 0) return null;
+        EntryRisk risk = resolveEntryRisk(st, 0.20, 60.0, null);
+        if (risk != null && risk.tpPct() != null) {
+            return calcTpFromPct(entryPrice, risk.tpPct());
+        }
+        WindowScalpingStrategySettings cfg = st.cfg;
+        if (cfg == null || cfg.getTakeProfitPct() == null || cfg.getTakeProfitPct().signum() <= 0) return null;
+        return calcTpFromPct(entryPrice, cfg.getTakeProfitPct());
+    }
+
+    private BigDecimal resolveSlForRestore(LocalState st, BigDecimal entryPrice) {
+        if (st == null || entryPrice == null || entryPrice.signum() <= 0) return null;
+        EntryRisk risk = resolveEntryRisk(st, 0.20, 60.0, null);
+        if (risk != null && risk.slPct() != null) {
+            return calcSlFromPct(entryPrice, risk.slPct());
+        }
+        WindowScalpingStrategySettings cfg = st.cfg;
+        if (cfg == null || cfg.getStopLossPct() == null || cfg.getStopLossPct().signum() <= 0) return null;
+        return calcSlFromPct(entryPrice, cfg.getStopLossPct());
+    }
+
+
+    private BigDecimal calcTpFromPct(BigDecimal entryPrice, BigDecimal tpPct) {
+        if (entryPrice == null || entryPrice.signum() <= 0) return null;
+        if (tpPct == null || tpPct.signum() <= 0) return null;
+
+        BigDecimal k = tpPct.divide(BigDecimal.valueOf(100), 12, RoundingMode.HALF_UP);
+        return entryPrice.multiply(BigDecimal.ONE.add(k))
+                .setScale(Math.max(8, safeScale(entryPrice)), RoundingMode.HALF_UP);
+    }
+
+    private BigDecimal calcSlFromPct(BigDecimal entryPrice, BigDecimal slPct) {
+        if (entryPrice == null || entryPrice.signum() <= 0) return null;
+        if (slPct == null || slPct.signum() <= 0) return null;
+
+        BigDecimal k = slPct.divide(BigDecimal.valueOf(100), 12, RoundingMode.HALF_UP);
+        BigDecimal sl = entryPrice.multiply(BigDecimal.ONE.subtract(k))
+                .setScale(Math.max(8, safeScale(entryPrice)), RoundingMode.HALF_UP);
+
+        return sl.signum() > 0 ? sl : null;
+    }
+
+    private EntryRisk resolveEntryRisk(LocalState st,
+                                       double rangePct,
+                                       double score,
+                                       Prediction pred) {
+        if (st == null || st.cfg == null) return null;
+
+        WindowScalpingStrategySettings cfg = st.cfg;
+
+        BigDecimal staticTp = positiveOrNull(cfg.getTakeProfitPct());
+        BigDecimal staticSl = positiveOrNull(cfg.getStopLossPct());
+
+        Boolean autoTpSlEnabled = cfg.getAutoTpSlEnabled();
+        boolean useAutoRiskModel = dynamicTpEnabled && !Boolean.FALSE.equals(autoTpSlEnabled);
+
+        if (!useAutoRiskModel) {
+            if (staticTp == null || staticSl == null) return null;
+            return new EntryRisk(staticTp, staticSl, "static");
+        }
+
+        double configuredTpMinPct = cfg.getAutoTpMinPct() != null
+                ? cfg.getAutoTpMinPct().doubleValue()
+                : dynamicTpMinPct;
+        if (!Double.isFinite(configuredTpMinPct) || configuredTpMinPct <= 0.0) {
+            configuredTpMinPct = 0.20;
+        }
+
+        double configuredTpMaxPct = cfg.getAutoTpMaxPct() != null
+                ? cfg.getAutoTpMaxPct().doubleValue()
+                : dynamicTpMaxPct;
+        if (!Double.isFinite(configuredTpMaxPct) || configuredTpMaxPct <= 0.0) {
+            configuredTpMaxPct = 0.65;
+        }
+
+        double configuredSlMinPct = cfg.getAutoSlMinPct() != null
+                ? cfg.getAutoSlMinPct().doubleValue()
+                : dynamicSlMinPct;
+        if (!Double.isFinite(configuredSlMinPct) || configuredSlMinPct <= 0.0) {
+            configuredSlMinPct = 0.08;
+        }
+
+        double configuredSlMaxPct = cfg.getAutoSlMaxPct() != null
+                ? cfg.getAutoSlMaxPct().doubleValue()
+                : dynamicSlMaxPct;
+        if (!Double.isFinite(configuredSlMaxPct) || configuredSlMaxPct <= 0.0) {
+            configuredSlMaxPct = 0.18;
+        }
+
+        if (configuredTpMaxPct < configuredTpMinPct) {
+            configuredTpMaxPct = configuredTpMinPct;
+        }
+        if (configuredSlMaxPct < configuredSlMinPct) {
+            configuredSlMaxPct = configuredSlMinPct;
+        }
+
+        double tpFromRangeFactor = cfg.getAutoTpFromRangeFactor() != null
+                ? cfg.getAutoTpFromRangeFactor().doubleValue()
+                : dynamicTpFromRangeFactor;
+        if (!Double.isFinite(tpFromRangeFactor) || tpFromRangeFactor <= 0.0) {
+            tpFromRangeFactor = 0.72;
+        }
+
+        double slFromRangeFactor = cfg.getAutoSlFromRangeFactor() != null
+                ? cfg.getAutoSlFromRangeFactor().doubleValue()
+                : dynamicSlFromRangeFactor;
+        if (!Double.isFinite(slFromRangeFactor) || slFromRangeFactor <= 0.0) {
+            slFromRangeFactor = 0.28;
+        }
+
+        double tpMlBoostFactor = cfg.getAutoTpMlBoostFactor() != null
+                ? cfg.getAutoTpMlBoostFactor().doubleValue()
+                : 1.08;
+        if (!Double.isFinite(tpMlBoostFactor) || tpMlBoostFactor <= 0.0) {
+            tpMlBoostFactor = 1.08;
+        }
+        tpMlBoostFactor = clampPct(tpMlBoostFactor, 0.80, 1.40);
+
+        double tpWeakSignalFactor = cfg.getAutoTpWeakSignalFactor() != null
+                ? cfg.getAutoTpWeakSignalFactor().doubleValue()
+                : 0.92;
+        if (!Double.isFinite(tpWeakSignalFactor) || tpWeakSignalFactor <= 0.0) {
+            tpWeakSignalFactor = 0.92;
+        }
+        tpWeakSignalFactor = clampPct(tpWeakSignalFactor, 0.60, 1.10);
+
+        double safeRangePct = Double.isFinite(rangePct) ? rangePct : 0.0;
+
+        double rangeAwareSlMinPct = safeRangePct > 0.0 ? safeRangePct * 0.12 : configuredSlMinPct;
+        double effectiveSlMinPct = Math.max(0.02, Math.min(configuredSlMinPct, Math.max(0.02, rangeAwareSlMinPct)));
+
+        double dynSl = clampPct(
+                safeRangePct * slFromRangeFactor,
+                effectiveSlMinPct,
+                configuredSlMaxPct
+        );
+
+        double dynTp = safeRangePct * tpFromRangeFactor;
+
+        double feeFloorTp = minProfitAfterFeesPct;
+        TradeExecutionServiceImpl exec = tradeExecImpl();
+        BigDecimal roundTripFeePctBd = null;
+        if (exec != null) {
+            BigDecimal feeFloorTpBd = exec.resolveMinHealthyTpPct(
+                    st.ss != null ? st.ss.getChatId() : null,
+                    st.exchange,
+                    st.network,
+                    pctBd(dynSl)
+            );
+            if (feeFloorTpBd != null && feeFloorTpBd.signum() > 0) {
+                feeFloorTp = Math.max(feeFloorTp, feeFloorTpBd.doubleValue());
+            }
+            roundTripFeePctBd = exec.estimateRoundTripFeePct(
+                    st.ss != null ? st.ss.getChatId() : null,
+                    st.exchange,
+                    st.network
+            );
+        }
+
+        double rangeAwareTpMinPct = safeRangePct > 0.0 ? safeRangePct * 0.22 : configuredTpMinPct;
+        double effectiveTpMinPct = Math.max(
+                feeFloorTp,
+                Math.max(0.03, Math.min(configuredTpMinPct, Math.max(rangeAwareTpMinPct, feeFloorTp)))
+        );
+
+        double effectiveMinRiskReward = cfg.getAutoMinRiskReward() != null
+                ? cfg.getAutoMinRiskReward().doubleValue()
+                : dynamicMinRiskReward;
+        if (!Double.isFinite(effectiveMinRiskReward) || effectiveMinRiskReward <= 0.0) {
+            effectiveMinRiskReward = 0.85;
+        }
+        effectiveMinRiskReward = Math.max(0.85, effectiveMinRiskReward);
+
+        if (safeRangePct > 0.0 && safeRangePct < configuredTpMinPct * 1.35) {
+            effectiveMinRiskReward = Math.max(0.60, Math.min(effectiveMinRiskReward, 0.90));
+        }
+
+        double minTp = Math.max(effectiveTpMinPct, feeFloorTp);
+        minTp = Math.max(minTp, dynSl * effectiveMinRiskReward);
+        minTp = Math.max(minTp, safeRangePct * 0.18);
+
+        double baseThreshold = resolveMlThreshold(st.ss);
+        double effectiveThreshold = (st.lastAdaptiveMlThreshold != null ? st.lastAdaptiveMlThreshold : baseThreshold);
+
+        if (pred != null && pred.ok) {
+            if (pred.proba >= effectiveThreshold + 0.08) {
+                dynTp *= tpMlBoostFactor;
+            } else if (pred.proba <= effectiveThreshold + 0.02) {
+                dynTp *= tpWeakSignalFactor;
+            }
+        }
+
+        if (Double.isFinite(score) && score >= 85.0) {
+            dynTp *= 1.04;
+        }
+
+        dynTp = clampPct(dynTp, minTp, configuredTpMaxPct);
+
+        if (!Double.isFinite(dynTp) || dynTp <= 0.0) return null;
+        if (!Double.isFinite(dynSl) || dynSl <= 0.0) return null;
+
+        double roundTripFeePct = 0.0;
+        if (roundTripFeePctBd != null && roundTripFeePctBd.signum() > 0) {
+            roundTripFeePct = roundTripFeePctBd.doubleValue();
+        }
+
+        double netRewardPct = dynTp - roundTripFeePct;
+        double netRiskPct = dynSl + roundTripFeePct;
+        double minNetRr = Double.isFinite(minNetRewardRiskForMarket) ? minNetRewardRiskForMarket : 1.35;
+        if (minNetRr < 0.35) minNetRr = 0.35;
+
+        if (netRewardPct <= 0.0) return null;
+        if (netRiskPct > 0.0 && netRewardPct + 1e-12 < netRiskPct * minNetRr) {
+            return null;
+        }
+
+        return new EntryRisk(pctBd(dynTp), pctBd(dynSl), "auto_tp_sl");
+    }
+
+
+    private EntryRisk alignRiskToWindowRoom(Long chatId,
+                                            LocalState st,
+                                            BigDecimal entryPrice,
+                                            BigDecimal windowHigh,
+                                            EntryRisk risk) {
+        if (risk == null || risk.tpPct() == null || risk.slPct() == null) return null;
+        if (entryPrice == null || entryPrice.signum() <= 0) return risk;
+        if (windowHigh == null || windowHigh.compareTo(entryPrice) <= 0) return risk;
+
+        double rawRoomPct = calcPctMove(entryPrice, windowHigh);
+        if (!Double.isFinite(rawRoomPct) || rawRoomPct <= 0.0) return risk;
+
+        double projectedRoomPct = rawRoomPct;
+        if (st != null && st.lastWindowHigh != null && st.lastWindowLow != null && st.lastWindowHigh.compareTo(st.lastWindowLow) > 0) {
+            BigDecimal windowRange = st.lastWindowHigh.subtract(st.lastWindowLow);
+            if (windowRange.signum() > 0) {
+                double projectionPct = windowHighProjectionPctOfRange;
+                if (!Double.isFinite(projectionPct) || projectionPct < 0.0) projectionPct = 3.20;
+                BigDecimal projectedHigh = st.lastWindowHigh.add(
+                        windowRange.multiply(BigDecimal.valueOf(Math.min(6.0, Math.max(0.80, projectionPct))))
+                );
+                if (projectedHigh.compareTo(windowHigh) > 0) {
+                    double projected = calcPctMove(entryPrice, projectedHigh);
+                    if (Double.isFinite(projected) && projected > projectedRoomPct) {
+                        projectedRoomPct = projected;
+                    }
+                }
+            }
+        }
+
+        TradeExecutionServiceImpl exec = tradeExecImpl();
+        double roundTripFeePct = 0.0;
+        if (exec != null) {
+            BigDecimal feePctBd = exec.estimateRoundTripFeePct(
+                    (st != null && st.ss != null) ? st.ss.getChatId() : chatId,
+                    st != null ? st.exchange : null,
+                    st != null ? st.network : null
+            );
+            if (feePctBd != null && feePctBd.signum() > 0) {
+                roundTripFeePct = feePctBd.doubleValue();
+            }
+        }
+
+        double roomSafetyPct = Math.max(0.0, minRoomToWindowHighPct);
+        roomSafetyPct = Math.min(roomSafetyPct, 0.0020);
+        double minRoomPct = Math.max(
+                roomSafetyPct,
+                roundTripFeePct + Math.max(0.0004, minProfitAfterFeesPct * 0.08)
+        );
+        double requestedTpPct = risk.tpPct().doubleValue();
+        double requestedSlPct = risk.slPct().doubleValue();
+        double emergencyMinRoomPct = roundTripFeePct + 0.00025;
+        if (projectedRoomPct + 1e-12 < emergencyMinRoomPct) {
+            if (projectedRoomPct > roundTripFeePct + 0.00005) {
+                double scalpTpPct = Math.max(projectedRoomPct * 0.88, roundTripFeePct + 0.00045);
+                double scalpSlPct = Math.max(0.0020, Math.min(requestedSlPct, Math.max(0.0020, scalpTpPct * 0.82)));
+                if (Double.isFinite(scalpTpPct) && Double.isFinite(scalpSlPct) && scalpTpPct > scalpSlPct * 0.08) {
+                    return new EntryRisk(pctBd(scalpTpPct), pctBd(scalpSlPct), risk.source() + "_micro_room");
+                }
+            }
+            return null;
+        }
+        if (projectedRoomPct + 1e-12 < minRoomPct) {
+            minRoomPct = emergencyMinRoomPct;
+        }
+
+        double roomUsage = clampUnit(tpRoomUsagePct);
+        if (roomUsage <= 0.0) roomUsage = 0.92;
+        roomUsage = Math.max(0.60, roomUsage);
+
+        double effectiveRoomPct = projectedRoomPct * roomUsage;
+
+        double cappedTpPct = Math.min(requestedTpPct, effectiveRoomPct);
+        if (cappedTpPct + 1e-12 < minRoomPct) {
+            cappedTpPct = Math.min(effectiveRoomPct, Math.max(minRoomPct, projectedRoomPct * 0.82));
+        }
+        if (!Double.isFinite(cappedTpPct) || cappedTpPct <= 0.0) {
+            return null;
+        }
+
+        double netRewardPct = cappedTpPct - roundTripFeePct;
+        double netRiskPct = requestedSlPct + roundTripFeePct;
+
+        double minRr = Double.isFinite(minRoomNetRewardRisk) ? minRoomNetRewardRisk : 0.06;
+        if (minRr < 0.03) minRr = 0.03;
+        minRr = Math.min(minRr, 0.10);
+
+        if (netRewardPct <= 0.0) {
+            double rescuedTpPct = Math.max(projectedRoomPct * 0.82, roundTripFeePct + 0.00055);
+            if (!Double.isFinite(rescuedTpPct) || rescuedTpPct <= roundTripFeePct + 0.00025) {
+                return null;
+            }
+            cappedTpPct = rescuedTpPct;
+            netRewardPct = cappedTpPct - roundTripFeePct;
+        }
+
+        BigDecimal adjustedTp = pctBd(cappedTpPct);
+        BigDecimal adjustedSl = risk.slPct();
+
+        if (netRiskPct > 0.0 && netRewardPct + 1e-12 < netRiskPct * minRr) {
+            double maxAllowedSlPct = (netRewardPct / Math.max(0.05, minRr)) - roundTripFeePct;
+            double slFloor = Math.max(
+                    0.0020,
+                    Math.min(
+                            Math.max(0.0020, dynamicSlMinPct * 0.40),
+                            Math.max(0.0030, cappedTpPct * 0.06)
+                    )
+            );
+            maxAllowedSlPct = Math.max(slFloor, maxAllowedSlPct);
+
+            if (Double.isFinite(maxAllowedSlPct) && maxAllowedSlPct > 0.0) {
+                double rescuedSlPct = Math.min(requestedSlPct, Math.max(slFloor, Math.min(maxAllowedSlPct, cappedTpPct * 0.95)));
+                adjustedSl = pctBd(rescuedSlPct);
+                netRiskPct = rescuedSlPct + roundTripFeePct;
+            } else {
+                return null;
+            }
+        }
+
+        if (netRiskPct > 0.0 && netRewardPct + 1e-12 < netRiskPct * 0.04) {
+            double rescuedSlPct = Math.max(0.0020, Math.min(adjustedSl.doubleValue(), Math.max(0.0020, cappedTpPct * 0.82)));
+            adjustedSl = pctBd(rescuedSlPct);
+            netRiskPct = rescuedSlPct + roundTripFeePct;
+            if (netRewardPct <= 0.0 || (netRiskPct > 0.0 && netRewardPct + 1e-12 < netRiskPct * 0.005)) {
+                return null;
+            }
+        }
+
+        if (adjustedTp.compareTo(risk.tpPct()) == 0 && adjustedSl.compareTo(risk.slPct()) == 0) {
+            return risk;
+        }
+
+        String suffix = projectedRoomPct > rawRoomPct + 1e-12 ? "_window_projected" : "_window";
+        return new EntryRisk(adjustedTp, adjustedSl, risk.source() + suffix);
+    }
+
+    private void maybeMoveStopToBreakEven(Long chatId,
+                                          LocalState st,
+                                          String sym,
+                                          BigDecimal price,
+                                          Instant now) {
+        if (!breakEvenEnabled) return;
+        if (chatId == null || st == null || sym == null || price == null || now == null) return;
+        if (!st.inPosition) return;
+        if (st.entryPrice == null || st.tp == null || st.sl == null || st.entryQty == null) return;
+
+        BigDecimal profitSpan = st.tp.subtract(st.entryPrice);
+        if (profitSpan.signum() <= 0) return;
+
+        BigDecimal triggerPrice = st.entryPrice.add(
+                profitSpan.multiply(BigDecimal.valueOf(clampUnit(breakEvenTriggerToTpRatio)))
+        );
+
+        TradeExecutionServiceImpl exec = tradeExecImpl();
+        BigDecimal roundTripFeePct = BigDecimal.ZERO;
+        if (exec != null) {
+            BigDecimal feePct = exec.estimateRoundTripFeePct(chatId, st.exchange, st.network);
+            if (feePct != null && feePct.signum() > 0) {
+                roundTripFeePct = feePct;
+            }
+        }
+
+        BigDecimal feeAwareTriggerPrice = st.entryPrice;
+        if (roundTripFeePct.signum() > 0) {
+            BigDecimal feeCoverTriggerPct = roundTripFeePct.add(pctBd(breakEvenFeeCoverBufferPct));
+            feeAwareTriggerPrice = st.entryPrice.multiply(
+                    BigDecimal.ONE.add(feeCoverTriggerPct.divide(BigDecimal.valueOf(100), 12, RoundingMode.HALF_UP))
+            ).setScale(Math.max(8, safeScale(st.entryPrice)), RoundingMode.HALF_UP);
+            if (feeAwareTriggerPrice.compareTo(triggerPrice) > 0) {
+                triggerPrice = feeAwareTriggerPrice;
+            }
+        }
+
+        if (price.compareTo(triggerPrice) < 0) return;
+
+        BigDecimal protectedStopPct = pctBd(breakEvenOffsetPct);
+        if (roundTripFeePct.signum() > 0) {
+            BigDecimal feeAwareProtectedPct = roundTripFeePct.add(pctBd(breakEvenProtectedNetBufferPct));
+            if (feeAwareProtectedPct.compareTo(protectedStopPct) > 0) {
+                protectedStopPct = feeAwareProtectedPct;
+            }
+        }
+
+        BigDecimal newSl = st.entryPrice.multiply(
+                BigDecimal.ONE.add(protectedStopPct.divide(BigDecimal.valueOf(100), 12, RoundingMode.HALF_UP))
+        ).setScale(Math.max(8, safeScale(st.entryPrice)), RoundingMode.HALF_UP);
+
+        if (newSl.compareTo(st.sl) <= 0) return;
+        if (newSl.compareTo(price) >= 0) return;
+
+        st.sl = newSl;
+
+        try {
+            String ex = normalizeExchangeOrNull(st.exchange);
+            NetworkType net = st.network;
+            String symbol = normalizeSymbolOrNull(sym);
+            if (ex != null && net != null && symbol != null) {
+                BigDecimal notional = st.entryPrice.multiply(st.entryQty).setScale(8, RoundingMode.HALF_UP);
+                positionStore.markOpened(
+                        chatId,
+                        StrategyType.WINDOW_SCALPING,
+                        ex,
+                        net,
+                        symbol,
+                        st.entryPrice,
+                        st.entryQty,
+                        st.tp,
+                        st.sl,
+                        notional,
+                        st.entryOrderId,
+                        st.lastEntryAt != null ? st.lastEntryAt : now
+                );
+            }
+        } catch (Exception ignored) {
+        }
+
+        publishPositionLines(chatId, sym, st);
+
+        log.info("[WINDOW] 🔒 BE chatId={} sym={} entry={} tp={} newSl={} trigger={}",
+                chatId,
+                sym,
+                fmtBd(st.entryPrice),
+                fmtBd(st.tp),
+                fmtBd(st.sl),
+                fmtBd(triggerPrice));
+    }
+
+    private void rememberEntryCandle(LocalState st, Instant time) {
+        if (st == null || time == null) return;
+        String tf = normalizeTimeframeOrNull(st.entryCandleTimeframe != null ? st.entryCandleTimeframe : st.timeframe);
+        if (tf == null) return;
+
+        long openMs = candleOpenTimeMs(time.toEpochMilli(), tf);
+        if (openMs <= 0) return;
+
+        st.entryCandleOpenTimeMs = openMs;
+        st.entryCandleTimeframe = tf;
+    }
+
+    private boolean isSameCandleAsEntry(LocalState st, Instant now) {
+        if (st == null || now == null) return false;
+        if (st.entryCandleOpenTimeMs == null) return false;
+
+        String tf = normalizeTimeframeOrNull(st.entryCandleTimeframe != null ? st.entryCandleTimeframe : st.timeframe);
+        if (tf == null) return false;
+
+        long openMs = candleOpenTimeMs(now.toEpochMilli(), tf);
+        return openMs > 0 && Objects.equals(openMs, st.entryCandleOpenTimeMs);
+    }
+
+    private long candleOpenTimeMs(long epochMs, String tf) {
+        long tfMs = timeframeToMillis(tf);
+        if (epochMs <= 0 || tfMs <= 0) return -1L;
+        return (epochMs / tfMs) * tfMs;
+    }
+
+    private long timeframeToMillis(String tf) {
+        if (tf == null) return -1L;
+        String s = tf.trim().toLowerCase(Locale.ROOT);
+        if (s.isEmpty()) return -1L;
+
+        long mul;
+        char unit = s.charAt(s.length() - 1);
+        String numPart = s.substring(0, s.length() - 1);
+
+        try {
+            long n = Long.parseLong(numPart);
+            if (n <= 0) return -1L;
+
+            switch (unit) {
+                case 's' -> mul = 1_000L;
+                case 'm' -> mul = 60_000L;
+                case 'h' -> mul = 3_600_000L;
+                case 'd' -> mul = 86_400_000L;
+                case 'w' -> mul = 604_800_000L;
+                default -> {
+                    return -1L;
+                }
+            }
+
+            return n * mul;
+        } catch (Exception e) {
+            return -1L;
+        }
+    }
+
+    private double calcPctMove(BigDecimal from,
+                               BigDecimal to) {
+        if (from == null || to == null || from.signum() <= 0) return Double.NaN;
+        return to.subtract(from)
+                .divide(from, 10, RoundingMode.HALF_UP)
+                .multiply(BigDecimal.valueOf(100))
+                .doubleValue();
+    }
+
+    private BigDecimal pctBd(double value) {
+        return BigDecimal.valueOf(value).setScale(8, RoundingMode.HALF_UP);
+    }
+
+    private double clampPct(double value, double min, double max) {
+        double v = Double.isFinite(value) ? value : min;
+        double lo = Double.isFinite(min) ? min : v;
+        double hi = Double.isFinite(max) ? max : v;
+        if (hi < lo) hi = lo;
+        if (v < lo) return lo;
+        if (v > hi) return hi;
+        return v;
+    }
+
+    private double clampUnit(double v) {
+        if (!Double.isFinite(v)) return 0.45;
+        if (v < 0.05) return 0.05;
+        if (v > 0.95) return 0.95;
+        return v;
+    }
+
+    @EventListener
+    public void onWindowScalpingSettingsUpdated(WindowScalpingSettingsUpdatedEvent e) {
+        LocalState st = states.get(e.chatId());
+        if (st == null) return;
+        synchronized (st) {
+            st.lastSettingsLoadAt = Instant.EPOCH;
+            st.lastFingerprint = null;
+            resetMlCache(st);
+            resetRestoreThrottleState(st);
+        }
+    }
+
+    @EventListener
+    public void onStrategySettingsUpdated(StrategySettingsUpdatedEvent e) {
+        if (e == null || e.type() != StrategyType.WINDOW_SCALPING) return;
+        LocalState st = states.get(e.chatId());
+        if (st == null) return;
+        synchronized (st) {
+            st.lastSettingsLoadAt = Instant.EPOCH;
+            st.lastFingerprint = null;
+            resetMlCache(st);
+            resetRestoreThrottleState(st);
+        }
+    }
+
+    private void maybePersistMlConfidence(LocalState st, StrategySettings ss, double proba, Instant now) {
+        if (st == null || ss == null || now == null) return;
+        if (isManualMode(ss)) return;
+
+        long minIntervalMs = 20_000L;
+
+        if (st.lastMlConfidenceSaveAt != null) {
+            long passed = Duration.between(st.lastMlConfidenceSaveAt, now).toMillis();
+            if (passed < minIntervalMs) return;
+        }
+
+        if (st.lastMlConfidenceSaved != null && Math.abs(st.lastMlConfidenceSaved - proba) < 1e-6) {
+            return;
+        }
+
+        /**
+         * ВАЖНО:
+         * mlConfidence — runtime/live значение.
+         * Его нельзя постоянно писать в StrategySettings в БД,
+         * иначе UI save + strategy runtime начинают конфликтовать по optimistic lock.
+         *
+         * Поэтому:
+         * 1. держим значение только в памяти стратегии
+         * 2. в entity кладём только в runtime-объект, без save(...)
+         */
+        st.lastMlConfidenceSaveAt = now;
+        st.lastMlConfidenceSaved = proba;
+        ss.setMlConfidence(BigDecimal.valueOf(proba));
+    }
     // =====================================================
     // UTILS
     // =====================================================
 
-    private static String safe(String s) {
-        return s == null ? "null" : s.trim();
+    private static String safeNullable(Object v) {
+        if (v == null) return "null";
+        String s = String.valueOf(v).trim();
+        return s.isEmpty() ? "null" : s;
     }
 
     private static String normalizeSymbolOrNull(String symbol) {
@@ -580,10 +5610,27 @@ public class WindowScalpingStrategyV4 implements TradingStrategy {
         return s.isEmpty() ? null : s;
     }
 
-    private static String normalizeExchangeOrNull(String exchange) {
+    private static String normalizeExchangeOrNull(Object exchange) {
         if (exchange == null) return null;
-        String s = exchange.trim().toUpperCase(Locale.ROOT);
+        String s = (exchange instanceof Enum<?> e) ? e.name() : String.valueOf(exchange);
+        s = s.trim().toUpperCase(Locale.ROOT);
         return s.isEmpty() ? null : s;
+    }
+
+    private static String normalizeTimeframeOrNull(String tf) {
+        if (tf == null) return null;
+        String s = tf.trim().toLowerCase(Locale.ROOT);
+        return s.isEmpty() ? null : s;
+    }
+
+    private double effectiveMinRangePct(LocalState st, WindowScalpingStrategySettings cfg) {
+        if (st != null && st.lastAutoMinRangeApplied != null && Double.isFinite(st.lastAutoMinRangeApplied) && st.lastAutoMinRangeApplied > 0.0) {
+            return st.lastAutoMinRangeApplied;
+        }
+        if (cfg != null && cfg.getMinRangePct() != null && Double.isFinite(cfg.getMinRangePct()) && cfg.getMinRangePct() > 0.0) {
+            return cfg.getMinRangePct();
+        }
+        return 0.0;
     }
 
     private static double clamp01(double v) {
@@ -595,4 +5642,20 @@ public class WindowScalpingStrategyV4 implements TradingStrategy {
     private static String fmt(double v) {
         return String.format(Locale.ROOT, "%.4f", v);
     }
+
+    private static String fmtBd(BigDecimal v) {
+        if (v == null) return "null";
+        try {
+            return v.stripTrailingZeros().toPlainString();
+        } catch (Exception e) {
+            return String.valueOf(v);
+        }
+    }
+
+    private static BigDecimal positiveOrNull(BigDecimal v) {
+        return (v != null && v.signum() > 0) ? v : null;
+    }
 }
+
+
+

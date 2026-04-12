@@ -366,7 +366,7 @@ public class RlAgentStrategyV4 implements TradingStrategy {
 
     private StrategySettings loadStrategySettings(Long chatId) {
         return strategySettingsService
-                .findAllByChatId(chatId, null, null)
+                .findAllByChatId(chatId)
                 .stream()
                 .filter(s -> s.getType() == StrategyType.RL_AGENT)
                 .sorted(

@@ -1,27 +1,33 @@
 package com.chicu.aitradebot.strategy.scalping;
 
+import com.chicu.aitradebot.ai.ml.training.MlTrainingResult;
+import com.chicu.aitradebot.ai.ml.training.MlTrainingServiceImpl;
+import com.chicu.aitradebot.ai.runtime.AdaptiveRuntimeController;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
+import com.chicu.aitradebot.market.model.Candle;
+import com.chicu.aitradebot.market.model.UnifiedKline;
+import com.chicu.aitradebot.market.stream.MarketDataStreamService;
+import com.chicu.aitradebot.orchestrator.AiStrategyOrchestrator;
 import com.chicu.aitradebot.service.StrategySettingsService;
 import com.chicu.aitradebot.strategy.core.TradingStrategy;
 import com.chicu.aitradebot.strategy.core.signal.Signal;
 import com.chicu.aitradebot.strategy.live.StrategyLivePublisher;
 import com.chicu.aitradebot.strategy.registry.StrategyBinding;
-import com.chicu.aitradebot.trade.TradeExecutionService;
+import com.chicu.aitradebot.trade.EntryResult;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
-import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.Instant;
-import java.time.LocalDateTime;
 import java.time.ZoneId;
-import java.util.ArrayDeque;
 import java.util.Comparator;
-import java.util.Deque;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
@@ -30,566 +36,801 @@ import java.util.concurrent.ConcurrentHashMap;
 @Slf4j
 @Component
 @RequiredArgsConstructor
-public class ScalpingStrategyV4 implements TradingStrategy {
+public class ScalpingStrategyV4 implements TradingStrategy,
+        AiStrategyOrchestrator.CandleCloseAware,
+        AiStrategyOrchestrator.PrepareStartAware {
 
     private static final Duration SETTINGS_REFRESH_EVERY = Duration.ofSeconds(10);
-    private static final long LOG_EVERY_TICKS = 200;
+    private static final Duration HOLD_LOG_EVERY = Duration.ofSeconds(60);
+    private static final Duration INTRABAR_REEVAL = Duration.ofSeconds(2);
+    private static final int MIN_CANDLES_TO_WORK = 24;
     private static final ZoneId ZONE = ZoneId.of("Europe/Warsaw");
 
     private final StrategyLivePublisher live;
     private final ScalpingStrategySettingsService scalpingSettingsService;
     private final StrategySettingsService strategySettingsService;
-    private final TradeExecutionService tradeExecutionService;
+    private final ObjectProvider<MlTrainingServiceImpl> mlTrainingServiceProvider;
+    private final MarketDataStreamService marketDataStreamService;
+    private final AdaptiveRuntimeController adaptiveRuntimeController;
 
-    private final Map<Long, LocalState> states = new ConcurrentHashMap<>();
+    private final TrendPullbackEntryEngine trendPullbackEntryEngine;
+    private final RangeBounceEntryEngine rangeBounceEntryEngine;
+    private final BreakoutContinuationEntryEngine breakoutContinuationEntryEngine;
+    private final ScalpingMarketRegimeDetector marketRegimeDetector;
+    private final ScalpingExecutionGuard executionGuard;
+    private final ScalpingPositionManager positionManager;
+    private final ScalpingRiskProfileResolver riskProfileResolver;
+    private final ScalpingMlGate mlGate;
+    private final com.chicu.aitradebot.trade.TradeExecutionService tradeExecutionService;
 
-    /**
-     * Важно: threshold в настройках хранится как ДОЛЯ (fraction):
-     * 0.005 = 0.5% (а не 0.005%)
-     */
-    public record WindowZoneSnapshot(BigDecimal high, BigDecimal low) {}
+    private final Map<Long, ScalpingRuntimeState> states = new ConcurrentHashMap<>();
+    private final Map<Long, Instant> entryBlockedUntil = new ConcurrentHashMap<>();
 
-    public WindowZoneSnapshot getLastWindowZone(long chatId) {
-        LocalState st = states.get(chatId);
-        if (st == null) return null;
-        if (st.lastWindowHigh == null || st.lastWindowLow == null) return null;
-        return new WindowZoneSnapshot(st.lastWindowHigh, st.lastWindowLow);
+    private MlTrainingServiceImpl mlTrainer() {
+        return mlTrainingServiceProvider != null ? mlTrainingServiceProvider.getIfAvailable() : null;
     }
 
-    private static class LocalState {
-        Instant startedAt;
-        boolean active;
-
-        String lastSettingsFingerprint;
-        Instant lastSettingsUpdatedAt;   // StrategySettings.updatedAt (LocalDateTime -> Instant)
-        Instant lastScalpingUpdatedAt;   // ScalpingStrategySettings.updatedAt (Instant)
-
-        StrategySettings strategySettings;
-        ScalpingStrategySettings scalpingSettings;
-
-        String symbol;
-        String exchange;
-        NetworkType network;
-
-        Instant lastSettingsLoadAt;
-
-        Deque<BigDecimal> window = new ArrayDeque<>();
-
-        boolean inPosition;
-        boolean isLong;
-
-        BigDecimal entryPrice;
-        BigDecimal tp;
-        BigDecimal sl;
-
-        Long entryOrderId;
-        BigDecimal entryQty;
-        String entrySide;
-
-        Instant lastTradeClosedAt;
-
-        BigDecimal lastWindowHigh;
-        BigDecimal lastWindowLow;
-
-        long ticks;
-        long warmups;
-        long entries;
-        long exits;
-
-        // чтобы не спамить одинаковыми hold-сигналами
-        String lastHoldReason;
-        Instant lastHoldAt;
-    }
-
-    // =====================================================
-    // START / STOP
-    // =====================================================
     @Override
     public void start(Long chatId, String ignored) {
+        start(chatId, ignored, null, null);
+    }
 
-        StrategySettings strategy = loadStrategySettings(chatId);
-        ScalpingStrategySettings cfg = scalpingSettingsService.getOrCreate(chatId);
+    @Override
+    public void start(Long chatId, String ignored, String exchange, NetworkType network) {
+        StrategySettings strategy = strategySettingsService.getOrCreate(chatId, StrategyType.SCALPING);
+        ScalpingStrategySettings settings = scalpingSettingsService.getEffective(chatId);
 
-        LocalState st = new LocalState();
-        st.active = true;
-        st.startedAt = Instant.now();
+        ScalpingRuntimeState state = new ScalpingRuntimeState();
+        state.setActive(true);
+        state.setStartedAt(Instant.now());
+        state.setStrategySettings(strategy);
+        state.setScalpingSettings(settings);
+        state.setExchange(firstNonBlank(upper(exchange), upper(strategy.getExchangeName()), "BINANCE"));
+        state.setNetwork(network != null ? network : (strategy.getNetworkType() != null ? strategy.getNetworkType() : NetworkType.TESTNET));
+        state.setSymbol(firstNonBlank(upper(strategy.getSymbol()), upper(settings.getSymbol()), "BTCUSDT"));
+        state.setTimeframe(firstNonBlank(lower(strategy.getTimeframe()), lower(settings.getTimeframe()), "1m"));
+        state.setSettingsFingerprint(buildSettingsFingerprint(strategy, settings));
+        state.setLastSettingsLoadAt(Instant.now());
+        preloadFromCache(chatId, state);
+        positionManager.syncFromStore(chatId, state, true);
+        states.put(chatId, state);
 
-        st.strategySettings = strategy;
-        st.scalpingSettings = cfg;
+        adaptiveRuntimeController.onStrategyStarted(chatId, StrategyType.SCALPING,
+                state.getExchange(), state.getNetwork(), state.getSymbol(), state.getTimeframe());
 
-        st.symbol = safeUpper(strategy.getSymbol());
-        st.exchange = strategy.getExchangeName();
-        st.network = strategy.getNetworkType();
+        live.pushState(chatId, StrategyType.SCALPING, state.getSymbol(), true);
+        if (state.isInPosition()) {
+            live.pushSignal(chatId, StrategyType.SCALPING, state.getSymbol(), state.getTimeframe(),
+                    Signal.hold("Позиция восстановлена, сопровождение активно"));
+            log.warn("[SCALPING] ♻️ При старте восстановлена открытая позиция chatId={} ex={} net={} symbol={} tf={} entry={} qty={} tp={} sl={} openedAt={}",
+                    chatId,
+                    state.getExchange(),
+                    state.getNetwork(),
+                    state.getSymbol(),
+                    state.getTimeframe(),
+                    fmt(state.getEntryPrice()),
+                    fmt(state.getEntryQty()),
+                    fmt(state.getTp()),
+                    fmt(state.getSl()),
+                    state.getEntryOpenedAt());
+        } else {
+            live.pushSignal(chatId, StrategyType.SCALPING, state.getSymbol(), state.getTimeframe(), Signal.hold("Стратегия запущена"));
+        }
 
-        st.lastSettingsLoadAt = Instant.now();
-
-        st.lastWindowHigh = null;
-        st.lastWindowLow = null;
-
-        st.lastSettingsUpdatedAt = toInstant(strategy.getUpdatedAt());
-        st.lastScalpingUpdatedAt = (cfg != null) ? cfg.getUpdatedAt() : null;
-        st.lastSettingsFingerprint = buildSettingsFingerprint(strategy, cfg);
-
-        states.put(chatId, st);
-
-        log.info("[SCALPING] ▶ START chatId={} symbol={} ex={} net={} windowSize={} thr={} cooldownSec={}",
+        log.info("[SCALPING] ▶️ Запуск скальпера chatId={} ex={} net={} symbol={} tf={} window={} regimeAuto={} trend={} range={} breakout={} orderVolume={}",
                 chatId,
-                st.symbol,
-                st.exchange,
-                st.network,
-                cfg != null ? cfg.getWindowSize() : null,
-                cfg != null ? num(cfg.getPriceChangeThreshold()) : null,
-                strategy.getCooldownSeconds()
-        );
-
-        safeLive(() -> live.pushState(chatId, StrategyType.SCALPING, st.symbol, true));
-        safeLive(() -> live.pushSignal(chatId, StrategyType.SCALPING, st.symbol, null, Signal.hold("started")));
+                state.getExchange(),
+                state.getNetwork(),
+                state.getSymbol(),
+                state.getTimeframe(),
+                settings.getWindowSize(),
+                settings.getRegimeAutoEnabled(),
+                settings.getAllowTrendTrades(),
+                settings.getAllowRangeTrades(),
+                settings.getAllowBreakoutTrades(),
+                settings.getOrderVolume());
     }
 
     @Override
     public void stop(Long chatId, String ignored) {
+        stop(chatId, ignored, null, null);
+    }
 
-        LocalState st = states.remove(chatId);
-        if (st == null) return;
+    @Override
+    public void stop(Long chatId, String ignored, String exchange, NetworkType network) {
+        ScalpingRuntimeState state = states.remove(chatId);
+        entryBlockedUntil.remove(chatId);
+        if (state == null) return;
 
-        String symbol = st.symbol;
+        adaptiveRuntimeController.onStrategyStopped(chatId, StrategyType.SCALPING, state.getExchange(), state.getNetwork());
+        live.clearTpSl(chatId, StrategyType.SCALPING, state.getSymbol());
+        live.clearPriceLines(chatId, StrategyType.SCALPING, state.getSymbol());
+        live.clearWindowZone(chatId, StrategyType.SCALPING, state.getSymbol());
+        live.pushSignal(chatId, StrategyType.SCALPING, state.getSymbol(), state.getTimeframe(), Signal.hold("Стратегия остановлена"));
+        live.pushState(chatId, StrategyType.SCALPING, state.getSymbol(), false);
 
-        if (symbol != null) {
-            safeLive(() -> live.clearTpSl(chatId, StrategyType.SCALPING, symbol));
-            safeLive(() -> live.clearPriceLines(chatId, StrategyType.SCALPING, symbol));
-            safeLive(() -> live.clearWindowZone(chatId, StrategyType.SCALPING, symbol));
-            safeLive(() -> live.pushState(chatId, StrategyType.SCALPING, symbol, false));
-        }
-
-        log.info("[SCALPING] ⏹ STOP chatId={} symbol={} ticks={} warmups={} entries={} exits={} inPos={}",
-                chatId, symbol, st.ticks, st.warmups, st.entries, st.exits, st.inPosition);
+        log.info("[SCALPING] ⏹️ Скальпер остановлен chatId={} symbol={} ticks={} candles={} entries={} exits={} inPosition={}",
+                chatId,
+                state.getSymbol(),
+                state.getTicks(),
+                state.getCandles(),
+                state.getEntries(),
+                state.getExits(),
+                state.isInPosition());
     }
 
     @Override
     public boolean isActive(Long chatId) {
-        LocalState st = states.get(chatId);
-        return st != null && st.active;
+        ScalpingRuntimeState state = states.get(chatId);
+        return state != null && state.isActive();
     }
 
     @Override
     public Instant getStartedAt(Long chatId) {
-        LocalState st = states.get(chatId);
-        return st != null ? st.startedAt : null;
+        ScalpingRuntimeState state = states.get(chatId);
+        return state != null ? state.getStartedAt() : null;
     }
 
-    // =====================================================
-    // PRICE UPDATE
-    // =====================================================
     @Override
-    public void onPriceUpdate(Long chatId, String symbolFromTick, BigDecimal price, Instant ts) {
-
-        LocalState st = states.get(chatId);
-        if (st == null || !st.active) return;
-
-        st.ticks++;
-
-        if (price == null || price.signum() <= 0) {
-            if (st.ticks % LOG_EVERY_TICKS == 0) {
-                log.warn("[SCALPING] ⚠ Invalid price chatId={} price={}", chatId, price);
-            }
-            return;
+    public AiStrategyOrchestrator.PreparationResult prepareStart(long chatId,
+                                                                 StrategyType type,
+                                                                 String symbol,
+                                                                 String timeframe,
+                                                                 String exchange,
+                                                                 NetworkType network) {
+        if (type != StrategyType.SCALPING) {
+            return AiStrategyOrchestrator.PreparationResult.fail("wrong_type");
         }
-
-        Instant time = (ts != null) ? ts : Instant.now();
-
-        // 🔥 важный фикс: не мешаем цены разных символов
-        String tickSymbol = safeUpper(symbolFromTick);
-        String cfgSymbol = safeUpper(st.symbol);
-
-        if (cfgSymbol != null && tickSymbol != null && !cfgSymbol.equals(tickSymbol)) {
-            return; // игнорим чужие тики
-        }
-        if (cfgSymbol == null && tickSymbol != null) {
-            st.symbol = tickSymbol;
-            cfgSymbol = tickSymbol;
-        }
-
-        // лайв тик (не ломаем торговлю если упадёт)
-        final String symbolForLive = safeUpper(st.symbol);
-        safeLive(() -> live.pushPriceTick(chatId, StrategyType.SCALPING, symbolForLive, price, time));
-
-        synchronized (st) {
-
-            refreshSettingsIfNeeded(chatId, st, time);
-
-            StrategySettings strategy = st.strategySettings;
-            ScalpingStrategySettings cfg = st.scalpingSettings;
-            String symbol = safeUpper(st.symbol);
-
-            if (cfg == null) {
-                pushHoldThrottled(chatId, symbol, st, "no_scalping_settings", time);
-                return;
-            }
-
-            int windowSize = cfg.getWindowSize() != null ? cfg.getWindowSize() : 0;
-            if (windowSize <= 1) {
-                pushHoldThrottled(chatId, symbol, st, "windowSize<=1", time);
-                return;
-            }
-
-            st.window.addLast(price);
-            while (st.window.size() > windowSize) st.window.removeFirst();
-
-            if (st.window.size() < windowSize) {
-                st.warmups++;
-                if (st.ticks % LOG_EVERY_TICKS == 0) {
-                    log.info("[SCALPING] … warming chatId={} symbol={} window={}/{} inPos={}",
-                            chatId, symbol, st.window.size(), windowSize, st.inPosition);
-                }
-                pushHoldThrottled(chatId, symbol, st, "warming_up", time);
-                return;
-            }
-
-            BigDecimal first = st.window.getFirst();
-            BigDecimal last = st.window.getLast();
-
-            if (first == null || first.signum() <= 0) {
-                pushHoldThrottled(chatId, symbol, st, "first_price_invalid", time);
-                return;
-            }
-
-            // diffFrac (доля): (last-first)/first
-            double diffFrac = last.subtract(first)
-                    .divide(first, 10, RoundingMode.HALF_UP)
-                    .doubleValue();
-
-            Double thresholdObj = cfg.getPriceChangeThreshold();
-            double thresholdFrac = (thresholdObj != null) ? thresholdObj : 0.0;
-
-            if (st.ticks % LOG_EVERY_TICKS == 0) {
-                log.info("[SCALPING] tick chatId={} symbol={} price={} diff={} thr={} windowSize={} inPos={}",
-                        chatId,
-                        symbol,
-                        price.stripTrailingZeros().toPlainString(),
-                        String.format("%.6f", diffFrac),
-                        String.format("%.6f", thresholdFrac),
-                        windowSize,
-                        st.inPosition
-                );
-            }
-
-            // =====================================================
-            // WINDOW ZONE (рисуем)
-            // thresholdFrac: 0.005 => +-0.5%
-            // =====================================================
-            if (thresholdFrac <= 0) {
-                if (st.lastWindowHigh != null || st.lastWindowLow != null) {
-                    st.lastWindowHigh = null;
-                    st.lastWindowLow = null;
-                    safeLive(() -> live.clearWindowZone(chatId, StrategyType.SCALPING, symbol));
-                }
-            } else {
-                BigDecimal high = last.multiply(BigDecimal.valueOf(1.0 + thresholdFrac));
-                BigDecimal low  = last.multiply(BigDecimal.valueOf(1.0 - thresholdFrac));
-
-                st.lastWindowHigh = high;
-                st.lastWindowLow = low;
-
-                safeLive(() -> live.pushWindowZone(chatId, StrategyType.SCALPING, symbol, high, low));
-            }
-
-            // =====================================================
-// ENTRY (SPOT: только LONG)
-// =====================================================
-            if (!st.inPosition && thresholdFrac > 0 && diffFrac >= thresholdFrac) { // ✅ только рост
-
-                Integer cooldown = strategy != null ? strategy.getCooldownSeconds() : null;
-                if (cooldown != null && cooldown > 0 && st.lastTradeClosedAt != null) {
-                    long passed = Duration.between(st.lastTradeClosedAt, time).getSeconds();
-                    if (passed < cooldown) {
-                        pushHoldThrottled(chatId, symbol, st, "cooldown", time);
-                        return;
-                    }
-                }
-
-                log.info("[SCALPING] ⚡ ENTRY try (SPOT LONG) chatId={} symbol={} price={} diff={} thr={}",
-                        chatId,
-                        symbol,
-                        price.stripTrailingZeros().toPlainString(),
-                        String.format("%.6f", diffFrac),
-                        String.format("%.6f", thresholdFrac)
-                );
-
-                try {
-                    var res = tradeExecutionService.executeEntry(
-                            chatId,
-                            StrategyType.SCALPING,
-                            symbol,
-                            price,
-                            BigDecimal.valueOf(diffFrac), // diffFrac >= thresholdFrac
-                            time,
-                            strategy
-                    );
-
-                    if (!res.executed()) {
-                        log.info("[SCALPING] ✋ ENTRY blocked chatId={} reason={}", chatId, res.reason());
-                        pushHoldThrottled(chatId, symbol, st, res.reason(), time);
-                        return;
-                    }
-
-                    st.entries++;
-                    st.inPosition = true;
-                    st.isLong = true;               // ✅ SPOT
-                    st.entryPrice = res.entryPrice();
-                    st.tp = res.tp();
-                    st.sl = res.sl();
-                    st.entryQty = res.qty();
-                    st.entrySide = "BUY";           // ✅ SPOT
-                    st.entryOrderId = res.orderId();
-
-                    log.info("[SCALPING] ✅ ENTRY OK (SPOT LONG) chatId={} qty={} entry={} tp={} sl={} orderId={}",
-                            chatId,
-                            st.entryQty != null ? st.entryQty.stripTrailingZeros().toPlainString() : "null",
-                            st.entryPrice != null ? st.entryPrice.stripTrailingZeros().toPlainString() : "null",
-                            st.tp != null ? st.tp.stripTrailingZeros().toPlainString() : "null",
-                            st.sl != null ? st.sl.stripTrailingZeros().toPlainString() : "null",
-                            st.entryOrderId
-                    );
-
-                    st.window.clear();
-                    st.lastHoldReason = null;
-
-                } catch (Exception e) {
-                    log.error("[SCALPING] ❌ ENTRY failed chatId={} err={}", chatId, e.getMessage(), e);
-                    pushHoldThrottled(chatId, symbol, st, "entry_failed", time);
-                }
-            }
-
-            // =====================================================
-            // EXIT
-            // =====================================================
-            if (st.inPosition && st.entryQty != null && st.tp != null && st.sl != null) {
-
-                try {
-                    var ex = tradeExecutionService.executeExitIfHit(
-                            chatId,
-                            StrategyType.SCALPING,
-                            symbol,
-                            price,
-                            time,
-                            st.isLong,
-                            st.entryQty,
-                            st.tp,
-                            st.sl
-                    );
-
-                    if (ex.executed()) {
-                        st.exits++;
-
-                        log.info("[SCALPING] ✅ EXIT OK chatId={} price={} (tp={} sl={})",
-                                chatId,
-                                price.stripTrailingZeros().toPlainString(),
-                                st.tp.stripTrailingZeros().toPlainString(),
-                                st.sl.stripTrailingZeros().toPlainString()
-                        );
-
-                        st.inPosition = false;
-                        st.entryQty = null;
-                        st.entryOrderId = null;
-                        st.entryPrice = null;
-                        st.tp = null;
-                        st.sl = null;
-
-                        st.lastTradeClosedAt = time;
-
-                        // очищаем линии на графике после закрытия
-                        safeLive(() -> live.clearTpSl(chatId, StrategyType.SCALPING, symbol));
-                        safeLive(() -> live.clearPriceLines(chatId, StrategyType.SCALPING, symbol));
-                    }
-
-                } catch (Exception e) {
-                    log.error("[SCALPING] ❌ EXIT failed chatId={} err={}", chatId, e.getMessage(), e);
-                }
-            }
-        }
-    }
-
-    // =====================================================
-    // SETTINGS REFRESH
-    // =====================================================
-    private void refreshSettingsIfNeeded(Long chatId, LocalState st, Instant now) {
-
-        if (st.lastSettingsLoadAt != null &&
-            Duration.between(st.lastSettingsLoadAt, now).compareTo(SETTINGS_REFRESH_EVERY) < 0) {
-            return;
-        }
-
         try {
-            StrategySettings loaded = loadStrategySettings(chatId);
-            ScalpingStrategySettings scalping = scalpingSettingsService.getOrCreate(chatId);
-
-            Instant loadedUpd = (loaded != null) ? toInstant(loaded.getUpdatedAt()) : null;
-            Instant scalpingUpd = (scalping != null) ? scalping.getUpdatedAt() : null;
-
-            String fp = buildSettingsFingerprint(loaded, scalping);
-
-            boolean changed =
-                    st.lastSettingsFingerprint == null ||
-                    !st.lastSettingsFingerprint.equals(fp) ||
-                    !Objects.equals(st.lastSettingsUpdatedAt, loadedUpd) ||
-                    !Objects.equals(st.lastScalpingUpdatedAt, scalpingUpd);
-
-            String oldSymbol = safeUpper(st.symbol);
-
-            if (loaded != null) st.strategySettings = loaded;
-            if (scalping != null) st.scalpingSettings = scalping;
-
-            if (loaded != null) {
-                String loadedSymbol = safeUpper(loaded.getSymbol());
-                if (loadedSymbol != null) st.symbol = loadedSymbol;
-
-                if (loaded.getExchangeName() != null) st.exchange = loaded.getExchangeName();
-                if (loaded.getNetworkType() != null) st.network = loaded.getNetworkType();
+            StrategySettings strategy = strategySettingsService.getOrCreate(chatId, StrategyType.SCALPING);
+            ScalpingStrategySettings settings = scalpingSettingsService.getEffective(chatId);
+            String sym = firstNonBlank(upper(symbol), upper(strategy.getSymbol()), upper(settings.getSymbol()));
+            String tf = firstNonBlank(lower(timeframe), lower(strategy.getTimeframe()), lower(settings.getTimeframe()));
+            String ex = firstNonBlank(upper(exchange), upper(strategy.getExchangeName()));
+            NetworkType net = network != null ? network : strategy.getNetworkType();
+            if (sym == null || tf == null || ex == null || net == null) {
+                return AiStrategyOrchestrator.PreparationResult.fail("context_missing");
             }
 
-            st.lastSettingsLoadAt = now;
+            int desired = Math.max(settings.getCachedCandlesLimit(), Math.max(settings.getWindowSize() * 3, 180));
+            int required = Math.max(MIN_CANDLES_TO_WORK, settings.getWindowSize() + 8);
+            List<Candle> candles = marketDataStreamService.getCachedCandles(chatId, StrategyType.SCALPING, ex, net, sym, tf, desired);
+            int usable = countUsableClosedCandles(candles);
+            boolean restoredTrackedPosition = hasTrackedPosition(chatId, ex, net, sym, tf);
 
-            if (changed) {
-                st.lastSettingsFingerprint = fp;
-                st.lastSettingsUpdatedAt = loadedUpd;
-                st.lastScalpingUpdatedAt = scalpingUpd;
+            MlTrainingServiceImpl trainer = mlTrainer();
+            if (trainer == null) {
+                if (restoredTrackedPosition) {
+                    log.warn("[SCALPING] ⚠️ prepareStart: ML trainer недоступен, но открытая позиция уже восстановлена. Разрешаю manage-only старт chatId={} ex={} net={} symbol={} tf={}",
+                            chatId, ex, net, sym, tf);
+                    return AiStrategyOrchestrator.PreparationResult.ok("manage_only:trainer_missing");
+                }
+                if (usable >= required) {
+                    log.warn("[SCALPING] ⚠️ prepareStart: ML trainer недоступен, но контекст уже достаточный. Разрешаю старт на текущих настройках chatId={} ex={} net={} symbol={} tf={} usable={} need={}",
+                            chatId, ex, net, sym, tf, usable, required);
+                    return AiStrategyOrchestrator.PreparationResult.ok("context_ready_without_trainer");
+                }
+                return AiStrategyOrchestrator.PreparationResult.fail("trainer_missing");
+            }
 
-                log.info("[SCALPING] ⚙️ settings updated chatId={} symbol={} ex={} net={} windowSize={} thr={} spread={}",
-                        chatId,
-                        st.symbol,
-                        st.exchange,
-                        st.network,
-                        scalping != null ? scalping.getWindowSize() : null,
-                        scalping != null ? num(scalping.getPriceChangeThreshold()) : null,
-                        scalping != null ? num(scalping.getSpreadThreshold()) : null
-                );
-
-                String newSymbol = safeUpper(st.symbol);
-                if (oldSymbol != null && newSymbol != null && !oldSymbol.equals(newSymbol)) {
-                    st.window.clear();
-                    st.lastWindowHigh = null;
-                    st.lastWindowLow = null;
-
-                    // чистим зону и линии по СТАРОМУ символу, чтобы не оставался мусор
-                    safeLive(() -> live.clearWindowZone(chatId, StrategyType.SCALPING, oldSymbol));
-                    safeLive(() -> live.clearTpSl(chatId, StrategyType.SCALPING, oldSymbol));
-                    safeLive(() -> live.clearPriceLines(chatId, StrategyType.SCALPING, oldSymbol));
-
-                    st.lastHoldReason = null;
+            if (usable < required) {
+                if (restoredTrackedPosition) {
+                    log.warn("[SCALPING] ⚠️ prepareStart: свечей меньше желаемого, но есть восстановленная позиция. Разрешаю сопровождение chatId={} ex={} net={} symbol={} tf={} usable={} need={}",
+                            chatId, ex, net, sym, tf, usable, required);
+                } else {
+                    log.warn("[SCALPING] В runtime-кэше мало свечей перед стартом chatId={} symbol={} tf={} usable={} need={} | пытаюсь прогреть контекст через ML loader",
+                            chatId, sym, tf, usable, required);
                 }
             } else {
-                log.debug("[SCALPING] settings unchanged chatId={} (skip log)", chatId);
+                log.info("[SCALPING] Контекст перед стартом готов chatId={} symbol={} tf={} usable={} need={}",
+                        chatId, sym, tf, usable, required);
             }
 
+            MlTrainingResult result = trainer.trainOnSelectedCandles(
+                    chatId,
+                    StrategyType.SCALPING,
+                    ex,
+                    net,
+                    sym,
+                    tf,
+                    desired,
+                    "prepare_start_train"
+            );
+            if (result == null) {
+                if (restoredTrackedPosition) {
+                    log.warn("[SCALPING] ⚠️ prepareStart: train result = null, но позиция уже восстановлена. Разрешаю manage-only старт chatId={} ex={} net={} symbol={} tf={}",
+                            chatId, ex, net, sym, tf);
+                    return AiStrategyOrchestrator.PreparationResult.ok("manage_only:train_result_null");
+                }
+                return AiStrategyOrchestrator.PreparationResult.fail("train_result_null");
+            }
+
+            if (!result.ok() || !result.applied()) {
+                String error = result.error() != null ? result.error() : "train_not_applied";
+
+                if (restoredTrackedPosition) {
+                    log.warn("[SCALPING] ⚠️ prepareStart: обучение не применилось, но позиция уже восстановлена. Разрешаю сопровождение chatId={} ex={} net={} symbol={} tf={} reason={}",
+                            chatId, ex, net, sym, tf, error);
+                    return AiStrategyOrchestrator.PreparationResult.ok("manage_only:" + error);
+                }
+
+                if (canUseExistingRuntimeContext(usable, required, error)) {
+                    log.warn("[SCALPING] ⚠️ prepareStart: новое обучение не применилось, но контекст уже рабочий. Разрешаю старт на текущих настройках chatId={} ex={} net={} symbol={} tf={} usable={} need={} reason={}",
+                            chatId, ex, net, sym, tf, usable, required, error);
+                    return AiStrategyOrchestrator.PreparationResult.ok("context_ready_existing_model:" + error);
+                }
+
+                return AiStrategyOrchestrator.PreparationResult.fail(error);
+            }
+
+            List<Candle> warmedCandles = marketDataStreamService.getCachedCandles(chatId, StrategyType.SCALPING, ex, net, sym, tf, desired);
+            int warmedUsable = countUsableClosedCandles(warmedCandles);
+            if (warmedUsable < required && !restoredTrackedPosition) {
+                log.warn("[SCALPING] После прогрева контекст всё ещё слабый chatId={} ex={} net={} symbol={} tf={} usable={} need={} | модель обучена, но старт пока рискованный",
+                        chatId, ex, net, sym, tf, warmedUsable, required);
+            }
+
+            log.info("[SCALPING] ✅ Подготовка к старту завершена chatId={} ex={} net={} symbol={} tf={} candlesBefore={} candlesAfter={} modelKey={} modelVer={}",
+                    chatId, ex, net, sym, tf, usable, warmedUsable, result.modelKey(), result.modelVersion());
+            return AiStrategyOrchestrator.PreparationResult.ok("context_ready");
         } catch (Exception e) {
-            st.lastSettingsLoadAt = now;
-            log.warn("[SCALPING] ⚠️ settings refresh failed chatId={} msg={}", chatId, e.toString());
+            log.warn("[SCALPING] Подготовка к старту завершилась ошибкой chatId={} err={}", chatId, rootMessage(e));
+            return AiStrategyOrchestrator.PreparationResult.fail("prepare_exception:" + rootMessage(e));
         }
     }
 
-    // =====================================================
-// FINGERPRINT
-// =====================================================
-    private String buildSettingsFingerprint(StrategySettings ss, ScalpingStrategySettings sc) {
-        if (ss == null && sc == null) return "null";
+    @Override
+    public void onPriceUpdate(Long chatId, String symbol, BigDecimal price, Instant ts) {
+        ScalpingRuntimeState state = states.get(chatId);
+        if (state == null || !state.isActive() || price == null || price.signum() <= 0) return;
+        Instant now = ts != null ? ts : Instant.now();
+        state.setTicks(state.getTicks() + 1);
+        state.setLastPrice(price);
+        live.pushPriceTick(chatId, StrategyType.SCALPING, state.getSymbol(), state.getTimeframe(), price, now);
 
-        // StrategySettings (unified) — только существующие поля
-        String symbol = ss != null ? safeUpper(ss.getSymbol()) : "null";
-        String ex     = ss != null ? String.valueOf(ss.getExchangeName()) : "null";
-        String net    = ss != null ? String.valueOf(ss.getNetworkType()) : "null";
-        String tf     = ss != null ? safe(ss.getTimeframe()) : "null";
+        synchronized (state) {
+            refreshSettingsIfNeeded(chatId, state, now);
+            positionManager.syncFromStore(chatId, state, false);
+            adaptiveRuntimeController.onTick(chatId, StrategyType.SCALPING, state.getExchange(), state.getNetwork());
 
-        String candles  = ss != null && ss.getCachedCandlesLimit() != null
-                ? String.valueOf(ss.getCachedCandlesLimit())
-                : "null";
+            if (state.isInPosition()) {
+                positionManager.manage(chatId, state, price, now, state.getLastFeatures(), state.getLastMarketSnapshot(), state.getScalpingSettings());
+                return;
+            }
 
-        String cooldown = ss != null && ss.getCooldownSeconds() != null
-                ? String.valueOf(ss.getCooldownSeconds())
-                : "null";
+            if (!Boolean.TRUE.equals(state.getScalpingSettings().getUseIntrabarConfirmation())) {
+                return;
+            }
+            if (state.getLastIntrabarEvalAt() != null && Duration.between(state.getLastIntrabarEvalAt(), now).compareTo(INTRABAR_REEVAL) < 0) {
+                return;
+            }
+            state.setLastIntrabarEvalAt(now);
 
-        // ScalpingStrategySettings — локальные параметры
-        String window = sc != null && sc.getWindowSize() != null
-                ? String.valueOf(sc.getWindowSize())
-                : "null";
+            if (state.getLastFeatures() == null || state.getLastMarketSnapshot() == null) {
+                return;
+            }
+            if (state.getCloseWindow().size() < Math.max(MIN_CANDLES_TO_WORK, state.getScalpingSettings().getWindowSize())) {
+                return;
+            }
 
-        String thr    = sc != null ? num(sc.getPriceChangeThreshold()) : "null";
-        String spread = sc != null ? num(sc.getSpreadThreshold()) : "null";
-
-        return symbol + "|" + ex + "|" + net + "|" + tf
-               + "|" + candles + "|" + cooldown
-               + "|" + window + "|" + thr + "|" + spread;
+            maybeOpenPosition(chatId, state, price, now, state.getLastFeatures(), state.getLastMarketSnapshot(), true);
+        }
     }
 
-    // =====================================================
-    // LOAD
-    // =====================================================
-    private StrategySettings loadStrategySettings(Long chatId) {
-        return strategySettingsService
-                .findAllByChatId(chatId, null, null)
-                .stream()
-                .filter(s -> s.getType() == StrategyType.SCALPING)
-                .sorted(
-                        Comparator
-                                .comparing(StrategySettings::getUpdatedAt, Comparator.nullsLast(Comparator.naturalOrder()))
-                                .reversed()
-                                .thenComparing(StrategySettings::getId, Comparator.nullsLast(Comparator.naturalOrder()))
-                                .reversed()
-                )
-                .findFirst()
-                .orElseThrow(() -> new IllegalStateException(
-                        "StrategySettings для SCALPING не найдены (chatId=" + chatId + ")"
+    @Override
+    public void onCandleClosed(long chatId,
+                               StrategyType type,
+                               String symbol,
+                               String timeframe,
+                               UnifiedKline kline,
+                               String exchange,
+                               NetworkType network) {
+        if (type != StrategyType.SCALPING || kline == null || !kline.isClosed()) return;
+        entryBlockedUntil.remove(chatId);
+        ScalpingRuntimeState state = states.get(chatId);
+        if (state == null || !state.isActive()) return;
+
+        Instant now = Instant.ofEpochMilli(kline.getCloseTime() > 0 ? kline.getCloseTime() : kline.getOpenTime());
+        synchronized (state) {
+            refreshSettingsIfNeeded(chatId, state, now);
+            if (!matchesContext(state, symbol, timeframe, exchange, network)) return;
+            positionManager.syncFromStore(chatId, state, false);
+
+            BigDecimal close = positive(kline.getClose());
+            if (close == null) {
+                pushHold(chatId, state, "close_invalid", "Закрытие свечи некорректно", now);
+                return;
+            }
+
+            appendCandle(state, toCandleInput(kline, now));
+            state.setCandles(state.getCandles() + 1);
+            state.setLastPrice(close);
+            live.publishCandle(chatId, StrategyType.SCALPING, kline);
+
+            if (state.getCandleWindow().size() < Math.max(MIN_CANDLES_TO_WORK, state.getScalpingSettings().getWindowSize())) {
+                state.setWarmups(state.getWarmups() + 1);
+                pushHold(chatId, state, "warmup", "Накопление контекста перед входом", now);
+                return;
+            }
+
+            ScalpingFeatureSnapshot features = ScalpingFeatureCalculator.calculateFromCandles(state.getCandleWindow(), state.getScalpingSettings(), now);
+            if (features == null) {
+                pushHold(chatId, state, "features_unavailable", "Не удалось вычислить признаки рынка", now);
+                return;
+            }
+            state.setLastFeatures(features);
+
+            ScalpingMarketRegimeSnapshot snapshot = marketRegimeDetector.detect(state.getCandleWindow(), features, state.getScalpingSettings(), now);
+            state.setPreviousRegime(state.getLastMarketSnapshot() != null ? state.getLastMarketSnapshot().regime() : null);
+            state.setLastMarketSnapshot(snapshot);
+            live.pushWindowZone(chatId, StrategyType.SCALPING, state.getSymbol(), features.windowHigh(), features.windowLow());
+
+            adaptiveRuntimeController.onCandleObserved(chatId, StrategyType.SCALPING, state.getExchange(), state.getNetwork(),
+                    state.getSymbol(), state.getTimeframe(), features.atrPct(), features.spreadPct(), features.volumeRatio(), now);
+
+            logRegimeIfChanged(chatId, state, snapshot, features);
+
+            if (state.isInPosition()) {
+                positionManager.manage(chatId, state, close, now, features, snapshot, state.getScalpingSettings());
+                return;
+            }
+
+            maybeOpenPosition(chatId, state, close, now, features, snapshot, false);
+        }
+    }
+
+    private void maybeOpenPosition(Long chatId,
+                                   ScalpingRuntimeState state,
+                                   BigDecimal price,
+                                   Instant now,
+                                   ScalpingFeatureSnapshot features,
+                                   ScalpingMarketRegimeSnapshot snapshot,
+                                   boolean intrabar) {
+        if (state.isInPosition()) return;
+
+        Instant blockedUntil = entryBlockedUntil.get(chatId);
+        if (blockedUntil != null) {
+            if (now.isBefore(blockedUntil)) {
+                return;
+            }
+            entryBlockedUntil.remove(chatId);
+        }
+
+        EntryDecision decision = selectDecision(state, snapshot, features);
+        if (decision == null || !decision.allowed()) {
+            pushHold(chatId, state, "decision_blocked", decision != null ? decision.reason() : "Сетап не найден", now);
+            return;
+        }
+
+        ScalpingRiskProfile risk = riskProfileResolver.resolve(snapshot, decision, state.getScalpingSettings());
+        decision = decision.withRisk(risk);
+
+        ScalpingMlGate.MlGateResult ml = mlGate.evaluate(state.getStrategySettings(), snapshot, decision);
+        if (ml.veto()) {
+            pushHold(chatId, state, "ml_veto", ml.reason(), now);
+            return;
+        }
+        decision = decision.withMlAdjustments(ml.riskScaleMultiplier(), ml.tpMultiplier(), ml.slMultiplier(), ml.reason());
+
+        ScalpingExecutionGuard.GuardResult guard = executionGuard.validate(
+                chatId,
+                state,
+                state.getStrategySettings(),
+                state.getScalpingSettings(),
+                features,
+                snapshot,
+                decision,
+                now
+        );
+        if (!guard.allowed()) {
+            pushHold(chatId, state, guard.code(), humanizeGuard(guard), now);
+            return;
+        }
+
+        BigDecimal diffPct = features.priceChangePct() != null && features.priceChangePct().signum() > 0
+                ? features.priceChangePct()
+                : new BigDecimal("0.000001");
+
+        EntryResult entry = executeEntry(chatId, state, price, diffPct, now, decision);
+
+        if (entry == null || !entry.executed()) {
+            String reason = entry != null ? entry.reason() : "entry_null";
+            if ("tp_too_small_for_fees".equals(reason)
+                    || "min_notional".equals(reason)
+                    || "wallet_base_untracked_position".equals(reason)
+                    || "balance".equals(reason)) {
+                entryBlockedUntil.put(chatId, now.plusSeconds(55));
+            }
+            pushHold(chatId, state, "entry_blocked", "Вход не выполнен: " + reason, now);
+            return;
+        }
+
+        state.setEntries(state.getEntries() + 1);
+        state.setEntryPrice(entry.entryPrice() != null ? entry.entryPrice() : price);
+        state.setEntryQty(entry.qty());
+        state.setTp(entry.tp());
+        state.setSl(entry.sl());
+        state.setEntryOrderId(entry.orderId());
+        state.setLastSetupType(decision.setupType());
+        positionManager.onEntryOpened(chatId, state, decision, now);
+        positionManager.syncFromStore(chatId, state, true);
+
+        adaptiveRuntimeController.onEntry(chatId, StrategyType.SCALPING, state.getExchange(), state.getNetwork(),
+                state.getSymbol(), state.getTimeframe(), now);
+
+        live.pushTrade(chatId, StrategyType.SCALPING, state.getSymbol(), "BUY", state.getEntryPrice(), state.getEntryQty(), now);
+        live.pushSignal(chatId, StrategyType.SCALPING, state.getSymbol(), state.getTimeframe(),
+                Signal.buy(price.doubleValue(), decision.reason()));
+
+        log.info("[SCALPING] ✅ Вход открыт chatId={} symbol={} regime={} setup={} intrabar={} entry={} qty={} tp={} sl={} riskScale={} reason={}",
+                chatId,
+                state.getSymbol(),
+                snapshot.regime(),
+                decision.setupType(),
+                intrabar,
+                fmt(state.getEntryPrice()),
+                fmt(state.getEntryQty()),
+                fmt(state.getTp()),
+                fmt(state.getSl()),
+                fmt(decision.riskScale()),
+                decision.reason());
+    }
+
+
+    private EntryResult executeEntry(Long chatId,
+                                     ScalpingRuntimeState state,
+                                     BigDecimal price,
+                                     BigDecimal diffPct,
+                                     Instant now,
+                                     EntryDecision decision) {
+        BigDecimal requestedQuoteBudget = resolveRequestedQuoteBudget(state);
+        if (requestedQuoteBudget != null
+                && tradeExecutionService instanceof com.chicu.aitradebot.trade.TradeExecutionServiceImpl impl) {
+            return impl.executeEntryWithQuoteBudget(
+                    chatId,
+                    StrategyType.SCALPING,
+                    state.getSymbol(),
+                    price,
+                    diffPct,
+                    now,
+                    state.getStrategySettings(),
+                    decision.tpPct(),
+                    decision.slPct(),
+                    requestedQuoteBudget
+            );
+        }
+
+        return tradeExecutionService.executeEntry(
+                chatId,
+                StrategyType.SCALPING,
+                state.getSymbol(),
+                price,
+                diffPct,
+                now,
+                state.getStrategySettings(),
+                decision.tpPct(),
+                decision.slPct()
+        );
+    }
+
+    private BigDecimal resolveRequestedQuoteBudget(ScalpingRuntimeState state) {
+        if (state == null || state.getScalpingSettings() == null) {
+            return null;
+        }
+        Double orderVolume = state.getScalpingSettings().getOrderVolume();
+        if (orderVolume == null || !Double.isFinite(orderVolume) || orderVolume <= 0.0d) {
+            return null;
+        }
+        return BigDecimal.valueOf(orderVolume).stripTrailingZeros();
+    }
+
+    private EntryDecision selectDecision(ScalpingRuntimeState state,
+                                         ScalpingMarketRegimeSnapshot snapshot,
+                                         ScalpingFeatureSnapshot features) {
+        if (snapshot == null || features == null) {
+            return EntryDecision.block(ScalpingMarketRegime.NO_TRADE, ScalpingSetupType.NO_TRADE, "нет market snapshot", Map.of());
+        }
+
+        EntryDecision breakout = breakoutContinuationEntryEngine.evaluate(state.getPreviousRegime(), snapshot, features, state.getScalpingSettings());
+        EntryDecision trend = trendPullbackEntryEngine.evaluate(snapshot, features, state.getScalpingSettings());
+        EntryDecision range = rangeBounceEntryEngine.evaluate(snapshot, features, state.getScalpingSettings());
+
+        return List.of(breakout, trend, range).stream()
+                .filter(Objects::nonNull)
+                .filter(EntryDecision::allowed)
+                .max(Comparator.comparing(d -> d.score() != null ? d.score() : BigDecimal.ZERO))
+                .orElseGet(() -> switch (snapshot.regime()) {
+                    case TREND_UP -> trend;
+                    case RANGE -> range;
+                    case SQUEEZE, TREND_DOWN, CHAOS, NO_TRADE -> EntryDecision.block(snapshot.regime(), ScalpingSetupType.NO_TRADE, snapshot.reason(), features.toMlFeatures());
+                });
+    }
+
+    private boolean hasTrackedPosition(Long chatId,
+                                      String exchange,
+                                      NetworkType network,
+                                      String symbol,
+                                      String timeframe) {
+        try {
+            ScalpingRuntimeState probe = new ScalpingRuntimeState();
+            probe.setActive(true);
+            probe.setExchange(exchange);
+            probe.setNetwork(network);
+            probe.setSymbol(symbol);
+            probe.setTimeframe(timeframe);
+            positionManager.syncFromStore(chatId, probe, false);
+            return probe.isInPosition()
+                    && probe.getEntryQty() != null
+                    && probe.getEntryQty().signum() > 0
+                    && probe.getEntryPrice() != null
+                    && probe.getEntryPrice().signum() > 0;
+        } catch (Exception e) {
+            log.debug("[SCALPING] hasTrackedPosition check skipped chatId={} symbol={} err={}", chatId, symbol, e.toString());
+            return false;
+        }
+    }
+
+    private boolean canUseExistingRuntimeContext(int usable, int required, String error) {
+        if (usable < required) {
+            return false;
+        }
+        if (error == null || error.isBlank()) {
+            return false;
+        }
+        String normalized = error.toLowerCase(Locale.ROOT);
+        return normalized.startsWith("not_enough_candle_rows")
+                || normalized.startsWith("not_enough_samples")
+                || normalized.startsWith("cooldown")
+                || normalized.startsWith("train_not_applied");
+    }
+
+    private void preloadFromCache(Long chatId, ScalpingRuntimeState state) {
+        try {
+            int desired = Math.max(state.getScalpingSettings().getCachedCandlesLimit(), Math.max(state.getScalpingSettings().getWindowSize() * 3, 180));
+            List<Candle> candles = marketDataStreamService.getCachedCandles(
+                    chatId,
+                    StrategyType.SCALPING,
+                    state.getExchange(),
+                    state.getNetwork(),
+                    state.getSymbol(),
+                    state.getTimeframe(),
+                    desired
+            );
+            if (candles == null || candles.isEmpty()) return;
+            for (Candle candle : candles) {
+                if (candle == null || !candle.isClosed() || candle.getClose() <= 0.0d) continue;
+                state.getCloseWindow().addLast(BigDecimal.valueOf(candle.getClose()));
+                state.getCandleWindow().addLast(new ScalpingFeatureCalculator.CandleInput(
+                        Instant.ofEpochMilli(candle.getTime()),
+                        BigDecimal.valueOf(candle.getOpen()),
+                        BigDecimal.valueOf(candle.getHigh()),
+                        BigDecimal.valueOf(candle.getLow()),
+                        BigDecimal.valueOf(candle.getClose()),
+                        BigDecimal.valueOf(candle.getVolume())
                 ));
+                trimWindows(state);
+                state.setLastPrice(BigDecimal.valueOf(candle.getClose()));
+            }
+            log.info("[SCALPING] 📥 Контекст загружен из кэша chatId={} symbol={} tf={} candles={}",
+                    chatId, state.getSymbol(), state.getTimeframe(), state.getCandleWindow().size());
+        } catch (Exception e) {
+            log.warn("[SCALPING] preloadFromCache пропущен chatId={} err={}", chatId, e.toString());
+        }
     }
 
-    // =====================================================
-    // LIVE HELPERS (безопасно)
-    // =====================================================
-    private void safeLive(Runnable r) {
-        try { r.run(); } catch (Exception ignored) {}
+    private void appendCandle(ScalpingRuntimeState state, ScalpingFeatureCalculator.CandleInput candle) {
+        if (state == null || candle == null) return;
+        state.getCloseWindow().addLast(candle.close());
+        state.getCandleWindow().addLast(candle);
+        trimWindows(state);
     }
 
-    private void pushHoldThrottled(Long chatId, String symbol, LocalState st, String reason, Instant now) {
-        if (symbol == null) return;
+    private void trimWindows(ScalpingRuntimeState state) {
+        int hardLimit = Math.max(state.getScalpingSettings().getCachedCandlesLimit(), state.getScalpingSettings().getWindowSize() * 3);
+        while (state.getCloseWindow().size() > hardLimit) state.getCloseWindow().removeFirst();
+        while (state.getCandleWindow().size() > hardLimit) state.getCandleWindow().removeFirst();
+    }
 
-        // если причина та же и прошла меньше 2 секунд — не спамим
-        if (Objects.equals(st.lastHoldReason, reason) && st.lastHoldAt != null) {
-            long ms = Duration.between(st.lastHoldAt, now).toMillis();
-            if (ms < 2000) return;
+    private int countUsableClosedCandles(List<Candle> candles) {
+        if (candles == null || candles.isEmpty()) return 0;
+        int usable = 0;
+        for (Candle candle : candles) {
+            if (candle != null && candle.isClosed() && candle.getClose() > 0.0d) {
+                usable++;
+            }
+        }
+        return usable;
+    }
+
+    private void refreshSettingsIfNeeded(Long chatId, ScalpingRuntimeState state, Instant now) {
+        if (state.getLastSettingsLoadAt() != null && Duration.between(state.getLastSettingsLoadAt(), now).compareTo(SETTINGS_REFRESH_EVERY) < 0) {
+            return;
+        }
+        StrategySettings strategy = strategySettingsService.getOrCreate(chatId, StrategyType.SCALPING);
+        ScalpingStrategySettings settings = scalpingSettingsService.getEffective(chatId);
+        String newFingerprint = buildSettingsFingerprint(strategy, settings);
+        boolean changed = !Objects.equals(state.getSettingsFingerprint(), newFingerprint);
+        state.setStrategySettings(strategy);
+        state.setScalpingSettings(settings);
+        state.setExchange(firstNonBlank(upper(strategy.getExchangeName()), state.getExchange(), "BINANCE"));
+        state.setNetwork(strategy.getNetworkType() != null ? strategy.getNetworkType() : state.getNetwork());
+        state.setSymbol(firstNonBlank(upper(strategy.getSymbol()), upper(settings.getSymbol()), state.getSymbol()));
+        state.setTimeframe(firstNonBlank(lower(strategy.getTimeframe()), lower(settings.getTimeframe()), state.getTimeframe()));
+        state.setSettingsFingerprint(newFingerprint);
+        state.setLastSettingsLoadAt(now);
+
+        if (changed) {
+            log.info("[SCALPING] ⚙️ Настройки обновлены chatId={} symbol={} tf={} trend={} range={} breakout={} spreadMax={} atr=[{},{}] volumeMin={}",
+                    chatId,
+                    state.getSymbol(),
+                    state.getTimeframe(),
+                    settings.getAllowTrendTrades(),
+                    settings.getAllowRangeTrades(),
+                    settings.getAllowBreakoutTrades(),
+                    settings.getMaxSpreadPct(),
+                    settings.getMinAtrPct(),
+                    settings.getMaxAtrPct(),
+                    settings.getMinVolumeRatio());
+        }
+    }
+
+    private void logRegimeIfChanged(Long chatId,
+                                    ScalpingRuntimeState state,
+                                    ScalpingMarketRegimeSnapshot snapshot,
+                                    ScalpingFeatureSnapshot features) {
+        String signature = snapshot.regime() + "|" + snapshot.reason();
+        if (Objects.equals(signature, state.getLastRegimeLogSignature())) {
+            return;
+        }
+        state.setLastRegimeLogSignature(signature);
+        log.info("[SCALPING] 📊 Режим рынка chatId={} symbol={} tf={} regime={} reason={} trend={} range={} chaos={} squeeze={} atr={} spread={} rsi={} volRatio={} emaFast={} emaSlow={}",
+                chatId,
+                state.getSymbol(),
+                state.getTimeframe(),
+                snapshot.regime(),
+                snapshot.reason(),
+                fmt(snapshot.trendScore()),
+                fmt(snapshot.rangeScore()),
+                fmt(snapshot.chaosScore()),
+                fmt(snapshot.squeezeScore()),
+                fmt(features.atrPct()),
+                fmt(features.spreadPct()),
+                fmt(features.rsi()),
+                fmt(features.volumeRatio()),
+                fmt(features.emaFast()),
+                fmt(features.emaSlow()));
+    }
+
+    private void pushHold(Long chatId,
+                          ScalpingRuntimeState state,
+                          String code,
+                          String text,
+                          Instant now) {
+        if (state == null || state.getSymbol() == null) return;
+        Instant logNow = Instant.now();
+        String holdSignature = (code == null ? "hold" : code) + "|" + (text == null ? "" : text);
+        if (Objects.equals(state.getLastHoldReason(), holdSignature)
+                && state.getLastHoldAt() != null
+                && Duration.between(state.getLastHoldAt(), logNow).compareTo(HOLD_LOG_EVERY) < 0) {
+            return;
+        }
+        state.setLastHoldReason(holdSignature);
+        state.setLastHoldAt(logNow);
+
+        boolean suppressAdaptiveHold = Objects.equals(code, "entry_blocked")
+                && text != null
+                && (text.contains("tp_too_small_for_fees")
+                || text.contains("min_notional")
+                || text.contains("wallet_base_untracked_position")
+                || text.contains("balance"));
+
+        if (!suppressAdaptiveHold) {
+            adaptiveRuntimeController.onHold(chatId, StrategyType.SCALPING, state.getExchange(), state.getNetwork(), code, logNow);
+        }
+        live.pushSignal(chatId, StrategyType.SCALPING, state.getSymbol(), state.getTimeframe(), Signal.hold(text));
+
+        boolean noisyTechnicalReason = Objects.equals(code, "warmup")
+                || Objects.equals(code, "features_unavailable")
+                || Objects.equals(code, "decision_blocked")
+                || Objects.equals(code, "ml_veto");
+
+        if (noisyTechnicalReason) {
+            if (log.isDebugEnabled()) {
+                log.debug("[SCALPING] ⏸ Вход пока не открыт chatId={} symbol={} code={} text={}", chatId, state.getSymbol(), code, text);
+            }
+            return;
         }
 
-        st.lastHoldReason = reason;
-        st.lastHoldAt = now;
-        safeLive(() -> live.pushSignal(chatId, StrategyType.SCALPING, symbol, null, Signal.hold(reason)));
+        log.info("[SCALPING] ⏸ Вход пропущен chatId={} symbol={} code={} text={}", chatId, state.getSymbol(), code, text);
     }
 
-    // =====================================================
-    // UTILS
-    // =====================================================
-    private static String safe(String s) {
-        return s == null ? "null" : s.trim();
+    private boolean matchesContext(ScalpingRuntimeState state,
+                                   String symbol,
+                                   String timeframe,
+                                   String exchange,
+                                   NetworkType network) {
+        String sym = upper(symbol);
+        String tf = lower(timeframe);
+        String ex = upper(exchange);
+        if (sym != null && state.getSymbol() != null && !state.getSymbol().equals(sym)) return false;
+        if (tf != null && state.getTimeframe() != null && !state.getTimeframe().equals(tf)) return false;
+        if (ex != null && state.getExchange() != null && !state.getExchange().equalsIgnoreCase(ex)) return false;
+        return network == null || state.getNetwork() == null || state.getNetwork() == network;
     }
 
-    private static String safeUpper(String s) {
-        if (s == null) return null;
-        String t = s.trim();
-        return t.isEmpty() ? null : t.toUpperCase();
+    private ScalpingFeatureCalculator.CandleInput toCandleInput(UnifiedKline kline, Instant fallbackTs) {
+        return new ScalpingFeatureCalculator.CandleInput(
+                fallbackTs != null ? fallbackTs : Instant.now(),
+                positive(kline.getOpen()),
+                positive(kline.getHigh()),
+                positive(kline.getLow()),
+                positive(kline.getClose()),
+                positive(kline.getVolume())
+        );
     }
 
-    private static Instant toInstant(LocalDateTime ldt) {
-        return ldt == null ? null : ldt.atZone(ZONE).toInstant();
+    private String buildSettingsFingerprint(StrategySettings strategy, ScalpingStrategySettings settings) {
+        if (strategy == null || settings == null) return "null";
+        return upper(strategy.getExchangeName()) + "|" + strategy.getNetworkType() + "|" + upper(strategy.getSymbol()) + "|" + lower(strategy.getTimeframe())
+                + "|" + settings.getAllowTrendTrades() + "|" + settings.getAllowRangeTrades() + "|" + settings.getAllowBreakoutTrades()
+                + "|" + settings.getTrendTpPct() + "|" + settings.getTrendSlPct() + "|" + settings.getRangeTpPct() + "|" + settings.getRangeSlPct()
+                + "|" + settings.getBreakoutTpPct() + "|" + settings.getBreakoutSlPct() + "|" + settings.getMaxSpreadPct()
+                + "|" + settings.getMinAtrPct() + "|" + settings.getMaxAtrPct() + "|" + settings.getMinVolumeRatio();
     }
 
-    private static String bd(BigDecimal v) {
-        return v == null ? "null" : v.stripTrailingZeros().toPlainString();
+    private String humanizeGuard(ScalpingExecutionGuard.GuardResult guard) {
+        if (guard == null) return "guard вернул пустой результат";
+        return switch (guard.code()) {
+            case "spread_bad" -> "Спред плохой, вход запрещён";
+            case "atr_too_small" -> "ATR слишком маленький, движения не хватит";
+            case "atr_too_large" -> "ATR слишком большой, рынок слишком нервный";
+            case "volume_low" -> "Объём слабый, импульс не подтверждён";
+            case "risk_reward_low" -> "Отношение риск/прибыль слишком слабое";
+            case "wallet_base_untracked_position" -> "На кошельке уже есть base-актив, сначала синхронизируй позицию";
+            case "decision_blocked" -> guard.message();
+            case "regime_block", "trend_down_spot_block" -> "Текущий режим рынка не подходит для спота";
+            case "cooldown_after_stop" -> "После стопа ещё действует защитный кулдаун";
+            case "cooldown_after_exit" -> "Слишком рано после прошлого выхода";
+            case "max_consecutive_stops" -> "Слишком много стопов подряд, временно не торгую";
+            default -> guard.message() != null ? guard.message() : guard.code();
+        };
     }
 
-    private static String num(Object v) {
-        if (v == null) return "null";
-        if (v instanceof BigDecimal bd) return bd.stripTrailingZeros().toPlainString();
-        if (v instanceof Double d) return BigDecimal.valueOf(d).stripTrailingZeros().toPlainString();
-        if (v instanceof Float f) return BigDecimal.valueOf(f.doubleValue()).stripTrailingZeros().toPlainString();
-        if (v instanceof Integer i) return String.valueOf(i);
-        if (v instanceof Long l) return String.valueOf(l);
-        return String.valueOf(v);
+    private static BigDecimal positive(BigDecimal value) {
+        return value != null && value.signum() > 0 ? value : null;
+    }
+
+    private static String fmt(BigDecimal value) {
+        return value == null ? "null" : value.stripTrailingZeros().toPlainString();
+    }
+
+    private static String upper(String value) {
+        if (value == null) return null;
+        String t = value.trim();
+        return t.isEmpty() ? null : t.toUpperCase(Locale.ROOT);
+    }
+
+    private static String lower(String value) {
+        if (value == null) return null;
+        String t = value.trim();
+        return t.isEmpty() ? null : t.toLowerCase(Locale.ROOT);
+    }
+
+    private static String firstNonBlank(String... values) {
+        if (values == null) return null;
+        for (String value : values) {
+            if (value != null && !value.isBlank()) return value.trim();
+        }
+        return null;
+    }
+
+    private static String rootMessage(Throwable throwable) {
+        if (throwable == null) return null;
+        Throwable current = throwable;
+        while (current.getCause() != null && current.getCause() != current) {
+            current = current.getCause();
+        }
+        return current.getMessage() != null && !current.getMessage().isBlank() ? current.getMessage() : throwable.getClass().getSimpleName();
     }
 }
+

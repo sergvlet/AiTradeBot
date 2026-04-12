@@ -244,14 +244,7 @@ public class MomentumStrategyV4 implements TradingStrategy {
             // =====================================================
             if (!st.inPosition && changePct >= minChangePct) {
 
-                Integer cooldown = strategy != null ? strategy.getCooldownSeconds() : null;
-                if (cooldown != null && cooldown > 0 && st.lastTradeClosedAt != null) {
-                    long passed = Duration.between(st.lastTradeClosedAt, time).getSeconds();
-                    if (passed < cooldown) {
-                        pushHoldThrottled(chatId, symbol, st, changePct, "cooldown", time);
-                        return;
-                    }
-                }
+
 
                 log.info("[MOMENTUM] ⚡ ENTRY try chatId={} symbol={} price={} changePct={}%",
                         chatId,
@@ -440,16 +433,14 @@ public class MomentumStrategyV4 implements TradingStrategy {
                 ? String.valueOf(ss.getCachedCandlesLimit())
                 : "null";
 
-        String cooldown = ss != null && ss.getCooldownSeconds() != null
-                ? String.valueOf(ss.getCooldownSeconds())
-                : "null";
+
 
         String lookback = cfg != null ? String.valueOf(cfg.getLookbackBars()) : "null";
         String minChg   = cfg != null ? String.valueOf(cfg.getMinPriceChangePct()) : "null";
         String confirm  = cfg != null ? String.valueOf(cfg.getConfirmBars()) : "null";
 
-        return symbol + "|" + ex + "|" + net + "|" + tf + "|" + candles + "|" + cooldown
-                + "|" + lookback + "|" + minChg + "|" + confirm;
+        return symbol + "|" + ex + "|" + net + "|" + tf + "|" + candles + "|"
+                 + lookback + "|" + minChg + "|" + confirm;
     }
 
     // =====================================================
@@ -458,7 +449,7 @@ public class MomentumStrategyV4 implements TradingStrategy {
 
     private StrategySettings loadStrategySettings(Long chatId) {
         return strategySettingsService
-                .findAllByChatId(chatId, null, null)
+                .findAllByChatId(chatId)
                 .stream()
                 .filter(s -> s.getType() == StrategyType.MOMENTUM)
                 .sorted(

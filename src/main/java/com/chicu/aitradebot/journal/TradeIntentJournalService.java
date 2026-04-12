@@ -5,6 +5,7 @@ import com.chicu.aitradebot.common.enums.StrategyType;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
@@ -23,7 +24,7 @@ public class TradeIntentJournalService {
      * Создаёт intent до выставления ордера.
      * Возвращает correlationId — его надо пронести дальше и вложить в clientOrderId.
      */
-    @Transactional
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public String recordIntent(
             Long chatId,
             StrategyType strategyType,
@@ -73,7 +74,7 @@ public class TradeIntentJournalService {
                 .createdAt(Instant.now())
                 .build();
 
-        repo.save(e);
+        repo.saveAndFlush(e);
 
         // лог минимальный, без спама
         if (decision != TradeIntentEvent.Decision.ALLOW) {
@@ -91,12 +92,14 @@ public class TradeIntentJournalService {
      * Проставляем clientOrderId после того, как OrderService реально сформировал/отправил ордер.
      * Можно вызывать и для случая, когда clientOrderId отличается от correlationId.
      */
-    @Transactional
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void attachClientOrderId(String correlationId, String clientOrderId) {
         if (correlationId == null || correlationId.isBlank()) return;
+        if (clientOrderId == null || clientOrderId.isBlank()) return;
+
         repo.findByCorrelationId(correlationId).ifPresent(e -> {
             e.setClientOrderId(clientOrderId);
-            repo.save(e);
+            repo.saveAndFlush(e);
         });
     }
 
@@ -104,3 +107,4 @@ public class TradeIntentJournalService {
         return (s == null || s.isBlank()) ? "—" : s;
     }
 }
+

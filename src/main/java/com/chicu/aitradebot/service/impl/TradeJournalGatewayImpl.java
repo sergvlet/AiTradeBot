@@ -7,11 +7,13 @@ import com.chicu.aitradebot.journal.TradeIntentJournalService;
 import com.chicu.aitradebot.journal.TradeOrderLinkService;
 import com.chicu.aitradebot.service.TradeJournalGateway;
 import lombok.RequiredArgsConstructor;
+import org.springframework.context.annotation.Primary;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
 
-@Service
+@Primary
+@Service("tradeJournalGatewayImpl")
 @RequiredArgsConstructor
 public class TradeJournalGatewayImpl implements TradeJournalGateway {
 
@@ -83,3 +85,4 @@ public class TradeJournalGatewayImpl implements TradeJournalGateway {
         );
     }
 }
+

@@ -41,4 +41,12 @@ public record ExitResult(
     public static ExitResult skipped(String reason) {
         return fail(reason);
     }
+
+    /**
+     * Короткий alias для pnlPercent().
+     */
+    public BigDecimal pnlPct() {
+        return pnlPercent;
+    }
 }
+

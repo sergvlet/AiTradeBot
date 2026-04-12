@@ -1,6 +1,7 @@
 // src/main/java/com/chicu/aitradebot/strategy/hybrid/HybridStrategyV4.java
 package com.chicu.aitradebot.strategy.hybrid;
 
+import com.chicu.aitradebot.ai.ml.dto.MlPrediction;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
@@ -8,18 +9,15 @@ import com.chicu.aitradebot.service.StrategySettingsService;
 import com.chicu.aitradebot.strategy.core.CandleProvider;
 import com.chicu.aitradebot.strategy.core.TradingStrategy;
 import com.chicu.aitradebot.strategy.core.signal.Signal;
+import com.chicu.aitradebot.strategy.core.signal.SignalType;
 import com.chicu.aitradebot.strategy.live.StrategyLivePublisher;
-
 import com.chicu.aitradebot.strategy.ml.MlFeatures;
-import com.chicu.aitradebot.strategy.ml.MlPrediction;
 import com.chicu.aitradebot.strategy.ml.MlSignalService;
-
 import com.chicu.aitradebot.strategy.registry.StrategyBinding;
 import com.chicu.aitradebot.strategy.rl.RlAction;
 import com.chicu.aitradebot.strategy.rl.RlAgentService;
 import com.chicu.aitradebot.strategy.rl.RlDecision;
 import com.chicu.aitradebot.strategy.rl.RlState;
-
 import com.chicu.aitradebot.trade.TradeExecutionService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -44,11 +42,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * - Евристика: trend up по свечам
  *
  * ВАЖНО:
- * HybridStrategySettings сейчас содержит:
+ * HybridStrategySettings содержит:
  *  - mlModelKey, rlAgentKey, minConfidence, allowSingleSourceBuy
- * Поэтому:
- *  - общий порог = cfg.minConfidence (и для ML, и для RL)
- *  - lookback берём из StrategySettings.cachedCandlesLimit (или дефолт 200)
  *
  * Выход: только TP/SL.
  */
@@ -60,6 +55,9 @@ public class HybridStrategyV4 implements TradingStrategy {
 
     private static final Duration SETTINGS_REFRESH_EVERY = Duration.ofSeconds(10);
     private static final long LOG_EVERY_TICKS = 300;
+
+    // HOLD throttle (чтобы UI не засыпать)
+    private static final long HOLD_THROTTLE_MS = 2000;
 
     private final StrategyLivePublisher live;
     private final HybridStrategySettingsService hybridSettingsService;
@@ -96,6 +94,9 @@ public class HybridStrategyV4 implements TradingStrategy {
 
         String lastHoldReason;
         Instant lastHoldAt;
+
+        // чтобы не спамить “ML недоступен” на каждый тик
+        Instant lastMlWarnAt;
     }
 
     // =====================================================
@@ -126,14 +127,15 @@ public class HybridStrategyV4 implements TradingStrategy {
         int lookback = resolveLookback(ss);
         double thr = normalizeThreshold(doubleOrNull(cfg != null ? cfg.getMinConfidence() : null), 0.60);
 
-        log.info("[HYBRID] ▶ START chatId={} symbol={} thr={} allowSingle={} lookback={} mlKey={} rlKey={}",
+        log.info("[HYBRID] ▶ START chatId={} symbol={} thr={} allowSingle={} lookback={} mlKey={} rlKey={} schemaHash={}",
                 chatId,
                 st.symbol,
                 round2(thr),
                 cfg != null ? String.valueOf(cfg.getAllowSingleSourceBuy()) : "null",
                 lookback,
                 cfg != null ? safe(cfg.getMlModelKey()) : "null",
-                cfg != null ? safe(cfg.getRlAgentKey()) : "null"
+                cfg != null ? safe(cfg.getRlAgentKey()) : "null",
+                safe(resolveSchemaHash(ss, cfg))
         );
 
         safeLive(() -> live.pushState(chatId, StrategyType.HYBRID, st.symbol, true));
@@ -220,24 +222,31 @@ public class HybridStrategyV4 implements TradingStrategy {
             // 1) EXIT TP/SL
             if (st.inPosition && st.entryQty != null && st.tp != null && st.sl != null) {
                 try {
-                    var ex = tradeExecutionService.executeExitIfHit(
+                    // ✅ ВАЖНО: в твоём TradeExecutionServiceImpl метод требует exchange/network
+                    String ex = (st.exchange != null ? st.exchange : (ss != null ? ss.getExchangeName() : null));
+                    NetworkType net = (st.network != null ? st.network : (ss != null ? ss.getNetworkType() : null));
+
+                    var exRes = tradeExecutionService.executeExitIfHit(
                             chatId,
                             StrategyType.HYBRID,
                             symFinal,
                             price,
                             time,
-                            false,
+                            true,          // spot long
                             st.entryQty,
                             st.tp,
-                            st.sl
+                            st.sl,
+                            ex,
+                            net
                     );
 
-                    if (ex.executed()) {
+                    if (exRes != null && exRes.executed()) {
                         clearPosition(st);
 
                         safeLive(() -> live.clearTpSl(chatId, StrategyType.HYBRID, symFinal));
                         safeLive(() -> live.clearPriceLines(chatId, StrategyType.HYBRID, symFinal));
-                        safeLive(() -> live.pushSignal(chatId, StrategyType.HYBRID, symFinal, null, Signal.sell(1.0, "tp_sl_exit")));
+                        safeLive(() -> live.pushSignal(chatId, StrategyType.HYBRID, symFinal, null,
+                                Signal.sell(price.doubleValue(), exRes.tpHit() ? "TP" : "SL")));
                         return;
                     }
                 } catch (Exception e) {
@@ -261,20 +270,39 @@ public class HybridStrategyV4 implements TradingStrategy {
                 double commonThr = normalizeThreshold(doubleOrNull(cfg.getMinConfidence()), 0.60);
 
                 // --- ML ---
-                MlPrediction mlPred;
-                try {
-                    MlFeatures feats = MlFeatures.fromCandles(candles, price);
-                    mlPred = mlSignalService.predict(chatId, symFinal, ss.getTimeframe(), feats);
-                } catch (Exception e) {
-                    pushHoldThrottled(chatId, symFinal, st, "ml_failed", time);
-                    return;
+                MlPrediction mlPred = null;
+                boolean mlOk = false;
+
+                if (mlSignalService.isAvailable()) {
+                    try {
+                        MlFeatures feats = MlFeatures.fromCandles(candles, price);
+
+                        String modelKey = safeEmptyToNull(cfg.getMlModelKey());
+                        String schemaHash = resolveSchemaHash(ss, cfg);
+
+                        Map<String, Object> featureMap = (feats != null ? feats.toMap() : Map.of());
+
+                        mlPred = mlSignalService.predict(
+                                chatId,
+                                symFinal,
+                                ss.getTimeframe(),
+                                modelKey,
+                                schemaHash,
+                                featureMap
+                        );
+
+                        double pBuy = (mlPred != null) ? clamp01(mlPred.probBuy()) : 0.0;
+                        double pSell = (mlPred != null) ? clamp01(mlPred.probSell()) : 0.0;
+
+                        mlOk = (pBuy >= commonThr) && (pBuy > pSell);
+
+                    } catch (Exception e) {
+                        warnMlOncePer(st, time, "[HYBRID] ⚠ ML predict failed chatId=" + chatId +
+                                                " sym=" + symFinal + " err=" + e.getMessage());
+                        mlPred = null;
+                        mlOk = false;
+                    }
                 }
-
-                // ВАЖНО: probBuy/probSell у тебя часто BigDecimal → clamp01(BigDecimal)
-                double pBuy = (mlPred != null) ? clamp01(mlPred.probBuy()) : 0.0;
-                double pSell = (mlPred != null) ? clamp01(mlPred.probSell()) : 0.0;
-
-                boolean mlOk = (pBuy >= commonThr) && (pBuy > pSell);
 
                 // --- RL ---
                 RlDecision rlDec;
@@ -287,18 +315,12 @@ public class HybridStrategyV4 implements TradingStrategy {
                 }
 
                 RlAction action = (rlDec != null && rlDec.action() != null) ? rlDec.action() : RlAction.HOLD;
-
-                // confidence тоже может быть BigDecimal → clamp01(BigDecimal)
                 double rlConf = (rlDec != null) ? clamp01(rlDec.confidence()) : 0.0;
-
                 boolean rlOk = (action == RlAction.BUY) && (rlConf >= commonThr);
 
                 // --- heuristics (trend) ---
                 boolean trendUp = simpleTrendUp(candles);
 
-                // allowSingleSourceBuy:
-                // - true: достаточно (ML ok && trendUp) ИЛИ (RL ok && trendUp)
-                // - false: нужен полный консенсус mlOk && rlOk && trendUp
                 boolean allowSingle = Boolean.TRUE.equals(cfg.getAllowSingleSourceBuy());
 
                 boolean consensusOk = allowSingle
@@ -306,34 +328,29 @@ public class HybridStrategyV4 implements TradingStrategy {
                         : (trendUp && mlOk && rlOk);
 
                 if (!consensusOk) {
+                    double pBuyDbg = (mlPred != null) ? clamp01(mlPred.probBuy()) : 0.0;
+
                     String reason = "no_consensus"
-                            + " ai=" + round2(pBuy)
-                            + " rl=" + action + ":" + round2(rlConf)
-                            + " trendUp=" + trendUp
-                            + " thr=" + round2(commonThr)
-                            + " single=" + allowSingle;
+                                    + " mlOk=" + mlOk
+                                    + " pBuy=" + round2(pBuyDbg)
+                                    + " rl=" + action + ":" + round2(rlConf)
+                                    + " trendUp=" + trendUp
+                                    + " thr=" + round2(commonThr)
+                                    + " single=" + allowSingle;
                     pushHoldThrottled(chatId, symFinal, st, reason, time);
                     return;
                 }
 
                 // score = уверенность источников
-                double mlPart = mlOk ? pBuy : 0.0;
+                double mlPart = (mlPred != null) ? clamp01(mlPred.probBuy()) : 0.0;
                 double rlPart = rlOk ? rlConf : 0.0;
 
-                double score01;
-                if (allowSingle) {
-                    score01 = Math.max(mlPart, rlPart);
-                } else {
-                    score01 = (mlPart + rlPart) / 2.0;
-                }
-
+                double score01 = allowSingle ? Math.max(mlPart, rlPart) : ((mlPart + rlPart) / 2.0);
                 score01 = Math.min(1.0, Math.max(0.50, score01));
                 final double scoreFinal = Math.min(100.0, Math.max(50.0, score01 * 100.0));
 
-                final double pBuyFinal = pBuy;
-                final double rlConfFinal = rlConf;
-
                 try {
+                    // ⚠️ если у тебя executeEntry требует tpPct/slPct — подгони здесь вызов
                     var res = tradeExecutionService.executeEntry(
                             chatId,
                             StrategyType.HYBRID,
@@ -344,8 +361,8 @@ public class HybridStrategyV4 implements TradingStrategy {
                             ss
                     );
 
-                    if (!res.executed()) {
-                        pushHoldThrottled(chatId, symFinal, st, res.reason(), time);
+                    if (res == null || !res.executed()) {
+                        pushHoldThrottled(chatId, symFinal, st, res != null ? res.reason() : "entry_null", time);
                         return;
                     }
 
@@ -355,12 +372,13 @@ public class HybridStrategyV4 implements TradingStrategy {
                     st.tp = res.tp();
                     st.sl = res.sl();
 
+                    double finalScore0 = score01;
                     safeLive(() -> live.pushSignal(
                             chatId,
                             StrategyType.HYBRID,
                             symFinal,
                             null,
-                            Signal.buy(scoreFinal, "consensus ai=" + round2(pBuyFinal) + " rl=" + round2(rlConfFinal))
+                            Signal.buy(price.doubleValue(), "consensus score=" + round2(finalScore0))
                     ));
                     return;
 
@@ -373,6 +391,15 @@ public class HybridStrategyV4 implements TradingStrategy {
 
             pushHoldThrottled(chatId, symFinal, st, "in_position", time);
         }
+    }
+
+    private void warnMlOncePer(LocalState st, Instant now, String msg) {
+        if (st.lastMlWarnAt != null) {
+            long ms = Duration.between(st.lastMlWarnAt, now).toMillis();
+            if (ms < 15_000) return;
+        }
+        st.lastMlWarnAt = now;
+        log.warn(msg);
     }
 
     // =====================================================
@@ -398,7 +425,7 @@ public class HybridStrategyV4 implements TradingStrategy {
     private void refreshSettingsIfNeeded(Long chatId, LocalState st, Instant now) {
 
         if (st.lastSettingsLoadAt != null &&
-                Duration.between(st.lastSettingsLoadAt, now).compareTo(SETTINGS_REFRESH_EVERY) < 0) {
+            Duration.between(st.lastSettingsLoadAt, now).compareTo(SETTINGS_REFRESH_EVERY) < 0) {
             return;
         }
 
@@ -426,14 +453,15 @@ public class HybridStrategyV4 implements TradingStrategy {
                 int lookback = resolveLookback(loaded);
                 double thr = normalizeThreshold(doubleOrNull(cfg != null ? cfg.getMinConfidence() : null), 0.60);
 
-                log.info("[HYBRID] ⚙️ settings updated chatId={} symbol={} thr={} allowSingle={} lookback={} mlKey={} rlKey={}",
+                log.info("[HYBRID] ⚙️ settings updated chatId={} symbol={} thr={} allowSingle={} lookback={} mlKey={} rlKey={} schemaHash={}",
                         chatId,
                         st.symbol,
                         round2(thr),
                         cfg != null ? String.valueOf(cfg.getAllowSingleSourceBuy()) : "null",
                         lookback,
                         cfg != null ? safe(cfg.getMlModelKey()) : "null",
-                        cfg != null ? safe(cfg.getRlAgentKey()) : "null"
+                        cfg != null ? safe(cfg.getRlAgentKey()) : "null",
+                        safe(resolveSchemaHash(loaded, cfg))
                 );
 
                 String newSymbol = safeUpper(st.symbol);
@@ -461,22 +489,51 @@ public class HybridStrategyV4 implements TradingStrategy {
         String mlKey = cfg != null ? safe(cfg.getMlModelKey()) : "null";
         String rlKey = cfg != null ? safe(cfg.getRlAgentKey()) : "null";
 
-        return symbol + "|" + ex + "|" + net + "|" + tf + "|" + candles + "|" + common + "|" + allowSingle + "|" + mlKey + "|" + rlKey;
+        String schemaHash = safe(resolveSchemaHash(ss, cfg));
+
+        return symbol + "|" + ex + "|" + net + "|" + tf + "|" + candles + "|"
+               + common + "|" + allowSingle + "|" + mlKey + "|" + rlKey + "|" + schemaHash;
     }
 
+    /**
+     * schemaHash нужен для версионирования фичей/моделей.
+     * Источники (по приоритету):
+     *  1) HybridStrategySettings.getSchemaHash() (если у тебя есть)
+     *  2) StrategySettings.getMlSchemaHash() (как у тебя уже заведено)
+     *  3) "" (пусто)
+     */
+    private String resolveSchemaHash(StrategySettings ss, HybridStrategySettings cfg) {
+        // 1) пробуем через cfg (рефлексия, чтобы не ломать сборку если поля нет)
+        if (cfg != null) {
+            try {
+                var m = cfg.getClass().getMethod("getSchemaHash");
+                Object v = m.invoke(cfg);
+                String s = (v != null ? String.valueOf(v).trim() : "");
+                if (!s.isEmpty()) return s;
+            } catch (Exception ignored) {}
+        }
+        // 2) из общих settings
+        if (ss != null) {
+            try {
+                String s = ss.getMlSchemaHash();
+                if (s != null && !s.trim().isEmpty()) return s.trim();
+            } catch (Exception ignored) {}
+        }
+        return "";
+    }
+
+    /**
+     * ✅ FIX: выбираем самый свежий settings по updatedAt/id без двойных reversed()
+     */
     private StrategySettings loadStrategySettings(Long chatId) {
         return strategySettingsService
-                .findAllByChatId(chatId, null, null)
+                .findAllByChatId(chatId)
                 .stream()
                 .filter(s -> s.getType() == StrategyType.HYBRID)
-                .sorted(
-                        Comparator
-                                .comparing(StrategySettings::getUpdatedAt, Comparator.nullsLast(Comparator.naturalOrder()))
-                                .reversed()
-                                .thenComparing(StrategySettings::getId, Comparator.nullsLast(Comparator.naturalOrder()))
-                                .reversed()
+                .max(Comparator
+                        .comparing(StrategySettings::getUpdatedAt, Comparator.nullsLast(Comparator.naturalOrder()))
+                        .thenComparing(StrategySettings::getId, Comparator.nullsLast(Comparator.naturalOrder()))
                 )
-                .findFirst()
                 .orElseThrow(() -> new IllegalStateException("StrategySettings для HYBRID не найдены (chatId=" + chatId + ")"));
     }
 
@@ -493,7 +550,7 @@ public class HybridStrategyV4 implements TradingStrategy {
 
         if (Objects.equals(st.lastHoldReason, reason) && st.lastHoldAt != null) {
             long ms = Duration.between(st.lastHoldAt, now).toMillis();
-            if (ms < 2000) return;
+            if (ms < HOLD_THROTTLE_MS) return;
         }
 
         st.lastHoldReason = reason;
@@ -529,7 +586,13 @@ public class HybridStrategyV4 implements TradingStrategy {
     private static String safeUpper(String s) {
         if (s == null) return null;
         String t = s.trim();
-        return t.isEmpty() ? null : t.toUpperCase();
+        return t.isEmpty() ? null : t.toUpperCase(Locale.ROOT);
+    }
+
+    private static String safeEmptyToNull(String s) {
+        if (s == null) return null;
+        String x = s.trim();
+        return x.isEmpty() ? null : x;
     }
 
     private static String fmtBd(BigDecimal v) {
@@ -559,11 +622,9 @@ public class HybridStrategyV4 implements TradingStrategy {
         return d;
     }
 
-    // ✅ ВОТ ЭТО — ключевой фикс твоей ошибки: принимаем BigDecimal напрямую
     private static double clamp01(BigDecimal v) {
         if (v == null) return 0.0;
-        double d = v.doubleValue();
-        return clamp01(d);
+        return clamp01(v.doubleValue());
     }
 
     private static String round2(double d) {

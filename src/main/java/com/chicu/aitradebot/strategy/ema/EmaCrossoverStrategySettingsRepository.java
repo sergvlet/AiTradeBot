@@ -7,5 +7,5 @@ import java.util.Optional;
 public interface EmaCrossoverStrategySettingsRepository
         extends JpaRepository<EmaCrossoverStrategySettings, Long> {
 
-    Optional<EmaCrossoverStrategySettings> findTopByChatIdOrderByIdDesc(Long chatId);
+    Optional<EmaCrossoverStrategySettings> findTopByChatIdOrderByUpdatedAtDesc(Long chatId);
 }

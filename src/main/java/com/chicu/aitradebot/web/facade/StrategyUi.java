@@ -4,244 +4,224 @@ import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.domain.StrategySettings;
 import com.chicu.aitradebot.domain.enums.AdvancedControlMode;
+import lombok.*;
 
-import java.util.List;
+import java.math.BigDecimal;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.util.Locale;
 
-public record StrategyUi(
+@Getter
+@Setter
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class StrategyUi {
 
-        // === ИДЕНТИФИКАЦИЯ ===
-        Long id,
-        Long chatId,
-        StrategyType type,
-        String exchangeName,
-        NetworkType networkType,
+    private Long chatId;
+    private StrategyType type;
 
-        // === СОСТОЯНИЕ (runtime) ===
-        boolean active,
+    private String title;
+    private String description;
 
-        // === БАЗОВЫЕ НАСТРОЙКИ (из StrategySettings) ===
-        String symbol,
-        String timeframe,
+    private boolean active;
 
-        // === UI ===
-        String title,
-        String description,
+    private String exchangeName;
+    private NetworkType networkType;
+    private String symbol;
+    private String timeframe;
 
-        // === РЕЖИМ УПРАВЛЕНИЯ ===
-        AdvancedControlMode advancedControlMode
-) {
+    private AdvancedControlMode advancedControlMode;
+    private String runPhase;
 
-    // ================================================================
-    // 🔁 PUBLIC MAPPER
-    // ================================================================
-    public static List<StrategyUi> fromSettings(List<StrategySettings> settings) {
-        return settings.stream()
-                .map(StrategyUi::fromSettings)
-                .toList();
+    private boolean autoTuneEnabled;
+    private boolean mlGateEnabled;
+
+    private BigDecimal mlConfidence;
+    private BigDecimal totalProfitPct;
+
+    private Instant startedAt;
+    private Instant stoppedAt;
+
+    private Integer version;
+
+    public static StrategyUi empty(Long chatId,
+                                   StrategyType type,
+                                   String exchange,
+                                   NetworkType network) {
+        return StrategyUi.builder()
+                .chatId(chatId)
+                .type(type)
+                .title(resolveTitle(type))
+                .description(resolveDescription(type))
+                .active(false)
+                .exchangeName(normalizeExchange(exchange))
+                .networkType(network != null ? network : NetworkType.MAINNET)
+                .symbol(null)
+                .timeframe(null)
+                .advancedControlMode(AdvancedControlMode.MANUAL)
+                .runPhase("—")
+                .autoTuneEnabled(false)
+                .mlGateEnabled(false)
+                .mlConfidence(BigDecimal.ZERO)
+                .totalProfitPct(BigDecimal.ZERO)
+                .startedAt(null)
+                .stoppedAt(null)
+                .version(null)
+                .build();
     }
 
     public static StrategyUi fromSettings(StrategySettings s) {
+        if (s == null) {
+            return StrategyUi.builder()
+                    .title(resolveTitle(null))
+                    .description(resolveDescription(null))
+                    .active(false)
+                    .exchangeName("BINANCE")
+                    .networkType(NetworkType.MAINNET)
+                    .advancedControlMode(AdvancedControlMode.MANUAL)
+                    .runPhase("—")
+                    .autoTuneEnabled(false)
+                    .mlGateEnabled(false)
+                    .mlConfidence(BigDecimal.ZERO)
+                    .totalProfitPct(BigDecimal.ZERO)
+                    .build();
+        }
 
-        UiText ui = uiText(s.getType());
-
-        return new StrategyUi(
-                s.getId(),
-                s.getChatId(),
-                s.getType(),
-                safe(s.getExchangeName(), "BINANCE"),
-                s.getNetworkType() != null ? s.getNetworkType() : NetworkType.MAINNET,
-
-                // ❗ active будет корректно переопределён facade'ом
-                false,
-
-                safe(s.getSymbol(), "—"),
-                safe(s.getTimeframe(), "—"),
-
-                ui.title,
-                ui.description,
-
-                s.getAdvancedControlMode() != null
-                        ? s.getAdvancedControlMode()
-                        : AdvancedControlMode.MANUAL
-        );
+        return StrategyUi.builder()
+                .chatId(s.getChatId())
+                .type(s.getType())
+                .title(resolveTitle(s.getType()))
+                .description(resolveDescription(s.getType()))
+                .active(s.isActive())
+                .exchangeName(normalizeExchange(s.getExchangeName()))
+                .networkType(s.getNetworkType() != null ? s.getNetworkType() : NetworkType.MAINNET)
+                .symbol(normalizeSymbol(s.getSymbol()))
+                .timeframe(normalizeTimeframe(s.getTimeframe()))
+                .advancedControlMode(s.getAdvancedControlMode() != null ? s.getAdvancedControlMode() : AdvancedControlMode.MANUAL)
+                .runPhase(s.getRunPhase() != null && !s.getRunPhase().isBlank()
+                        ? s.getRunPhase().trim().toUpperCase(Locale.ROOT)
+                        : "—")
+                .autoTuneEnabled(s.isAutoTuneEnabled())
+                .mlGateEnabled(s.isMlGateEnabled())
+                .mlConfidence(s.getMlConfidence() != null ? s.getMlConfidence() : BigDecimal.ZERO)
+                .totalProfitPct(s.getTotalProfitPct() != null ? s.getTotalProfitPct() : BigDecimal.ZERO)
+                .startedAt(toInstant(s.getStartedAt()))
+                .stoppedAt(toInstant(s.getStoppedAt()))
+                .version(s.getVersion())
+                .build();
     }
 
-    // ================================================================
-    // 🔁 RUNTIME UPDATE (ВАЖНО!)
-    // ================================================================
     public StrategyUi withActive(boolean active) {
-        return new StrategyUi(
-                id,
-                chatId,
-                type,
-                exchangeName,
-                networkType,
-                active,
-                symbol,
-                timeframe,
-                title,
-                description,
-                advancedControlMode
-        );
+        return StrategyUi.builder()
+                .chatId(this.chatId)
+                .type(this.type)
+                .title(this.title)
+                .description(this.description)
+                .active(active)
+                .exchangeName(this.exchangeName)
+                .networkType(this.networkType)
+                .symbol(this.symbol)
+                .timeframe(this.timeframe)
+                .advancedControlMode(this.advancedControlMode)
+                .runPhase(this.runPhase)
+                .autoTuneEnabled(this.autoTuneEnabled)
+                .mlGateEnabled(this.mlGateEnabled)
+                .mlConfidence(this.mlConfidence)
+                .totalProfitPct(this.totalProfitPct)
+                .startedAt(this.startedAt)
+                .stoppedAt(this.stoppedAt)
+                .version(this.version)
+                .build();
     }
 
-    // ================================================================
-    // 🧩 EMPTY — если записи нет в БД
-    // ================================================================
-    public static StrategyUi empty(
-            Long chatId,
-            StrategyType type,
-            String exchange,
-            NetworkType network
-    ) {
-
-        UiText ui = uiText(type);
-
-        return new StrategyUi(
-                null,
-                chatId,
-                type,
-                safe(exchange, "BINANCE"),
-                network != null ? network : NetworkType.MAINNET,
-                false,
-                "—",
-                "—",
-                ui.title,
-                "Стратегия ещё не настроена",
-                AdvancedControlMode.MANUAL
-        );
+    private static Instant toInstant(LocalDateTime value) {
+        return value != null ? value.atZone(ZoneId.systemDefault()).toInstant() : null;
     }
 
-    // ================================================================
-    // 🧠 UI TEXT (все StrategyType)
-    // ================================================================
-    private static UiText uiText(StrategyType type) {
+    private static String normalizeExchange(String exchange) {
+        if (exchange == null || exchange.isBlank()) {
+            return "BINANCE";
+        }
+        return exchange.trim().toUpperCase(Locale.ROOT);
+    }
+
+    private static String normalizeSymbol(String symbol) {
+        if (symbol == null || symbol.isBlank()) {
+            return null;
+        }
+        return symbol.trim().toUpperCase(Locale.ROOT);
+    }
+
+    private static String normalizeTimeframe(String timeframe) {
+        if (timeframe == null || timeframe.isBlank()) {
+            return null;
+        }
+        return timeframe.trim().toLowerCase(Locale.ROOT);
+    }
+
+    private static String resolveTitle(StrategyType type) {
+        if (type == null) return "UNKNOWN";
+
         return switch (type) {
-
-            // SYSTEM / META
-            case GLOBAL -> new UiText(
-                    "Global",
-                    "Глобальные настройки и общая логика оркестратора (не торговая стратегия)"
-            );
-
-            // I) MOMENTUM / TREND
-            case MOMENTUM -> new UiText(
-                    "Momentum",
-                    "Торгует по импульсу: ищет ускорение движения цены и пытается войти в продолжение"
-            );
-            case TREND_FOLLOWING -> new UiText(
-                    "Trend Following",
-                    "Следование за трендом: вход по подтверждённому направлению, выход при ослаблении"
-            );
-            case EMA_CROSSOVER -> new UiText(
-                    "EMA Crossover",
-                    "Сигналы по пересечению быстрых/медленных EMA: классика трендовых входов"
-            );
-            case TREND -> new UiText(
-                    "Trend",
-                    "Базовая трендовая стратегия: оценивает направление и силу движения"
-            );
-
-            // II) MEAN REVERSION / RSI
-            case MEAN_REVERSION -> new UiText(
-                    "Mean Reversion",
-                    "Возврат к среднему: ищет отклонение цены и играет на откат к средним значениям"
-            );
-            case RSI_OBOS -> new UiText(
-                    "RSI OB/OS",
-                    "RSI перекуплен/перепродан: входы на экстремумах с расчётом на коррекцию"
-            );
-
-            // III) SCALPING
-            case SCALPING -> new UiText(
-                    "Scalping",
-                    "Быстрые сделки на малых движениях цены с жёсткими ограничениями по риску"
-            );
-            case WINDOW_SCALPING -> new UiText(
-                    "Window Scalping",
-                    "Скальпинг по окну: анализ high/low за окно и вход при пробое/возврате внутри диапазона"
-            );
-
-            // IV) BREAKOUT
-            case BREAKOUT -> new UiText(
-                    "Breakout",
-                    "Пробой уровня/диапазона: вход при выходе цены из консолидации"
-            );
-            case VOLATILITY_BREAKOUT -> new UiText(
-                    "Volatility Breakout",
-                    "Пробой по волатильности: вход когда движение превышает ожидаемую амплитуду (ATR/диапазон)"
-            );
-
-            // V) LEVELS / STRUCTURE
-            case SUPPORT_RESISTANCE -> new UiText(
-                    "Support / Resistance",
-                    "Торговля от уровней поддержки/сопротивления: реакции от уровней и пробои"
-            );
-            case FIBONACCI_RETRACE -> new UiText(
-                    "Fibonacci Retrace",
-                    "Входы по откату к уровням Фибоначчи внутри тренда (ретрейсмент)"
-            );
-            case PRICE_ACTION -> new UiText(
-                    "Price Action",
-                    "Прайс-экшен: решения по структуре свечей и поведению цены без тяжёлых индикаторов"
-            );
-
-            // VI) GRIDS
-            case GRID -> new UiText(
-                    "Grid",
-                    "Сетка ордеров: серия входов по шагу цены, фиксация прибыли на колебаниях"
-            );
-            case FIBONACCI_GRID -> new UiText(
-                    "Fibonacci Grid",
-                    "Сетка ордеров по уровням Фибоначчи: распределение входов/выходов по структуре рынка"
-            );
-
-            // VII) VOLUME
-            case VOLUME_PROFILE -> new UiText(
-                    "Volume Profile",
-                    "Объёмный профиль: уровни интереса рынка по накопленным объёмам (POC/зоны)"
-            );
-            case VWAP -> new UiText(
-                    "VWAP",
-                    "VWAP: торговля относительно средней цены по объёму (перекос/возврат к VWAP)"
-            );
-            case ORDER_FLOW -> new UiText(
-                    "Order Flow",
-                    "Поток ордеров: анализ дисбаланса покупок/продаж (лента/стакан/дельта) — если данные доступны"
-            );
-
-            // VIII) AI
-            case ML_CLASSIFICATION -> new UiText(
-                    "ML Classification",
-                    "ML-классификация сигналов: модель оценивает вероятность BUY/SELL по признакам рынка"
-            );
-            case RL_AGENT -> new UiText(
-                    "RL Agent",
-                    "RL-агент: выбирает действие (BUY/SELL/HOLD) на основе политики обучения с подкреплением"
-            );
-            case HYBRID -> new UiText(
-                    "Hybrid",
-                    "Гибрид: объединяет несколько подходов (индикаторы + ML/RL) с общей логикой риска"
-            );
-
-            // Дополнительно
-            case DCA -> new UiText(
-                    "DCA",
-                    "Покупка частями: усреднение позиции по времени/цене с контролем суммарного риска"
-            );
-            case SMART_FUSION -> new UiText(
-                    "Smart Fusion",
-                    "Комбинированная AI-стратегия: объединяет сигналы нескольких модулей (индикаторы + ML + RL)"
-            );
+            case WINDOW_SCALPING -> "Window Scalping";
+            case EMA_CROSSOVER -> "EMA Crossover";
+            case SCALPING -> "Scalping";
+            case FIBONACCI_GRID -> "Fibonacci Grid";
+            case GRID -> "Grid";
+            case RSI_OBOS -> "RSI OB/OS";
+            case TREND_FOLLOWING -> "Trend Following";
+            case VOLATILITY_BREAKOUT -> "Volatility Breakout";
+            case SUPPORT_RESISTANCE -> "Support / Resistance";
+            case PRICE_ACTION -> "Price Action";
+            case MOMENTUM -> "Momentum";
+            case TREND -> "Trend";
+            case BREAKOUT -> "Breakout";
+            case DCA -> "DCA";
+            case VWAP -> "VWAP";
+            case ORDER_FLOW -> "Order Flow";
+            case ML_CLASSIFICATION -> "ML Classification";
+            case RL_AGENT -> "RL Agent";
+            case HYBRID -> "Hybrid";
+            case SMART_FUSION -> "Smart Fusion";
+            case FIBONACCI_RETRACE -> "Fibonacci Retrace";
+            case MEAN_REVERSION -> "Mean Reversion";
+            case VOLUME_PROFILE -> "Volume Profile";
+            case GLOBAL -> "Global";
         };
     }
 
-    // ================================================================
-    // 🧰 HELPERS
-    // ================================================================
-    private static String safe(String v, String def) {
-        return (v != null && !v.isBlank()) ? v : def;
-    }
+    private static String resolveDescription(StrategyType type) {
+        if (type == null) {
+            return "Описание стратегии пока не задано";
+        }
 
-    private record UiText(String title, String description) {}
+        return switch (type) {
+            case WINDOW_SCALPING -> "Короткие сделки внутри торгового окна с быстрым сопровождением.";
+            case EMA_CROSSOVER -> "Входы по пересечению быстрых и медленных EMA.";
+            case SCALPING -> "Короткие сделки на малых движениях цены.";
+            case FIBONACCI_GRID -> "Сетка ордеров по уровням Фибоначчи.";
+            case GRID -> "Сеточная торговля в диапазоне.";
+            case RSI_OBOS -> "Сигналы перекупленности и перепроданности по RSI.";
+            case TREND_FOLLOWING -> "Торговля по направлению основного тренда.";
+            case VOLATILITY_BREAKOUT -> "Входы на пробой после расширения волатильности.";
+            case SUPPORT_RESISTANCE -> "Работа от уровней поддержки и сопротивления.";
+            case PRICE_ACTION -> "Решения по структуре свечей и поведению цены.";
+            case MOMENTUM -> "Поиск ускорения движения цены.";
+            case TREND -> "Базовая трендовая стратегия.";
+            case BREAKOUT -> "Торговля пробоев уровней и диапазонов.";
+            case DCA -> "Пошаговый набор позиции по стратегии усреднения.";
+            case VWAP -> "Ориентация на VWAP как базовый уровень цены.";
+            case ORDER_FLOW -> "Оценка рыночного потока покупателей и продавцов.";
+            case ML_CLASSIFICATION -> "Сигналы на основе ML-классификации.";
+            case RL_AGENT -> "Стратегия с reinforcement learning.";
+            case HYBRID -> "Комбинация классических правил и ML-фильтра.";
+            case SMART_FUSION -> "Объединение нескольких источников сигнала.";
+            case FIBONACCI_RETRACE -> "Входы на откатах по уровням Фибоначчи.";
+            case MEAN_REVERSION -> "Возврат цены к среднему значению.";
+            case VOLUME_PROFILE -> "Опора на распределение объёма по уровням.";
+            case GLOBAL -> "Системная стратегия общего назначения.";
+        };
+    }
 }

@@ -1,0 +1,16 @@
+cd C:\Users\schic\IdeaProjects\ai-trade-bot
+powershell -ExecutionPolicy Bypass -File .\tools\project-snapshot\make_report.ps1
+
+
+Как запускать (примеры)
+1) По пакету (самый удобный)
+.\tools\project-snapshot\make_report_package.ps1 -Path src/main/resources
+
+2) По пути в проекте
+.\tools\project-snapshot\make_report_package.ps1 -Path src\main\java\com\chicu\aitradebot\strategy\windowscalping
+
+3) Если хочешь ещё и первые строки исходников (чтобы мне вообще не просить файлы)
+.\tools\project-snapshot\make_report_package.ps1 -Package com.chicu.aitradebot -IncludeContent -MaxLines 250
+
+
+Результат будет в проекте:

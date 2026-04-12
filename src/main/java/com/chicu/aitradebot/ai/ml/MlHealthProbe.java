@@ -1,26 +1,304 @@
 package com.chicu.aitradebot.ai.ml;
 
+import com.chicu.aitradebot.ai.ml.dto.MlHealthResponse;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.stereotype.Component;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.Locale;
 
 @Slf4j
 @Component
 @RequiredArgsConstructor
 public class MlHealthProbe implements ApplicationRunner {
 
-    private final MlClient mlClient;
+    private final MlProperties props;
+
+    /**
+     * ✅ MlClient создаётся только при ml.enabled=true.
+     * Поэтому берём через ObjectProvider, иначе контекст падает при ml.enabled=false.
+     */
+    private final ObjectProvider<MlClient> clientProvider;
+
+    /**
+     * Если sidecar/health реально недоступен — можно валить старт.
+     * Но отсутствие модели не должно убивать приложение:
+     * иначе бот не сможет подняться и сам обучить новую модель.
+     */
+    @Value("${ml.failFast:false}")
+    private boolean failFast;
+
+    /**
+     * Требовать наличие модели на старте.
+     * ВАЖНО:
+     * теперь это только WARNING, а не падение приложения.
+     * Иначе после самочистки/ротации бот не сможет стартовать.
+     */
+    @Value("${ml.requireModel:false}")
+    private boolean requireModel;
 
     @Override
     public void run(ApplicationArguments args) {
-        try {
-            var node = mlClient.health();
-            log.info("✅ ML service OK: {}", node.toString());
-        } catch (Exception e) {
-            // В проде лучше НЕ валить приложение, просто предупреждение.
-            log.warn("⚠️ ML service NOT available: {}", e.getMessage());
+
+        if (props == null || !props.isEnabled()) {
+            startup("INFO", "🧠 ML выключен (ml.enabled=false). Health-check пропущен.");
+            return;
         }
+
+        MlClient client = clientProvider != null ? clientProvider.getIfAvailable() : null;
+        if (client == null) {
+            String msg = "🧠 ML включён (ml.enabled=true), но MlClient bean отсутствует (проверь MlConfig/ConditionalOnProperty)";
+            if (failFast) {
+                throw new IllegalStateException(msg);
+            }
+            startup("WARN", msg);
+            return;
+        }
+
+        String baseUrl = (props.getBaseUrl() == null ? "" : props.getBaseUrl().trim());
+        if (baseUrl.isEmpty()) {
+            String msg = "🧠 ML включён (ml.enabled=true), но ml.baseUrl пустой";
+            if (failFast) {
+                throw new IllegalStateException(msg);
+            }
+            startup("WARN", msg);
+            return;
+        }
+
+        String healthUrl = trimSlash(baseUrl) + "/health";
+        startup("INFO", "🧠 ML включён (ml.enabled=true). Проверяю /health: {}", healthUrl);
+
+        try {
+            MlHealthResponse h = client.health();
+
+            Boolean ok = asBool(readAny(h, "getOk", "isOk", "ok"));
+            if (ok == null || !ok) {
+                String err = asStr(readAny(h, "getError", "error", "getMessage", "message"));
+                String msg = "❌ ML service NOT OK: ok=" + ok + " error=" + (err == null ? "null" : err);
+
+                if (failFast) {
+                    throw new IllegalStateException(msg);
+                }
+
+                startup("WARN", "🧠 {}", msg);
+                return;
+            }
+
+            Boolean xgboost = asBool(readAny(h, "isXgboost", "getXgboost", "getXGBoost", "xgboost"));
+            Boolean modelExists = asBool(readAny(
+                    h,
+                    "isModelExists", "getModelExists", "modelExists",
+                    "getModel_exists", "model_exists"
+            ));
+
+            String modelVersion = asStr(readAny(
+                    h,
+                    "getModelVersion", "modelVersion",
+                    "getModel_version", "model_version"
+            ));
+
+            String version = asStr(readAny(h, "getVersion", "version"));
+            String modelsDir = asStr(readAny(h, "getModelsDir", "modelsDir"));
+
+            startup("INFO",
+                    "✅ ML service OK: ok=true version={} xgboost={} model_exists={} modelVersion={} modelsDir={}",
+                    nn(version), nn(xgboost), nn(modelExists), nn(modelVersion), nn(modelsDir)
+            );
+
+            // ✅ КЛЮЧЕВАЯ ПРАВКА:
+            // отсутствие модели больше НЕ валит приложение.
+            // Это только предупреждение, чтобы бот мог подняться и затем обучить новую модель.
+            if (requireModel) {
+                if (modelExists == null) {
+                    startup("WARN",
+                            "⚠️ ml.requireModel=true, но в health-ответе нет model_exists (нужен геттер/поле в MlHealthResponse).");
+                } else if (!modelExists) {
+                    startup("WARN",
+                            "⚠️ ml.requireModel=true, но model_exists=false — приложение НЕ останавливается. Сначала обучи новую модель (/train), затем включай AI/HYBRID для торговли.");
+                }
+            }
+
+        } catch (Exception e) {
+            String msg = "❌ ML health-check failed: " + e.getMessage();
+
+            if (failFast) {
+                throw new IllegalStateException(msg, e);
+            }
+
+            startup("WARN", "🧠 {}", msg);
+        }
+    }
+
+    private void startup(String defaultLevel, String fmt, Object... args) {
+        String lvl = resolveStartupLogLevel(defaultLevel);
+
+        if ("DEBUG".equals(lvl)) {
+            log.debug(fmt, args);
+        } else if ("WARN".equals(lvl) || "WARNING".equals(lvl)) {
+            log.warn(fmt, args);
+        } else if ("ERROR".equals(lvl)) {
+            log.error(fmt, args);
+        } else {
+            log.info(fmt, args);
+        }
+    }
+
+    private String resolveStartupLogLevel(String defaultLevel) {
+        String lvl = null;
+
+        // ✅ новое место: ml.health.startupLogLevel
+        try {
+            if (props != null && props.getHealth() != null) {
+                String v = props.getHealth().getStartupLogLevel();
+                if (v != null && !v.isBlank()) {
+                    lvl = v;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+
+        // ✅ backward-compat: ml.healthStartupLogLevel
+        if (lvl == null) {
+            try {
+                String v = props != null ? props.getHealthStartupLogLevel() : null;
+                if (v != null && !v.isBlank()) {
+                    lvl = v;
+                }
+            } catch (Exception ignored) {
+            }
+        }
+
+        if (lvl == null || lvl.isBlank()) {
+            lvl = defaultLevel;
+        }
+
+        return lvl.trim().toUpperCase(Locale.ROOT);
+    }
+
+    private static String trimSlash(String s) {
+        if (s == null) {
+            return "";
+        }
+        String t = s.trim();
+        while (t.endsWith("/")) {
+            t = t.substring(0, t.length() - 1);
+        }
+        return t;
+    }
+
+    /**
+     * Пытаемся прочитать:
+     * 1) public method (0 args) по имени
+     * 2) getter/is-variant если передали "ok"/"error"/...
+     * 3) поле по имени (включая private)
+     */
+    private static Object readAny(Object target, String... names) {
+        if (target == null || names == null) {
+            return null;
+        }
+
+        for (String n : names) {
+            if (n == null || n.isBlank()) {
+                continue;
+            }
+
+            // 1) public method exact
+            try {
+                for (Method m : target.getClass().getMethods()) {
+                    if (!m.getName().equals(n)) {
+                        continue;
+                    }
+                    if (m.getParameterCount() != 0) {
+                        continue;
+                    }
+                    return m.invoke(target);
+                }
+            } catch (Exception ignore) {
+            }
+
+            // 2) getter/is variants если n выглядит как "ok"
+            if (!n.startsWith("get") && !n.startsWith("is")) {
+                String cap = Character.toUpperCase(n.charAt(0)) + n.substring(1);
+
+                try {
+                    Method m = target.getClass().getMethod("get" + cap);
+                    return m.invoke(target);
+                } catch (Exception ignore) {
+                }
+
+                try {
+                    Method m = target.getClass().getMethod("is" + cap);
+                    return m.invoke(target);
+                } catch (Exception ignore) {
+                }
+            }
+
+            // 3) field exact (including private)
+            Object fv = readField(target, n);
+            if (fv != null) {
+                return fv;
+            }
+        }
+
+        return null;
+    }
+
+    private static Object readField(Object target, String fieldName) {
+        try {
+            Class<?> c = target.getClass();
+            while (c != null && c != Object.class) {
+                try {
+                    Field f = c.getDeclaredField(fieldName);
+                    f.setAccessible(true);
+                    return f.get(target);
+                } catch (NoSuchFieldException e) {
+                    c = c.getSuperclass();
+                }
+            }
+        } catch (Exception ignore) {
+        }
+        return null;
+    }
+
+    private static Boolean asBool(Object v) {
+        if (v == null) {
+            return null;
+        }
+        if (v instanceof Boolean b) {
+            return b;
+        }
+        if (v instanceof Number n) {
+            return n.intValue() != 0;
+        }
+
+        String s = String.valueOf(v).trim().toLowerCase(Locale.ROOT);
+        if (s.isEmpty()) {
+            return null;
+        }
+        if (s.equals("true") || s.equals("1") || s.equals("yes") || s.equals("y")) {
+            return true;
+        }
+        if (s.equals("false") || s.equals("0") || s.equals("no") || s.equals("n")) {
+            return false;
+        }
+        return null;
+    }
+
+    private static String asStr(Object v) {
+        if (v == null) {
+            return null;
+        }
+        String s = String.valueOf(v).trim();
+        return s.isEmpty() ? null : s;
+    }
+
+    private static String nn(Object v) {
+        return v == null ? "null" : String.valueOf(v);
     }
 }

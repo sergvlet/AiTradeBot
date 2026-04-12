@@ -4,135 +4,198 @@
 
 <div th:fragment="content">
 
-    <h2 class="fw-bold mb-4 d-flex align-items-center gap-2">
-        <i class="bi bi-diagram-3"></i>
-        <span>Стратегии</span>
-    </h2>
+    <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-2">
+        <h2 class="fw-bold mb-0 d-flex align-items-center gap-2">
+            <i class="bi bi-diagram-3"></i>
+            <span>Стратегии</span>
+        </h2>
 
-    <div class="row g-4">
+        <span class="text-secondary small"
+              th:if="${strategies != null}"
+              th:text="|Всего стратегий: ${#lists.size(strategies)}|">
+            Всего стратегий: 0
+        </span>
+    </div>
 
-        <!-- ОДНА КАРТОЧКА НА СТРАТЕГИЮ -->
-        <div class="col-md-4 col-sm-6"
+    <div th:if="${notice != null}" class="alert alert-info shadow-sm mb-4" th:text="${notice}">
+        Статус операции
+    </div>
+
+    <div th:if="${strategies == null or #lists.isEmpty(strategies)}"
+         class="alert alert-warning shadow-sm">
+        <div class="fw-semibold mb-1">Стратегии не найдены</div>
+        <div class="small text-secondary">
+            Backend не передал список стратегий в модель.
+        </div>
+    </div>
+
+    <div th:if="${strategies != null and !#lists.isEmpty(strategies)}" class="row g-4">
+
+        <div class="col-xl-4 col-md-6"
              th:each="s : ${strategies}"
              th:with="
+                titleSafe=${s.title != null and !#strings.isEmpty(#strings.trim(s.title)) ? #strings.trim(s.title) : (s.type != null ? s.type : 'UNKNOWN')},
+                descriptionSafe=${s.description != null and !#strings.isEmpty(#strings.trim(s.description)) ? #strings.trim(s.description) : 'Описание пока не задано'},
                 symbolSafe=${s.symbol != null ? #strings.trim(s.symbol) : ''},
                 tfSafe=${s.timeframe != null ? #strings.trim(s.timeframe) : ''},
+                exSafe=${s.exchangeName != null and !#strings.isEmpty(#strings.trim(s.exchangeName)) ? #strings.trim(s.exchangeName) : ''},
+                netSafe=${s.networkType != null ? s.networkType.name() : ''},
+                modeSafe=${s.advancedControlMode != null ? s.advancedControlMode : 'MANUAL'},
+                phaseSafe=${s.runPhase != null ? s.runPhase : '—'},
+                hasChatId=${s.chatId != null},
+                hasType=${s.type != null},
                 hasSymbol=${!#strings.isEmpty(symbolSafe)},
                 hasTimeframe=${!#strings.isEmpty(tfSafe)},
-                configured=${hasSymbol and hasTimeframe},
-                exSafe=${s.exchangeName != null ? s.exchangeName : 'BINANCE'},
-                netSafe=${s.networkType != null ? s.networkType : 'MAINNET'}
+                configured=${hasChatId and hasType and hasSymbol and hasTimeframe},
+                canToggle=${hasChatId and hasType},
+                mlConfSafe=${s.mlConfidence != null ? s.mlConfidence : 0},
+                pnlSafe=${s.totalProfitPct != null ? s.totalProfitPct : 0}
              ">
 
             <div class="card card-theme strategy-card h-100 shadow-sm"
-                 th:classappend="${s.active} ? ' border-success border-2' : ''">
+                 th:classappend="${s.active ? ' border-success border-2' : ' border-secondary-subtle'}">
 
-                <div class="card-body text-center">
+                <div class="card-body d-flex flex-column">
 
-                    <!-- Название стратегии -->
-                    <h5 class="strategy-title mb-2" th:text="${s.title}">Strategy</h5>
+                    <div class="d-flex justify-content-between align-items-start gap-2 mb-2">
+                        <h5 class="strategy-title mb-0" th:text="${titleSafe}">Strategy</h5>
 
-                    <!-- Статусы -->
-                    <div class="d-flex justify-content-center gap-2 flex-wrap mb-2">
-
-                        <span class="badge px-3 py-2"
-                              th:classappend="${s.active} ? ' bg-success' : ' bg-secondary'">
-                            <span th:text="${s.active} ? '🟢 Активна' : '⚫ Остановлена'">⚫ Остановлена</span>
+                        <span class="badge"
+                              th:classappend="${s.active ? ' text-bg-success' : ' text-bg-secondary'}"
+                              th:text="${s.active ? 'Активна' : 'Остановлена'}">
+                            Остановлена
                         </span>
-
-                        <!-- ⚠ Не настроено -->
-                        <span th:if="${!configured}"
-                              class="badge px-3 py-2 bg-warning text-dark">
-                            ⚠ Не настроено
-                        </span>
-
                     </div>
 
-                    <!-- Описание -->
-                    <div class="small text-secondary mb-3" th:text="${s.description}">
+                    <div class="d-flex flex-wrap gap-2 mb-3">
+                        <span class="badge text-bg-warning" th:if="${!configured}">
+                            Не настроено
+                        </span>
+
+                        <span class="badge text-bg-info" th:text="${modeSafe}">
+                            MANUAL
+                        </span>
+
+                        <span class="badge text-bg-dark"
+                              th:if="${phaseSafe != '—'}"
+                              th:text="${phaseSafe}">
+                            LIVE
+                        </span>
+
+                        <span class="badge text-bg-primary"
+                              th:text="${s.autoTuneEnabled ? 'AUTO-TUNE ON' : 'AUTO-TUNE OFF'}">
+                            AUTO-TUNE OFF
+                        </span>
+
+                        <span class="badge text-bg-secondary"
+                              th:text="${s.mlGateEnabled ? 'ML GATE ON' : 'ML GATE OFF'}">
+                            ML GATE OFF
+                        </span>
+                    </div>
+
+                    <div class="small text-secondary mb-3" th:text="${descriptionSafe}">
                         Описание стратегии
                     </div>
 
-                    <!-- Основная инфа -->
-                    <div class="small text-start">
-                        <div>
+                    <div class="small text-start mb-4">
+                        <div class="mb-1">
+                            <strong>Тип:</strong>
+                            <span th:text="${hasType ? s.type : '—'}">WINDOW_SCALPING</span>
+                        </div>
+                        <div class="mb-1">
+                            <strong>Chat ID:</strong>
+                            <span th:text="${hasChatId ? s.chatId : '—'}">1</span>
+                        </div>
+                        <div class="mb-1">
                             <strong>Биржа:</strong>
-                            <span th:text="${exSafe}">BINANCE</span>
+                            <span th:text="${!#strings.isEmpty(exSafe) ? exSafe : '— не выбрано —'}">BYBIT</span>
                         </div>
-                        <div>
+                        <div class="mb-1">
                             <strong>Сеть:</strong>
-                            <span th:text="${netSafe}">MAINNET</span>
+                            <span th:text="${!#strings.isEmpty(netSafe) ? netSafe : '— не выбрано —'}">MAINNET</span>
                         </div>
-                        <div>
+                        <div class="mb-1">
                             <strong>Пара:</strong>
                             <span th:text="${hasSymbol ? symbolSafe : '— не настроено —'}">BTCUSDT</span>
                         </div>
-                        <div>
+                        <div class="mb-1">
                             <strong>Таймфрейм:</strong>
                             <span th:text="${hasTimeframe ? tfSafe : '— не настроено —'}">1m</span>
                         </div>
-                        <div>
+                        <div class="mb-1">
                             <strong>Режим:</strong>
-                            <span th:text="${s.advancedControlMode != null ? s.advancedControlMode : '—'}">MANUAL</span>
+                            <span th:text="${modeSafe}">MANUAL</span>
+                        </div>
+                        <div class="mb-1">
+                            <strong>Фаза:</strong>
+                            <span th:text="${phaseSafe}">LIVE</span>
+                        </div>
+                        <div class="mb-1">
+                            <strong>ML confidence:</strong>
+                            <span th:text="${mlConfSafe}">0</span>
+                        </div>
+                        <div class="mb-1">
+                            <strong>PnL %:</strong>
+                            <span th:text="${pnlSafe}">0</span>
                         </div>
                     </div>
 
-                    <!-- КНОПКИ -->
-                    <div class="mt-4 d-grid gap-2">
+                    <div class="mt-auto d-grid gap-2">
 
-                        <!-- 🔁 TOGGLE (FORM, НЕ JS) -->
                         <form method="post" th:action="@{/strategies/toggle}">
-                            <input type="hidden" name="chatId"   th:value="${s.chatId}">
-                            <input type="hidden" name="type"     th:value="${s.type}">
-                            <input type="hidden" name="exchange" th:value="${exSafe}">
-                            <input type="hidden" name="network"  th:value="${netSafe}">
+                            <input type="hidden" name="chatId" th:value="${s.chatId}">
+                            <input type="hidden" name="type" th:value="${s.type}">
+                            <input type="hidden"
+                                   th:if="${_csrf != null}"
+                                   th:name="${_csrf.parameterName}"
+                                   th:value="${_csrf.token}"/>
 
-                            <!-- если активна — даём остановить всегда -->
                             <button th:if="${s.active}"
                                     type="submit"
-                                    class="btn btn-outline-danger">
+                                    class="btn btn-outline-danger"
+                                    th:disabled="${!canToggle}"
+                                    title="Остановить стратегию">
                                 <i class="bi bi-stop-fill"></i>
                                 <span>Остановить</span>
                             </button>
 
-                            <!-- если НЕ активна — запуск разрешаем только если настроено -->
                             <button th:if="${!s.active}"
                                     type="submit"
                                     class="btn btn-outline-success"
                                     th:disabled="${!configured}"
-                                    th:attr="title=${configured} ? 'Запустить стратегию' : 'Сначала настрой символ и таймфрейм'">
+                                    th:title="${configured ? 'Запустить стратегию' : 'Сначала настрой символ и таймфрейм'}">
                                 <i class="bi bi-play-fill"></i>
-                                <span th:text="${configured} ? 'Запустить' : 'Запустить (сначала настрой)'">
+                                <span th:text="${configured ? 'Запустить' : 'Запустить (сначала настрой)'}">
                                     Запустить
                                 </span>
                             </button>
                         </form>
 
-                        <!-- 📊 Дашборд (ВСЕГДА ведёт на страницу; если не настроено — там покажется предупреждение) -->
                         <a class="btn btn-outline-primary"
-                           th:href="@{'/strategies/' + ${s.type} + '/dashboard'(chatId=${s.chatId})}"
-                           th:attr="title=${configured} ? 'Открыть дашборд' : 'Стратегия не настроена — откроется подсказка'">
+                           th:if="${hasType and hasChatId}"
+                           th:href="@{/strategies/{type}/dashboard(type=${s.type}, chatId=${s.chatId})}"
+                           th:title="${configured ? 'Открыть дашборд' : 'Стратегия не настроена — откроется подсказка'}">
                             <i class="bi bi-graph-up"></i>
-                            <span th:text="${configured} ? 'Дашборд' : 'Дашборд (не настроено)'">Дашборд</span>
+                            <span th:text="${configured ? 'Дашборд' : 'Дашборд (не настроено)'}">Дашборд</span>
                         </a>
 
-                        <!-- ⚙️ Настройки (всегда доступны) -->
-                        <a class="btn btn-outline-primary"
-                           th:href="@{'/strategies/' + ${s.type} + '/config'(
-                                chatId=${s.chatId},
-                                exchange=${exSafe},
-                                network=${netSafe}
-                           )}">
-                            <i class="bi bi-gear"></i> Настройки
+                        <a class="btn btn-outline-secondary"
+                           th:if="${hasType and hasChatId}"
+                           th:href="@{/strategies/{type}/config(type=${s.type}, chatId=${s.chatId})}">
+                            <i class="bi bi-gear"></i>
+                            <span>Настройки</span>
                         </a>
 
+                        <div th:if="${!hasType or !hasChatId}" class="alert alert-danger py-2 px-3 mb-0 small">
+                            Для этой стратегии backend не передал обязательные поля:
+                            <span th:if="${!hasType}">type </span>
+                            <span th:if="${!hasChatId}">chatId</span>
+                        </div>
                     </div>
 
                 </div>
             </div>
-
         </div>
-
     </div>
 
 </div>

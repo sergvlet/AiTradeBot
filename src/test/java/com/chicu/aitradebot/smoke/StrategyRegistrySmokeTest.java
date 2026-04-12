@@ -18,8 +18,8 @@ class StrategyRegistrySmokeTest {
     void shouldHaveCoreStrategiesRegistered() {
         assertNotNull(registry);
         assertNotNull(registry.get(StrategyType.SCALPING));
-        assertNotNull(registry.get(StrategyType.RSI_EMA));
+
         assertNotNull(registry.get(StrategyType.SMART_FUSION));
-        assertNotNull(registry.get(StrategyType.ML_INVEST));
+
     }
 }

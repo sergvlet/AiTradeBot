@@ -20,18 +20,25 @@ public class AdvancedRenderContext {
 
     AdvancedControlMode controlMode;
 
-    /**
-     * Все POST-параметры формы (name -> value)
-     */
     Map<String, String> params;
 
-    public boolean isAi()     { return controlMode == AdvancedControlMode.AI; }
-    public boolean isHybrid() { return controlMode == AdvancedControlMode.HYBRID; }
-    public boolean isManual() { return controlMode == AdvancedControlMode.MANUAL; }
+    public boolean isAi() {
+        return controlMode == AdvancedControlMode.AI;
+    }
 
-    /** true если ручные поля запрещены */
-    public boolean isReadOnly() { return isAi(); }
+    public boolean isHybrid() {
+        return controlMode == AdvancedControlMode.HYBRID;
+    }
 
-    /** true если можно сохранять ручные параметры стратегии */
-    public boolean canSubmit() { return !isAi(); }
+    public boolean isManual() {
+        return controlMode == AdvancedControlMode.MANUAL;
+    }
+
+    public boolean isReadOnly() {
+        return isAi();
+    }
+
+    public boolean canSubmit() {
+        return !isAi();
+    }
 }

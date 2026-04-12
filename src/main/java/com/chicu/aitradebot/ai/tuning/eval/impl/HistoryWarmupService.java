@@ -1,5 +1,6 @@
 package com.chicu.aitradebot.ai.tuning.eval.impl;
 
+import com.chicu.aitradebot.ai.tuning.eval.StrategyEnvResolver;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import com.chicu.aitradebot.exchange.client.ExchangeClient;
@@ -10,6 +11,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.lang.reflect.Method;
 import java.util.List;
 import java.util.Locale;
 
@@ -22,11 +24,6 @@ public class HistoryWarmupService {
     private final MarketStreamManager streamManager;
     private final StrategyEnvResolver envResolver;
 
-    /**
-     * ✅ BACKWARD COMPAT:
-     * Старый метод — оставляем, но он НЕ гарантирует MAINNET/TESTNET,
-     * потому что берёт окружение из envResolver.resolve(chatId, type).
-     */
     public int warmup(long chatId,
                       StrategyType type,
                       String symbol,
@@ -38,11 +35,6 @@ public class HistoryWarmupService {
         return warmup(chatId, type, null, null, symbol, timeframe, startMs, endMs, limit);
     }
 
-    /**
-     * ✅ FIXED:
-     * Прогрев истории с явным указанием exchange/network.
-     * Если exchange/network не заданы — используем envResolver.resolve(chatId, type).
-     */
     public int warmup(long chatId,
                       StrategyType type,
                       String exchange,
@@ -74,6 +66,12 @@ public class HistoryWarmupService {
             netUsed = env.networkType();
         }
 
+        if (exUsed == null || exUsed.isBlank() || netUsed == null) {
+            log.warn("🔥 Warmup skipped: env unresolved (chatId={} type={} ex={} net={})",
+                    chatId, type, exUsed, netUsed);
+            return 0;
+        }
+
         ExchangeClient client = exchangeClientFactory.get(exUsed, netUsed);
 
         try {
@@ -84,6 +82,8 @@ public class HistoryWarmupService {
             }
 
             for (ExchangeClient.Kline k : klines) {
+                if (k == null) continue;
+
                 Candle candle = new Candle(
                         k.openTime(),
                         k.open(),
@@ -93,7 +93,10 @@ public class HistoryWarmupService {
                         k.volume(),
                         true
                 );
-                streamManager.addCandle(s, tf, candle);
+
+                if (!tryAddCandleToStream(exUsed, netUsed, s, tf, candle)) {
+                    streamManager.addCandle(s, tf, candle);
+                }
             }
 
             log.info("🔥 Warmup done: {} {} candles={} exchange={} network={}",
@@ -105,6 +108,47 @@ public class HistoryWarmupService {
             log.warn("🔥 Warmup failed: {} {} (exchange={} network={}): {}",
                     s, tf, exUsed, netUsed, e.getMessage());
             return 0;
+        }
+    }
+
+    private boolean tryAddCandleToStream(String exchange,
+                                         NetworkType network,
+                                         String symbol,
+                                         String timeframe,
+                                         Candle candle) {
+        if (streamManager == null) return false;
+
+        if (tryInvoke(streamManager,
+                "addCandle",
+                new Class<?>[]{String.class, NetworkType.class, String.class, String.class, Candle.class},
+                new Object[]{exchange, network, symbol, timeframe, candle})) {
+            return true;
+        }
+
+        if (tryInvoke(streamManager,
+                "addCandle",
+                new Class<?>[]{String.class, String.class, String.class, String.class, Candle.class},
+                new Object[]{exchange, (network != null ? network.name() : null), symbol, timeframe, candle})) {
+            return true;
+        }
+
+        if (tryInvoke(streamManager,
+                "addCandle",
+                new Class<?>[]{NetworkType.class, String.class, String.class, Candle.class},
+                new Object[]{network, symbol, timeframe, candle})) {
+            return true;
+        }
+
+        return false;
+    }
+
+    private boolean tryInvoke(Object target, String method, Class<?>[] sig, Object[] args) {
+        try {
+            Method m = target.getClass().getMethod(method, sig);
+            m.invoke(target, args);
+            return true;
+        } catch (Exception ignored) {
+            return false;
         }
     }
 }

@@ -5,6 +5,7 @@ import lombok.*;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
+import java.util.Locale;
 
 @Entity
 @Table(
@@ -12,7 +13,11 @@ import java.time.LocalDateTime;
         indexes = {
                 @Index(name = "idx_orders_chat_symbol", columnList = "chat_id,symbol"),
                 @Index(name = "idx_orders_chat_strategy", columnList = "chat_id,strategy_type"),
-                @Index(name = "idx_orders_status", columnList = "status")
+                @Index(name = "idx_orders_status", columnList = "status"),
+                @Index(name = "idx_orders_ctx_runtime", columnList = "chat_id,strategy_type,symbol,exchange_name,network_type,timestamp"),
+                @Index(name = "idx_orders_position_uid", columnList = "position_uid"),
+                @Index(name = "idx_orders_client_order", columnList = "client_order_id"),
+                @Index(name = "idx_orders_exchange_order", columnList = "exchange_order_id")
         }
 )
 @Getter
@@ -26,10 +31,12 @@ public class OrderEntity {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
+    @Column(name = "position_uid", length = 80)
+    private String positionUid;
+
     /** chatId — идентификатор пользователя */
     @Column(name = "chat_id", nullable = false)
     private Long chatId;
-
 
     /** старое поле, оставлено для миграции */
     @Column(name = "user_id")
@@ -42,6 +49,14 @@ public class OrderEntity {
     @Column(nullable = false, length = 10)
     private String side;
 
+    /** MARKET / LIMIT / OCO */
+    @Column(name = "order_type", length = 16)
+    private String orderType;
+
+    /** ENTRY / EXIT / TP / SL / MANUAL_CLOSE / RESTORE */
+    @Column(name = "intent", length = 24)
+    private String intent;
+
     @Column(nullable = false, precision = 28, scale = 12)
     private BigDecimal price;
 
@@ -52,7 +67,7 @@ public class OrderEntity {
     @Column(nullable = false, precision = 28, scale = 12)
     private BigDecimal total;
 
-    /** SMART_FUSION / SCALPING / ML_INVEST */
+    /** SMART_FUSION / SCALPING / ML_INVEST / WINDOW_SCALPING */
     @Column(name = "strategy_type", nullable = false, length = 64)
     private String strategyType;
 
@@ -74,6 +89,58 @@ public class OrderEntity {
     @Column(name = "updated_at")
     private LocalDateTime updatedAt;
 
+    /** новый контекст для восстановления после рестарта */
+    @Column(name = "exchange_name", length = 32)
+    private String exchangeName;
+
+    /** MAINNET / TESTNET */
+    @Column(name = "network_type", length = 32)
+    private String networkType;
+
+    @Column(name = "client_order_id", length = 128)
+    private String clientOrderId;
+
+    @Column(name = "exchange_order_id", length = 128)
+    private String exchangeOrderId;
+
+    @Column(name = "exchange_status", length = 64)
+    private String exchangeStatus;
+
+    @Column(name = "requested_qty", precision = 28, scale = 12)
+    private BigDecimal requestedQty;
+
+    @Column(name = "requested_price", precision = 28, scale = 12)
+    private BigDecimal requestedPrice;
+
+    @Column(name = "executed_qty", precision = 28, scale = 12)
+    private BigDecimal executedQty;
+
+    @Column(name = "executed_quote_qty", precision = 28, scale = 12)
+    private BigDecimal executedQuoteQty;
+
+    @Column(name = "avg_executed_price", precision = 28, scale = 12)
+    private BigDecimal avgExecutedPrice;
+
+    @Column(name = "fee_total", precision = 28, scale = 12)
+    private BigDecimal feeTotal;
+
+    @Column(name = "fee_asset", length = 16)
+    private String feeAsset;
+
+    @Column(name = "parent_order_id")
+    private Long parentOrderId;
+
+    @Column(name = "is_reduce_only")
+    private Boolean reduceOnly;
+
+    @Column(name = "is_close_order")
+    private Boolean closeOrder;
+
+    @Column(name = "source", length = 24)
+    private String source;
+
+    @Column(name = "correlation_id", length = 80)
+    private String correlationId;
 
     // ============================================
     // ULTRA-поля (TP/SL, ML, причины, PnL)
@@ -112,37 +179,87 @@ public class OrderEntity {
     @Column(name = "ml_confidence", precision = 10, scale = 5)
     private BigDecimal mlConfidence;
 
+    @Column(name = "reject_code", length = 64)
+    private String rejectCode;
+
+    @Column(name = "reject_message", length = 512)
+    private String rejectMessage;
 
     // ============================================
     // Lifecycle
     // ============================================
+
     @PrePersist
     public void prePersist() {
-
-        if (createdAt == null)
-            createdAt = LocalDateTime.now();
-
-        if (timestamp == null)
-            timestamp = System.currentTimeMillis();
-
-        if (price != null && quantity != null && total == null)
-            total = price.multiply(quantity);
-
-        if (chatId == null && userId != null)
+        if (chatId == null && userId != null) {
             chatId = userId;
+        }
 
-        if (filled == null)
+        normalizeContext();
+
+        if (createdAt == null) {
+            createdAt = LocalDateTime.now();
+        }
+        if (updatedAt == null) {
+            updatedAt = createdAt;
+        }
+
+        if (timestamp == null) {
+            timestamp = System.currentTimeMillis();
+        }
+
+        if (price != null && quantity != null && total == null) {
+            total = price.multiply(quantity);
+        }
+
+        if (filled == null) {
             filled = true;
+        }
     }
 
     @PreUpdate
     public void preUpdate() {
+        normalizeContext();
         updatedAt = LocalDateTime.now();
 
-        if (price != null && quantity != null)
+        if (price != null && quantity != null) {
             total = price.multiply(quantity);
+        }
 
-        if (filled == null)
+        if (filled == null) {
             filled = true;
+        }
+    }
+
+    private void normalizeContext() {
+        symbol = normalizeUpperOrNull(symbol);
+        side = normalizeUpperOrNull(side);
+        orderType = normalizeUpperOrNull(orderType);
+        intent = normalizeUpperOrNull(intent);
+        status = normalizeUpperOrNull(status);
+        strategyType = normalizeUpperOrNull(strategyType);
+        exchangeName = normalizeUpperOrNull(exchangeName);
+        networkType = normalizeUpperOrNull(networkType);
+        source = normalizeUpperOrNull(source);
+        exchangeStatus = normalizeUpperOrNull(exchangeStatus);
+        feeAsset = normalizeUpperOrNull(feeAsset);
+        clientOrderId = normalizeTrimOrNull(clientOrderId);
+        exchangeOrderId = normalizeTrimOrNull(exchangeOrderId);
+        positionUid = normalizeTrimOrNull(positionUid);
+        correlationId = normalizeTrimOrNull(correlationId);
+        rejectCode = normalizeUpperOrNull(rejectCode);
+        rejectMessage = normalizeTrimOrNull(rejectMessage);
+    }
+
+    private static String normalizeUpperOrNull(String value) {
+        if (value == null) return null;
+        String v = value.trim().toUpperCase(Locale.ROOT);
+        return v.isEmpty() ? null : v;
+    }
+
+    private static String normalizeTrimOrNull(String value) {
+        if (value == null) return null;
+        String v = value.trim();
+        return v.isEmpty() ? null : v;
     }
 }

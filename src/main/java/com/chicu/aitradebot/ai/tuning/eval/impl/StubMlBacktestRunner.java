@@ -6,13 +6,17 @@ import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Service;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Instant;
 import java.util.Map;
 
 @Slf4j
 @Service
+@ConditionalOnProperty(prefix = "ai.ml.backtest", name = "use-stub", havingValue = "true")
 @ConditionalOnMissingBean(MlBacktestRunner.class)
 public class StubMlBacktestRunner implements MlBacktestRunner {
 
@@ -27,10 +31,25 @@ public class StubMlBacktestRunner implements MlBacktestRunner {
                                Instant startAt,
                                Instant endAt) {
 
-        log.warn("🧪 ML BacktestRunner = STUB (type={}, ex={}, net={}, symbol={}, tf={}) — подключи RealMlBacktestRunner",
+        log.warn("🧪 ML BacktestRunner = STUB (type={}, ex={}, net={}, symbol={}, tf={})",
                 type, exchange, network, symbolOverride, timeframeOverride);
 
-        // ok=true, чтобы пайплайн тюнера не ломался
-        return BacktestMetrics.stubOk(chatId, type, symbolOverride, timeframeOverride, candidateParams, startAt, endAt);
+        return BacktestMetrics.builder()
+                .ok(true)
+                .reason("STUB")
+                .chatId(chatId)
+                .type(type)
+                .symbol(symbolOverride)
+                .timeframe(timeframeOverride)
+                .startAt(startAt)
+                .endAt(endAt)
+                .profitPct(BigDecimal.ZERO.setScale(6, RoundingMode.HALF_UP))
+                .maxDrawdownPct(BigDecimal.ZERO.setScale(6, RoundingMode.HALF_UP))
+                .trades(0)
+                .wins(0)
+                .losses(0)
+                .winRatePct(BigDecimal.ZERO.setScale(6, RoundingMode.HALF_UP))
+                .params(candidateParams)
+                .build();
     }
 }

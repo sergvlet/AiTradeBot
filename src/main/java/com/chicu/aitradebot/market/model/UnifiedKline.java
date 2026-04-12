@@ -1,7 +1,9 @@
 package com.chicu.aitradebot.market.model;
 
+import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
+import lombok.NoArgsConstructor;
 
 import java.math.BigDecimal;
 
@@ -11,7 +13,9 @@ import java.math.BigDecimal;
  */
 @Data
 @Builder
-public class UnifiedKline {
+@NoArgsConstructor
+@AllArgsConstructor
+public class UnifiedKline implements UnifiedKlineView {
 
     /** Время открытия свечи (ms epoch) */
     private long openTime;
@@ -42,4 +46,15 @@ public class UnifiedKline {
      * Bybit: аналогично (в их kline тоже есть флаг финальности)
      */
     private boolean closed;
+
+    /**
+     * ✅ Требуется интерфейсом UnifiedKlineView.
+     * StrategyLivePublisher использует именно getOpenTimeMs().
+     */
+    @Override
+    public Long getOpenTimeMs() {
+        return openTime > 0 ? openTime : null;
+    }
+
+
 }

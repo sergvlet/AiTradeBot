@@ -8,11 +8,23 @@ import java.util.List;
 
 public interface OrderRepository extends JpaRepository<OrderEntity, Long> {
 
-    // 🔥 Основной метод, который нужен Dashboard + Chart
     List<OrderEntity> findByChatIdAndSymbolOrderByTimestampAsc(long chatId, String symbol);
 
-    // Открытые ордера для cancel / getOpenOrders
     List<OrderEntity> findByChatIdAndSymbolAndStatusIn(Long chatId,
                                                        String symbol,
                                                        Collection<String> statuses);
+
+    List<OrderEntity> findByChatIdAndStrategyTypeAndSymbolAndExchangeNameAndNetworkTypeOrderByTimestampAsc(
+            Long chatId,
+            String strategyType,
+            String symbol,
+            String exchangeName,
+            String networkType
+    );
+
+    List<OrderEntity> findByChatIdAndStrategyTypeAndSymbolOrderByTimestampAsc(
+            Long chatId,
+            String strategyType,
+            String symbol
+    );
 }

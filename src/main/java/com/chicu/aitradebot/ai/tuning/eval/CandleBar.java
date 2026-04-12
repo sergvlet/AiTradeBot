@@ -14,4 +14,8 @@ public record CandleBar(
     public Instant time() {
         return openTime;
     }
+
+    public long timeMs() {
+        return openTime != null ? openTime.toEpochMilli() : 0L;
+    }
 }

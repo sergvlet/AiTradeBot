@@ -1,571 +1,708 @@
 "use strict";
 
+/**
+ * Trade tab (market.js)
+ *
+ * FIX:
+ * - ctx всегда берётся из актуального DOM/state, а не из старого window.StrategySettingsContext
+ * - после смены exchange/network вкладка сама перезагружает symbols/limits
+ * - publishState публикует только валидный UiState
+ * - initialSymbol не берётся из label/placeholder
+ */
 window.SettingsTabTrade = (function () {
 
-    let _inited = false;
+    function byId(id) { return document.getElementById(id); }
 
-    function init() {
-        if (_inited) return;
-        _inited = true;
+    function isBlank(s) {
+        return s === null || s === undefined || String(s).trim() === "";
+    }
 
-        const ctx = window.StrategySettingsContext;
-        if (!ctx) return;
+    function normalizeUpper(s) {
+        return isBlank(s) ? "" : String(s).trim().toUpperCase();
+    }
 
-        const form = document.getElementById("tradeForm");
-        if (!form) return;
+    function normalizeTf(s) {
+        return isBlank(s) ? "" : String(s).trim();
+    }
 
-        // UI
-        const tradeModeBadge  = document.getElementById("tradeModeBadge");
-        const tradeModeHint   = document.getElementById("tradeModeHint");
+    function looksLikeUiState(obj) {
+        return !!(obj && typeof obj === "object"
+            && ("chatId" in obj) && ("type" in obj) && ("exchange" in obj) && ("network" in obj));
+    }
 
-        const saveState   = document.getElementById("tradeSaveState");
-        const saveMeta    = document.getElementById("tradeSaveMeta");
-        const changedList = document.getElementById("tradeChangedList");
-        const dirtyBadge  = document.getElementById("tradeDirtyBadge");
+    function getRoot() {
+        return document.querySelector(".strategy-settings-page[data-chat-id][data-type]");
+    }
 
-        // General tab control mode (источник правды)
-        const controlModeSelect = document.getElementById("advancedControlMode");
+    function normalizeNetworkValue(v) {
+        if (v === null || v === undefined) return "";
+        if (typeof v === "object" && v.name) return String(v.name).trim().toUpperCase();
+        return String(v).trim().toUpperCase();
+    }
 
-        // Asset (из general)
-        const accountAssetSelect = document.getElementById("accountAssetSelect");
-        const selectedAssetView  = document.getElementById("selectedAssetView");
+    function syncCtxFromRoot() {
+        const root = getRoot();
+        const ctx = window.StrategySettingsContext || {};
 
-        // Symbol picker
-        const modeGroup    = document.getElementById("tradeSymbolModes");
-        const symbolList   = document.getElementById("symbolList");
-        const symbolLabel  = document.getElementById("symbolLabel");
-        const symbolHidden = document.getElementById("symbolHidden");
+        if (root) {
+            const chatId = root.dataset.chatId || "";
+            const type = root.dataset.type || "";
+            const exchange = root.dataset.exchange || "";
+            const network = root.dataset.network || "";
 
-        // ✅ dropdown scroll fix
-        if (symbolList) {
-            symbolList.style.maxHeight = "420px";
-            symbolList.style.overflowY = "auto";
-            symbolList.style.overscrollBehavior = "contain";
-            symbolList.setAttribute("tabindex", "0");
-            symbolList.addEventListener("wheel", (e) => e.stopPropagation(), { passive: true });
-            symbolList.addEventListener("touchmove", (e) => e.stopPropagation(), { passive: true });
+            if (!isBlank(chatId)) ctx.chatId = String(chatId);
+            if (!isBlank(type)) ctx.type = String(type);
+            if (!isBlank(exchange)) ctx.exchange = normalizeUpper(exchange);
+            if (!isBlank(network)) ctx.network = normalizeNetworkValue(network);
         }
 
-        // Timeframe
-        const tfLabel    = document.getElementById("tradeTimeframeLabel");
-        const tfSelect   = document.getElementById("tradeTimeframeSelect");
-        const tfReadonly = document.getElementById("tradeTimeframeReadonly");
-        const tfHint     = document.getElementById("tradeTimeframeHint");
-        const tfAiNote   = document.getElementById("tradeAiTimeframeNote");
+        if (!ctx.baseUrl) ctx.baseUrl = window.location.pathname;
 
-        // Candles
-        const candlesInput = document.getElementById("tradeCachedCandlesLimit");
+        window.StrategySettingsContext = ctx;
+        return ctx;
+    }
 
-        // Exchange limits ui (readonly)
-        const exMinNotional      = document.getElementById("exMinNotional");
-        const exMinNotionalScope = document.getElementById("exMinNotionalScope");
+    function syncCtxFromState(state) {
+        if (!looksLikeUiState(state)) return window.StrategySettingsContext || null;
 
-        const exStepSize      = document.getElementById("exStepSize");
-        const exStepSizeScope = document.getElementById("exStepSizeScope");
+        const ctx = window.StrategySettingsContext || {};
 
-        const exTickSize      = document.getElementById("exTickSize");
-        const exTickSizeScope = document.getElementById("exTickSizeScope");
+        if (!isBlank(state.chatId)) ctx.chatId = String(state.chatId);
+        if (!isBlank(state.type)) ctx.type = String(state.type);
+        if (!isBlank(state.exchange)) ctx.exchange = normalizeUpper(state.exchange);
+        if (!isBlank(state.network)) ctx.network = normalizeNetworkValue(state.network);
+        if (!isBlank(state.accountAsset)) ctx.accountAsset = normalizeUpper(state.accountAsset);
+        if (!ctx.baseUrl) ctx.baseUrl = window.location.pathname;
 
-        const exMaxOrders      = document.getElementById("exMaxOrders");
-        const exMaxOrdersScope = document.getElementById("exMaxOrdersScope");
+        window.StrategySettingsContext = ctx;
 
-        // endpoints
-        const AUTOSAVE_ENDPOINT = "/api/strategy/settings/autosave";
-        const SYMBOLS_ENDPOINT  = "/api/market/symbols";
+        const root = getRoot();
+        if (root) {
+            if (!isBlank(ctx.chatId)) root.dataset.chatId = String(ctx.chatId);
+            if (!isBlank(ctx.type)) root.dataset.type = String(ctx.type);
+            if (!isBlank(ctx.exchange)) root.dataset.exchange = String(ctx.exchange);
+            if (!isBlank(ctx.network)) root.dataset.network = String(ctx.network);
+        }
 
-        // autosave engine
-        const rootEl = document.querySelector(".strategy-settings-page") || form;
+        return ctx;
+    }
 
-        const autosave = window.SettingsAutoSave?.create?.({
-            rootEl,
-            scope: "trade",
-            context: ctx,
-            endpoints: {
-                autosave: AUTOSAVE_ENDPOINT,
-                apply: AUTOSAVE_ENDPOINT
-            },
-            elements: { saveState, saveMeta, changedList, applyBtn: null },
-            buildPayload
+    function ensureCtx() {
+        return syncCtxFromRoot();
+    }
+
+    function getCtx() {
+        return ensureCtx();
+    }
+
+    function getCtxKey(ctx) {
+        if (!ctx) return "";
+        return [
+            String(ctx.chatId || ""),
+            String(ctx.type || ""),
+            String(ctx.exchange || ""),
+            String(ctx.network || "")
+        ].join("|");
+    }
+
+    function publishState(state) {
+        if (!looksLikeUiState(state)) return;
+
+        syncCtxFromState(state);
+
+        try {
+            if (window.StrategySettingsStore && typeof window.StrategySettingsStore.setState === "function") {
+                window.StrategySettingsStore.setState(state);
+            } else if (window.StrategySettingsStore && typeof window.StrategySettingsStore.set === "function") {
+                window.StrategySettingsStore.set(state);
+            }
+        } catch (e) {}
+
+        try {
+            window.dispatchEvent(new CustomEvent("strategy:state", { detail: state }));
+        } catch (e) {}
+    }
+
+    function dispatchAccountAssetChanged(asset, source) {
+        const a = normalizeUpper(asset || "");
+        if (!a) return;
+        try {
+            window.dispatchEvent(new CustomEvent("strategy:accountAssetChanged", {
+                detail: { asset: a, source: source || "trade" }
+            }));
+        } catch (e) {}
+    }
+
+    function ctxQuery() {
+        const ctx = getCtx();
+        if (!ctx) return "";
+        const q = new URLSearchParams();
+        if (ctx.chatId) q.set("chatId", String(ctx.chatId));
+        if (ctx.exchange) q.set("exchange", String(ctx.exchange));
+        if (ctx.network) q.set("network", String(ctx.network));
+        q.set("_ts", String(Date.now()));
+        return q.toString();
+    }
+
+    function marketQuery(accountAsset) {
+        const ctx = getCtx();
+        const q = new URLSearchParams();
+        if (ctx?.exchange) q.set("exchange", String(ctx.exchange));
+        if (ctx?.network) q.set("network", String(ctx.network));
+        if (!isBlank(accountAsset)) q.set("accountAsset", normalizeUpper(accountAsset));
+        return q.toString();
+    }
+
+    function setUiValue(el, val) {
+        if (!el) return;
+        const tag = (el.tagName || "").toUpperCase();
+        const v = (val === null || val === undefined || val === "") ? "" : String(val);
+
+        if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") {
+            el.value = v;
+        } else {
+            el.textContent = (v === "" ? "—" : v);
+        }
+    }
+
+    function fmtNum(v, digits) {
+        if (v === null || v === undefined) return null;
+        const n = Number(v);
+        if (!Number.isFinite(n)) return null;
+        const d = Number.isFinite(digits) ? digits : 8;
+        return n.toFixed(d).replace(/\.?0+$/, "");
+    }
+
+    function nowMode() {
+        const el = byId("advancedControlMode");
+        if (el && el.value) return normalizeUpper(el.value);
+        if (window.__StrategyControlMode) return normalizeUpper(window.__StrategyControlMode);
+        const badge = byId("tradeModeBadge");
+        if (badge && badge.textContent) return normalizeUpper(badge.textContent);
+        return "MANUAL";
+    }
+
+    function getAccountAsset() {
+        const sel = byId("accountAssetSelect");
+        if (sel && sel.value) return normalizeUpper(sel.value);
+
+        const hid = byId("accountAssetHidden");
+        if (hid && hid.value) return normalizeUpper(hid.value);
+
+        const ctx = getCtx();
+        if (ctx?.accountAsset) return normalizeUpper(ctx.accountAsset);
+
+        if (sel && sel.options && sel.options.length > 0) {
+            return normalizeUpper(sel.options[0].value);
+        }
+        return "";
+    }
+
+    function setAccountAssetUi(asset) {
+        const a = normalizeUpper(asset);
+        const sel = byId("accountAssetSelect");
+        const hid = byId("accountAssetHidden");
+
+        if (sel) {
+            sel.value = a || "";
+            if (a && sel.value !== a && sel.options && sel.options.length > 0) {
+                sel.value = sel.options[0].value;
+            }
+            if (!sel.value && sel.options && sel.options.length > 0) {
+                sel.value = sel.options[0].value;
+            }
+        }
+
+        const finalA = normalizeUpper(sel ? sel.value : a);
+
+        if (hid) hid.value = finalA || "";
+
+        const hint = byId("assetInHint");
+        if (hint) hint.textContent = finalA || "—";
+
+        const ctx = getCtx();
+        if (ctx) {
+            ctx.accountAsset = finalA || "";
+            window.StrategySettingsContext = ctx;
+        }
+    }
+
+    function rebuildAssetsIfNeeded(assetsUpper) {
+        const sel = byId("accountAssetSelect");
+        if (!sel || !Array.isArray(assetsUpper) || assetsUpper.length === 0) return;
+
+        const want = assetsUpper.map(normalizeUpper).filter(Boolean);
+        if (want.length === 0) return;
+
+        const have = Array.from(sel.options || []).map(o => normalizeUpper(o.value));
+        const same = have.length === want.length && want.every(a => have.includes(a));
+        if (same) return;
+
+        sel.innerHTML = "";
+        want.forEach(a => {
+            const opt = document.createElement("option");
+            opt.value = a;
+            opt.textContent = a;
+            sel.appendChild(opt);
         });
+    }
 
-        function markChanged(key) {
-            if (dirtyBadge) dirtyBadge.classList.remove("d-none");
-            autosave?.markChanged?.(key);
+    function applyUiState(state) {
+        if (!looksLikeUiState(state)) return;
+
+        syncCtxFromState(state);
+
+        if (state.advancedControlMode) {
+            window.__StrategyControlMode = normalizeUpper(state.advancedControlMode);
+        }
+
+        if (Array.isArray(state.availableAssets)) {
+            rebuildAssetsIfNeeded(state.availableAssets);
+        }
+
+        const bal = state.selectedBalance || state.balance || null;
+        const asset =
+            normalizeUpper(
+                state.accountAsset ||
+                (bal && (bal.asset || bal.currency || bal.code)) ||
+                ""
+            );
+
+        if (asset) setAccountAssetUi(asset);
+
+        if (bal) {
+            const free = (bal.free ?? null);
+            const locked = (bal.locked ?? null);
+            const total = (Number(free) || 0) + (Number(locked) || 0);
+
+            setUiValue(byId("assetFreeView"), fmtNum(free, 8));
+            setUiValue(byId("assetLockedView"), fmtNum(locked, 8));
+            setUiValue(byId("assetTotalView"), fmtNum(total, 8));
+        }
+
+        if (!isBlank(state.symbol)) {
+            setSymbolUi(state.symbol);
+        }
+
+        if (!isBlank(state.timeframe)) {
+            const tfSelect = byId("tradeTimeframeSelect");
+            const tfReadonly = byId("tradeTimeframeReadonly");
+            if (tfSelect) tfSelect.value = String(state.timeframe);
+            if (tfReadonly) setUiValue(tfReadonly, String(state.timeframe));
+        }
+
+        if (state.cachedCandlesLimit !== null && state.cachedCandlesLimit !== undefined) {
+            const candlesInput = byId("tradeCachedCandlesLimit");
+            if (candlesInput) candlesInput.value = String(state.cachedCandlesLimit);
+        }
+
+        setModeUi();
+    }
+
+    function setModeUi() {
+        const mode = nowMode();
+
+        const badge = byId("tradeModeBadge");
+        if (badge) {
+            badge.textContent = mode;
+            badge.className =
+                "badge " +
+                (mode === "AI" ? "bg-warning text-dark"
+                    : (mode === "HYBRID" ? "bg-info text-dark" : "bg-secondary"));
+        }
+
+        const tfSelect = byId("tradeTimeframeSelect");
+        const tfReadonly = byId("tradeTimeframeReadonly");
+        const tfNote = byId("tradeAiTimeframeNote");
+        const candlesInput = byId("tradeCachedCandlesLimit");
+
+        if (mode === "AI") {
+            if (tfSelect) tfSelect.classList.add("d-none");
+            if (tfReadonly) tfReadonly.classList.remove("d-none");
+            if (tfNote) tfNote.classList.remove("d-none");
+
+            const curTf = tfSelect ? tfSelect.value : "";
+            setUiValue(tfReadonly, curTf || "—");
+
+            if (candlesInput) candlesInput.disabled = true;
+        } else {
+            if (tfSelect) tfSelect.classList.remove("d-none");
+            if (tfReadonly) tfReadonly.classList.add("d-none");
+            if (tfNote) tfNote.classList.add("d-none");
+
+            if (candlesInput) candlesInput.disabled = false;
+        }
+    }
+
+    function setLimitsUiEmpty() {
+        setUiValue(byId("exMinNotional"), "—");
+        setUiValue(byId("exMinNotionalScope"), "—");
+        setUiValue(byId("exStepSize"), "—");
+        setUiValue(byId("exStepSizeScope"), "—");
+        setUiValue(byId("exTickSize"), "—");
+        setUiValue(byId("exTickSizeScope"), "—");
+    }
+
+    function applyLimitsFromDescriptor(d) {
+        if (!d) { setLimitsUiEmpty(); return; }
+
+        const root = d.filters ? d.filters : d;
+
+        const minNotional = root.minNotional ?? root.min_notional ?? root.minQuote ?? null;
+        const stepSize = root.stepSize ?? root.qtyStep ?? root.lotStepSize ?? null;
+        const tickSize = root.tickSize ?? root.priceStep ?? null;
+
+        setUiValue(byId("exMinNotional"), minNotional !== null ? String(minNotional) : "—");
+        setUiValue(byId("exMinNotionalScope"), root.minNotionalScope || d.scope || "—");
+
+        setUiValue(byId("exStepSize"), stepSize !== null ? String(stepSize) : "—");
+        setUiValue(byId("exStepSizeScope"), root.stepSizeScope || d.scope || "—");
+
+        setUiValue(byId("exTickSize"), tickSize !== null ? String(tickSize) : "—");
+        setUiValue(byId("exTickSizeScope"), root.tickSizeScope || d.scope || "—");
+    }
+
+    async function loadLimits(symbol) {
+        const ctx = getCtx();
+        if (!ctx?.exchange || !ctx?.network) return;
+
+        const sym = normalizeUpper(symbol);
+        const asset = getAccountAsset();
+
+        if (!sym || !asset) {
+            setLimitsUiEmpty();
+            return;
+        }
+
+        const url =
+            `/api/market/symbol-info?${marketQuery(asset)}&symbol=${encodeURIComponent(sym)}`;
+
+        try {
+            const d = await window.SettingsApi.getJson(url);
+            applyLimitsFromDescriptor(d);
+        } catch (e) {
+            console.error("[trade] loadLimits failed:", e);
+            setLimitsUiEmpty();
+        }
+    }
+
+    function setSymbolUi(symbol) {
+        const label = byId("symbolLabel");
+        const hidden = byId("symbolHidden");
+        const sym = normalizeUpper(symbol);
+        if (label) label.textContent = sym || "Выберите торговую пару";
+        if (hidden) hidden.value = sym || "";
+    }
+
+    function buildSymbolItem(symbol, price, changePct) {
+        const li = document.createElement("li");
+        const a = document.createElement("a");
+        a.className = "dropdown-item d-flex justify-content-between align-items-center";
+        a.href = "#";
+
+        const left = document.createElement("span");
+        left.className = "fw-semibold";
+        left.textContent = symbol;
+
+        const right = document.createElement("span");
+        right.className = "text-muted small";
+        const p = fmtNum(price, 6);
+        const c = fmtNum(changePct, 2);
+        right.textContent = (p ? p : "—") + (c ? (" • " + c + "%") : "");
+
+        a.appendChild(left);
+        a.appendChild(right);
+        li.appendChild(a);
+        return { li, a };
+    }
+
+    function getActiveSymbolMode() {
+        const host = byId("tradeSymbolModes");
+        if (!host) return "POPULAR";
+        const active = host.querySelector("[data-symbol-mode].active");
+        return active ? (active.getAttribute("data-symbol-mode") || "POPULAR") : "POPULAR";
+    }
+
+    function setActiveSymbolMode(mode) {
+        const host = byId("tradeSymbolModes");
+        if (!host) return;
+        host.querySelectorAll("[data-symbol-mode]").forEach(btn => {
+            btn.classList.toggle("active", (btn.getAttribute("data-symbol-mode") === mode));
+        });
+    }
+
+    async function fetchSymbols(mode) {
+        const ctx = getCtx();
+        if (!ctx?.exchange || !ctx?.network) return [];
+
+        const asset = getAccountAsset();
+        if (!asset) return [];
+
+        const url =
+            `/api/market/symbols?${marketQuery(asset)}&mode=${encodeURIComponent(mode || "POPULAR")}`;
+
+        try {
+            const d = await window.SettingsApi.getJson(url);
+            if (Array.isArray(d)) return d;
+            if (Array.isArray(d.items)) return d.items;
+            return [];
+        } catch (e) {
+            console.error("[trade] fetchSymbols failed:", e);
+            return [];
+        }
+    }
+
+    async function saveTradeSettings() {
+        const ctx = getCtx();
+        if (!ctx?.type || !ctx?.chatId) return null;
+
+        const asset = getAccountAsset();
+        const symbol = normalizeUpper(byId("symbolHidden")?.value || "");
+        const tf = normalizeTf(byId("tradeTimeframeSelect")?.value || "");
+        const candles = (byId("tradeCachedCandlesLimit")?.value || "").trim();
+
+        const url = `/strategies/${encodeURIComponent(String(ctx.type))}/config?${ctxQuery()}`;
+
+        const payload = {
+            saveScope: "trade",
+            tab: "trade",
+            exchange: ctx.exchange,
+            network: ctx.network,
+            accountAsset: asset,
+            symbol: symbol,
+            timeframe: tf,
+            cachedCandlesLimit: candles
+        };
+
+        return await window.SettingsApi.postForm(url, payload);
+    }
+
+    let started = false;
+
+    function init() {
+        if (started) return;
+
+        const api = window.SettingsApi;
+        if (!api?.getJson || !api?.postForm) {
+            console.warn("[trade] SettingsApi not ready -> skip init (will retry)");
+            return;
+        }
+
+        const ctx = ensureCtx();
+        if (!ctx?.chatId || !ctx?.type) {
+            console.warn("[trade] ctx not ready -> skip init (will retry)");
+            return;
+        }
+
+        const list = byId("symbolList");
+        const symbolHidden = byId("symbolHidden");
+        const tfSelect = byId("tradeTimeframeSelect");
+        const candlesInput = byId("tradeCachedCandlesLimit");
+        const assetSelect = byId("accountAssetSelect");
+
+        if (!assetSelect || !symbolHidden || !tfSelect || !candlesInput) {
+            console.warn("[trade] required DOM not ready -> skip init (will retry)");
+            return;
+        }
+
+        started = true;
+
+        const saveState = byId("tradeSaveState");
+        const saveMeta = byId("tradeSaveMeta");
+
+        function setSave(text, kind) {
+            if (saveState) {
+                saveState.textContent = text || "Готово";
+                saveState.className =
+                    "badge " +
+                    (kind === "ok" ? "bg-success"
+                        : kind === "err" ? "bg-danger"
+                            : kind === "info" ? "bg-info text-dark"
+                                : "bg-secondary");
+            }
+            if (saveMeta) saveMeta.textContent = "";
+        }
+
+        let timer = null;
+        let inFlight = false;
+        let contextReloadInFlight = false;
+        let lastCtxKey = getCtxKey(getCtx());
+
+        async function doSave() {
+            if (inFlight) return;
+
+            inFlight = true;
+            setSave("Сохраняю…", "info");
+
+            try {
+                const state = await saveTradeSettings();
+
+                if (looksLikeUiState(state)) {
+                    applyUiState(state);
+                    publishState(state);
+                    dispatchAccountAssetChanged(state.accountAsset || getAccountAsset(), "trade_save_ok");
+                    lastCtxKey = getCtxKey(getCtx());
+                }
+
+                setSave("Сохранено", "ok");
+            } catch (e) {
+                setSave("Ошибка", "err");
+                console.error("[trade] save failed:", e);
+            } finally {
+                inFlight = false;
+                setTimeout(() => setSave("Готово", "idle"), 900);
+            }
         }
 
         function scheduleSave(ms) {
-            autosave?.scheduleSave?.(ms ?? 500);
-        }
-
-        autosave?.initReadyState?.();
-
-        // =====================================================
-        // helpers
-        // =====================================================
-        function isAbortError(err) {
-            return err && (err.name === "AbortError" || String(err).includes("AbortError"));
-        }
-
-        function nowMode() {
-            const v = (controlModeSelect?.value || ctx.advancedControlMode || "MANUAL").trim().toUpperCase();
-            return v || "MANUAL";
-        }
-
-        function setModeUi() {
-            const m = nowMode();
-
-            if (tradeModeBadge) tradeModeBadge.textContent = m;
-
-            if (tradeModeHint) {
-                if (m === "AI") {
-                    tradeModeHint.textContent =
-                        "В AI: часть параметров может меняться в рантайме. Здесь хранится fallback и ручной выбор.";
-                } else if (m === "HYBRID") {
-                    tradeModeHint.textContent =
-                        "В HYBRID: AI может рекомендовать, но ты можешь править вручную. Всё сохраняется автоматически.";
-                } else {
-                    tradeModeHint.textContent =
-                        "В MANUAL: всё управляется вручную. Всё сохраняется автоматически.";
-                }
-            }
-
-            // ✅ важное: в AI отключаем редактирование trade-полей (но сохраняем отображение)
-            const disable = (m === "AI");
-
-            if (tfSelect) tfSelect.disabled = disable;
-            if (candlesInput) candlesInput.disabled = disable;
-
-            // символы: в AI не даём менять символ (чтобы не было “сохраню, а потом откатит”)
-            if (modeGroup) {
-                for (const b of modeGroup.querySelectorAll("button[data-symbol-mode]")) {
-                    b.disabled = disable;
-                }
-            }
-            if (symbolList) {
-                const buttons = symbolList.querySelectorAll("button.dropdown-item");
-                buttons.forEach(btn => btn.disabled = disable);
-            }
-
-            if (disable) {
-                tfSelect?.classList.add("d-none");
-                tfReadonly?.classList.remove("d-none");
-                tfAiNote?.classList.remove("d-none");
-
-                const currentTf = (tfSelect?.value || "").trim() || "—";
-                if (tfReadonly) tfReadonly.textContent = currentTf;
-
-                if (tfLabel) tfLabel.textContent = "Базовый таймфрейм (fallback)";
-                if (tfHint) tfHint.textContent =
-                    "В рантайме AI может использовать другой таймфрейм. В базе хранится fallback.";
-            } else {
-                tfReadonly?.classList.add("d-none");
-                tfSelect?.classList.remove("d-none");
-                tfAiNote?.classList.add("d-none");
-
-                if (tfLabel) {
-                    tfLabel.textContent = (m === "HYBRID")
-                        ? "Таймфрейм (AI может рекомендовать)"
-                        : "Таймфрейм стратегии";
-                }
-                if (tfHint) {
-                    tfHint.textContent = (m === "HYBRID")
-                        ? "AI может рекомендовать, но менять можно вручную."
-                        : "Используется стратегией как основной таймфрейм.";
-                }
-            }
-        }
-
-        function normalizeSymbol(sym) {
-            if (!sym) return "";
-            return String(sym).trim().toUpperCase();
-        }
-
-        function fmtBdOrNull(v) {
-            if (v == null) return null;
-            const s = String(v).trim();
-            return s === "" || s === "null" ? null : s;
-        }
-
-        function fmtWithUnit(valueStr, unit) {
-            if (!valueStr) return "—";
-            const u = (unit || "").trim().toUpperCase();
-            return u ? `${valueStr} ${u}` : valueStr;
-        }
-
-        // ✅ ВАЖНО: НЕ берём ctx.accountAsset первым, он “залипает”
-        function getAssetForRequest() {
-            const a1 = (accountAssetSelect?.value || "").trim();
-            if (a1) return a1.toUpperCase();
-
-            const a2 = (selectedAssetView?.textContent || "").trim();
-            if (a2 && a2 !== "—") return a2.toUpperCase();
-
-            const a0 = String(ctx.accountAsset || "").trim();
-            if (a0) return a0.toUpperCase();
-
-            return "USDT";
-        }
-
-        function setLimitsUiEmpty() {
-            if (exMinNotional) exMinNotional.value = "—";
-            if (exMinNotionalScope) exMinNotionalScope.textContent = "—";
-
-            if (exStepSize) exStepSize.value = "—";
-            if (exStepSizeScope) exStepSizeScope.textContent = "—";
-
-            if (exTickSize) exTickSize.value = "—";
-            if (exTickSizeScope) exTickSizeScope.textContent = "—";
-
-            if (exMaxOrders) exMaxOrders.value = "—";
-            if (exMaxOrdersScope) exMaxOrdersScope.textContent = "—";
-        }
-
-        function applyLimitsFromDescriptor(d) {
-            if (!d) return setLimitsUiEmpty();
-
-            const quote = String(d.quoteAsset || getAssetForRequest() || "").trim().toUpperCase();
-            const base  = String(d.baseAsset || "").trim().toUpperCase();
-
-            const mn = fmtBdOrNull(d.minNotional);
-            if (exMinNotional) exMinNotional.value = fmtWithUnit(mn, quote);
-            if (exMinNotionalScope) exMinNotionalScope.textContent = (d.minNotionalScope ?? "—");
-
-            const ss = fmtBdOrNull(d.stepSize);
-            if (exStepSize) exStepSize.value = fmtWithUnit(ss, base);
-            if (exStepSizeScope) exStepSizeScope.textContent = (d.stepSizeScope ?? "—");
-
-            const ts = fmtBdOrNull(d.tickSize);
-            if (exTickSize) exTickSize.value = fmtWithUnit(ts, quote);
-            if (exTickSizeScope) exTickSizeScope.textContent = (d.tickSizeScope ?? "—");
-
-            if (exMaxOrders) exMaxOrders.value = (d.maxOrders != null ? String(d.maxOrders) : "—");
-            if (exMaxOrdersScope) exMaxOrdersScope.textContent = (d.maxOrdersScope ?? "—");
-        }
-
-        function buildPayload() {
-            // ✅ в AI сохранять trade-параметры нельзя (иначе потом “откатывает” и бесит)
-            if (nowMode() === "AI") {
-                return {
-                    chatId: ctx.chatId,
-                    type: ctx.type,
-                    exchange: ctx.exchange || "BINANCE",
-                    network: ctx.network || "TESTNET",
-                    scope: "trade"
-                };
-            }
-
-            return {
-                chatId: ctx.chatId,
-                type: ctx.type,
-                exchange: ctx.exchange || "BINANCE",
-                network: ctx.network || "TESTNET",
-                scope: "trade",
-                symbol: normalizeSymbol(symbolHidden?.value || ""),
-                timeframe: (tfSelect?.value || "").trim() || null,
-                cachedCandlesLimit: (candlesInput?.value || "").trim() || null
-            };
-        }
-
-        // =====================================================
-        // symbols api (Abort-safe + race-safe)
-        // =====================================================
-        let activeMode = "POPULAR";
-        let lastMap = new Map(); // SYMBOL -> descriptor
-
-        const SymbolsRequest = {
-            controller: null,
-            seq: 0
-        };
-
-        async function fetchSymbols(mode) {
-            const exchange = String(ctx.exchange || "BINANCE").trim() || "BINANCE";
-            const network  = String(ctx.network  || "TESTNET").trim() || "TESTNET";
-            const asset    = getAssetForRequest();
-
-            const url =
-                `${SYMBOLS_ENDPOINT}` +
-                `?exchange=${encodeURIComponent(exchange)}` +
-                `&network=${encodeURIComponent(network)}` +
-                `&accountAsset=${encodeURIComponent(asset)}` +
-                `&mode=${encodeURIComponent(mode || "POPULAR")}`;
-
-            // abort previous
-            if (SymbolsRequest.controller) {
-                try { SymbolsRequest.controller.abort("new symbols request"); }
-                catch (_) { SymbolsRequest.controller.abort(); }
-            }
-
-            const controller = new AbortController();
-            SymbolsRequest.controller = controller;
-            const mySeq = ++SymbolsRequest.seq;
-
-            const res = await fetch(url, {
-                method: "GET",
-                headers: { "Accept": "application/json" },
-                signal: controller.signal
-            });
-
-            // устаревший запрос — игнор
-            if (mySeq !== SymbolsRequest.seq) return null;
-
-            if (!res.ok) throw new Error(`symbols http ${res.status}`);
-            const data = await res.json();
-
-            // и тут тоже защита от гонок
-            if (mySeq !== SymbolsRequest.seq) return null;
-
-            return data;
-        }
-
-        function rebuildMap(items) {
-            lastMap = new Map();
-            if (!Array.isArray(items)) return;
-            for (const it of items) {
-                const sym = normalizeSymbol(it?.symbol);
-                if (sym) lastMap.set(sym, it);
-            }
-        }
-
-        function renderSymbolList(items) {
-            if (!symbolList) return;
-            symbolList.innerHTML = "";
-
-            if (!Array.isArray(items) || items.length === 0) {
-                const li = document.createElement("li");
-                li.className = "dropdown-item text-muted";
-                li.textContent = "Нет данных";
-                symbolList.appendChild(li);
-                return;
-            }
-
-            const current = normalizeSymbol(symbolHidden?.value || "");
-            const disable = (nowMode() === "AI");
-
-            for (const it of items) {
-                const sym = normalizeSymbol(it.symbol);
-
-                const li = document.createElement("li");
-                const btn = document.createElement("button");
-                btn.type = "button";
-                btn.className = "dropdown-item d-flex justify-content-between align-items-center gap-2";
-                btn.disabled = disable;
-
-                const left = document.createElement("span");
-                left.textContent = sym || "—";
-
-                const right = document.createElement("span");
-                right.className = "small text-secondary";
-
-                const lp  = (it.lastPrice != null) ? String(it.lastPrice) : "";
-                const ch  = (it.priceChangePct24h != null) ? String(it.priceChangePct24h) : "";
-                const vol = (it.volume24h != null) ? String(it.volume24h) : "";
-
-                const parts = [];
-                if (lp) parts.push(lp);
-                if (ch) parts.push(ch + "%");
-                if (vol) parts.push("vol " + vol);
-                right.textContent = parts.join(" · ");
-
-                btn.appendChild(left);
-                btn.appendChild(right);
-
-                if (sym && sym === current) {
-                    const badge = document.createElement("span");
-                    badge.className = "badge bg-primary ms-2";
-                    badge.textContent = "Выбрано";
-                    btn.appendChild(badge);
-                }
-
-                btn.addEventListener("click", async () => {
-                    if (nowMode() === "AI") return;
-                    await selectSymbol(sym);
-                });
-
-                li.appendChild(btn);
-                symbolList.appendChild(li);
-            }
+            clearTimeout(timer);
+            timer = setTimeout(doSave, (ms ?? 250));
         }
 
         async function reloadSymbols() {
-            try {
-                const items = await fetchSymbols(activeMode);
+            if (!list) return;
 
-                if (items == null) return;
+            const asset = getAccountAsset();
+            setAccountAssetUi(asset);
 
-                rebuildMap(items);
-                renderSymbolList(items);
-
-                const cur = normalizeSymbol(symbolHidden?.value || "");
-                if (cur && lastMap.has(cur)) applyLimitsFromDescriptor(lastMap.get(cur));
-                else setLimitsUiEmpty();
-
-            } catch (e) {
-                if (isAbortError(e)) return;
-
-                console.error("reloadSymbols failed", e);
-                rebuildMap([]);
-                renderSymbolList([]);
-                setLimitsUiEmpty();
+            const finalAsset = getAccountAsset();
+            if (!finalAsset) {
+                list.innerHTML = `<li><span class="dropdown-item text-muted">Выберите актив</span></li>`;
+                return;
             }
-        }
 
-        function setSymbolUi(sym) {
-            const s = normalizeSymbol(sym);
-            if (symbolLabel) symbolLabel.textContent = s || "Выберите торговую пару";
-            if (symbolHidden) symbolHidden.value = s || "";
-        }
+            list.innerHTML = `<li><span class="dropdown-item text-muted">Загрузка…</span></li>`;
 
-        async function selectSymbol(sym) {
-            const s = normalizeSymbol(sym);
-            if (!s) return;
+            const mode = getActiveSymbolMode();
+            const items = await fetchSymbols(mode);
 
-            setSymbolUi(s);
-            markChanged("symbol");
+            if (!items.length) {
+                list.innerHTML = `<li><span class="dropdown-item text-muted">Нет данных</span></li>`;
+                return;
+            }
 
-            applyLimitsFromDescriptor(lastMap.get(s) || null);
+            list.innerHTML = "";
+            items.forEach(it => {
+                const sym = normalizeUpper(it.symbol || it.s || "");
+                const price = it.lastPrice ?? it.price ?? it.p ?? null;
+                const change = it.changePct ?? it.c ?? null;
+                if (!sym) return;
 
-            // ✅ тут же отправим автосейв, чтобы symbol реально закрепился в БД
-            scheduleSave(200);
-        }
+                const { li, a } = buildSymbolItem(sym, price, change);
+                a.addEventListener("click", async (e) => {
+                    e.preventDefault();
+                    setSymbolUi(sym);
+                    scheduleSave(120);
+                    await loadLimits(sym);
+                });
 
-        // =====================================================
-        // ✅ СИНХРОНИЗАЦИЯ АКТИВА + CONTROL MODE (единые события)
-        // =====================================================
-        let _lastAsset = "";
-        let _lastMode  = "";
-
-        function notifyAssetChanged(asset, opts) {
-            const a = (asset || "").trim().toUpperCase();
-            if (!a) return;
-
-            if (a === _lastAsset) return;
-            _lastAsset = a;
-
-            ctx.accountAsset = a;
-
-            if (opts?.silent) return;
-            window.dispatchEvent(new CustomEvent("strategy:asset-changed", { detail: { asset: a } }));
-        }
-
-        function notifyModeChanged(mode, opts) {
-            const m = (mode || "").trim().toUpperCase();
-            if (!m) return;
-
-            if (m === _lastMode) return;
-            _lastMode = m;
-
-            ctx.advancedControlMode = m;
-
-            if (opts?.silent) return;
-            window.dispatchEvent(new CustomEvent("strategy:controlModeChanged", { detail: { mode: m } }));
-        }
-
-        // 1) если актив меняется через select
-        if (accountAssetSelect) {
-            accountAssetSelect.addEventListener("change", () => {
-                const a = (accountAssetSelect.value || "").trim();
-                notifyAssetChanged(a);
+                list.appendChild(li);
             });
         }
 
-        // 2) если актив меняется иначе (General/другие вкладки)
-        window.addEventListener("strategy:asset-changed", async (e) => {
-            const a = e?.detail?.asset;
-            if (!a) return;
+        async function reloadAfterContextChange(state) {
+            if (contextReloadInFlight) return;
+            contextReloadInFlight = true;
 
-            const next = String(a).trim().toUpperCase();
-            if (!next || next === _lastAsset) return;
-
-            notifyAssetChanged(next, { silent: true });
-            await reloadSymbols();
-        });
-
-        // 3) режим управления — источник правды общий (General)
-        if (controlModeSelect) {
-            controlModeSelect.addEventListener("change", () => {
-                notifyModeChanged(controlModeSelect.value, { silent: true });
-                setModeUi();
-                renderSymbolList(Array.from(lastMap.values())); // обновим disabled на кнопках
-            });
-        }
-
-        // 4) общий сигнал от General (мы его диспатчим там)
-        window.addEventListener("strategy:controlModeChanged", (e) => {
-            const m = String(e?.detail?.mode || "").toUpperCase();
-            if (!m) return;
-
-            if (m === _lastMode) return;
-            notifyModeChanged(m, { silent: true });
-
-            setModeUi();
-            renderSymbolList(Array.from(lastMap.values()));
-        });
-
-        // =====================================================
-        // binds
-        // =====================================================
-        if (modeGroup) {
-            modeGroup.addEventListener("click", async (e) => {
-                if (nowMode() === "AI") return;
-
-                const btn = e.target?.closest?.("button[data-symbol-mode]");
-                if (!btn) return;
-
-                activeMode = (btn.dataset.symbolMode || "POPULAR").trim();
-
-                for (const b of modeGroup.querySelectorAll("button[data-symbol-mode]")) {
-                    b.classList.toggle("active", b === btn);
+            try {
+                if (looksLikeUiState(state)) {
+                    applyUiState(state);
                 }
 
                 await reloadSymbols();
+
+                const currentSymbol = normalizeUpper(symbolHidden?.value || "");
+                if (currentSymbol) {
+                    await loadLimits(currentSymbol);
+                } else {
+                    setLimitsUiEmpty();
+                }
+            } catch (e) {
+                console.error("[trade] reloadAfterContextChange failed:", e);
+            } finally {
+                contextReloadInFlight = false;
+            }
+        }
+
+        const modeHost = byId("tradeSymbolModes");
+        if (modeHost) {
+            modeHost.querySelectorAll("[data-symbol-mode]").forEach(btn => {
+                btn.addEventListener("click", async () => {
+                    const m = btn.getAttribute("data-symbol-mode") || "POPULAR";
+                    setActiveSymbolMode(m);
+                    await reloadSymbols();
+                });
             });
         }
 
-        if (tfSelect) {
-            tfSelect.addEventListener("change", async () => {
-                if (nowMode() === "AI") {
-                    setModeUi();
-                    return;
-                }
-                markChanged("timeframe");
-                scheduleSave(250);
-            });
-        }
+        assetSelect.addEventListener("change", async () => {
+            const asset = normalizeUpper(assetSelect.value || "");
+            setAccountAssetUi(asset);
+
+            dispatchAccountAssetChanged(asset, "trade_asset_change");
+
+            setSymbolUi("");
+            setLimitsUiEmpty();
+
+            scheduleSave(10);
+            await reloadSymbols();
+        });
+
+        tfSelect.addEventListener("change", () => scheduleSave(180));
 
         if (candlesInput) {
             let t = null;
             candlesInput.addEventListener("input", () => {
                 if (nowMode() === "AI") return;
-
-                markChanged("cachedCandlesLimit");
                 if (t) clearTimeout(t);
-                t = setTimeout(() => scheduleSave(200), 600);
+                t = setTimeout(() => scheduleSave(250), 450);
             });
             candlesInput.addEventListener("change", () => {
                 if (nowMode() === "AI") return;
-
-                markChanged("cachedCandlesLimit");
-                scheduleSave(200);
+                scheduleSave(180);
             });
         }
 
-        // =====================================================
-        // first load
-        // =====================================================
+        window.addEventListener("strategy:controlModeChanged", () => setModeUi());
+
         setModeUi();
-
-        setSymbolUi(symbolHidden?.value || symbolLabel?.textContent || "");
         setLimitsUiEmpty();
+        setAccountAssetUi(getAccountAsset());
 
-        // ✅ при старте: только обновляем ctx кэши, без событий
-        notifyAssetChanged(getAssetForRequest(), { silent: true });
-        notifyModeChanged(nowMode(), { silent: true });
+        const initialSymbol = normalizeUpper(symbolHidden?.value || "");
+        if (initialSymbol) {
+            loadLimits(initialSymbol).catch(() => {});
+        }
 
         reloadSymbols().catch(() => {});
+
+        const onState = async (state) => {
+            try {
+                if (!looksLikeUiState(state)) return;
+
+                const before = lastCtxKey;
+
+                applyUiState(state);
+
+                const after = getCtxKey(getCtx());
+                if (before !== after) {
+                    lastCtxKey = after;
+                    await reloadAfterContextChange(state);
+                } else {
+                    lastCtxKey = after;
+                }
+            } catch (e) {
+                console.error("[trade] onState failed:", e);
+            }
+        };
+
+        if (window.StrategySettingsStore && typeof window.StrategySettingsStore.subscribe === "function") {
+            window.StrategySettingsStore.subscribe(onState);
+        }
+        window.addEventListener("strategy:state", (ev) => onState(ev?.detail));
     }
 
     return { init };
 })();
 
-// алиас для совместимости, если где-то осталось старое имя
 window.SettingsTabMarket = window.SettingsTabTrade;

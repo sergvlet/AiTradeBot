@@ -1,6 +1,7 @@
 package com.chicu.aitradebot.market.stream;
 
 import com.chicu.aitradebot.market.MarketPriceService;
+import com.chicu.aitradebot.market.model.UnifiedKline;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -17,24 +18,39 @@ public class MarketStreamRouter {
     private final MarketPriceService priceService;
 
     /**
-     * symbol → BINANCE / BYBIT
-     * Если карта пустая — пропускаются ВСЕ источники (режим по умолчанию).
+     * symbol -> exchangeName
+     *
+     * Если карта пустая — фильтрация отключена (пропускаем всё).
+     * Если символ есть в карте — пропускаем события только от указанной биржи.
      */
     private final Map<String, String> allowedExchange = new ConcurrentHashMap<>();
 
-
     /**
-     * Включает фильтрацию и привязывает символ к бирже
+     * Включает фильтрацию и привязывает символ к бирже.
      */
     public void allowSymbol(String symbol, String exchangeName) {
-        if (symbol == null || exchangeName == null) return;
-        allowedExchange.put(symbol.toUpperCase(), exchangeName.toUpperCase());
-        log.info("✅ Разрешён стрим: {} @ {}", symbol, exchangeName);
+        String sym = normalize(symbol);
+        String ex  = normalize(exchangeName);
+
+        if (sym.isEmpty() || ex.isEmpty()) return;
+
+        allowedExchange.put(sym, ex);
+        log.info("✅ Разрешён стрим: {} @ {}", sym, ex);
     }
 
+    /**
+     * (Опционально) убрать ограничение по символу.
+     */
+    public void disallowSymbol(String symbol) {
+        String sym = normalize(symbol);
+        if (sym.isEmpty()) return;
+
+        allowedExchange.remove(sym);
+        log.info("🧹 Фильтр снят: {}", sym);
+    }
 
     /**
-     * Основной роутер
+     * Основной роутер тиков.
      */
     public void route(Tick tick) {
         if (tick == null) return;
@@ -42,45 +58,59 @@ public class MarketStreamRouter {
         String symbol = normalize(tick.symbol());
         if (symbol.isEmpty()) return;
 
-        // ФИЛЬТРАЦИЯ ТИКОВ
-        if (!isAllowed(symbol, tick.exchange())) {
-            return;
-        }
+        String exchangeFromEvent = normalize(tick.exchange());
+        if (!isAllowed(symbol, exchangeFromEvent)) return;
 
         BigDecimal price = tick.price();
-        if (price == null || price.signum() <= 0) return;
+        if (!isValidPrice(price)) return;
 
         priceService.updatePrice(symbol, price);
-
-        //log.debug("💹 [{}] {} = {}", tick.exchange(), symbol, price);
+        // log.debug("💹 [{}] {} = {}", exchangeFromEvent, symbol, price);
     }
 
+    /**
+     * Роутер KLINE (универсальный).
+     * Цена берётся из close (самая логичная для "текущей" цены на UI/логике).
+     */
+    public void routeKline(String exchangeName, UnifiedKline kline) {
+        if (kline == null) return;
+
+        String symbol = normalize(kline.getSymbol());
+        if (symbol.isEmpty()) return;
+
+        String exchangeFromEvent = normalize(exchangeName);
+        if (!isAllowed(symbol, exchangeFromEvent)) return;
+
+        BigDecimal close = kline.getClose();
+        if (!isValidPrice(close)) return;
+
+        priceService.updatePrice(symbol, close);
+        // log.debug("🕯 [{}] {} close={}", exchangeFromEvent, symbol, close);
+    }
 
     /**
-     * Логика допуска источников
+     * Логика допуска источников:
      * 1) Если allowedExchange пустой → пропускаем всё
      * 2) Если символ есть в карте → пропускаем только подходящую биржу
-     * 3) Если символа нет в карте → пропускаем (символ не отфильтрован)
+     * 3) Если символа нет в карте → пропускаем (символ не ограничен)
      */
-    private boolean isAllowed(String symbol, String exchangeFromTick) {
+    private boolean isAllowed(String symbol, String exchangeFromEvent) {
 
-        // 1) Если пользователь НЕ настроил фильтрацию — разрешаем ВСЁ
         if (allowedExchange.isEmpty()) {
             return true;
         }
 
-        // 2) Пользователь ограничил именно этот символ?
         String allowed = allowedExchange.get(symbol);
-
         if (allowed == null) {
-            // Фильтрация включена, но символ не указан → В ЭТОМ случае допускаем цену
             return true;
         }
 
-        // 3) Символ найден → пропускаем только правильную биржу
-        return allowed.equalsIgnoreCase(exchangeFromTick);
+        return allowed.equalsIgnoreCase(exchangeFromEvent);
     }
 
+    private boolean isValidPrice(BigDecimal price) {
+        return price != null && price.signum() > 0;
+    }
 
     private String normalize(String s) {
         return s == null ? "" : s.trim().toUpperCase();

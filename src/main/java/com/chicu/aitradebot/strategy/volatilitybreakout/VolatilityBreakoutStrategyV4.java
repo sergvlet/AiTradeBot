@@ -266,14 +266,6 @@ public class VolatilityBreakoutStrategyV4 implements TradingStrategy {
             // =====================================================
             if (!st.inPosition && breakout) {
 
-                Integer cooldown = ss != null ? ss.getCooldownSeconds() : null;
-                if (cooldown != null && cooldown > 0 && st.lastTradeClosedAt != null) {
-                    long passed = Duration.between(st.lastTradeClosedAt, time).getSeconds();
-                    if (passed < cooldown) {
-                        pushHoldThrottled(chatId, sym, st, "cooldown", time);
-                        return;
-                    }
-                }
 
                 // уверенность/score: насколько выше базы
                 final double score = clamp01((rangePct / Math.max(0.000001, baseRangePct)) / Math.max(1.0, mult)) * 100.0;
@@ -447,14 +439,12 @@ public class VolatilityBreakoutStrategyV4 implements TradingStrategy {
         String tf     = ss != null ? safe(ss.getTimeframe()) : "null";
 
         String candles  = ss != null && ss.getCachedCandlesLimit() != null ? String.valueOf(ss.getCachedCandlesLimit()) : "null";
-        String cooldown = ss != null && ss.getCooldownSeconds() != null ? String.valueOf(ss.getCooldownSeconds()) : "null";
 
         String w = cfg != null && cfg.getWindowSize() != null ? String.valueOf(cfg.getWindowSize()) : "null";
         String m = cfg != null && cfg.getBreakoutMultiplier() != null ? String.valueOf(cfg.getBreakoutMultiplier()) : "null";
         String r = cfg != null && cfg.getMinRangePct() != null ? String.valueOf(cfg.getMinRangePct()) : "null";
 
-        return symbol + "|" + ex + "|" + net + "|" + tf + "|" + candles + "|" + cooldown
-                + "|" + w + "|" + m + "|" + r;
+        return symbol + "|" + ex + "|" + net + "|" + tf + "|" + candles + "|"  + w + "|" + m + "|" + r;
     }
 
     // =====================================================
@@ -463,7 +453,7 @@ public class VolatilityBreakoutStrategyV4 implements TradingStrategy {
 
     private StrategySettings loadStrategySettings(Long chatId) {
         return strategySettingsService
-                .findAllByChatId(chatId, null, null)
+                .findAllByChatId(chatId)
                 .stream()
                 .filter(s -> s.getType() == StrategyType.VOLATILITY_BREAKOUT)
                 .sorted(

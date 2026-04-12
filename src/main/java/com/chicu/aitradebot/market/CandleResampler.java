@@ -119,4 +119,12 @@ public final class CandleResampler {
             default -> -1;
         };
     }
+    private boolean isScalpTimeframe(String timeframe) {
+        long tfMs = timeframeToMillis(timeframe);
+        if (tfMs <= 0) {
+            return false;
+        }
+
+        return tfMs <= 5L * 60_000L;
+    }
 }

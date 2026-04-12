@@ -9,11 +9,15 @@ import org.springframework.beans.factory.config.BeanPostProcessor;
 import org.springframework.core.annotation.AnnotatedElementUtils;
 import org.springframework.stereotype.Component;
 
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
 @Slf4j
 @Component
 public class StrategyBindingProcessor implements BeanPostProcessor {
 
     private final StrategyRegistry registry;
+    private final Set<String> processed = ConcurrentHashMap.newKeySet();
 
     public StrategyBindingProcessor(StrategyRegistry registry) {
         this.registry = registry;
@@ -22,29 +26,39 @@ public class StrategyBindingProcessor implements BeanPostProcessor {
     @Override
     public Object postProcessAfterInitialization(@NotNull Object bean, @NotNull String beanName) throws BeansException {
 
-        // Прокси тоже обычно instanceof TradingStrategy, так что это ок.
         if (!(bean instanceof TradingStrategy strategy)) {
             return bean;
         }
 
-        // ✅ КЛЮЧЕВО: берём реальный класс (а не proxy-class)
         Class<?> targetClass = AopUtils.getTargetClass(bean);
+        if (targetClass == null) {
+            targetClass = bean.getClass();
+        }
 
-        // ✅ Надёжный поиск аннотации (учитывает наследование/мета-аннотации)
-        StrategyBinding binding =
-                AnnotatedElementUtils.findMergedAnnotation(targetClass, StrategyBinding.class);
+        StrategyBinding binding = AnnotatedElementUtils.findMergedAnnotation(targetClass, StrategyBinding.class);
 
         if (binding == null) {
-            // Можно оставить debug, чтобы не шуметь в логах
-            log.debug("Strategy bean has no @StrategyBinding: beanName={}, class={}",
-                    beanName, targetClass.getName());
+            if (log.isDebugEnabled()) {
+                log.debug("Стратегия без @StrategyBinding пропущена: beanName={}, class={}", beanName, targetClass.getName());
+            }
+            return bean;
+        }
+
+        String dedupKey = binding.value().name() + "|" + beanName + "|" + targetClass.getName();
+        if (!processed.add(dedupKey)) {
+            if (log.isDebugEnabled()) {
+                log.debug("Повторная регистрация пропущена: type={} beanName={} class={}",
+                        binding.value(), beanName, targetClass.getName());
+            }
             return bean;
         }
 
         registry.register(binding.value(), strategy);
 
-        log.info("✅ Strategy bound: {} -> {} (beanName={})",
-                binding.value(), targetClass.getSimpleName(), beanName);
+        if (log.isDebugEnabled()) {
+            log.debug("✅ Strategy bound: {} -> {} (beanName={})",
+                    binding.value(), targetClass.getSimpleName(), beanName);
+        }
 
         return bean;
     }

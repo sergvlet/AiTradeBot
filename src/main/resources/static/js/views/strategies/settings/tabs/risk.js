@@ -2,598 +2,534 @@
 
 window.SettingsTabRisk = (function () {
 
-    function init() {
-        const ctx = window.StrategySettingsContext;
-        if (!ctx) return;
+    let started = false;
+    let currentAsset = "USDT";
 
-        const form = document.getElementById("riskForm");
-        if (!form) return;
+    let refreshInFlight = false;
+    let lastRefreshAt = 0;
+    let saveInFlight = false;
+    let saveTimer = null;
 
-        // =====================================================
-        // UI
-        // =====================================================
-        const riskModeBadge = document.getElementById("riskModeBadge");
-        const riskModeHelp  = document.getElementById("riskModeHelp");
+    const DEBUG = false;
+    function dbg(...a) { if (DEBUG) console.log("[risk]", ...a); }
 
-        const saveState   = document.getElementById("riskSaveState");
-        const saveMeta    = document.getElementById("riskSaveMeta");
-        const changedList = document.getElementById("riskChangedList");
-        const dirtyBadge  = document.getElementById("riskDirtyBadge");
+    function byId(id) { return document.getElementById(id); }
 
-        // confirm modal (используем общий, если он уже есть на странице)
-        const confirmModalEl = document.getElementById("generalConfirmModal");
-        const confirmTitleEl = document.getElementById("generalConfirmTitle");
-        const confirmTextEl  = document.getElementById("generalConfirmText");
-        const confirmOkBtn   = document.getElementById("generalConfirmOk");
+    function getCtx() {
+        return window.StrategySettingsContext || null;
+    }
 
-        // режим управления — берём из вкладки general
-        const controlModeSelect = document.getElementById("advancedControlMode");
+    function isBlank(v) {
+        return v === null || v === undefined || String(v).trim() === "";
+    }
 
-        // general (для валюты и free)
-        const accountAssetSelect   = document.getElementById("accountAssetSelect");
-        const selectedAssetView    = document.getElementById("selectedAssetView");
-        const availableBalanceView = document.getElementById("availableBalanceView");
+    function normalizeUpper(v) {
+        return isBlank(v) ? "" : String(v).trim().toUpperCase();
+    }
 
-        // =====================================================
-        // Inputs (risk)
-        // =====================================================
-        const riskPerTradePctInput       = document.getElementById("riskPerTradePctInput");
-        const minRiskRewardInput         = document.getElementById("minRiskRewardInput");
-        const leverageInput              = document.getElementById("leverageInput");
+    function normalizeMode(v) {
+        const x = normalizeUpper(v || "ALL");
+        return ["ALL", "FIX", "PCT"].includes(x) ? x : "ALL";
+    }
 
-        const allowAveragingInput        = document.getElementById("allowAveragingInput");
-        const cooldownSecondsInput       = document.getElementById("cooldownSecondsInput");
-        const maxTradesPerDayInput       = document.getElementById("maxTradesPerDayInput");
+    function toNum(v) {
+        if (v === null || v === undefined) return null;
+        const s = String(v).trim().replace(",", ".");
+        if (!s) return null;
+        const n = Number(s);
+        return Number.isFinite(n) ? n : null;
+    }
 
-        const maxDrawdownPctInput        = document.getElementById("maxDrawdownPctInput");
-        const maxDrawdownUsdInput        = document.getElementById("maxDrawdownUsdInput");
-        const drawdownPreview            = document.getElementById("drawdownPreview");
+    function fmt(n) {
+        if (n === null || n === undefined || !Number.isFinite(n)) return "—";
+        return (Math.round(n * 100) / 100).toFixed(2);
+    }
 
-        const maxPositionPctInput        = document.getElementById("maxPositionPctInput");
-        const maxPositionUsdInput        = document.getElementById("maxPositionUsdInput");
-        const positionPreview            = document.getElementById("positionPreview");
+    function fmtNum(v, digits) {
+        if (v === null || v === undefined) return null;
+        const n = Number(v);
+        if (!Number.isFinite(n)) return null;
+        const d = Number.isFinite(digits) ? digits : 8;
+        return n.toFixed(d).replace(/\.?0+$/, "");
+    }
 
-        const cooldownAfterLossSecondsInput = document.getElementById("cooldownAfterLossSecondsInput");
-        const maxConsecutiveLossesInput     = document.getElementById("maxConsecutiveLossesInput");
-        const maxOpenOrdersInput            = document.getElementById("maxOpenOrdersInput");
+    function looksLikeUiState(obj) {
+        return !!(
+            obj &&
+            typeof obj === "object" &&
+            ("chatId" in obj) &&
+            ("type" in obj) &&
+            ("exchange" in obj) &&
+            ("network" in obj)
+        );
+    }
 
-        // =====================================================
-        // API endpoints
-        // =====================================================
-        const AUTOSAVE_ENDPOINT = "/api/strategy/settings/autosave";
-
-        // =====================================================
-        // Autosave helper (без кнопок)
-        // =====================================================
-        function nowHHmm() {
-            const d = new Date();
-            const hh = String(d.getHours()).padStart(2, "0");
-            const mm = String(d.getMinutes()).padStart(2, "0");
-            return `${hh}:${mm}`;
+    function ensureStrategyStore() {
+        if (window.StrategySettingsStore && typeof window.StrategySettingsStore.subscribe === "function") {
+            return window.StrategySettingsStore;
         }
 
-        function setSavingUi() {
-            if (saveState) {
-                saveState.classList.remove("bg-success");
-                saveState.classList.add("bg-secondary");
-                saveState.textContent = "Сохранение…";
-            }
-        }
+        let state = null;
+        const listeners = new Set();
 
-        function setSavedUi(metaText) {
-            if (dirtyBadge) dirtyBadge.classList.add("d-none");
-            if (saveState) {
-                saveState.classList.remove("bg-secondary");
-                saveState.classList.add("bg-success");
-                saveState.textContent = "Сохранено ✓";
-            }
-            if (saveMeta) saveMeta.textContent = metaText || nowHHmm();
-        }
-
-        function setErrorUi() {
-            if (saveState) {
-                saveState.classList.remove("bg-success");
-                saveState.classList.add("bg-secondary");
-                saveState.textContent = "Ошибка";
-            }
-            if (saveMeta) saveMeta.textContent = "проверь API";
-        }
-
-        function markChanged(key) {
-            if (dirtyBadge) dirtyBadge.classList.remove("d-none");
-            if (changedList) {
-                const t = (changedList.textContent || "").trim();
-                const next = key && !t.includes(key) ? (t ? (t + ", " + key) : key) : t;
-                changedList.textContent = next;
-            }
-        }
-
-        // =====================================================
-        // Helpers (numbers, asset, free)
-        // =====================================================
-        function parseNumberLoose(v) {
-            if (v == null) return null;
-            const s = String(v).trim().replace(",", ".");
-            if (!s) return null;
-            const n = Number(s);
-            return Number.isFinite(n) ? n : null;
-        }
-
-        function fmt(n, decimals = 8) {
-            if (!Number.isFinite(n)) return "—";
-            return n.toFixed(decimals).replace(/\.?0+$/, "");
-        }
-
-        function getAssetForUi() {
-            const a1 = (accountAssetSelect?.value || "").trim();
-            if (a1) return a1;
-
-            const a2 = (selectedAssetView?.textContent || "").trim();
-            if (a2 && a2 !== "—") return a2;
-
-            return null;
-        }
-
-        function getFreeBalanceNumber() {
-            const raw = (availableBalanceView?.value || "").trim();
-            return parseNumberLoose(raw);
-        }
-
-        // =====================================================
-        // Confirm modal (только когда надо, и не мешает вводить)
-        // =====================================================
-        function showConfirm(title, text) {
-            return new Promise((resolve) => {
-                if (!confirmModalEl || !window.bootstrap?.Modal) {
-                    resolve(true);
-                    return;
-                }
-
-                if (confirmTitleEl) confirmTitleEl.textContent = title || "Подтверждение";
-                if (confirmTextEl) confirmTextEl.textContent = text || "Сохранить изменения?";
-
-                const modal = window.bootstrap.Modal.getOrCreateInstance(confirmModalEl, {
-                    backdrop: "static",
-                    keyboard: false
+        const store = {
+            set(next) {
+                state = next || null;
+                listeners.forEach(fn => {
+                    try { fn(state); } catch (_) {}
                 });
-
-                let done = false;
-
-                const cleanup = () => {
-                    confirmOkBtn?.removeEventListener("click", onOk);
-                    confirmModalEl.removeEventListener("hidden.bs.modal", onHide);
-                };
-
-                const onOk = () => {
-                    if (done) return;
-                    done = true;
-                    cleanup();
-                    modal.hide();
-                    resolve(true);
-                };
-
-                const onHide = () => {
-                    if (done) return;
-                    done = true;
-                    cleanup();
-                    resolve(false);
-                };
-
-                confirmOkBtn?.addEventListener("click", onOk, { once: true });
-                confirmModalEl.addEventListener("hidden.bs.modal", onHide);
-                modal.show();
-            });
-        }
-
-        // Gate: input → дебаунс, blur/change → мгновенно
-        const ConfirmGate = (function () {
-            let timer = null;
-            let inFlight = false;
-
-            function clear() {
-                if (timer) {
-                    clearTimeout(timer);
-                    timer = null;
-                }
-            }
-
-            async function runHybridConfirm() {
-                const mode = getControlMode();
-                if (mode !== "HYBRID") return true;
-                return await showConfirm(
-                    "Подтверждение",
-                    "Изменение параметров риска влияет на объём сделок. Сохранить?"
-                );
-            }
-
-            async function commit(action, rollback) {
-                if (inFlight) return;
-                inFlight = true;
-                try {
-                    const ok = await runHybridConfirm();
-                    if (!ok) {
-                        if (typeof rollback === "function") rollback();
-                        return;
-                    }
-                    await action();
-                } finally {
-                    inFlight = false;
-                }
-            }
-
-            function schedule(delayMs, action, rollback) {
-                clear();
-                timer = setTimeout(() => {
-                    timer = null;
-                    commit(action, rollback);
-                }, Math.max(0, delayMs | 0));
-            }
-
-            return { clear, schedule, commit };
-        })();
-
-        // =====================================================
-        // Mode badge + enable/disable
-        // =====================================================
-        function getControlMode() {
-            const v = (controlModeSelect?.value || ctx.advancedControlMode || "MANUAL").trim().toUpperCase();
-            return v || "MANUAL";
-        }
-
-        function setModeUi(mode) {
-            if (riskModeBadge) {
-                riskModeBadge.textContent = mode;
-                riskModeBadge.classList.remove("bg-success", "bg-warning", "bg-secondary");
-                if (mode === "AI") riskModeBadge.classList.add("bg-warning");
-                else if (mode === "HYBRID") riskModeBadge.classList.add("bg-secondary");
-                else riskModeBadge.classList.add("bg-success");
-            }
-
-            if (riskModeHelp) {
-                if (mode === "AI") {
-                    riskModeHelp.textContent = "AI режим: значения задаёт система. Поля только для просмотра.";
-                } else if (mode === "HYBRID") {
-                    riskModeHelp.textContent = "HYBRID: изменения сохраняются автоматически после подтверждения.";
-                } else {
-                    riskModeHelp.textContent = "MANUAL: изменения сохраняются автоматически.";
-                }
-            }
-
-            const disable = (mode === "AI");
-            const allInputs = form.querySelectorAll("input, select, textarea");
-            allInputs.forEach(el => {
-                if (el.id === "advancedControlMode") return;
-                el.disabled = disable;
-            });
-        }
-
-        // =====================================================
-        // Preview + взаимное исключение полей
-        // =====================================================
-        function updateDrawdownPreview() {
-            if (!drawdownPreview) return;
-
-            const asset = getAssetForUi();
-            const free = getFreeBalanceNumber();
-
-            const pct = parseNumberLoose(maxDrawdownPctInput?.value);
-            const usd = parseNumberLoose(maxDrawdownUsdInput?.value);
-
-            if (pct != null) {
-                if (free != null && asset) {
-                    const abs = (free * pct) / 100.0;
-                    drawdownPreview.textContent = `Просадка: ${fmt(pct, 2)}% ≈ ${fmt(abs)} ${asset}`;
-                } else {
-                    drawdownPreview.textContent = `Просадка: ${fmt(pct, 2)}%`;
-                }
-                return;
-            }
-
-            if (usd != null) {
-                drawdownPreview.textContent = asset ? `Просадка: ${fmt(usd)} ${asset}` : `Просадка: ${fmt(usd)}`;
-                return;
-            }
-
-            drawdownPreview.textContent = "Просадка: —";
-        }
-
-        function updatePositionPreview() {
-            if (!positionPreview) return;
-
-            const asset = getAssetForUi();
-            const free = getFreeBalanceNumber();
-
-            const pct = parseNumberLoose(maxPositionPctInput?.value);
-            const usd = parseNumberLoose(maxPositionUsdInput?.value);
-
-            if (pct != null) {
-                if (free != null && asset) {
-                    const abs = (free * pct) / 100.0;
-                    positionPreview.textContent = `Позиция: ${fmt(pct, 2)}% ≈ ${fmt(abs)} ${asset}`;
-                } else {
-                    positionPreview.textContent = `Позиция: ${fmt(pct, 2)}%`;
-                }
-                return;
-            }
-
-            if (usd != null) {
-                positionPreview.textContent = asset ? `Позиция: ${fmt(usd)} ${asset}` : `Позиция: ${fmt(usd)}`;
-                return;
-            }
-
-            positionPreview.textContent = "Позиция: —";
-        }
-
-        function clearPairIfFilled(primaryEl, secondaryEl) {
-            const p = parseNumberLoose(primaryEl?.value);
-            if (p == null) return;
-            if (secondaryEl && String(secondaryEl.value || "").trim() !== "") {
-                secondaryEl.value = "";
-            }
-        }
-
-        // =====================================================
-        // Payload (scope=risk) — НЕ затираем поля, если инпута нет
-        // =====================================================
-        function buildPayloadRisk() {
-            return {
-                chatId: ctx.chatId,
-                type: ctx.type,
-                exchange: ctx.exchange,
-                network: ctx.network,
-                scope: "risk",
-
-                riskPerTradePct: (riskPerTradePctInput?.value || "").trim() || null,
-                minRiskReward: (minRiskRewardInput?.value || "").trim() || null,
-                leverage: (leverageInput?.value || "").trim() || null,
-
-                allowAveraging: allowAveragingInput ? !!allowAveragingInput.checked : null,
-                cooldownSeconds: (cooldownSecondsInput?.value || "").trim() || null,
-                maxTradesPerDay: (maxTradesPerDayInput?.value || "").trim() || null,
-
-                maxDrawdownPct: (maxDrawdownPctInput?.value || "").trim() || null,
-                maxDrawdownUsd: (maxDrawdownUsdInput?.value || "").trim() || null,
-
-                maxPositionPct: (maxPositionPctInput?.value || "").trim() || null,
-                maxPositionUsd: (maxPositionUsdInput?.value || "").trim() || null,
-
-                cooldownAfterLossSeconds: (cooldownAfterLossSecondsInput?.value || "").trim() || null,
-                maxConsecutiveLosses: (maxConsecutiveLossesInput?.value || "").trim() || null,
-
-                maxOpenOrders: (maxOpenOrdersInput?.value || "").trim() || null
-            };
-        }
-
-        async function saveNow() {
-            const payload = buildPayloadRisk();
-            setSavingUi();
-
-            try {
-                const res = await fetch(AUTOSAVE_ENDPOINT, {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                        "Accept": "application/json"
-                    },
-                    body: JSON.stringify(payload)
-                });
-
-                if (!res.ok) throw new Error(`autosave http ${res.status}`);
-
-                // если бек вернул JSON — ок, но нам не обязателен
-                await res.text().catch(() => "");
-                setSavedUi();
-            } catch (e) {
-                console.error("risk autosave failed", e);
-                setErrorUi();
-            }
-        }
-
-        // =====================================================
-        // Bind helpers (чтобы модалка не мешала)
-        // =====================================================
-        function bindNumberInput(el, key, opts) {
-            if (!el) return;
-
-            const delay = opts?.delayMs ?? 900;
-            const onInput = opts?.onInput;
-            const onBeforeSave = opts?.onBeforeSave;
-            const confirmRollback = opts?.rollback;
-
-            el.dataset.prevValue = el.value || "";
-
-            el.addEventListener("input", () => {
-                // ✅ AI: игнорируем (на всякий случай, если инпут не disabled)
-                if (getControlMode() === "AI") return;
-
-                markChanged(key);
-                if (typeof onInput === "function") onInput();
-
-                const prev = el.dataset.prevValue ?? "";
-                ConfirmGate.schedule(delay, async () => {
-                    if (getControlMode() === "AI") return;
-
-                    if (typeof onBeforeSave === "function") onBeforeSave();
-                    el.dataset.prevValue = el.value || "";
-                    await saveNow();
-                }, () => {
-                    el.value = prev;
-                    if (typeof confirmRollback === "function") confirmRollback();
-                });
-            });
-
-            el.addEventListener("change", async () => {
-                ConfirmGate.clear();
-
-                // ✅ AI: откатываем и выходим
-                if (getControlMode() === "AI") {
-                    el.value = el.dataset.prevValue ?? "";
-                    if (typeof confirmRollback === "function") confirmRollback();
-                    return;
-                }
-
-                markChanged(key);
-
-                const prev = el.dataset.prevValue ?? "";
-                const next = el.value || "";
-
-                const n = parseNumberLoose(next);
-                if (next.trim() !== "" && n == null) {
-                    el.value = prev;
-                    if (typeof confirmRollback === "function") confirmRollback();
-                    return;
-                }
-
-                await ConfirmGate.commit(async () => {
-                    if (typeof onBeforeSave === "function") onBeforeSave();
-                    el.dataset.prevValue = el.value || "";
-                    await saveNow();
-                }, () => {
-                    el.value = prev;
-                    if (typeof confirmRollback === "function") confirmRollback();
-                });
-            });
-        }
-
-        function bindCheckbox(el, key, opts) {
-            if (!el) return;
-
-            el.dataset.prevChecked = el.checked ? "1" : "0";
-
-            el.addEventListener("change", async () => {
-                // ✅ AI: откат
-                if (getControlMode() === "AI") {
-                    el.checked = (el.dataset.prevChecked === "1");
-                    return;
-                }
-
-                markChanged(key);
-                const prev = el.dataset.prevChecked === "1";
-                const next = !!el.checked;
-
-                await ConfirmGate.commit(async () => {
-                    el.dataset.prevChecked = next ? "1" : "0";
-                    await saveNow();
-                }, () => {
-                    el.checked = prev;
-                });
-            });
-        }
-
-        // =====================================================
-        // Binds
-        // =====================================================
-        bindNumberInput(riskPerTradePctInput, "riskPerTradePct");
-        bindNumberInput(minRiskRewardInput, "minRiskReward");
-        bindNumberInput(leverageInput, "leverage", {
-            onBeforeSave: () => {
-                const n = parseNumberLoose(leverageInput.value);
-                if (n != null && n < 1) leverageInput.value = "1";
-            }
-        });
-
-        bindCheckbox(allowAveragingInput, "allowAveraging");
-        bindNumberInput(cooldownSecondsInput, "cooldownSeconds");
-        bindNumberInput(maxTradesPerDayInput, "maxTradesPerDay");
-
-        // drawdown pair
-        bindNumberInput(maxDrawdownPctInput, "maxDrawdownPct", {
-            onInput: () => {
-                clearPairIfFilled(maxDrawdownPctInput, maxDrawdownUsdInput);
-                updateDrawdownPreview();
             },
-            onBeforeSave: () => {
-                clearPairIfFilled(maxDrawdownPctInput, maxDrawdownUsdInput);
-                updateDrawdownPreview();
+            setState(next) {
+                this.set(next);
             },
-            rollback: updateDrawdownPreview
-        });
-
-        bindNumberInput(maxDrawdownUsdInput, "maxDrawdownUsd", {
-            onInput: () => {
-                clearPairIfFilled(maxDrawdownUsdInput, maxDrawdownPctInput);
-                updateDrawdownPreview();
+            get() {
+                return state;
             },
-            onBeforeSave: () => {
-                clearPairIfFilled(maxDrawdownUsdInput, maxDrawdownPctInput);
-                updateDrawdownPreview();
+            getState() {
+                return state;
             },
-            rollback: updateDrawdownPreview
-        });
-
-        // position pair
-        bindNumberInput(maxPositionPctInput, "maxPositionPct", {
-            onInput: () => {
-                clearPairIfFilled(maxPositionPctInput, maxPositionUsdInput);
-                updatePositionPreview();
+            subscribe(fn) {
+                if (typeof fn !== "function") return () => {};
+                listeners.add(fn);
+                try { fn(state); } catch (_) {}
+                return () => listeners.delete(fn);
             },
-            onBeforeSave: () => {
-                clearPairIfFilled(maxPositionPctInput, maxPositionUsdInput);
-                updatePositionPreview();
-            },
-            rollback: updatePositionPreview
-        });
-
-        bindNumberInput(maxPositionUsdInput, "maxPositionUsd", {
-            onInput: () => {
-                clearPairIfFilled(maxPositionUsdInput, maxPositionPctInput);
-                updatePositionPreview();
-            },
-            onBeforeSave: () => {
-                clearPairIfFilled(maxPositionUsdInput, maxPositionPctInput);
-                updatePositionPreview();
-            },
-            rollback: updatePositionPreview
-        });
-
-        bindNumberInput(cooldownAfterLossSecondsInput, "cooldownAfterLossSeconds");
-        bindNumberInput(maxConsecutiveLossesInput, "maxConsecutiveLosses");
-        bindNumberInput(maxOpenOrdersInput, "maxOpenOrders");
-
-        // =====================================================
-        // Sync mode badge on change + слушаем глобальный эвент из General
-        // =====================================================
-        function syncMode() {
-            const mode = getControlMode();
-            setModeUi(mode);
-
-            // ✅ если режим стал AI — сбросим in-flight confirm/debounce
-            if (mode === "AI") {
-                ConfirmGate.clear();
-                setSavedUi(nowHHmm());
+            onChange(fn) {
+                return this.subscribe(fn);
             }
+        };
+
+        window.StrategySettingsStore = store;
+        return store;
+    }
+
+    function publishState(state) {
+        if (!looksLikeUiState(state)) return;
+
+        try {
+            ensureStrategyStore().setState(state);
+        } catch (_) {}
+
+        try {
+            window.dispatchEvent(new CustomEvent("strategy:state", { detail: state }));
+        } catch (_) {}
+    }
+
+    function ctxQuery() {
+        const ctx = getCtx();
+        if (!ctx) return "";
+
+        const q = new URLSearchParams();
+        if (ctx.chatId) q.set("chatId", String(ctx.chatId));
+        if (ctx.exchange) q.set("exchange", String(ctx.exchange));
+        if (ctx.network) q.set("network", String(ctx.network));
+        q.set("_ts", String(Date.now()));
+        return q.toString();
+    }
+
+    function setSaveState(text, ok) {
+        const badge = byId("riskSaveState");
+        const meta = byId("riskSaveMeta");
+
+        if (badge) {
+            badge.textContent = text || "Готово";
+            badge.className =
+                "badge " +
+                (ok === true ? "bg-success" :
+                    ok === false ? "bg-danger" :
+                        "bg-secondary");
         }
 
-        if (controlModeSelect) {
-            controlModeSelect.addEventListener("change", () => {
-                syncMode();
-            });
-        }
-
-        // ✅ общий сигнал от General (мы его диспатчим там)
-        window.addEventListener("strategy:controlModeChanged", (e) => {
-            const m = String(e?.detail?.mode || "").toUpperCase();
-            if (m) {
-                ctx.advancedControlMode = m;
-                syncMode();
-            }
-        });
-
-        // =====================================================
-        // First render
-        // =====================================================
-        syncMode();
-        updateDrawdownPreview();
-        updatePositionPreview();
-
-        // если актив/баланс меняется в general — превью тоже обновим
-        if (accountAssetSelect) {
-            accountAssetSelect.addEventListener("change", () => {
-                updateDrawdownPreview();
-                updatePositionPreview();
-            });
+        if (meta && text === "Сохранено") {
+            meta.textContent = new Date().toLocaleTimeString();
         }
     }
 
-    return { init };
+    function pickModeFromState(state) {
+        return normalizeMode(
+            state?.capitalMode ||
+            state?.riskCapitalMode ||
+            state?.strategy?.capitalMode ||
+            state?.settings?.capitalMode ||
+            "ALL"
+        );
+    }
+
+    function pickValueFromState(state) {
+        const v =
+            state?.capitalValue ??
+            state?.riskCapitalValue ??
+            state?.strategy?.capitalValue ??
+            state?.settings?.capitalValue ??
+            null;
+
+        return (v === null || v === undefined) ? "" : String(v);
+    }
+
+    function applyModeUi(mode, asset) {
+        const label = byId("riskValueLabel");
+        const input = byId("riskValueInput");
+        const unit = byId("riskValueUnit");
+        const hint = byId("riskValueHint");
+        const help = byId("riskModeHelp");
+        const badge = byId("riskModeBadge");
+
+        const m = normalizeMode(mode);
+        const a = normalizeUpper(asset || currentAsset || "USDT");
+
+        if (badge) badge.textContent = m;
+
+        if (m === "ALL") {
+            if (label) label.textContent = "Значение";
+            if (unit) unit.textContent = a || "USDT";
+            if (hint) hint.textContent = "Значение не требуется — будет использован весь доступный баланс.";
+            if (help) help.textContent = "ALL — стратегия может использовать весь доступный баланс выбранного актива.";
+
+            if (input) {
+                input.value = "";
+                input.disabled = true;
+                input.readOnly = true;
+                input.placeholder = "";
+            }
+            return;
+        }
+
+        if (m === "FIX") {
+            if (label) label.textContent = "Сумма";
+            if (unit) unit.textContent = a || "USDT";
+            if (hint) hint.textContent = "Фиксированная сумма на один вход.";
+            if (help) help.textContent = "FIX — стратегия использует фиксированную сумму выбранного актива.";
+
+            if (input) {
+                input.disabled = false;
+                input.readOnly = false;
+                input.placeholder = "Напр. 40";
+            }
+            return;
+        }
+
+        if (label) label.textContent = "Процент";
+        if (unit) unit.textContent = "%";
+        if (hint) hint.textContent = "Процент от доступного баланса.";
+        if (help) help.textContent = "PCT — стратегия использует долю от доступного баланса.";
+
+        if (input) {
+            input.disabled = false;
+            input.readOnly = false;
+            input.placeholder = "Напр. 25";
+        }
+    }
+
+    function calcPreview() {
+        const modeSel = byId("riskModeSelect");
+        const valInp = byId("riskValueInput");
+        const freeValueEl = byId("riskFreeBalanceValue");
+        const effEl = byId("riskEffectiveAmount");
+
+        const mode = normalizeMode(modeSel?.value || "ALL");
+        const free = toNum(freeValueEl?.value);
+        const raw = toNum(valInp?.value);
+
+        let eff = null;
+
+        if (mode === "ALL") {
+            eff = free;
+        } else if (mode === "FIX") {
+            eff = raw;
+        } else if (mode === "PCT") {
+            eff = (free !== null && raw !== null) ? (free * (raw / 100.0)) : null;
+        }
+
+        if (effEl) {
+            effEl.textContent = (eff !== null)
+                ? (fmt(eff) + " " + (currentAsset || "USDT"))
+                : "—";
+        }
+    }
+
+    function clampRiskIfNeeded() {
+        const modeSel = byId("riskModeSelect");
+        const valInp = byId("riskValueInput");
+        const freeValueEl = byId("riskFreeBalanceValue");
+
+        if (!modeSel || !valInp || !freeValueEl) return false;
+
+        const mode = normalizeMode(modeSel.value);
+        const free = toNum(freeValueEl.value);
+        const raw = toNum(valInp.value);
+
+        let changed = false;
+
+        if (mode === "FIX" && free !== null && raw !== null && raw > free) {
+            valInp.value = String(free);
+            changed = true;
+        }
+
+        if (mode === "PCT" && raw !== null && raw > 100) {
+            valInp.value = "100";
+            changed = true;
+        }
+
+        return changed;
+    }
+
+    async function refreshUiStateFromServer(reason) {
+        const ctx = getCtx();
+        if (!ctx?.type || !ctx?.chatId) return;
+        if (!window.SettingsApi?.getJson) return;
+
+        const now = Date.now();
+        if (refreshInFlight) return;
+        if (now - lastRefreshAt < 250) return;
+        lastRefreshAt = now;
+
+        refreshInFlight = true;
+        try {
+            const url = `/strategies/${encodeURIComponent(String(ctx.type))}/config/state?${ctxQuery()}`;
+            dbg("refresh:", reason, url);
+
+            const state = await window.SettingsApi.getJson(url);
+            if (looksLikeUiState(state)) {
+                publishState(state);
+            }
+        } catch (e) {
+            console.warn("[risk] refreshUiStateFromServer failed:", e);
+        } finally {
+            refreshInFlight = false;
+        }
+    }
+
+    async function saveRisk() {
+        const ctx = getCtx();
+        if (!ctx?.type || !ctx?.chatId) return;
+        if (!window.SettingsApi?.postForm) return;
+        if (saveInFlight) return;
+
+        const modeSel = byId("riskModeSelect");
+        const valInp = byId("riskValueInput");
+
+        const payload = {
+            chatId: String(ctx.chatId || ""),
+            saveScope: "risk",
+            tab: "risk",
+            exchange: ctx.exchange || "",
+            network: ctx.network || "",
+            capitalMode: normalizeMode(modeSel?.value || "ALL"),
+            capitalValue: String(valInp?.value ?? "").trim(),
+            accountAsset: normalizeUpper(byId("riskSelectedAsset")?.value || currentAsset || "")
+        };
+
+        saveInFlight = true;
+        setSaveState("Сохраняю…", null);
+
+        try {
+            const url = `/strategies/${encodeURIComponent(String(ctx.type))}/config?${ctxQuery()}`;
+            const state = await window.SettingsApi.postForm(url, payload);
+
+            setSaveState("Сохранено", true);
+
+            if (looksLikeUiState(state)) {
+                publishState(state);
+            } else {
+                await refreshUiStateFromServer("risk_save_ok");
+            }
+        } catch (e) {
+            setSaveState("Ошибка", false);
+            console.error("[risk] save failed:", e);
+        } finally {
+            saveInFlight = false;
+        }
+    }
+
+    function scheduleSaveRisk() {
+        clearTimeout(saveTimer);
+        saveTimer = setTimeout(() => {
+            saveTimer = null;
+            saveRisk().catch(() => {});
+        }, 250);
+    }
+
+    function applyUiState(state) {
+        if (!looksLikeUiState(state)) return;
+
+        const modeSel = byId("riskModeSelect");
+        const valInp = byId("riskValueInput");
+
+        const freeValueEl = byId("riskFreeBalanceValue");
+        const freeTextEl = byId("riskFreeBalanceText");
+        const assetEl = byId("riskSelectedAsset");
+        const assetTextEl = byId("riskAssetText");
+
+        const bal = state.selectedBalance || state.balance || null;
+
+        const nextAsset = normalizeUpper(
+            state.accountAsset || (bal && (bal.asset || bal.currency || bal.code))
+        );
+
+        if (nextAsset) {
+            currentAsset = nextAsset;
+
+            if (assetEl) assetEl.value = nextAsset;
+            if (assetTextEl) assetTextEl.textContent = nextAsset;
+
+            const ctx = getCtx();
+            if (ctx) ctx.accountAsset = nextAsset;
+        }
+
+        if (bal && bal.free !== undefined && bal.free !== null) {
+            if (freeValueEl) freeValueEl.value = String(bal.free);
+            if (freeTextEl) freeTextEl.textContent = fmtNum(bal.free, 8) || "—";
+        }
+
+        const modeFromState = pickModeFromState(state);
+        const valFromState = pickValueFromState(state);
+
+        if (modeSel && modeSel.value !== modeFromState) {
+            modeSel.value = modeFromState;
+        }
+
+        if (valInp && String(valInp.value || "") !== String(valFromState || "")) {
+            valInp.value = String(valFromState || "");
+        }
+
+        applyModeUi(modeFromState, currentAsset || "USDT");
+        clampRiskIfNeeded();
+        calcPreview();
+    }
+
+    function attachAccountAssetListeners() {
+        let assetRefreshTimer = null;
+
+        window.addEventListener("strategy:accountAssetChanged", (ev) => {
+            const next = normalizeUpper(ev?.detail?.asset || "");
+            if (!next) return;
+
+            currentAsset = next;
+
+            const assetEl = byId("riskSelectedAsset");
+            const assetTextEl = byId("riskAssetText");
+
+            if (assetEl) assetEl.value = next;
+            if (assetTextEl) assetTextEl.textContent = next;
+
+            calcPreview();
+
+            clearTimeout(assetRefreshTimer);
+            assetRefreshTimer = setTimeout(() => {
+                refreshUiStateFromServer("accountAsset_event").catch(() => {});
+            }, 100);
+        });
+    }
+
+    function init() {
+        if (started) return;
+
+        const ctx = getCtx();
+        if (!ctx?.chatId || !ctx?.type) {
+            dbg("ctx not ready -> skip init");
+            return;
+        }
+
+        if (!window.SettingsApi?.postForm || !window.SettingsApi?.getJson) {
+            dbg("SettingsApi not ready -> skip init");
+            return;
+        }
+
+        const form = byId("riskForm");
+        const modeSel = byId("riskModeSelect");
+        const valInp = byId("riskValueInput");
+
+        if (!form || !modeSel || !valInp) {
+            dbg("risk DOM not ready -> skip init");
+            return;
+        }
+
+        started = true;
+
+        const initModeEl = byId("riskInitMode");
+        const initValueEl = byId("riskInitValue");
+        const assetEl = byId("riskSelectedAsset");
+
+        currentAsset = normalizeUpper(assetEl?.value || "USDT");
+
+        const initMode = normalizeMode(initModeEl?.value || "ALL");
+        const initVal = String(initValueEl?.value || "").trim();
+
+        modeSel.value = initMode;
+        valInp.value = initVal;
+
+        applyModeUi(initMode, currentAsset);
+        clampRiskIfNeeded();
+        calcPreview();
+
+        ensureStrategyStore().subscribe((state) => {
+            try {
+                applyUiState(state);
+            } catch (e) {
+                console.warn("[risk] applyUiState failed:", e);
+            }
+        });
+
+        attachAccountAssetListeners();
+
+        modeSel.addEventListener("change", () => {
+            const m = normalizeMode(modeSel.value);
+
+            const freeValueEl = byId("riskFreeBalanceValue");
+            const free = toNum(freeValueEl?.value);
+            const currentRaw = String(valInp?.value || "").trim();
+
+            if (m === "ALL") {
+                valInp.value = "";
+            } else if (m === "FIX") {
+                if (!currentRaw) {
+                    if (free !== null && free > 0) {
+                        valInp.value = String(Math.min(free, 20));
+                    } else {
+                        valInp.value = "20";
+                    }
+                }
+            } else if (m === "PCT") {
+                if (!currentRaw) {
+                    valInp.value = "25";
+                }
+            }
+
+            clampRiskIfNeeded();
+            applyModeUi(m, currentAsset);
+            calcPreview();
+            saveRisk().catch(() => {});
+        });
+
+        valInp.addEventListener("input", () => {
+            clampRiskIfNeeded();
+            calcPreview();
+        });
+
+        valInp.addEventListener("change", () => {
+            clampRiskIfNeeded();
+            calcPreview();
+            scheduleSaveRisk();
+        });
+
+        document.querySelectorAll("[data-risk-set]").forEach(btn => {
+            btn.addEventListener("click", async () => {
+                const m = normalizeMode(btn.getAttribute("data-risk-mode") || "FIX");
+                const v = btn.getAttribute("data-risk-set") || "";
+
+                modeSel.value = m;
+                valInp.value = v;
+
+                clampRiskIfNeeded();
+                applyModeUi(m, currentAsset);
+                calcPreview();
+
+                await saveRisk();
+            });
+        });
+
+        refreshUiStateFromServer("risk_init").catch(() => {});
+    }
+
+    return { init, applyUiState };
 })();

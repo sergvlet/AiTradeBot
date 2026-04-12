@@ -236,14 +236,6 @@ public class RsiObosStrategyV4 implements TradingStrategy {
                     return;
                 }
 
-                Integer cooldown = ss != null ? ss.getCooldownSeconds() : null;
-                if (cooldown != null && cooldown > 0 && st.lastTradeClosedAt != null) {
-                    long passed = Duration.between(st.lastTradeClosedAt, time).getSeconds();
-                    if (passed < cooldown) {
-                        pushHoldThrottled(chatId, sym, st, "cooldown", time);
-                        return;
-                    }
-                }
 
                 if (rsi <= buyBelow) {
 
@@ -423,19 +415,17 @@ public class RsiObosStrategyV4 implements TradingStrategy {
         String tf     = ss != null ? safe(ss.getTimeframe()) : "null";
 
         String candles  = ss != null && ss.getCachedCandlesLimit() != null ? String.valueOf(ss.getCachedCandlesLimit()) : "null";
-        String cooldown = ss != null && ss.getCooldownSeconds() != null ? String.valueOf(ss.getCooldownSeconds()) : "null";
 
         String p = cfg != null && cfg.getRsiPeriod() != null ? String.valueOf(cfg.getRsiPeriod()) : "null";
         String b = cfg != null && cfg.getBuyBelow() != null ? String.valueOf(cfg.getBuyBelow()) : "null";
         String ba = cfg != null && cfg.getBlockAbove() != null ? String.valueOf(cfg.getBlockAbove()) : "null";
 
-        return symbol + "|" + ex + "|" + net + "|" + tf + "|" + candles + "|" + cooldown
-                + "|" + p + "|" + b + "|" + ba;
+        return symbol + "|" + ex + "|" + net + "|" + tf + "|" + candles + "|" + p + "|" + b + "|" + ba;
     }
 
     private StrategySettings loadStrategySettings(Long chatId) {
         return strategySettingsService
-                .findAllByChatId(chatId, null, null)
+                .findAllByChatId(chatId)
                 .stream()
                 .filter(s -> s.getType() == StrategyType.RSI_OBOS)
                 .sorted(

@@ -8,16 +8,26 @@ import com.chicu.aitradebot.exchange.client.ExchangeClientFactory;
 import com.chicu.aitradebot.market.model.Candle;
 import com.chicu.aitradebot.market.stream.MarketDataStreamService;
 import com.chicu.aitradebot.service.StrategySettingsService;
+import com.chicu.aitradebot.strategy.ema.EmaCrossoverStrategySettings;
+import com.chicu.aitradebot.strategy.ema.EmaCrossoverStrategySettingsService;
 import com.chicu.aitradebot.web.dto.StrategyChartDto;
 import com.chicu.aitradebot.web.facade.WebChartFacade;
+import com.chicu.aitradebot.web.ui.UiStrategyLayerService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
-import java.lang.reflect.Method;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 
 @Slf4j
 @Service
@@ -26,129 +36,271 @@ public class WebChartFacadeImpl implements WebChartFacade {
 
     private static final int MIN_LIMIT = 10;
     private static final int MAX_LIMIT = 1500;
+    private static final int MAX_TRADE_MARKERS = 300;
+    private static final int EXCHANGE_PRELOAD_MAX_LIMIT = 1000;
+    private static final long PRELOAD_COOLDOWN_MS = 15_000L;
+    private static final long TRADE_TIME_BUCKET_MS = 2_000L;
+    private static final int PRICE_SCALE = 8;
+    private static final int QTY_SCALE = 8;
 
     private final MarketDataStreamService streamService;
     private final ExchangeClientFactory exchangeClientFactory;
     private final StrategySettingsService settingsService;
+    private final EmaCrossoverStrategySettingsService emaSettingsService;
+    private final UiStrategyLayerService uiLayers;
+    private final ChartTradeHistoryLoader tradeHistoryLoader;
+
+    private final ConcurrentMap<ChartContextKey, Long> lastPreloadAtMs = new ConcurrentHashMap<>();
 
     @Override
-    public StrategyChartDto buildChart(
-            long chatId,
-            StrategyType strategyType,
-            String symbol,
-            String timeframe,
-            int limit
-    ) {
-        // 1) Базовая валидация
-        if (chatId <= 0) throw new IllegalArgumentException("chatId must be positive");
-        if (strategyType == null) throw new IllegalArgumentException("strategyType must be provided");
-        if (symbol == null || symbol.isBlank()) return empty();
+    public StrategyChartDto buildChart(long chatId,
+                                       StrategyType strategyType,
+                                       String symbol,
+                                       String timeframe,
+                                       int limit) {
 
-        final String sym = symbol.trim().toUpperCase(Locale.ROOT);
-
-        // 2) Берём baseline StrategySettings (контекст: exchange/network + дефолтный tf/limit)
-        StrategySettings s = null;
-        try {
-            s = resolveBaselineSettings(chatId, strategyType);
-        } catch (Exception e) {
-            log.warn("⚠️ Chart: cannot resolve baseline StrategySettings (chatId={}, type={})",
-                    chatId, strategyType, e);
+        if (chatId <= 0) {
+            throw new IllegalArgumentException("chatId must be positive");
         }
-
-        // 3) tf и limit: приоритет параметров запроса, иначе из StrategySettings
-        final String tf = resolveTimeframe(timeframe, s);
-        final int finalLimit = resolveLimit(limit, s);
-
-        if (tf == null || tf.isBlank()) {
-            log.warn("⚠️ Chart: timeframe is empty (chatId={}, type={}, symbol={})", chatId, strategyType, sym);
+        if (strategyType == null) {
+            throw new IllegalArgumentException("strategyType must be provided");
+        }
+        if (symbol == null || symbol.isBlank()) {
             return empty();
         }
 
-        // 4) Сначала пробуем кэш
-        List<Candle> cached = safeCandles(streamService.getCandles(chatId, strategyType, sym, tf));
-
-        // 5) Если кэша не хватает — preload из биржи (по exchange+network из StrategySettings)
-        if (cached.size() < finalLimit) {
-            tryPreloadFromExchange(chatId, strategyType, sym, tf, finalLimit, s);
+        final String sym = normalizeSymbol(symbol);
+        if (sym == null) {
+            return empty();
         }
 
-        // 6) Собираем результат из кэша (после preload)
-        List<Candle> all = safeCandles(streamService.getCandles(chatId, strategyType, sym, tf));
-        if (all.isEmpty()) return empty();
+        StrategySettings settings = loadSettings(chatId, strategyType);
 
-        // последние N свечей
-        int size = all.size();
-        int from = Math.max(0, size - finalLimit);
-        List<Candle> slice = all.subList(from, size);
+        final String tf = resolveTimeframe(timeframe, settings);
+        final int finalLimit = resolveLimit(limit, settings);
+        final String exchange = normalizeExchange(settings != null ? settings.getExchangeName() : null);
+        final NetworkType network = settings != null ? settings.getNetworkType() : null;
 
-        List<StrategyChartDto.CandleDto> candleDtos = slice.stream()
-                .map(c -> StrategyChartDto.CandleDto.builder()
-                        .time(c.getTime() / 1000L) // контракт: seconds
-                        .open(c.getOpen())
-                        .high(c.getHigh())
-                        .low(c.getLow())
-                        .close(c.getClose())
-                        .build()
-                )
-                .toList();
+        StrategyChartDto.Layers snapshotLayers = uiLayers.buildLatestLayersForSnapshot(chatId, strategyType, sym);
+        if (snapshotLayers == null) {
+            snapshotLayers = StrategyChartDto.Layers.empty();
+        }
 
-        double lastClose = slice.get(slice.size() - 1).getClose();
+        Map<String, Object> info = buildInfo(chatId, strategyType, settings);
 
-        // ВАЖНО: фасад графика не рисует “специфичные слои” (windowZone и т.п.)
+        if (tf == null) {
+            log.warn("⚠️ Chart: timeframe пустой (chatId={}, type={}, symbol={})", chatId, strategyType, sym);
+            return StrategyChartDto.builder()
+                    .candles(List.of())
+                    .layers(snapshotLayers)
+                    .info(info)
+                    .build();
+        }
+
+        if (exchange == null || network == null) {
+            log.warn("⚠️ Chart: пропуск кэша/прелоада — нет exchange/network (chatId={}, type={}, symbol={}, tf={}, ex={}, net={})",
+                    chatId, strategyType, sym, tf, exchange, network);
+
+            long[] fallbackRange = fallbackRange(tf, finalLimit);
+            StrategyChartDto.Layers layersWithoutContext = mergeWithTradeHistory(
+                    snapshotLayers,
+                    List.of(),
+                    fallbackRange[0],
+                    fallbackRange[1],
+                    MAX_TRADE_MARKERS
+            );
+
+            return StrategyChartDto.builder()
+                    .candles(List.of())
+                    .layers(layersWithoutContext)
+                    .info(info)
+                    .build();
+        }
+
+        List<Candle> candles = loadCandlesForChart(chatId, strategyType, exchange, network, sym, tf, finalLimit);
+        candles = sanitizeCandleSeries(candles);
+
+        long fromMs;
+        long toMs;
+
+        List<StrategyChartDto.CandleDto> candleDtos;
+        Double lastPrice = null;
+
+        if (!candles.isEmpty()) {
+            int size = candles.size();
+            int from = Math.max(0, size - finalLimit);
+            List<Candle> slice = candles.subList(from, size);
+
+            candleDtos = slice.stream()
+                    .map(c -> StrategyChartDto.CandleDto.builder()
+                            .time(c.getTime() / 1000L)
+                            .open(c.getOpen())
+                            .high(c.getHigh())
+                            .low(c.getLow())
+                            .close(c.getClose())
+                            .build())
+                    .toList();
+
+            Candle last = slice.get(slice.size() - 1);
+            lastPrice = last != null ? last.getClose() : null;
+
+            fromMs = slice.get(0).getTime();
+            toMs = last.getTime() + timeframeMs(tf);
+        } else {
+            candleDtos = List.of();
+            long[] fallbackRange = fallbackRange(tf, finalLimit);
+            fromMs = fallbackRange[0];
+            toMs = fallbackRange[1];
+        }
+
+        List<StrategyChartDto.TradeMarker> tradeHistory = tradeHistoryLoader.loadTradeMarkers(
+                chatId,
+                strategyType,
+                exchange,
+                network,
+                sym,
+                tf,
+                fromMs,
+                toMs,
+                MAX_TRADE_MARKERS
+        );
+
+        StrategyChartDto.Layers layers = mergeWithTradeHistory(snapshotLayers, tradeHistory, fromMs, toMs, MAX_TRADE_MARKERS);
+
+        if (lastPrice == null) {
+            lastPrice = inferLastPrice(layers);
+        }
+
         return StrategyChartDto.builder()
                 .candles(candleDtos)
-                .lastPrice(lastClose)
-                .layers(StrategyChartDto.Layers.empty())
+                .lastPrice(lastPrice)
+                .layers(layers)
+                .info(info)
                 .build();
     }
 
-    /**
-     * ✅ ВАЖНО:
-     * Раньше было findLatest(chatId,type,null,null) — теперь метода нет и “latest без контекста”
-     * в принципе опасен.
-     *
-     * Поэтому:
-     * - берём все настройки по chatId (без фильтра exchange/network)
-     * - выбираем для данного type:
-     *   1) сначала active=true (если есть)
-     *   2) затем по updatedAt (desc)
-     *   3) затем по id (desc)
-     */
-    private StrategySettings resolveBaselineSettings(long chatId, StrategyType type) {
-        List<StrategySettings> all = settingsService.findAllByChatId(chatId, null);
-        if (all == null || all.isEmpty()) return null;
+    private StrategySettings loadSettings(long chatId, StrategyType strategyType) {
+        StrategySettings settings = null;
+        try {
+            settings = settingsService.getSettings(chatId, strategyType);
+        } catch (Exception ignored) {
+        }
 
-        return all.stream()
-                .filter(s -> s != null && s.getType() == type)
-                .sorted(Comparator
-                        .comparing(StrategySettings::isActive).reversed()
-                        .thenComparing(StrategySettings::getUpdatedAt, Comparator.nullsLast(Comparator.naturalOrder())).reversed()
-                        .thenComparing(StrategySettings::getId, Comparator.nullsLast(Comparator.naturalOrder())).reversed()
-                )
-                .findFirst()
-                .orElse(null);
+        if (settings == null) {
+            try {
+                settings = settingsService.getOrCreate(chatId, strategyType);
+            } catch (Exception ignored) {
+            }
+        }
+
+        return settings;
     }
 
-    private void tryPreloadFromExchange(
-            long chatId,
-            StrategyType type,
-            String symbol,
-            String timeframe,
-            int limit,
-            StrategySettings s
-    ) {
-        ExchangeClient client = resolveClientForChart(s);
+    private List<Candle> loadCandlesForChart(long chatId,
+                                             StrategyType strategyType,
+                                             String exchange,
+                                             NetworkType network,
+                                             String symbol,
+                                             String timeframe,
+                                             int limit) {
 
-        if (client == null) {
-            log.warn("⚠️ Chart preload skipped: no exchange client (chatId={}, type={}, symbol={}, tf={})",
-                    chatId, type, symbol, timeframe);
-            return;
+        List<Candle> exact = trimTail(
+                sanitizeCandleSeries(streamService.getCandles(chatId, strategyType, exchange, network, symbol, timeframe)),
+                limit
+        );
+
+        List<Candle> best = exact;
+
+        List<Candle> fallbackBySymbol = trimTail(
+                sanitizeCandleSeries(streamService.getCachedCandles(chatId, strategyType, symbol, timeframe, limit)),
+                limit
+        );
+
+        if (fallbackBySymbol.size() > best.size()) {
+            best = fallbackBySymbol;
+        }
+
+        boolean exactCacheMissing = exact.isEmpty();
+        if (exactCacheMissing && shouldAttemptPreload(chatId, strategyType, exchange, network, symbol, timeframe)) {
+            List<Candle> preloaded = tryPreloadFromExchange(chatId, strategyType, exchange, network, symbol, timeframe, limit);
+            if (preloaded.size() > best.size()) {
+                best = trimTail(sanitizeCandleSeries(preloaded), limit);
+            }
+        }
+
+        if (best.isEmpty()) {
+            List<Candle> direct = loadCandlesDirectFromExchange(exchange, network, symbol, timeframe, limit);
+            if (!direct.isEmpty()) {
+                try {
+                    streamService.putCandles(chatId, strategyType, exchange, network, symbol, timeframe, direct);
+                } catch (Exception e) {
+                    log.debug("⚠️ Chart direct putCandles failed chatId={} type={} ex={} net={} {} {} : {}",
+                            chatId, strategyType, exchange, network, symbol, timeframe, e.toString());
+                }
+                best = trimTail(sanitizeCandleSeries(direct), limit);
+            }
+        }
+
+        return best;
+    }
+
+    private List<Candle> tryPreloadFromExchange(long chatId,
+                                                StrategyType type,
+                                                String exchange,
+                                                NetworkType network,
+                                                String symbol,
+                                                String timeframe,
+                                                int limit) {
+
+        ChartContextKey key = new ChartContextKey(chatId, type, exchange, network, symbol, timeframe);
+        lastPreloadAtMs.put(key, System.currentTimeMillis());
+
+        List<Candle> preload = sanitizeCandleSeries(loadCandlesDirectFromExchange(exchange, network, symbol, timeframe, limit));
+        if (preload.isEmpty()) {
+            return List.of();
         }
 
         try {
-            List<ExchangeClient.Kline> klines = client.getKlines(symbol, timeframe, limit);
+            streamService.putCandles(chatId, type, exchange, network, symbol, timeframe, preload);
+            log.info("📥 Chart preloaded: {} candles (chatId={}, type={}, ex={}, net={}, {} {}, limit={})",
+                    preload.size(), chatId, type, exchange, network, symbol, timeframe, limit);
+        } catch (Exception e) {
+            log.error("❌ Chart preload failed (chatId={}, type={}, ex={}, net={}, {} {})",
+                    chatId, type, exchange, network, symbol, timeframe, e);
+        }
 
-            List<Candle> preload = klines.stream()
+        return preload;
+    }
+
+    private List<Candle> loadCandlesDirectFromExchange(String exchange,
+                                                       NetworkType network,
+                                                       String symbol,
+                                                       String timeframe,
+                                                       int limit) {
+        int requestLimit = Math.max(MIN_LIMIT, Math.min(limit, EXCHANGE_PRELOAD_MAX_LIMIT));
+
+        ExchangeClient client;
+        try {
+            client = exchangeClientFactory.get(exchange, network);
+        } catch (Exception e) {
+            client = null;
+        }
+
+        if (client == null) {
+            log.warn("⚠️ Chart preload пропущен: нет exchange client (ex={}, net={}, symbol={}, tf={})",
+                    exchange, network, symbol, timeframe);
+            return List.of();
+        }
+
+        try {
+            List<ExchangeClient.Kline> klines = client.getKlines(symbol, timeframe, requestLimit);
+            if (klines == null || klines.isEmpty()) {
+                return List.of();
+            }
+
+            return klines.stream()
+                    .filter(Objects::nonNull)
+                    .sorted(Comparator.comparingLong(ExchangeClient.Kline::openTime))
                     .map(k -> new Candle(
                             k.openTime(),
                             k.open(),
@@ -159,151 +311,323 @@ public class WebChartFacadeImpl implements WebChartFacade {
                             true
                     ))
                     .toList();
-
-            if (!preload.isEmpty()) {
-                streamService.putCandles(chatId, type, symbol, timeframe, preload);
-                log.info("📥 Chart preloaded: {} candles (chatId={}, type={}, {} {}, limit={})",
-                        preload.size(), chatId, type, symbol, timeframe, limit);
-            }
         } catch (Exception e) {
-            log.error("❌ Chart preload failed (chatId={}, type={}, {} {})", chatId, type, symbol, timeframe, e);
+            log.error("❌ Chart direct klines failed (ex={}, net={}, {} {})", exchange, network, symbol, timeframe, e);
+            return List.of();
         }
     }
 
-    /**
-     * ВАЖНО: для истории свечей НЕ должен требоваться “включённый exchange settings у пользователя”.
-     * Поэтому берём клиента по exchange+network из StrategySettings.
-     *
-     * Чтобы не привязываться к точной сигнатуре ExchangeClientFactory#get(...),
-     * аккуратно резолвим через reflection (поддерживает разные overload'ы).
-     */
-    private ExchangeClient resolveClientForChart(StrategySettings s) {
-        if (s == null) return null;
+    private boolean shouldAttemptPreload(long chatId,
+                                         StrategyType strategyType,
+                                         String exchange,
+                                         NetworkType network,
+                                         String symbol,
+                                         String timeframe) {
+        ChartContextKey key = new ChartContextKey(chatId, strategyType, exchange, network, symbol, timeframe);
+        long nowMs = System.currentTimeMillis();
+        Long last = lastPreloadAtMs.get(key);
+        return last == null || nowMs - last >= PRELOAD_COOLDOWN_MS;
+    }
 
-        Object exchange = s.getExchangeName();
-        Object network = s.getNetworkType();
+    private StrategyChartDto.Layers mergeWithTradeHistory(StrategyChartDto.Layers snapshot,
+                                                          List<StrategyChartDto.TradeMarker> historyTrades,
+                                                          long fromMs,
+                                                          long toMs,
+                                                          int maxTrades) {
+        StrategyChartDto.Layers base = snapshot != null ? snapshot : StrategyChartDto.Layers.empty();
 
-        if (exchange == null) return null;
-        if (exchange instanceof String exStr && exStr.isBlank()) return null;
-        if (network == null) return null;
+        List<StrategyChartDto.TradeMarker> history = historyTrades == null ? List.of() : historyTrades;
+        List<StrategyChartDto.TradeMarker> live = base.getTrades() == null ? List.of() : base.getTrades();
 
-        try {
-            for (Method m : exchangeClientFactory.getClass().getMethods()) {
-                if (!m.getName().equals("get")) continue;
-                if (m.getParameterCount() != 2) continue;
-                if (!ExchangeClient.class.isAssignableFrom(m.getReturnType())) continue;
+        // Источник истины для трейдов на графике — история исполнений с биржи.
+        // Snapshot-trades используем только как fallback, когда история с биржи пуста
+        // (например, нет exchange/network или биржа временно ничего не вернула).
+        List<StrategyChartDto.TradeMarker> merged = new ArrayList<>(
+                !history.isEmpty() ? history.size() : history.size() + live.size()
+        );
+        merged.addAll(history);
+        if (merged.isEmpty()) {
+            merged.addAll(live);
+        }
 
-                Class<?> exParam = m.getParameterTypes()[0];
-                Class<?> netParam = m.getParameterTypes()[1];
+        merged = merged.stream()
+                .filter(Objects::nonNull)
+                .filter(t -> t.getTime() != null && t.getTime() >= fromMs && t.getTime() <= toMs)
+                .sorted(Comparator
+                        .comparingLong((StrategyChartDto.TradeMarker t) -> t.getTime() != null ? t.getTime() : 0L)
+                        .thenComparing(t -> String.valueOf(t.getSide()))
+                        .thenComparing(t -> normalizeNumberForKey(t.getPrice(), PRICE_SCALE))
+                        .thenComparing(t -> normalizeNumberForKey(t.getQty(), QTY_SCALE)))
+                .toList();
 
-                Object exArg = adaptExchangeArg(exchange, exParam);
-                Object netArg = adaptNetworkArg(network, netParam);
+        LinkedHashMap<String, StrategyChartDto.TradeMarker> uniq = new LinkedHashMap<>();
+        for (StrategyChartDto.TradeMarker marker : merged) {
+            String strictKey = strictTradeKey(marker);
+            String softKey = softTradeKey(marker);
 
-                if (exArg == null || netArg == null) continue;
-
-                Object res = m.invoke(exchangeClientFactory, exArg, netArg);
-                if (res instanceof ExchangeClient ec) return ec;
+            StrategyChartDto.TradeMarker existingStrict = uniq.get(strictKey);
+            if (existingStrict != null) {
+                uniq.put(strictKey, chooseBetterTradeMarker(existingStrict, marker));
+                continue;
             }
 
+            StrategyChartDto.TradeMarker existingSoft = uniq.get(softKey);
+            if (existingSoft != null) {
+                StrategyChartDto.TradeMarker better = chooseBetterTradeMarker(existingSoft, marker);
+                uniq.put(softKey, better);
+                continue;
+            }
+
+            uniq.put(strictKey, marker);
+        }
+
+        List<StrategyChartDto.TradeMarker> deduped = new ArrayList<>(uniq.values());
+        if (deduped.size() > maxTrades) {
+            deduped = new ArrayList<>(deduped.subList(deduped.size() - maxTrades, deduped.size()));
+        }
+
+        return StrategyChartDto.Layers.builder()
+                .levels(base.getLevels() != null ? base.getLevels() : List.of())
+                .zone(base.getZone())
+                .tpSl(base.getTpSl())
+                .windowZone(base.getWindowZone())
+                .priceLines(base.getPriceLines() != null ? base.getPriceLines() : List.of())
+                .trades(deduped)
+                .build();
+    }
+
+    private Map<String, Object> buildInfo(long chatId, StrategyType strategyType, StrategySettings settings) {
+        LinkedHashMap<String, Object> out = new LinkedHashMap<>();
+        if (settings != null) {
+            out.put("timeframe", settings.getTimeframe());
+            out.put("cachedCandlesLimit", settings.getCachedCandlesLimit());
+            out.put("exchange", settings.getExchangeName());
+            out.put("network", settings.getNetworkType() != null ? settings.getNetworkType().name() : null);
+            out.put("symbol", settings.getSymbol());
+        }
+
+        if (strategyType == StrategyType.EMA_CROSSOVER) {
+            try {
+                EmaCrossoverStrategySettings ema = emaSettingsService.getOrCreate(chatId);
+                if (ema != null) {
+                    out.put("emaFast", ema.getEmaFast());
+                    out.put("emaSlow", ema.getEmaSlow());
+                    out.put("confirmBars", ema.getConfirmBars());
+                    out.put("maxSpreadPct", ema.getMaxSpreadPct());
+                    out.put("takeProfitPct", ema.getTakeProfitPct());
+                    out.put("stopLossPct", ema.getStopLossPct());
+                }
+            } catch (Exception e) {
+                log.debug("⚠️ Chart info EMA load failed chatId={} err={}", chatId, e.toString());
+            }
+        }
+
+        return out;
+    }
+
+    private static Double inferLastPrice(StrategyChartDto.Layers layers) {
+        if (layers == null) {
             return null;
-        } catch (Exception e) {
-            log.warn("⚠️ Cannot resolve exchange client for chart: exchange={} network={}", exchange, network, e);
-            return null;
-        }
-    }
-
-    private Object adaptExchangeArg(Object exchangeValue, Class<?> targetType) {
-        if (targetType.isInstance(exchangeValue)) return exchangeValue;
-
-        // если targetType=String, а exchangeValue=Enum → берём name()
-        if (targetType == String.class && exchangeValue instanceof Enum<?> en) {
-            return en.name();
         }
 
-        // если targetType=Enum, а exchangeValue=String → Enum.valueOf(...)
-        if (targetType.isEnum() && exchangeValue instanceof String s) {
-            String name = s.trim().toUpperCase(Locale.ROOT);
-            if (name.isBlank()) return null;
-            @SuppressWarnings({"rawtypes", "unchecked"})
-            Class<? extends Enum> enumType = (Class<? extends Enum>) targetType;
-            try {
-                return Enum.valueOf(enumType, name);
-            } catch (Exception ignored) {
-                return null;
+        if (layers.getTrades() != null && !layers.getTrades().isEmpty()) {
+            StrategyChartDto.TradeMarker lastTrade = layers.getTrades().get(layers.getTrades().size() - 1);
+            if (lastTrade != null && lastTrade.getPrice() != null) {
+                return lastTrade.getPrice();
             }
         }
 
-        // если targetType=Enum, а exchangeValue=Enum другого типа → пробуем по имени
-        if (targetType.isEnum() && exchangeValue instanceof Enum<?> en) {
-            @SuppressWarnings({"rawtypes", "unchecked"})
-            Class<? extends Enum> enumType = (Class<? extends Enum>) targetType;
+        if (layers.getPriceLines() != null && !layers.getPriceLines().isEmpty()) {
+            Object lastLine = layers.getPriceLines().get(layers.getPriceLines().size() - 1);
             try {
-                return Enum.valueOf(enumType, en.name());
+                Object price = lastLine.getClass().getMethod("getPrice").invoke(lastLine);
+                if (price instanceof Number n) {
+                    double v = n.doubleValue();
+                    if (Double.isFinite(v)) {
+                        return v;
+                    }
+                }
             } catch (Exception ignored) {
-                return null;
             }
         }
 
         return null;
     }
 
-    private Object adaptNetworkArg(Object networkValue, Class<?> targetType) {
-        if (targetType.isInstance(networkValue)) return networkValue;
-
-        // если targetType=String, а networkValue=Enum → name()
-        if (targetType == String.class && networkValue instanceof Enum<?> en) {
-            return en.name();
+    private static String resolveTimeframe(String timeframe, StrategySettings settings) {
+        String tf = normalizeTimeframeOrNull(timeframe);
+        if (tf != null) {
+            return tf;
         }
 
-        // если targetType=Enum, а networkValue=Enum другого типа → по имени
-        if (targetType.isEnum() && networkValue instanceof Enum<?> en) {
-            @SuppressWarnings({"rawtypes", "unchecked"})
-            Class<? extends Enum> enumType = (Class<? extends Enum>) targetType;
-            try {
-                return Enum.valueOf(enumType, en.name());
-            } catch (Exception ignored) {
-                return null;
-            }
-        }
-
-        return null;
-    }
-
-    private String resolveTimeframe(String timeframe, StrategySettings s) {
-        String tf = (timeframe == null) ? null : timeframe.trim().toLowerCase(Locale.ROOT);
-        if (tf != null && !tf.isBlank()) return tf;
-
-        if (s != null && s.getTimeframe() != null && !s.getTimeframe().isBlank()) {
-            return s.getTimeframe().trim().toLowerCase(Locale.ROOT);
+        if (settings != null && settings.getTimeframe() != null && !settings.getTimeframe().isBlank()) {
+            return normalizeTimeframeOrNull(settings.getTimeframe());
         }
         return null;
     }
 
-    private int resolveLimit(int limit, StrategySettings s) {
+    private static int resolveLimit(int limit, StrategySettings settings) {
         int resolved = limit;
 
-        // если лимит не задан/кривой — берём из StrategySettings
         if (resolved < MIN_LIMIT || resolved > MAX_LIMIT) {
-            if (s != null && s.getCachedCandlesLimit() != null) {
-                resolved = s.getCachedCandlesLimit();
+            Integer fromSettings = settings != null ? settings.getCachedCandlesLimit() : null;
+            if (fromSettings != null) {
+                resolved = fromSettings;
             }
         }
 
-        // финальная защита диапазона (контракт UI/графика)
-        if (resolved < MIN_LIMIT) resolved = MIN_LIMIT;
-        if (resolved > MAX_LIMIT) resolved = MAX_LIMIT;
+        if (resolved < MIN_LIMIT) {
+            resolved = MIN_LIMIT;
+        }
+        if (resolved > MAX_LIMIT) {
+            resolved = MAX_LIMIT;
+        }
 
         return resolved;
     }
 
-    private List<Candle> safeCandles(List<Candle> list) {
-        return list == null ? List.of() : list;
+    private static long[] fallbackRange(String timeframe, int limit) {
+        long now = System.currentTimeMillis();
+        long span = Math.max(1L, limit) * Math.max(1L, timeframeMs(timeframe));
+        return new long[]{Math.max(0L, now - span), now};
     }
 
-    private StrategyChartDto empty() {
+    private static long timeframeMs(String tf) {
+        if (tf == null || tf.isBlank()) return 60_000L;
+        String s = tf.trim().toLowerCase(Locale.ROOT);
+        if (s.length() < 2) return 60_000L;
+        char unit = s.charAt(s.length() - 1);
+        long value;
+        try {
+            value = Long.parseLong(s.substring(0, s.length() - 1));
+        } catch (Exception e) {
+            return 60_000L;
+        }
+        return switch (unit) {
+            case 's' -> value * 1_000L;
+            case 'm' -> value * 60_000L;
+            case 'h' -> value * 3_600_000L;
+            case 'd' -> value * 86_400_000L;
+            case 'w' -> value * 604_800_000L;
+            default -> 60_000L;
+        };
+    }
+
+    private static String normalizeSymbol(String symbol) {
+        if (symbol == null) return null;
+        String s = symbol.trim().toUpperCase(Locale.ROOT).replace("/", "");
+        return s.isBlank() ? null : s;
+    }
+
+    private static String normalizeExchange(String exchange) {
+        if (exchange == null) return null;
+        String s = exchange.trim().toUpperCase(Locale.ROOT);
+        return s.isBlank() ? null : s;
+    }
+
+    private static String normalizeTimeframeOrNull(String timeframe) {
+        if (timeframe == null) return null;
+        String s = timeframe.trim().toLowerCase(Locale.ROOT);
+        return s.isBlank() ? null : s;
+    }
+
+    private static List<Candle> sanitizeCandleSeries(List<Candle> list) {
+        if (list == null || list.isEmpty()) {
+            return List.of();
+        }
+
+        LinkedHashMap<Long, Candle> uniq = new LinkedHashMap<>();
+        for (Candle candle : list) {
+            if (candle == null) {
+                continue;
+            }
+            uniq.put(candle.getTime(), candle);
+        }
+
+        return uniq.values().stream()
+                .filter(Objects::nonNull)
+                .sorted(Comparator.comparingLong(Candle::getTime))
+                .toList();
+    }
+
+    private static List<Candle> trimTail(List<Candle> list, int limit) {
+        if (list == null || list.isEmpty()) {
+            return List.of();
+        }
+        int lim = Math.max(1, limit);
+        if (list.size() <= lim) {
+            return list;
+        }
+        return new ArrayList<>(list.subList(list.size() - lim, list.size()));
+    }
+
+    private static String strictTradeKey(StrategyChartDto.TradeMarker marker) {
+        return baseTradeKey(marker) + "|q=" + normalizeNumberForKey(marker.getQty(), QTY_SCALE);
+    }
+
+    private static String softTradeKey(StrategyChartDto.TradeMarker marker) {
+        return baseTradeKey(marker) + "|q=*";
+    }
+
+    private static String baseTradeKey(StrategyChartDto.TradeMarker marker) {
+        long bucket = marker.getTime() == null ? 0L : marker.getTime() / TRADE_TIME_BUCKET_MS;
+        return String.valueOf(marker.getSide())
+                + "|tb=" + bucket
+                + "|p=" + normalizeNumberForKey(marker.getPrice(), PRICE_SCALE);
+    }
+
+    private static String normalizeNumberForKey(Number value, int scale) {
+        if (value == null) {
+            return "null";
+        }
+        try {
+            BigDecimal bd = new BigDecimal(String.valueOf(value));
+            return bd.setScale(scale, RoundingMode.HALF_UP).stripTrailingZeros().toPlainString();
+        } catch (Exception e) {
+            return String.valueOf(value);
+        }
+    }
+
+    private static StrategyChartDto.TradeMarker chooseBetterTradeMarker(StrategyChartDto.TradeMarker a,
+                                                                        StrategyChartDto.TradeMarker b) {
+        if (a == null) return b;
+        if (b == null) return a;
+
+        boolean aHasQty = a.getQty() != null && Math.abs(a.getQty()) > 0d;
+        boolean bHasQty = b.getQty() != null && Math.abs(b.getQty()) > 0d;
+        if (aHasQty != bHasQty) {
+            return bHasQty ? b : a;
+        }
+
+        boolean aHasPrice = a.getPrice() != null && Double.isFinite(a.getPrice());
+        boolean bHasPrice = b.getPrice() != null && Double.isFinite(b.getPrice());
+        if (aHasPrice != bHasPrice) {
+            return bHasPrice ? b : a;
+        }
+
+        long aTime = a.getTime() != null ? a.getTime() : Long.MIN_VALUE;
+        long bTime = b.getTime() != null ? b.getTime() : Long.MIN_VALUE;
+        return bTime >= aTime ? b : a;
+    }
+
+    private static StrategyChartDto empty() {
         return StrategyChartDto.builder()
                 .candles(List.of())
                 .layers(StrategyChartDto.Layers.empty())
+                .info(Map.of())
                 .build();
+    }
+
+    private record ChartContextKey(long chatId,
+                                   StrategyType strategyType,
+                                   String exchange,
+                                   NetworkType network,
+                                   String symbol,
+                                   String timeframe) {
+        private ChartContextKey {
+            exchange = exchange != null ? exchange.toUpperCase(Locale.ROOT) : null;
+            symbol = symbol != null ? symbol.toUpperCase(Locale.ROOT) : null;
+            timeframe = timeframe != null ? timeframe.toLowerCase(Locale.ROOT) : null;
+        }
     }
 }

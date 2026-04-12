@@ -1,10 +1,12 @@
 package com.chicu.aitradebot.ai.tuning;
 
+import com.chicu.aitradebot.ai.tuning.eval.StrategyEnvResolver;
 import com.chicu.aitradebot.common.enums.NetworkType;
 import com.chicu.aitradebot.common.enums.StrategyType;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.lang.reflect.Method;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Locale;
@@ -17,70 +19,49 @@ import java.util.concurrent.ConcurrentHashMap;
 public class AutoTunerOrchestrator {
 
     private final Map<StrategyType, StrategyAutoTuner> tuners = new EnumMap<>(StrategyType.class);
-
-    /**
-     * ✅ Защита от дублей: один контекст (chatId/type/exchange/network) — один тюнинг одновременно.
-     */
+    private final StrategyEnvResolver envResolver;
     private final Set<TuningKey> inFlight = ConcurrentHashMap.newKeySet();
-
-    /**
-     * ✅ Debounce/anti-spam:
-     * чтобы при автосейве/перерендерах не запускать тюнер много раз на один и тот же контекст.
-     */
     private final Map<TuningKey, LastRun> lastRunByKey = new ConcurrentHashMap<>();
 
-    /**
-     * Настройки дебаунса:
-     * - если сигнатура контекста та же самая и прошло меньше cooldownMs — пропускаем.
-     */
-    private final long cooldownMs = 60_000L; // 60 секунд
+    private static final long COOLDOWN_MS = 60_000L;
 
-    public AutoTunerOrchestrator(List<StrategyAutoTuner> tunerList) {
-        for (StrategyAutoTuner t : tunerList) {
-            StrategyType type = t.getStrategyType();
-            if (type == null) continue;
+    public AutoTunerOrchestrator(List<StrategyAutoTuner> tunerList,
+                                 StrategyEnvResolver envResolver) {
 
-            StrategyAutoTuner prev = tuners.put(type, t);
-            if (prev != null) {
-                log.warn("⚠️ Найдено 2 тюнера для {}: {} и {}. Использую последний.",
-                        type, prev.getClass().getSimpleName(), t.getClass().getSimpleName());
+        this.envResolver = envResolver;
+
+        if (tunerList != null) {
+            for (StrategyAutoTuner t : tunerList) {
+                if (t == null) continue;
+                StrategyType type = t.getStrategyType();
+                if (type == null) continue;
+
+                StrategyAutoTuner prev = tuners.put(type, t);
+                if (prev != null) {
+                    log.warn("⚠️ Найдено 2 тюнера для {}: {} и {}. Использую последний.",
+                            type, prev.getClass().getSimpleName(), t.getClass().getSimpleName());
+                }
             }
         }
-
         log.info("🧠 AI AutoTunerOrchestrator поднят. Тюнеров зарегистрировано: {}", tuners.size());
     }
 
     public TuningResult tune(TuningRequest request) {
+        if (request == null) return reject("request = null");
 
-        // ==========================
-        // ✅ Валидация + нормализация
-        // ==========================
-        if (request == null) {
-            return reject("request = null");
-        }
-        if (request.chatId() == null || request.chatId() <= 0) {
-            return reject("chatId не задан");
-        }
-        if (request.strategyType() == null) {
-            return reject("strategyType не задан");
-        }
+        Long chatId = request.chatId();
+        if (chatId == null || chatId <= 0) return reject("chatId не задан");
 
         StrategyType type = request.strategyType();
-        String exchange = normalizeExchange(request.exchange());
-
-        // ✅ network может быть null из UI — не режем, берём дефолт
-        NetworkType network = (request.network() != null ? request.network() : NetworkType.MAINNET);
+        if (type == null) return reject("strategyType не задан");
 
         StrategyAutoTuner tuner = tuners.get(type);
-        if (tuner == null) {
-            return reject("Тюнер для " + type + " не зарегистрирован");
-        }
+        if (tuner == null) return reject("Тюнер для " + type + " не зарегистрирован");
 
-        // ==========================
-        // ✅ Анти-гонка (один ctx -> один тюнинг)
-        // ==========================
-        TuningKey key = new TuningKey(request.chatId(), type, exchange, network);
+        ResolvedEnv env = resolveEnv(chatId, type, request.exchange(), request.network());
+        if (!env.ok) return reject(env.failReason);
 
+        TuningKey key = new TuningKey(chatId, type, env.exchange, env.network);
         if (!inFlight.add(key)) {
             return TuningResult.builder()
                     .applied(false)
@@ -88,34 +69,50 @@ public class AutoTunerOrchestrator {
                     .build();
         }
 
-        long started = System.currentTimeMillis();
+        long startedAtMs = System.currentTimeMillis();
+        String signatureForCatch = "unknown";
 
         try {
-            // ✅ Нормализованный запрос, который реально уйдёт в тюнер
             TuningRequest normalized = TuningRequest.builder()
-                    .chatId(request.chatId())
+                    .chatId(chatId)
                     .strategyType(type)
-                    .exchange(exchange)
-                    .network(network)
-                    .symbol(request.symbol())
-                    .timeframe(request.timeframe())
+                    .exchange(env.exchange)
+                    .network(env.network)
+                    .symbol(normSymbolOrNull(request.symbol()))
+                    .timeframe(normTimeframeOrNull(request.timeframe()))
                     .candlesLimit(request.candlesLimit())
                     .startAt(request.startAt())
                     .endAt(request.endAt())
                     .seed(request.seed())
-                    .reason(request.reason())
+                    .reason(safe(request.reason()))
                     .build();
 
-            // ==========================
-            // ✅ Debounce по "сигнатуре"
-            // ==========================
             String signature = signatureOf(normalized);
+            signatureForCatch = signature;
 
             LastRun last = lastRunByKey.get(key);
             long now = System.currentTimeMillis();
-            if (last != null && signature.equals(last.signature()) && (now - last.atMs()) < cooldownMs) {
-                log.info("🧠 TUNE SKIP (cooldown) chatId={} type={} ex={} net={} signature={} ageMs={}",
-                        request.chatId(), type, exchange, network, signature, (now - last.atMs()));
+
+            boolean adaptiveReason = isAdaptiveReason(normalized.reason());
+            if (adaptiveReason && isNonTunableAdaptiveReason(normalized.reason())) {
+                log.info("🧠 TUNE SKIP (non-tunable reason) chatId={} type={} ex={} net={} reason={}",
+                        chatId, type, env.exchange, env.network, safe(normalized.reason()));
+                lastRunByKey.put(key, new LastRun(signature, now, last != null ? last.modelVersion() : null, TuneOutcome.NO_IMPROVEMENT));
+                return TuningResult.builder()
+                        .applied(false)
+                        .reason("Тюнинг пропущен: причина не относится к настройке фильтров")
+                        .modelVersion(last != null ? last.modelVersion() : null)
+                        .build();
+            }
+            boolean sameSignature = (last != null && signature.equals(last.signature()));
+            boolean withinCooldown = (last != null && (now - last.atMs()) < COOLDOWN_MS);
+            boolean cooldownApplies = (last != null
+                    && (last.outcome() == TuneOutcome.APPLIED
+                    || (last.outcome() == TuneOutcome.NO_IMPROVEMENT && !adaptiveReason)));
+
+            if (sameSignature && withinCooldown && cooldownApplies) {
+                log.info("🧠 TUNE SKIP (cooldown) chatId={} type={} ex={} net={} signature={} ageMs={} lastOutcome={}",
+                        chatId, type, env.exchange, env.network, signature, (now - last.atMs()), last.outcome());
 
                 return TuningResult.builder()
                         .applied(false)
@@ -125,47 +122,72 @@ public class AutoTunerOrchestrator {
             }
 
             log.info("🧠 TUNE START chatId={} type={} ex={} net={} sym={} tf={} candles={} reason={}",
-                    normalized.chatId(),
-                    type,
-                    exchange,
-                    network,
+                    chatId, type, env.exchange, env.network,
                     safe(normalized.symbol()),
                     safe(normalized.timeframe()),
                     normalized.candlesLimit(),
                     safe(normalized.reason())
             );
 
-            // ставим lastRun заранее, чтобы при шквале одинаковых автосейвов не стартануло параллельно
-            lastRunByKey.put(key, new LastRun(signature, now, null));
+            lastRunByKey.put(key, new LastRun(signature, now, null, TuneOutcome.RUNNING));
 
             TuningResult res = tuner.tune(normalized);
             if (res == null) {
-                return TuningResult.builder()
-                        .applied(false)
-                        .reason("Тюнер вернул null")
-                        .build();
+                lastRunByKey.put(key, new LastRun(signature, System.currentTimeMillis(), null, TuneOutcome.ERROR));
+                return TuningResult.builder().applied(false).reason("Тюнер вернул null").build();
             }
 
-            long took = System.currentTimeMillis() - started;
+            long tookMs = System.currentTimeMillis() - startedAtMs;
+            boolean mlVetoAdaptiveReason = isMlVetoAdaptiveReason(normalized.reason());
+
+            if (isNoTrades(res)) {
+                if (adaptiveReason && !mlVetoAdaptiveReason) {
+                    tryAdjustCoarseFilters(tuner, normalized);
+                } else if (adaptiveReason) {
+                    log.info("🧠 NO_TRADES при причине {} → coarse filters не трогаю, потому что корень проблемы в ML gate",
+                            safe(normalized.reason()));
+                }
+
+                log.info("✅ TUNE DONE outcome=NO_TRADES applied=false scoreBefore={} scoreAfter={} model={} tookMs={} reason={}",
+                        res.scoreBefore(),
+                        res.scoreAfter(),
+                        safe(res.modelVersion()),
+                        tookMs,
+                        safe(res.reason())
+                );
+
+                lastRunByKey.put(key, new LastRun(signature, System.currentTimeMillis(), safe(res.modelVersion()), TuneOutcome.NO_TRADES));
+                return res;
+            }
 
             log.info("✅ TUNE DONE applied={} scoreBefore={} scoreAfter={} model={} tookMs={} reason={}",
                     res.applied(),
                     res.scoreBefore(),
                     res.scoreAfter(),
                     safe(res.modelVersion()),
-                    took,
+                    tookMs,
                     safe(res.reason())
             );
 
-            // ✅ фиксируем modelVersion для skip-сообщений
-            lastRunByKey.put(key, new LastRun(signature, System.currentTimeMillis(), safe(res.modelVersion())));
+            if (!res.applied()
+                    && adaptiveReason
+                    && shouldForceRelaxAfterNoImprovement(res)
+                    && !mlVetoAdaptiveReason) {
+                tryAdjustCoarseFilters(tuner, normalized);
+            }
+
+            TuneOutcome outcome = res.applied() ? TuneOutcome.APPLIED : TuneOutcome.NO_IMPROVEMENT;
+            lastRunByKey.put(key, new LastRun(signature, System.currentTimeMillis(), safe(res.modelVersion()), outcome));
 
             return res;
 
         } catch (Exception e) {
-            long took = System.currentTimeMillis() - started;
+            long tookMs = System.currentTimeMillis() - startedAtMs;
+
             log.error("❌ TUNE FAILED tookMs={} chatId={} type={} ex={} net={} : {}",
-                    took, request.chatId(), type, exchange, network, e.getMessage(), e);
+                    tookMs, chatId, type, env.exchange, env.network, e.getMessage(), e);
+
+            lastRunByKey.put(key, new LastRun(signatureForCatch, System.currentTimeMillis(), null, TuneOutcome.ERROR));
 
             return TuningResult.builder()
                     .applied(false)
@@ -177,21 +199,84 @@ public class AutoTunerOrchestrator {
         }
     }
 
-    // =========================================================
-    // helpers
-    // =========================================================
+    private record ResolvedEnv(boolean ok, String exchange, NetworkType network, String failReason) {}
 
-    private static TuningResult reject(String reason) {
-        return TuningResult.builder()
-                .applied(false)
-                .reason(reason)
-                .build();
+    private ResolvedEnv resolveEnv(Long chatId,
+                                   StrategyType type,
+                                   String exchange,
+                                   NetworkType network) {
+
+        String ex = normalizeExchangeOrNull(exchange);
+        NetworkType net = network;
+
+        if (ex == null || net == null) {
+            try {
+                StrategyEnvResolver.Env env = envResolver.resolve(chatId, type);
+                if (ex == null) ex = normalizeExchangeOrNull(env.exchangeName());
+                if (net == null) net = env.networkType();
+            } catch (Exception e) {
+                return new ResolvedEnv(false, null, null, "Не удалось определить env: " + safeMsg(e));
+            }
+        }
+
+        if (ex == null) return new ResolvedEnv(false, null, null, "exchange не задан и не найден в настройках");
+        if (net == null) return new ResolvedEnv(false, null, null, "network не задан и не найден в настройках");
+
+        return new ResolvedEnv(true, ex, net, null);
     }
 
-    private static String normalizeExchange(String exchange) {
-        if (exchange == null) return "BINANCE";
+    private static TuningResult reject(String reason) {
+        return TuningResult.builder().applied(false).reason(reason).build();
+    }
+
+    private static boolean isAdaptiveReason(String reason) {
+        String normalized = safe(reason).toLowerCase(Locale.ROOT);
+        return normalized.startsWith("starvation:")
+                || normalized.startsWith("regime_shift:")
+                || normalized.startsWith("loss_recovery:")
+                || normalized.startsWith("profit_expand:");
+    }
+
+    private static boolean isNonTunableAdaptiveReason(String reason) {
+        String normalized = safe(reason).toLowerCase(Locale.ROOT);
+        return normalized.startsWith("starvation:decision_blocked")
+                || normalized.startsWith("starvation:entry_blocked")
+                || normalized.contains("tp_too_small_for_fees")
+                || normalized.contains("min_notional")
+                || normalized.contains("wallet_base_untracked_position")
+                || normalized.contains("balance");
+    }
+
+    private static boolean isMlVetoAdaptiveReason(String reason) {
+        String normalized = safe(reason).toLowerCase(Locale.ROOT);
+        return normalized.startsWith("starvation:ml_veto")
+                || normalized.contains("ml_veto");
+    }
+
+    private static boolean shouldForceRelaxAfterNoImprovement(TuningResult res) {
+        if (res == null || res.applied()) {
+            return false;
+        }
+        String reason = safe(res.reason()).toLowerCase(Locale.ROOT);
+        return reason.contains("no_improvement") || reason.contains("no_change_needed") || reason.contains("no_trades");
+    }
+
+    private static String normalizeExchangeOrNull(String exchange) {
+        if (exchange == null) return null;
         String ex = exchange.trim().toUpperCase(Locale.ROOT);
-        return ex.isEmpty() ? "BINANCE" : ex;
+        return ex.isEmpty() ? null : ex;
+    }
+
+    private static String normSymbolOrNull(String symbol) {
+        if (symbol == null) return null;
+        String s = symbol.trim().toUpperCase(Locale.ROOT);
+        return s.isEmpty() ? null : s;
+    }
+
+    private static String normTimeframeOrNull(String timeframe) {
+        if (timeframe == null) return null;
+        String s = timeframe.trim().toLowerCase(Locale.ROOT);
+        return s.isEmpty() ? null : s;
     }
 
     private static String safe(String s) {
@@ -201,17 +286,91 @@ public class AutoTunerOrchestrator {
     }
 
     private static String signatureOf(TuningRequest r) {
-        // Важно: сюда входят поля, которые должны ТРИГГЕРИТЬ новый тюнинг
-        // (symbol/timeframe/candlesLimit/exchange/network + strategyType).
-        String ex = normalizeExchange(r.exchange());
-        NetworkType net = (r.network() != null ? r.network() : NetworkType.MAINNET);
-
         String sym = (r.symbol() == null ? "" : r.symbol().trim().toUpperCase(Locale.ROOT));
-        String tf = (r.timeframe() == null ? "" : r.timeframe().trim().toLowerCase(Locale.ROOT));
-
+        String tf  = (r.timeframe() == null ? "" : r.timeframe().trim().toLowerCase(Locale.ROOT));
         int cl = (r.candlesLimit() == null ? 0 : r.candlesLimit());
 
-        return r.strategyType() + "|" + ex + "|" + net + "|" + sym + "|" + tf + "|" + cl;
+        return r.strategyType() + "|" + r.exchange() + "|" + r.network() + "|" + sym + "|" + tf + "|" + cl;
+    }
+
+    private static boolean isNoTrades(TuningResult res) {
+        if (res == null) return false;
+
+        String reason = safe(res.reason()).toLowerCase(Locale.ROOT);
+        if (reason.contains("no_trades") || reason.contains("no trades") || reason.contains("0 trades") || reason.contains("нет сделок")) {
+            return true;
+        }
+
+        Integer trades = tryExtractTradesCount(res);
+        if (trades != null) return trades <= 0;
+
+        try {
+            Double sb = toDouble(res.scoreBefore());
+            Double sa = toDouble(res.scoreAfter());
+            if (!res.applied() && sb != null && sa != null) {
+                return (sb <= -1.0 && sa <= -1.0);
+            }
+        } catch (Exception ignore) {
+        }
+
+        return false;
+    }
+
+    private static Integer tryExtractTradesCount(TuningResult res) {
+        String[] names = {"tradesCount", "totalTrades", "trades"};
+        for (String n : names) {
+            try {
+                Method m = res.getClass().getMethod(n);
+                Object v = m.invoke(res);
+                if (v instanceof Number num) return num.intValue();
+            } catch (NoSuchMethodException ignore) {
+            } catch (Exception ignore) {
+            }
+        }
+        return null;
+    }
+
+    private static Double toDouble(Object v) {
+        if (v instanceof Number n) return n.doubleValue();
+        return null;
+    }
+
+    private static void tryAdjustCoarseFilters(StrategyAutoTuner tuner, TuningRequest req) {
+        if (tuner == null || req == null) return;
+
+        boolean invoked = invokeOptional(tuner, "adjustCoarseFilters", req);
+        if (!invoked) {
+            invoked = invokeOptional(tuner, "onNoTrades", req);
+        }
+
+        if (invoked) {
+            log.warn("🧠 NO_TRADES → coarse filters updated by tuner: type={} ex={} net={} sym={} tf={}",
+                    req.strategyType(), req.exchange(), req.network(), safe(req.symbol()), safe(req.timeframe()));
+        } else {
+            log.warn("🧠 NO_TRADES → tuner {} has no coarse filter handler (adjustCoarseFilters/onNoTrades).",
+                    tuner.getClass().getSimpleName());
+        }
+    }
+
+    private static boolean invokeOptional(Object target, String methodName, TuningRequest arg) {
+        try {
+            Method m = target.getClass().getMethod(methodName, TuningRequest.class);
+            m.setAccessible(true);
+            m.invoke(target, arg);
+            return true;
+        } catch (NoSuchMethodException ignore) {
+            return false;
+        } catch (Exception e) {
+            log.warn("⚠️ Ошибка при вызове {}.{}(): {}", target.getClass().getSimpleName(), methodName, e.getMessage());
+            return false;
+        }
+    }
+
+    private static String safeMsg(Throwable e) {
+        if (e == null) return "null";
+        String m = e.getMessage();
+        if (m == null || m.isBlank()) return e.getClass().getSimpleName();
+        return m;
     }
 
     private record TuningKey(
@@ -221,9 +380,18 @@ public class AutoTunerOrchestrator {
             NetworkType network
     ) {}
 
+    private enum TuneOutcome {
+        RUNNING,
+        APPLIED,
+        NO_IMPROVEMENT,
+        NO_TRADES,
+        ERROR
+    }
+
     private record LastRun(
             String signature,
             long atMs,
-            String modelVersion
+            String modelVersion,
+            TuneOutcome outcome
     ) {}
 }

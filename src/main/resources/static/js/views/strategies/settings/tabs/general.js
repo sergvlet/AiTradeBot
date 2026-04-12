@@ -2,955 +2,460 @@
 
 window.SettingsTabGeneral = (function () {
 
-    function init() {
-        const ctx = window.StrategySettingsContext;
-        if (!ctx) return;
+    let started = false;
 
-        const form = document.getElementById("generalForm");
-        if (!form) return;
+    function byId(id) { return document.getElementById(id); }
 
-        // =====================================================
-        // UI
-        // =====================================================
-        const saveState   = document.getElementById("generalSaveState");
-        const saveMeta    = document.getElementById("generalSaveMeta");
-        const changedList = document.getElementById("generalChangedList");
-        const dirtyBadge  = document.getElementById("generalDirtyBadge");
-        const applyBtn    = document.getElementById("generalApplyBtn");
+    function isBlank(s) {
+        return s === null || s === undefined || String(s).trim() === "";
+    }
 
-        const confirmModalEl = document.getElementById("generalConfirmModal");
-        const confirmTitleEl = document.getElementById("generalConfirmTitle");
-        const confirmTextEl  = document.getElementById("generalConfirmText");
-        const confirmOkBtn   = document.getElementById("generalConfirmOk");
+    function normalizeMode(v) {
+        const m = String(v || "MANUAL").trim().toUpperCase();
+        if (m === "MANUAL" || m === "HYBRID" || m === "AI") return m;
+        return "MANUAL";
+    }
 
-        const controlModeSelect   = document.getElementById("advancedControlMode");
-        const controlModeProgress = document.getElementById("controlModeProgress");
+    function nowHHmm() {
+        const d = new Date();
+        const hh = String(d.getHours()).padStart(2, "0");
+        const mm = String(d.getMinutes()).padStart(2, "0");
+        return `${hh}:${mm}`;
+    }
 
-        const accountAssetSelect   = document.getElementById("accountAssetSelect");
-        const selectedAssetView    = document.getElementById("selectedAssetView");
-        const availableBalanceView = document.getElementById("availableBalanceView");
+    // =====================================================
+    // Context / URLs
+    // =====================================================
+    function getCtx() {
+        return window.StrategySettingsContext || null;
+    }
 
-        const exposureMode          = document.getElementById("strategyBudgetMode");
-        const exposureValue         = document.getElementById("strategyBudgetValue");
-        const exposureValueReadonly = document.getElementById("strategyBudgetValueReadonly");
+    function ctxQueryParams(ctx) {
+        const q = new URLSearchParams();
+        if (ctx?.chatId) q.set("chatId", String(ctx.chatId));
+        if (!isBlank(ctx?.exchange)) q.set("exchange", String(ctx.exchange));
+        if (!isBlank(ctx?.network)) q.set("network", String(ctx.network));
+        return q;
+    }
 
-        const exposureValueLabel = document.getElementById("strategyBudgetValueLabel");
-        const exposureValueHint  = document.getElementById("strategyBudgetValueHint");
-        const exposurePreview    = document.getElementById("strategyBudgetPreview");
+    function buildConfigUrl(ctx, tabName) {
+        const base = `/strategies/${encodeURIComponent(String(ctx.type || ""))}/config`;
+        const q = ctxQueryParams(ctx);
+        if (!isBlank(tabName)) q.set("tab", String(tabName));
+        const qs = q.toString();
+        return qs ? (base + "?" + qs) : base;
+    }
 
-        const maxExposureUsdHidden = document.getElementById("maxExposureUsd");
-        const maxExposurePctHidden = document.getElementById("maxExposurePct");
-        const exposureInitialMode  = document.getElementById("strategyBudgetInitialMode");
+    function buildStateUrl(ctx, diagnostics) {
+        const base = `/strategies/${encodeURIComponent(String(ctx.type || ""))}/config/state`;
+        const q = new URLSearchParams();
+        q.set("chatId", String(ctx.chatId || ""));
+        if (!isBlank(ctx?.exchange)) q.set("exchange", String(ctx.exchange));
+        if (!isBlank(ctx?.network)) q.set("network", String(ctx.network));
+        q.set("diagnostics", diagnostics ? "true" : "false");
+        return base + "?" + q.toString();
+    }
 
-        const dailyLossInput   = document.getElementById("dailyLossLimitPct");
-        const reinvestCheckbox = document.getElementById("reinvestProfit");
+    // =====================================================
+    // Confirm modal (Bootstrap) fallback -> window.confirm
+    // =====================================================
+    function showConfirm(title, text) {
+        if (!window.bootstrap || !window.bootstrap.Modal) {
+            const ok = window.confirm(text || "Подтвердить?");
+            return Promise.resolve(ok);
+        }
 
-        // =====================================================
-        // AUTOSAVE
-        // =====================================================
-        const rootEl = document.getElementById("generalHeader") || form;
+        return new Promise((resolve) => {
+            const modalEl = byId("confirmModal");
+            const titleEl = byId("confirmModalTitle");
+            const bodyEl  = byId("confirmModalBody");
+            const okBtn   = byId("confirmModalOk");
 
-        const AUTOSAVE_ENDPOINT = "/api/strategy/settings/autosave";
-        const BALANCE_ENDPOINT  = "/api/strategy/settings/balance";
-        const APPLY_ENDPOINT    = "/api/strategy/settings/apply";
+            if (!modalEl || !titleEl || !bodyEl || !okBtn) {
+                const ok = window.confirm(text || "Подтвердить?");
+                resolve(ok);
+                return;
+            }
 
-        const autosave = window.SettingsAutoSave?.create?.({
-            rootEl,
-            scope: "general",
-            context: ctx,
-            endpoints: { autosave: AUTOSAVE_ENDPOINT },
-            elements: { saveState, saveMeta, changedList, applyBtn },
-            buildPayload: buildPayload
+            titleEl.textContent = title || "Подтверждение";
+            bodyEl.textContent  = text || "Подтвердить действие?";
+
+            const modal = new window.bootstrap.Modal(modalEl, { backdrop: "static", keyboard: false });
+
+            let done = false;
+
+            const cleanup = () => {
+                okBtn.removeEventListener("click", onOk);
+                modalEl.removeEventListener("hidden.bs.modal", onHide);
+            };
+
+            const onOk = () => {
+                if (done) return;
+                done = true;
+                cleanup();
+                try { modal.hide(); } catch (_) {}
+                resolve(true);
+            };
+
+            const onHide = () => {
+                if (done) return;
+                done = true;
+                cleanup();
+                resolve(false);
+            };
+
+            okBtn.addEventListener("click", onOk);
+            modalEl.addEventListener("hidden.bs.modal", onHide);
+
+            try { modal.show(); } catch (_) { resolve(window.confirm(text || "Подтвердить?")); }
         });
+    }
 
-        function markChanged(key) {
-            if (dirtyBadge) dirtyBadge.classList.remove("d-none");
-            autosave?.markChanged?.(key);
+    // =====================================================
+    // UI helpers
+    // =====================================================
+    function setBadge(el, kind, text) {
+        if (!el) return;
+
+        el.textContent = text || "";
+        el.classList.remove(
+            "bg-success", "bg-warning", "bg-secondary", "bg-danger", "bg-info",
+            "text-dark"
+        );
+
+        if (kind === "ok") el.classList.add("bg-success");
+        else if (kind === "warn") { el.classList.add("bg-warning"); el.classList.add("text-dark"); }
+        else if (kind === "err") el.classList.add("bg-danger");
+        else if (kind === "info") { el.classList.add("bg-info"); el.classList.add("text-dark"); }
+        else el.classList.add("bg-secondary");
+    }
+
+    function setProgress(on) {
+        const progress = byId("controlModeProgress");
+        if (!progress) return;
+        progress.classList.toggle("d-none", !on);
+    }
+
+    function setModeHint(mode) {
+        const hint = byId("controlModeHint");
+        if (!hint) return;
+
+        if (mode === "MANUAL") {
+            hint.innerHTML =
+                "<b>MANUAL:</b> бот не меняет параметры." +
+                "<br><b>HYBRID:</b> бот предлагает/записывает параметры, ты можешь править." +
+                "<br><b>AI:</b> бот управляет постоянно; часть полей может стать read-only.";
+            return;
         }
 
-        function scheduleSave(ms) {
-            autosave?.scheduleSave?.(ms ?? 400);
+        if (mode === "HYBRID") {
+            hint.innerHTML =
+                "<b>HYBRID:</b> ты меняешь поля, бот может предлагать и перезаписывать параметры после тюнинга/бэктеста." +
+                "<br>Изменения важных параметров подтверждаются.";
+            return;
         }
 
-        autosave?.bindApplyButton?.();
-        autosave?.initReadyState?.();
+        if (mode === "AI") {
+            hint.innerHTML =
+                "<b>AI:</b> система управляет параметрами автоматически." +
+                "<br>Часть полей может стать read-only, а значения могут меняться в рантайме.";
+        }
+    }
 
-        // =====================================================
-        // HELPERS
-        // =====================================================
-        function nowHHmm() {
-            const d = new Date();
-            const hh = String(d.getHours()).padStart(2, "0");
-            const mm = String(d.getMinutes()).padStart(2, "0");
-            return `${hh}:${mm}`;
+    function dispatchMode(mode) {
+        try {
+            window.__StrategyControlMode = mode;
+            window.dispatchEvent(new CustomEvent("strategy:controlModeChanged", { detail: { mode } }));
+        } catch (_) {}
+    }
+
+    function dispatchUiState(state) {
+        try {
+            window.dispatchEvent(new CustomEvent("strategy:uiStateChanged", { detail: { state } }));
+        } catch (_) {}
+    }
+
+    // =====================================================
+    // ✅ “железно” применяем режим к UI (без ожидания сервера)
+    // =====================================================
+    function applyControlModeUi(mode) {
+        const m = normalizeMode(mode);
+
+        // общие ID (если есть на странице)
+        const autoTuneCb = byId("autoTuneEnabled");
+        const mlGateCb   = byId("mlGateEnabled");
+        const gateMin    = byId("gateMinProb");
+
+        // MANUAL: запретить/сбросить
+        if (m === "MANUAL") {
+            if (autoTuneCb) { autoTuneCb.checked = false; autoTuneCb.disabled = true; }
+            if (mlGateCb)   { mlGateCb.checked = false;   mlGateCb.disabled = true; }
+            if (gateMin)    { gateMin.value = ""; gateMin.disabled = true; }
+            return;
         }
 
-        function parseNumberLoose(v) {
-            if (v == null) return null;
-            const s = String(v).trim().replace(",", ".");
-            if (!s) return null;
-            const n = Number(s);
-            return Number.isFinite(n) ? n : null;
+        // HYBRID: разрешаем ручное (но система может менять после тюнинга)
+        if (m === "HYBRID") {
+            if (autoTuneCb) autoTuneCb.disabled = false;
+            if (mlGateCb)   mlGateCb.disabled = false;
+            if (gateMin)    gateMin.disabled = false;
+            return;
         }
 
-        function fmt(n, decimals = 8) {
-            if (!Number.isFinite(n)) return "—";
-            return n.toFixed(decimals).replace(/\.?0+$/, "");
+        // AI: autotune обязателен (UI), ml-gate по желанию
+        if (m === "AI") {
+            if (autoTuneCb) { autoTuneCb.checked = true; autoTuneCb.disabled = true; }
+            if (mlGateCb)   mlGateCb.disabled = false;
+            if (gateMin)    gateMin.disabled = false;
+        }
+    }
+
+    // =====================================================
+    // State sync
+    // =====================================================
+    function isObj(x) { return x && typeof x === "object"; }
+
+    function applyStateToCtx(ctx, st) {
+        if (!ctx || !isObj(st)) return;
+
+        if (!isBlank(st.exchange)) ctx.exchange = String(st.exchange);
+        if (st.network) ctx.network = String(st.network);
+
+        if (st.advancedControlMode) ctx.advancedControlMode = normalizeMode(st.advancedControlMode);
+        if (!isBlank(st.runPhase)) ctx.runPhase = String(st.runPhase);
+
+        if (typeof st.autoTuneEnabled === "boolean") ctx.autoTuneEnabled = st.autoTuneEnabled;
+        if (typeof st.mlGateEnabled === "boolean") ctx.mlGateEnabled = st.mlGateEnabled;
+
+        if (!isBlank(st.symbol)) ctx.symbol = String(st.symbol);
+        if (!isBlank(st.timeframe)) ctx.timeframe = String(st.timeframe);
+        if (typeof st.cachedCandlesLimit === "number") ctx.cachedCandlesLimit = st.cachedCandlesLimit;
+    }
+
+    async function fetchUiState(ctx) {
+        const api = window.SettingsApi;
+        const url = buildStateUrl(ctx, false);
+
+        try {
+            if (api?.getJson) return await api.getJson(url);
+
+            const resp = await fetch(url, {
+                method: "GET",
+                credentials: "same-origin",
+                headers: { "Accept": "application/json" }
+            });
+            if (!resp.ok) return null;
+            return await resp.json().catch(() => null);
+        } catch (e) {
+            console.warn("[general] fetch state failed:", e);
+            return null;
+        }
+    }
+
+    // =====================================================
+    // MAIN INIT
+    // =====================================================
+    function init() {
+        if (started) return;
+
+        const ctx = getCtx();
+        if (!ctx?.type || !ctx?.chatId) {
+            console.warn("[general] ctx not ready -> skip init (will retry on tab click)");
+            return;
         }
 
-        function setSavedUiHint(extraMeta) {
-            if (dirtyBadge) dirtyBadge.classList.add("d-none");
-            if (saveState) {
-                saveState.classList.remove("bg-secondary");
-                saveState.classList.add("bg-success");
-                saveState.textContent = "Сохранено ✓";
-            }
-            if (saveMeta) saveMeta.textContent = extraMeta || nowHHmm();
+        const api = window.SettingsApi;
+        if (!api?.postForm) {
+            console.error("[general] SettingsApi.postForm not found");
+            return;
         }
 
-        function setSavingUiHint() {
-            if (saveState) {
-                saveState.classList.remove("bg-success");
-                saveState.classList.add("bg-secondary");
-                saveState.textContent = "Сохранение…";
-            }
+        const form = byId("controlForm") || byId("generalForm");
+        if (!form) {
+            console.warn("[general] controlForm/generalForm not found -> skip init (will retry)");
+            return;
         }
 
-        function setErrorUiHint() {
-            if (saveState) {
-                saveState.classList.remove("bg-success");
-                saveState.classList.add("bg-secondary");
-                saveState.textContent = "Ошибка";
-            }
-            if (saveMeta) saveMeta.textContent = "проверь API";
+        const modeSelect = byId("advancedControlMode");
+        if (!modeSelect) {
+            console.warn("[general] #advancedControlMode not found -> skip init (will retry)");
+            return;
         }
 
-        function setApplyingUiHint() {
-            if (saveState) {
-                saveState.classList.remove("bg-success");
-                saveState.classList.add("bg-secondary");
-                saveState.textContent = "Применяю AI…";
-            }
+        started = true;
+
+        const saveState = byId("controlSaveState") || byId("generalSaveState");
+        const saveMeta  = byId("controlSaveMeta")  || byId("generalSaveMeta");
+
+        const initialMode = normalizeMode(modeSelect.value || ctx.advancedControlMode || "MANUAL");
+        ctx.advancedControlMode = initialMode;
+        modeSelect.dataset.prevValue = initialMode;
+
+        setModeHint(initialMode);
+        applyControlModeUi(initialMode);
+        setBadge(saveState, "info", "Готово");
+        if (saveMeta) saveMeta.textContent = "";
+        dispatchMode(initialMode);
+
+        function setSavedUi(extra) {
+            setBadge(saveState, "ok", "Сохранено ✓");
+            if (saveMeta) saveMeta.textContent = extra || nowHHmm();
+        }
+
+        function setSavingUi() {
+            setBadge(saveState, "info", "Сохранение…");
             if (saveMeta) saveMeta.textContent = nowHHmm();
         }
 
-        function showProgress(on) {
-            if (!controlModeProgress) return;
-            controlModeProgress.classList.toggle("d-none", !on);
+        function setErrorUi(msg) {
+            setBadge(saveState, "err", "Ошибка");
+            if (saveMeta) saveMeta.textContent = msg || "проверь сервер";
         }
 
-        function getAssetForUi() {
-            const a1 = (accountAssetSelect?.value || "").trim();
-            if (a1) return a1;
-
-            const a2 = (selectedAssetView?.textContent || "").trim();
-            if (a2 && a2 !== "—") return a2;
-
-            return null;
-        }
-
-        function getFreeBalanceNumber() {
-            const raw = (availableBalanceView?.value || "").trim();
-            return parseNumberLoose(raw);
-        }
-
-        function setBalanceUi(asset, freeValue) {
-            if (selectedAssetView) selectedAssetView.textContent = asset || "—";
-            if (availableBalanceView) {
-                const v = (freeValue === null || freeValue === undefined || freeValue === "")
-                    ? "—"
-                    : String(freeValue);
-                availableBalanceView.value = v;
-            }
-        }
-
-        // =====================================================
-        // CSRF helpers (Spring Security friendly)
-        // =====================================================
-        function readCsrf() {
-            const token = document.querySelector('meta[name="_csrf"]')?.getAttribute("content") || "";
-            const header = document.querySelector('meta[name="_csrf_header"]')?.getAttribute("content") || "";
-            if (!token || !header) return null;
-            return { token, header };
-        }
-
-        // =====================================================
-        // ✅ ЖЁСТКИЙ AUTOSAVE: гарантирует payload из buildPayload
-        // + CSRF/credentials
-        // =====================================================
-        async function postAutosaveDirect(payload) {
-            const headers = {
-                "Content-Type": "application/json",
-                "Accept": "application/json"
-            };
-
-            const csrf = readCsrf();
-            if (csrf) headers[csrf.header] = csrf.token;
-
-            const res = await fetch(AUTOSAVE_ENDPOINT, {
-                method: "POST",
-                credentials: "same-origin",
-                headers,
-                body: JSON.stringify(payload)
-            });
-
-            if (!res.ok) throw new Error(`autosave http ${res.status}`);
-
-            const text = await res.text();
-            try { return JSON.parse(text); } catch { return null; }
-        }
-
-        // =====================================================
-        // ✅ НОРМАЛИЗАТОР ответа сервера
-        // =====================================================
-        function unwrapSnapshot(resp) {
-            if (!resp) return null;
-            return resp.snapshot || resp.settingsSnapshot || resp.data?.snapshot || resp;
-        }
-
-        // =====================================================
-        // ✅ FIX: синхронизация контекста (обязательно!)
-        // =====================================================
-        function syncContextFromServer(resp) {
-            const snap = unwrapSnapshot(resp) || {};
-
-            const ex =
-                (snap.exchange || snap.exchangeName || resp?.exchange || resp?.exchangeName || "")
-                    .toString().trim();
-
-            const net =
-                (snap.network || snap.networkType || resp?.network || resp?.networkType || "")
-                    .toString().trim();
-
-            const type =
-                (snap.type || resp?.type || "")
-                    .toString().trim();
-
-            if (ex) ctx.exchange = ex;
-            if (net) ctx.network = net;
-            if (type) ctx.type = type;
-        }
-
-        // =====================================================
-        // ✅ FIX: прижим режима к факту БД (snapshot.advancedControlMode)
-        // =====================================================
-        function syncControlModeFromServer(resp) {
-            const snap = unwrapSnapshot(resp) || {};
-            const raw =
-                snap.advancedControlMode ??
-                resp?.advancedControlMode ??
-                snap.controlMode ??
-                resp?.controlMode ??
-                null;
-
-            const mode = String(raw || "").trim().toUpperCase();
-            if (!mode) return;
-
-            if (controlModeSelect) {
-                // прижимаем только если реально есть такой option
-                const hasOpt = Array.from(controlModeSelect.options || []).some(o =>
-                    String(o.value || "").trim().toUpperCase() === mode
-                );
-
-                if (hasOpt) {
-                    const cur = String(controlModeSelect.value || "").trim().toUpperCase();
-                    if (cur !== mode) controlModeSelect.value = mode;
-                    controlModeSelect.dataset.prevValue = mode;
-                } else {
-                    // если option нет — просто фиксируем prevValue, чтобы не было отката/петли
-                    controlModeSelect.dataset.prevValue = String(controlModeSelect.value || "").trim().toUpperCase();
-                }
-            }
-
-            ctx.advancedControlMode = mode;
-            window.__StrategyControlMode = mode;
-
-            try {
-                window.dispatchEvent(new CustomEvent("strategy:controlModeChanged", { detail: { mode } }));
-            } catch (_) {}
-        }
-
-        // =====================================================
-        // PAYLOAD
-        // =====================================================
-        function buildPayload() {
-            const asset = (accountAssetSelect?.value || "").trim() || null;
-
-            return {
-                chatId: ctx.chatId,
-                type: ctx.type,
-                exchange: ctx.exchange,
-                network: ctx.network,
-                scope: "general",
-
-                advancedControlMode: controlModeSelect ? ((controlModeSelect.value || "").trim() || null) : null,
-
-                accountAsset: asset,
-                maxExposureUsd: (maxExposureUsdHidden?.value || "").trim() || null,
-                maxExposurePct: (maxExposurePctHidden?.value || "").trim() || null,
-                dailyLossLimitPct: (dailyLossInput?.value || "").trim() || null,
-                reinvestProfit: reinvestCheckbox ? !!reinvestCheckbox.checked : null
-            };
-        }
-
-        // =====================================================
-        // BALANCE API
-        // =====================================================
-        async function fetchBalanceSnapshot(asset) {
-            const a = (asset || "").trim();
-            if (!a) return null;
-
-            const url =
-                `${BALANCE_ENDPOINT}` +
-                `?chatId=${encodeURIComponent(ctx.chatId)}` +
-                `&type=${encodeURIComponent(ctx.type)}` +
-                `&exchange=${encodeURIComponent(ctx.exchange)}` +
-                `&network=${encodeURIComponent(ctx.network)}` +
-                `&asset=${encodeURIComponent(a)}`;
-
-            const res = await fetch(url, { method: "GET", headers: { "Accept": "application/json" }, credentials: "same-origin" });
-            if (!res.ok) throw new Error(`balance http ${res.status}`);
-
-            const text = await res.text();
-            try { return JSON.parse(text); } catch { throw new Error("balance not json"); }
-        }
-
-        async function refreshBalance(asset) {
-            const a = (asset || "").trim() || getAssetForUi();
-            if (!a) {
-                setBudgetUi(false);
-                return null;
-            }
-
-            if (selectedAssetView) selectedAssetView.textContent = a;
-
-            try {
-                const snap = await fetchBalanceSnapshot(a);
-                const selAsset = snap?.selectedAsset || a;
-                const free = snap?.selectedFreeBalance ?? "—";
-                setBalanceUi(selAsset, free);
-
-                setBudgetUi(false);
-                return snap;
-            } catch (e) {
-                console.error("refreshBalance failed", e);
-                setBudgetUi(false);
-                return null;
-            }
-        }
-
-        // =====================================================
-        // CONFIRM
-        // =====================================================
-        function confirmText(el) {
-            return {
-                title: el?.dataset?.confirmTitle || "Подтверждение",
-                text: el?.dataset?.confirmText || "Сохранить изменения?"
-            };
-        }
-
-        function showConfirm(el, overrideText) {
-            return new Promise((resolve) => {
-                if (!confirmModalEl || !window.bootstrap?.Modal) {
-                    resolve(true);
-                    return;
-                }
-
-                const { title, text } = overrideText || confirmText(el);
-                if (confirmTitleEl) confirmTitleEl.textContent = title;
-                if (confirmTextEl) confirmTextEl.textContent = text;
-
-                const modal = window.bootstrap.Modal.getOrCreateInstance(confirmModalEl, {
-                    backdrop: "static",
-                    keyboard: false
-                });
-
-                let done = false;
-
-                const cleanup = () => {
-                    confirmOkBtn?.removeEventListener("click", onOk);
-                    confirmModalEl.removeEventListener("hidden.bs.modal", onHide);
-                };
-
-                const onOk = () => {
-                    if (done) return;
-                    done = true;
-                    cleanup();
-                    modal.hide();
-                    resolve(true);
-                };
-
-                const onHide = () => {
-                    if (done) return;
-                    done = true;
-                    cleanup();
-                    resolve(false);
-                };
-
-                confirmOkBtn?.addEventListener("click", onOk, { once: true });
-                confirmModalEl.addEventListener("hidden.bs.modal", onHide);
-
-                modal.show();
+        async function saveModeToServer(mode) {
+            const url = buildConfigUrl(ctx, "control");
+            return await api.postForm(url, {
+                saveScope: "general",
+                tab: "control",
+                exchange: ctx.exchange || "",
+                network: ctx.network || "",
+                advancedControlMode: String(mode)
             });
         }
 
-        function shouldConfirmByPolicy(el, key, extra) {
-            if (!el) return false;
-            const flag = String(el.dataset.confirm || "").toLowerCase() === "true";
-            if (!flag) return false;
-
-            if (key === "budgetValue") return false;
-
-            if (key === "budgetMode") {
-                const nextMode = (extra?.nextMode || "").trim();
-                return nextMode === "NONE";
-            }
-
-            return true;
-        }
-
-        // =====================================================
-        // DEBOUNCE
-        // =====================================================
-        const Debounce = (function () {
-            let t = null;
-
-            function clear() {
-                if (t) {
-                    clearTimeout(t);
-                    t = null;
-                }
-            }
-
-            function schedule(fn, ms) {
-                clear();
-                t = setTimeout(() => {
-                    t = null;
-                    fn();
-                }, Math.max(0, ms | 0));
-            }
-
-            function flush(fn) {
-                clear();
-                fn();
-            }
-
-            return { schedule, flush, clear };
-        })();
-
-        // =====================================================
-        // ✅ SAVE NOW: всегда POST /autosave с advancedControlMode
-        // + прижим селекта к snapshot.advancedControlMode
-        // =====================================================
-        async function autosaveNowStrict() {
-            const payload = buildPayload();
-
-            setSavingUiHint();
-
-            const resp = await postAutosaveDirect(payload);
-
-            // 1) синхронизируем ctx (exchange/network/type)
-            syncContextFromServer(resp);
-
-            // 2) жёстко прижимаем режим к факту БД
-            syncControlModeFromServer(resp);
-
-            // 3) баланс (если сервер вернул)
-            const snap = resp?.snapshot || resp?.balanceSnapshot || null;
-            if (snap?.selectedAsset) {
-                setBalanceUi(snap.selectedAsset, snap.selectedFreeBalance);
-                setBudgetUi(false);
-            }
-
-            setSavedUiHint();
-            return resp;
-        }
-
-        // =====================================================
-        // APPLY
-        // =====================================================
-        async function applyControlMode(reason) {
-            if (!controlModeSelect) return null;
-
+        async function tryApplyMode(mode) {
+            const url = "/strategies/apply";
             const payload = {
-                chatId: ctx.chatId,
-                type: ctx.type,
-                exchange: ctx.exchange,
-                network: ctx.network,
-                advancedControlMode: (controlModeSelect.value || "").trim() || null,
-                reason: (reason || "").trim() || null
+                chatId: Number(ctx.chatId),
+                type: String(ctx.type),
+                exchange: String(ctx.exchange || ""),
+                network: String(ctx.network || "TESTNET"),
+                advancedControlMode: String(mode),
+                reason: "ui-change"
             };
-
-            const headers = {
-                "Content-Type": "application/json",
-                "Accept": "application/json"
-            };
-
-            const csrf = readCsrf();
-            if (csrf) headers[csrf.header] = csrf.token;
-
-            const res = await fetch(APPLY_ENDPOINT, {
-                method: "POST",
-                credentials: "same-origin",
-                headers,
-                body: JSON.stringify(payload)
-            });
-
-            if (!res.ok) throw new Error(`apply http ${res.status}`);
-
-            const text = await res.text();
-            try { return JSON.parse(text); } catch { return null; }
-        }
-
-        // =====================================================
-        // “CHANGE” ACTION WRAPPER
-        // =====================================================
-        async function commitChange(el, key, action, confirmExtra, overrideConfirmText) {
-            markChanged(key);
-
-            if (shouldConfirmByPolicy(el, key, confirmExtra)) {
-                const ok = await showConfirm(el, overrideConfirmText);
-                if (!ok) return false;
-            }
-
-            if (typeof action === "function") {
-                await action();
-            }
 
             try {
-                await autosaveNowStrict();
-            } catch (e) {
-                console.error("autosaveNowStrict failed", e);
-                setErrorUiHint();
-                return false;
-            }
-
-            scheduleSave(250);
-            return true;
-        }
-
-        // =====================================================
-        // BUDGET UI
-        // =====================================================
-        function setBudgetTexts(mode, asset, valueRaw) {
-            const free = getFreeBalanceNumber();
-
-            if (mode === "NONE") {
-                if (exposureValueLabel) exposureValueLabel.textContent = "Значение";
-                if (exposureValueHint) exposureValueHint.textContent = "Будет использован весь доступный баланс.";
-
-                if (exposureValueReadonly) {
-                    if (asset && free != null) exposureValueReadonly.value = `Весь доступный баланс: ${fmt(free)} ${asset}`;
-                    else exposureValueReadonly.value = "Весь доступный баланс";
-                }
-
-                if (exposurePreview) {
-                    if (asset && free != null) exposurePreview.textContent = `Лимит: весь баланс ≈ ${fmt(free)} ${asset}`;
-                    else exposurePreview.textContent = "Лимит: весь баланс";
-                }
-                return;
-            }
-
-            if (mode === "USD") {
-                if (exposureValueLabel) exposureValueLabel.textContent = asset ? `Сумма (${asset})` : "Сумма";
-                if (exposureValueHint) exposureValueHint.textContent = asset ? `Максимальная сумма в ${asset}.` : "Максимальная сумма в выбранном активе.";
-
-                if (exposurePreview) {
-                    const v = parseNumberLoose(valueRaw);
-                    if (v != null && asset) {
-                        if (free != null && free > 0) {
-                            const pct = (v / free) * 100;
-                            exposurePreview.textContent = `Лимит: ${fmt(v)} ${asset} (≈ ${fmt(pct, 2)}% от free)`;
-                        } else {
-                            exposurePreview.textContent = `Лимит: ${fmt(v)} ${asset}`;
-                        }
-                    } else {
-                        exposurePreview.textContent = asset ? `Лимит: укажи сумму (${asset})` : "Лимит: укажи сумму";
-                    }
-                }
-                return;
-            }
-
-            if (mode === "PCT") {
-                if (exposureValueLabel) exposureValueLabel.textContent = "Процент (%)";
-                if (exposureValueHint) exposureValueHint.textContent = "Процент от доступного баланса (0–100%).";
-
-                if (exposurePreview) {
-                    const p = parseNumberLoose(valueRaw);
-                    if (p != null) {
-                        const clamped = Math.min(100, Math.max(0, p));
-                        if (free != null && asset) {
-                            const abs = (free * clamped) / 100.0;
-                            exposurePreview.textContent = `Лимит: ${fmt(clamped, 2)}% ≈ ${fmt(abs)} ${asset}`;
-                        } else {
-                            exposurePreview.textContent = `Лимит: ${fmt(clamped, 2)}%`;
-                        }
-                    } else {
-                        exposurePreview.textContent = "Лимит: укажи процент (0–100)";
-                    }
-                }
-            }
-        }
-
-        function setBudgetUi(triggerSave) {
-            if (!exposureMode) return;
-
-            const mode = (exposureMode.value || "PCT").trim();
-            const asset = getAssetForUi();
-
-            if (mode === "NONE") {
-                exposureValue?.classList.add("d-none");
-                exposureValueReadonly?.classList.remove("d-none");
-
-                if (exposureValue) exposureValue.value = "";
-                if (maxExposureUsdHidden) maxExposureUsdHidden.value = "";
-                if (maxExposurePctHidden) maxExposurePctHidden.value = "";
-
-                setBudgetTexts("NONE", asset, "");
-
-                if (triggerSave) {
-                    markChanged("budget");
-                    scheduleSave(400);
-                }
-                return;
-            }
-
-            exposureValueReadonly?.classList.add("d-none");
-            exposureValue?.classList.remove("d-none");
-
-            if (mode === "USD") {
-                if (exposureValue) {
-                    exposureValue.min = "0";
-                    exposureValue.step = "1";
-                    exposureValue.placeholder = "Напр. 500";
-                    const free = getFreeBalanceNumber();
-                    exposureValue.max = (free != null && free > 0) ? String(free) : "";
-                }
-            }
-
-            if (mode === "PCT") {
-                if (exposureValue) {
-                    exposureValue.min = "0";
-                    exposureValue.max = "100";
-                    exposureValue.step = "0.1";
-                    exposureValue.placeholder = "Напр. 10";
-                }
-            }
-
-            syncBudgetHidden(triggerSave);
-        }
-
-        function syncBudgetHidden(triggerSave) {
-            const mode = (exposureMode?.value || "PCT").trim();
-            const raw  = (exposureValue?.value || "").trim();
-            const asset = getAssetForUi();
-
-            if (!raw) {
-                if (maxExposureUsdHidden) maxExposureUsdHidden.value = "";
-                if (maxExposurePctHidden) maxExposurePctHidden.value = "";
-                setBudgetTexts(mode, asset, "");
-
-                if (triggerSave) {
-                    markChanged("budget");
-                    scheduleSave(400);
-                }
-                return;
-            }
-
-            const v = parseNumberLoose(raw);
-            if (v == null || v < 0) return;
-
-            if (mode === "USD") {
-                const free = getFreeBalanceNumber();
-                const clamped = (free != null && free > 0) ? Math.min(v, free) : v;
-
-                if (maxExposureUsdHidden) maxExposureUsdHidden.value = String(clamped);
-                if (maxExposurePctHidden) maxExposurePctHidden.value = "";
-                if (exposureValue && clamped !== v) exposureValue.value = String(clamped);
-
-                setBudgetTexts("USD", asset, String(clamped));
-            }
-
-            if (mode === "PCT") {
-                const clamped = Math.min(100, Math.max(0, v));
-                if (maxExposurePctHidden) maxExposurePctHidden.value = String(clamped);
-                if (maxExposureUsdHidden) maxExposureUsdHidden.value = "";
-                if (exposureValue) exposureValue.value = String(clamped);
-
-                setBudgetTexts("PCT", asset, String(clamped));
-            }
-
-            if (triggerSave) {
-                markChanged("budget");
-                scheduleSave(400);
-            }
-        }
-
-        function moveOptionToEnd(selectEl, value) {
-            if (!selectEl) return;
-            const opt = Array.from(selectEl.options).find(o => o.value === value);
-            if (!opt) return;
-            selectEl.removeChild(opt);
-            selectEl.appendChild(opt);
-        }
-
-        function initBudgetFromBackendSafe() {
-            moveOptionToEnd(exposureMode, "NONE");
-
-            let initial = (exposureInitialMode?.value || "").trim();
-
-            if (!initial || initial === "NONE") {
-                initial = "PCT";
-                if (exposureValue) exposureValue.value = "10";
-                if (maxExposurePctHidden) maxExposurePctHidden.value = "10";
-                if (maxExposureUsdHidden) maxExposureUsdHidden.value = "";
-            } else {
-                if (initial === "USD" && exposureValue) exposureValue.value = maxExposureUsdHidden?.value || "";
-                if (initial === "PCT" && exposureValue) exposureValue.value = maxExposurePctHidden?.value || "";
-            }
-
-            if (exposureMode) exposureMode.value = initial;
-            setBudgetUi(false);
-        }
-
-        initBudgetFromBackendSafe();
-
-        // =====================================================
-        // FIELD HANDLERS
-        // =====================================================
-
-        if (controlModeSelect) {
-            controlModeSelect.dataset.prevValue = controlModeSelect.value;
-            controlModeSelect.dataset.confirm = "false";
-
-            controlModeSelect.addEventListener("change", async () => {
-                const prev = (controlModeSelect.dataset.prevValue ?? "").trim();
-                const next = (controlModeSelect.value || "").trim();
-
-                const nextUpper = String(next).toUpperCase();
-                const isAiMode = (nextUpper === "HYBRID" || nextUpper === "AI");
-
-                markChanged("advancedControlMode");
-
-                // ✅ 1) мгновенно отражаем в runtime + событие
-                window.__StrategyControlMode = nextUpper;
-                try {
-                    window.dispatchEvent(new CustomEvent("strategy:controlModeChanged", { detail: { mode: nextUpper } }));
-                } catch (_) {}
-
-                if (isAiMode) {
-                    showProgress(true);
-                    setApplyingUiHint();
-                } else {
-                    setSavingUiHint();
-                }
-
-                try {
-                    // ✅ 2) всегда autosaveNow() → POST /autosave (в payload есть advancedControlMode)
-                    const saved = await autosaveNowStrict();
-                    if (!saved) throw new Error("autosave returned null");
-
-                    // ✅ 3) для HYBRID/AI — apply (pipeline)
-                    if (isAiMode) {
-                        try {
-                            await applyControlMode(null);
-                            setSavedUiHint(`${nowHHmm()} • apply ok`);
-                        } catch (e) {
-                            console.error("applyControlMode failed", e);
-                            setSavedUiHint(`${nowHHmm()} • apply error`);
-                        } finally {
-                            showProgress(false);
-                        }
-                    } else {
-                        showProgress(false);
-                        setSavedUiHint();
-                    }
-
-                    // ✅ 4) prevValue фиксируем ПОСЛЕ прижима к серверу (syncControlModeFromServer)
-                    controlModeSelect.dataset.prevValue = String(controlModeSelect.value || "").trim();
-
-                } catch (e) {
-                    console.error("controlMode change failed", e);
-
-                    // откат UI
-                    controlModeSelect.value = prev;
-                    controlModeSelect.dataset.prevValue = prev;
-
-                    window.__StrategyControlMode = String(prev).trim().toUpperCase();
-                    try {
-                        window.dispatchEvent(new CustomEvent("strategy:controlModeChanged", { detail: { mode: window.__StrategyControlMode } }));
-                    } catch (_) {}
-
-                    showProgress(false);
-                    setErrorUiHint();
-                }
-
-                scheduleSave(250);
-            });
-        }
-
-        if (accountAssetSelect) {
-            accountAssetSelect.dataset.prevValue = (accountAssetSelect.value || "").trim();
-
-            accountAssetSelect.addEventListener("change", async () => {
-                const prev = accountAssetSelect.dataset.prevValue ?? "";
-                const next = (accountAssetSelect.value || "").trim();
-
-                await refreshBalance(next);
-
-                const ok = await commitChange(
-                    accountAssetSelect,
-                    "accountAsset",
-                    async () => { accountAssetSelect.dataset.prevValue = next; }
-                );
-
-                if (!ok) {
-                    accountAssetSelect.value = prev;
-                    await refreshBalance(prev);
-                }
-            });
-        }
-
-        if (dailyLossInput) {
-            dailyLossInput.dataset.prevValue = dailyLossInput.value;
-
-            dailyLossInput.addEventListener("input", () => {
-                markChanged("dailyLossLimitPct");
-                Debounce.schedule(async () => {
-                    await commitChange(dailyLossInput, "dailyLossLimitPct", async () => {});
-                }, 1200);
-            });
-
-            dailyLossInput.addEventListener("change", async () => {
-                Debounce.clear();
-
-                const prev = dailyLossInput.dataset.prevValue ?? "";
-                const next = dailyLossInput.value;
-
-                const ok = await commitChange(
-                    dailyLossInput,
-                    "dailyLossLimitPct",
-                    async () => { dailyLossInput.dataset.prevValue = next; }
-                );
-
-                if (!ok) dailyLossInput.value = prev;
-            });
-        }
-
-        if (reinvestCheckbox) {
-            reinvestCheckbox.addEventListener("change", async () => {
-                await commitChange(reinvestCheckbox, "reinvestProfit", async () => {});
-            });
-        }
-
-        if (exposureMode) {
-            exposureMode.dataset.prevValue = exposureMode.value;
-
-            exposureMode.addEventListener("change", async () => {
-                const prev = exposureMode.dataset.prevValue ?? "";
-                const next = (exposureMode.value || "PCT").trim();
-
-                setBudgetUi(false);
-                markChanged("budget");
-
-                const ok = await commitChange(
-                    exposureMode,
-                    "budgetMode",
-                    async () => {
-                        exposureMode.dataset.prevValue = next;
-                        syncBudgetHidden(false);
-                    },
-                    { nextMode: next },
-                    next === "NONE"
-                        ? { title: "Внимание", text: "Режим «Весь баланс» опасен. Стратегия сможет использовать весь доступный free. Включить?" }
-                        : null
-                );
-
-                if (!ok) {
-                    exposureMode.value = prev;
-                    setBudgetUi(false);
-                    syncBudgetHidden(false);
-                }
-            });
-        }
-
-        if (exposureValue) {
-            exposureValue.dataset.prevValue = exposureValue.value;
-            exposureValue.dataset.confirm = "false";
-
-            exposureValue.addEventListener("input", () => {
-                syncBudgetHidden(false);
-                markChanged("budget");
-
-                Debounce.schedule(async () => {
-                    const n = parseNumberLoose(exposureValue.value);
-                    if (n == null) return;
-
-                    syncBudgetHidden(false);
-
-                    exposureValue.dataset.prevValue = exposureValue.value;
-                    try {
-                        await autosaveNowStrict();
-                    } catch (e) {
-                        console.error("budget autosave failed", e);
-                        setErrorUiHint();
-                    }
-                    scheduleSave(250);
-                }, 1200);
-            });
-
-            const saveBudgetValueNow = async () => {
-                Debounce.flush(async () => {
-                    const n = parseNumberLoose(exposureValue.value);
-                    if (n == null) {
-                        exposureValue.value = exposureValue.dataset.prevValue ?? "";
-                        syncBudgetHidden(false);
-                        return;
-                    }
-
-                    syncBudgetHidden(false);
-                    exposureValue.dataset.prevValue = exposureValue.value;
-
-                    try {
-                        await autosaveNowStrict();
-                    } catch (e) {
-                        console.error("budget autosave failed", e);
-                        setErrorUiHint();
-                    }
-                    scheduleSave(250);
+                if (api?.postJson) return await api.postJson(url, payload);
+
+                const token  = document.querySelector('meta[name="_csrf"]')?.getAttribute("content") || "";
+                const header = document.querySelector('meta[name="_csrf_header"]')?.getAttribute("content") || "";
+                const headers = { "Content-Type": "application/json", "Accept": "application/json" };
+                if (token && header) headers[header] = token;
+
+                const resp = await fetch(url, {
+                    method: "POST",
+                    credentials: "same-origin",
+                    headers,
+                    body: JSON.stringify(payload)
                 });
-            };
 
-            exposureValue.addEventListener("change", saveBudgetValueNow);
-            exposureValue.addEventListener("blur", saveBudgetValueNow);
-
-            exposureValue.addEventListener("keydown", (e) => {
-                if (e.key === "Enter") {
-                    e.preventDefault();
-                    saveBudgetValueNow();
-                }
-            });
-        }
-
-        // =====================================================
-        // FIRST LOAD
-        // =====================================================
-        if (controlModeSelect) {
-            const m = String(controlModeSelect.value || "").trim().toUpperCase();
-            if (m) {
-                window.__StrategyControlMode = m;
-                try {
-                    window.dispatchEvent(new CustomEvent("strategy:controlModeChanged", { detail: { mode: m } }));
-                } catch (_) {}
+                if (!resp.ok) return {};
+                return await resp.json().catch(() => ({}));
+            } catch (e) {
+                console.warn("[general] apply failed:", e);
+                return {};
             }
         }
 
-        const initialAsset = getAssetForUi();
-        if (initialAsset) {
-            refreshBalance(initialAsset).catch(() => {});
-        } else {
-            setBudgetUi(false);
+        function revertToPrev(prev) {
+            modeSelect.value = prev;
+            ctx.advancedControlMode = prev;
+            modeSelect.dataset.prevValue = prev;
+            setModeHint(prev);
+            applyControlModeUi(prev);
+            dispatchMode(prev);
         }
+
+        let inFlight = false;
+
+        modeSelect.addEventListener("change", async () => {
+            if (inFlight) return;
+
+            const prev = normalizeMode(modeSelect.dataset.prevValue || "MANUAL");
+            const next = normalizeMode(modeSelect.value || "MANUAL");
+            if (next === prev) return;
+
+            // подтверждение
+            if (next === "HYBRID") {
+                const ok = await showConfirm(
+                    "Подтверждение",
+                    "Включить HYBRID режим? Бот сможет применять/перезаписывать параметры после тюнинга/бэктеста."
+                );
+                if (!ok) { revertToPrev(prev); return; }
+            }
+
+            if (next === "AI") {
+                const ok = await showConfirm(
+                    "Внимание",
+                    "В режиме AI система может менять параметры автоматически и блокировать ручное редактирование. Включить AI?"
+                );
+                if (!ok) { revertToPrev(prev); return; }
+            }
+
+            // ✅ UI сразу
+            ctx.advancedControlMode = next;
+            setModeHint(next);
+            applyControlModeUi(next);
+            dispatchMode(next);
+
+            inFlight = true;
+            setSavingUi();
+            setProgress(next === "HYBRID" || next === "AI");
+
+            try {
+                const saved = await saveModeToServer(next);
+
+                // подтянуть реальный state
+                let state = (isObj(saved) && (saved.type || saved.advancedControlMode)) ? saved : null;
+                if (!state) state = await fetchUiState(ctx);
+
+                if (state) {
+                    applyStateToCtx(ctx, state);
+
+                    const realMode = normalizeMode(state.advancedControlMode || next);
+                    modeSelect.value = realMode;
+                    modeSelect.dataset.prevValue = realMode;
+
+                    setModeHint(realMode);
+                    applyControlModeUi(realMode);
+                    dispatchMode(realMode);
+                    dispatchUiState(state);
+                } else {
+                    modeSelect.dataset.prevValue = next;
+                }
+
+                // apply только для HYBRID/AI
+                if (next === "HYBRID" || next === "AI") {
+                    const r = await tryApplyMode(next);
+                    const applied = (r && r.applied === true);
+                    const reason = (r && r.reason) ? String(r.reason) : "";
+                    setSavedUi(nowHHmm() + (applied ? " • применено" : (reason ? (" • " + reason) : "")));
+
+                    const st2 = await fetchUiState(ctx);
+                    if (st2) {
+                        applyStateToCtx(ctx, st2);
+                        // важное: если сервер “зажал” правила, UI должен подстроиться
+                        const m2 = normalizeMode(st2.advancedControlMode || next);
+                        modeSelect.value = m2;
+                        modeSelect.dataset.prevValue = m2;
+                        applyControlModeUi(m2);
+                        dispatchUiState(st2);
+                    }
+                } else {
+                    setSavedUi(nowHHmm());
+                }
+
+                setProgress(false);
+
+            } catch (e) {
+                console.error("[general] save control mode failed:", e);
+                revertToPrev(prev);
+                setProgress(false);
+                setErrorUi(String(e?.message || "ошибка"));
+            } finally {
+                inFlight = false;
+            }
+        });
     }
 
     return { init };
