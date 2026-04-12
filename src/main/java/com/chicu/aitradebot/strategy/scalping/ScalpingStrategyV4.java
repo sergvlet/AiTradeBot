@@ -47,6 +47,7 @@ public class ScalpingStrategyV4 implements TradingStrategy,
     private static final Duration INTRABAR_REEVAL = Duration.ofSeconds(2);
     private static final int MIN_CANDLES_TO_WORK = 24;
     private static final ZoneId ZONE = ZoneId.of("Europe/Warsaw");
+    private static final BigDecimal MIN_SPREAD_EDGE_PCT = new BigDecimal("0.06");
 
     private final StrategyLivePublisher live;
     private final ScalpingStrategySettingsService scalpingSettingsService;
@@ -364,6 +365,11 @@ public class ScalpingStrategyV4 implements TradingStrategy,
             return;
         }
 
+        if (!hasPositiveNetEdge(decision, features)) {
+            pushHold(chatId, state, "net_edge_low", "Сделка пропущена: ожидаемая прибыль после спреда слишком мала", now);
+            return;
+        }
+
         BigDecimal diffPct = features.priceChangePct() != null && features.priceChangePct().signum() > 0
                 ? features.priceChangePct()
                 : new BigDecimal("0.000001");
@@ -637,8 +643,27 @@ public class ScalpingStrategyV4 implements TradingStrategy,
             case "cooldown_after_stop" -> "После стопа ещё действует защитный кулдаун";
             case "cooldown_after_exit" -> "Слишком рано после прошлого выхода";
             case "max_consecutive_stops" -> "Слишком много стопов подряд, временно не торгую";
+            case "net_edge_low" -> "Ожидаемая прибыль после спреда слишком мала";
             default -> guard.message() != null ? guard.message() : guard.code();
         };
+    }
+
+    private boolean hasPositiveNetEdge(EntryDecision decision, ScalpingFeatureSnapshot features) {
+        if (decision == null || decision.tpPct() == null || decision.slPct() == null || features == null || features.spreadPct() == null) {
+            return false;
+        }
+        if (decision.tpPct().signum() <= 0 || decision.slPct().signum() <= 0 || features.spreadPct().signum() < 0) {
+            return false;
+        }
+
+        BigDecimal spreadCostPct = features.spreadPct().multiply(BigDecimal.valueOf(2));
+        BigDecimal minTpWithSpread = spreadCostPct.add(MIN_SPREAD_EDGE_PCT);
+        if (decision.tpPct().compareTo(minTpWithSpread) < 0) {
+            return false;
+        }
+
+        BigDecimal netTpPct = decision.tpPct().subtract(spreadCostPct);
+        return netTpPct.compareTo(decision.slPct()) > 0;
     }
 
     private static BigDecimal positive(BigDecimal value) {
@@ -678,7 +703,6 @@ public class ScalpingStrategyV4 implements TradingStrategy,
         return current.getMessage() != null && !current.getMessage().isBlank() ? current.getMessage() : throwable.getClass().getSimpleName();
     }
 }
-
 
 
 
