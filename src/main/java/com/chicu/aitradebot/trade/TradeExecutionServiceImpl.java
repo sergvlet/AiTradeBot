@@ -68,7 +68,10 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
     private static final String EXIT_KEY_SUFFIX = ":EXIT";
 
     /** Анти-спам логов по ML gate. */
-    private static final long ML_GATE_LOG_THROTTLE_MS = 5_000L;
+    private static final long ML_GATE_LOG_THROTTLE_MS = 60_000L;
+
+    /** Анти-спам повторных входных блокировок по одной и той же причине. */
+    private static final long ENTRY_BLOCK_LOG_THROTTLE_MS = 60_000L;
 
     /** На сколько блокировать повторный restore после dust-exit. */
     private static final long DEFAULT_DUST_RESTORE_SUPPRESS_MS = 21_600_000L;
@@ -97,6 +100,12 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
     /** Короткий grace-период после SELL, пока биржа/кэш баланса не синхронизировались. */
     private final Map<String, Instant> walletBaseSyncGraceUntil = new ConcurrentHashMap<>();
 
+    /** Последняя успешно полученная комиссия аккаунта. Используем как fallback при временных сбоях fee API. */
+    private final Map<String, BigDecimal> lastKnownTakerFeePct = new ConcurrentHashMap<>();
+
+    /** Явный бюджет входа от стратегии на текущий поток (например orderVolume из стратегии). */
+    private final ThreadLocal<BigDecimal> explicitQuoteBudgetOverride = new ThreadLocal<>();
+
     @Value("${trade.position-restore.retry-cooldown-ms:30000}")
     private long restoreRetryCooldownMs;
 
@@ -121,8 +130,16 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
     @Value("${trade.position-restore.dust-suppress-ms:21600000}")
     private long dustRestoreSuppressMs;
 
-    @Value("${trade.entry.wallet-base-sync-grace-ms:12000}")
+    @Value("${trade.entry.wallet-base-sync-grace-ms:30000}")
     private long walletBaseSyncGraceMs;
+
+    /** Разрешать fallback на последнюю известную комиссию, если fee API временно недоступен. */
+    @Value("${trade.fee.use-cached-when-unavailable:true}")
+    private boolean useCachedFeeWhenUnavailable;
+
+    /** Жёсткий fallback taker fee в процентах, если биржа временно не отдала fee и кэша ещё нет. */
+    @Value("${trade.fee.fallback-taker-pct:0.18}")
+    private BigDecimal fallbackTakerFeePct;
 
     /** Минимальный запас прибыли сверх комиссий, иначе market-entry не имеет смысла. */
     @Value("${trade.entry.min-net-edge-pct:0.08}")
@@ -132,9 +149,55 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
     @Value("${trade.entry.min-net-reward-risk:1.02}")
     private BigDecimal minNetRewardRisk;
 
+    /** Дополнительный защитный буфер для раннего market-exit, чтобы "любой плюс" был реальным после исполнения. */
+    @Value("${trade.exit.fast-profit-extra-buffer-pct:0.05}")
+    private BigDecimal fastExitExtraBufferPct;
+
+    /** Минимальный запас net-прибыли для раннего выхода после нескольких свечей. */
+    @Value("${trade.exit.fast-profit-min-net-pct:0.01}")
+    private BigDecimal fastExitMinNetProfitPct;
+
+    /** Разрешать автоматически поднимать TP до минимально здорового уровня. */
+    @Value("${trade.entry.auto-bump-tp-to-net-profit:true}")
+    private boolean autoBumpTpToNetProfit;
+
+    /** Верхний предел auto-bump для TP в процентах. */
+    @Value("${trade.entry.max-auto-bumped-tp-pct:5.00}")
+    private BigDecimal maxAutoBumpedTpPct;
+
+    /** Максимальный множитель, во сколько раз можно поднять requested TP. */
+    @Value("${trade.entry.max-auto-bumped-tp-multiple:6.00}")
+    private BigDecimal maxAutoBumpedTpMultiple;
+
+    /** Если requested TP аномально низкий относительно комиссии — вход всё равно блокируем. */
+    @Value("${trade.entry.reject-when-requested-tp-below-roundtrip-fee:false}")
+    private boolean rejectWhenRequestedTpBelowRoundtripFee;
+
     @PostConstruct
     public void onStart() {
         log.info("✅ [Трейд] TradeExecutionServiceImpl активен | paperBlocksRealOrders={}", paperBlocksRealOrders);
+    }
+
+    public EntryResult executeEntryWithQuoteBudget(Long chatId,
+                                                   StrategyType strategyType,
+                                                   String symbol,
+                                                   BigDecimal price,
+                                                   BigDecimal diffPct,
+                                                   Instant time,
+                                                   StrategySettings ss,
+                                                   BigDecimal tpPct,
+                                                   BigDecimal slPct,
+                                                   BigDecimal quoteBudget) {
+        if (quoteBudget == null || quoteBudget.signum() <= 0) {
+            return EntryResult.fail("quote_budget_invalid");
+        }
+
+        explicitQuoteBudgetOverride.set(quoteBudget);
+        try {
+            return executeEntry(chatId, strategyType, symbol, price, diffPct, time, ss, tpPct, slPct);
+        } finally {
+            explicitQuoteBudgetOverride.remove();
+        }
     }
 
     private void clearDustPositionFromRuntime(Long chatId,
@@ -261,12 +324,12 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
 
         boolean paperBlocksNow = paperMode && paperBlocksRealOrders && net == NetworkType.MAINNET;
 
-        MlGateDecision mlGate = evaluateMlGate(ss, strategyType);
+        MlGateDecision mlGate = evaluateMlGate(strategyType, ss);
 
         if (mlGate.bypassed()) {
             String logKey = buildMlGateLogKey(chatId, strategyType, ex, net, sym) + ":bypass";
             if (shouldLogNow(logKey, ML_GATE_LOG_THROTTLE_MS)) {
-                log.info("⚠️ [Вход] ML-фильтр пропущен | reason={} | conf={} minProb={} | chatId={} {} {} ex={} net={}",
+                log.info("⚠️ [Вход] ML gate пропущен в fail-open режиме | reason={} | conf={} minProb={} | chatId={} {} {} ex={} net={}",
                         mlGate.reason(),
                         QtyMath.strip(mlGate.confidence()),
                         QtyMath.strip(mlGate.minProb()),
@@ -277,7 +340,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         if (mlGate.reject()) {
             String logKey = buildMlGateLogKey(chatId, strategyType, ex, net, sym);
             if (shouldLogNow(logKey, ML_GATE_LOG_THROTTLE_MS)) {
-                log.info("⛔ [Вход] ML-фильтр отклонил вход | reason={} | conf={} < minProb={} | chatId={} {} {} ex={} net={}",
+                log.info("⛔ [Вход] ML gate отклонил вход | reason={} | conf={} < minProb={} | chatId={} {} {} ex={} net={}",
                         mlGate.reason(),
                         QtyMath.strip(mlGate.confidence()),
                         QtyMath.strip(mlGate.minProb()),
@@ -289,7 +352,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                     strategyType,
                     sym,
                     null,
-                    Signal.hold("ML-фильтр: вероятность ниже порога")
+                    Signal.hold("ML gate: вероятность ниже порога")
             ));
             return EntryResult.fail("ml_gate_reject");
         }
@@ -447,17 +510,47 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         }
         if (commissionPct != null && commissionPct.signum() > 0) {
             BigDecimal minTpToNotLose = resolveMinHealthyTpPct(chatId, ex, net, slPct);
+            BigDecimal roundTripFeePct = estimateRoundTripFeePct(chatId, ex, net);
             if (tpPct.compareTo(minTpToNotLose) < 0) {
-                log.warn("⛔ [Вход] TP слишком маленький для market-execution | tpPct={} < minTp={} (feePct={} x2 + buffer={} + edge={} + rrWithSl={}) | chatId={} {} {}",
-                        tpPct.stripTrailingZeros().toPlainString(),
-                        minTpToNotLose.stripTrailingZeros().toPlainString(),
-                        commissionPct.stripTrailingZeros().toPlainString(),
-                        TP_FEE_BUFFER_PCT.stripTrailingZeros().toPlainString(),
-                        sanitizePctConfig(minNetEdgePct, "0.24").stripTrailingZeros().toPlainString(),
-                        QtyMath.strip(slPct),
-                        chatId, strategyType, sym
-                );
-                return EntryResult.fail("tp_too_small_for_fees");
+                BigDecimal maxAutoPct = sanitizePctConfig(maxAutoBumpedTpPct, "5.00");
+                BigDecimal maxAutoMultiple = sanitizePctConfig(maxAutoBumpedTpMultiple, "6.00");
+                boolean absurdlyLowRequestedTp = rejectWhenRequestedTpBelowRoundtripFee
+                        && QtyMath.isPositive(roundTripFeePct)
+                        && tpPct.compareTo(roundTripFeePct.multiply(new BigDecimal("0.60"))) < 0;
+
+                boolean canAutoBump = autoBumpTpToNetProfit
+                        && QtyMath.isPositive(tpPct)
+                        && minTpToNotLose.compareTo(maxAutoPct) <= 0
+                        && minTpToNotLose.divide(tpPct, 6, RoundingMode.HALF_UP).compareTo(maxAutoMultiple) <= 0
+                        && !absurdlyLowRequestedTp;
+
+                if (canAutoBump) {
+                    BigDecimal oldTpPct = tpPct;
+                    tpPct = minTpToNotLose;
+
+                    log.info("↗️ [Вход] TP автоматически поднят до здорового уровня | requestedTp={} -> effectiveTp={} (roundTripFee={} edge={} rrWithSl={}) | chatId={} {} {} ex={} net={}",
+                            oldTpPct.stripTrailingZeros().toPlainString(),
+                            tpPct.stripTrailingZeros().toPlainString(),
+                            roundTripFeePct.stripTrailingZeros().toPlainString(),
+                            sanitizePctConfig(minNetEdgePct, "0.24").stripTrailingZeros().toPlainString(),
+                            QtyMath.strip(slPct),
+                            chatId, strategyType, sym, ex, net
+                    );
+                } else {
+                    String logKey = entryKey(chatId, strategyType, ex, net, sym) + ":tp_too_small_for_fees";
+                    if (shouldLogNow(logKey, ENTRY_BLOCK_LOG_THROTTLE_MS)) {
+                        log.warn("⛔ [Вход] TP слишком маленький для market-execution | tpPct={} < minTp={} (feePct={} x2 + buffer={} + edge={} + rrWithSl={}) | chatId={} {} {} ex={} net={}",
+                                tpPct.stripTrailingZeros().toPlainString(),
+                                minTpToNotLose.stripTrailingZeros().toPlainString(),
+                                commissionPct.stripTrailingZeros().toPlainString(),
+                                TP_FEE_BUFFER_PCT.stripTrailingZeros().toPlainString(),
+                                sanitizePctConfig(minNetEdgePct, "0.24").stripTrailingZeros().toPlainString(),
+                                QtyMath.strip(slPct),
+                                chatId, strategyType, sym, ex, net
+                        );
+                    }
+                    return EntryResult.fail("tp_too_small_for_fees");
+                }
             }
         }
 
@@ -746,13 +839,21 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         BigDecimal effSl  = sl;
 
         BigDecimal entryPriceFromStore = null;
+        BigDecimal positionQtyFromStore = null;
 
         Optional<PositionStore.PositionSnapshot> posOpt = Optional.empty();
         try {
             posOpt = positionStore.getPosition(chatId, strategyType, ex, net, sym);
             if (posOpt.isPresent()) {
                 PositionStore.PositionSnapshot snap = posOpt.get();
-                if (snap.qty() != null && snap.qty().signum() > 0) effQty = snap.qty();
+                if (snap.qty() != null && snap.qty().signum() > 0) {
+                    positionQtyFromStore = snap.qty();
+                    if (effQty == null || effQty.signum() <= 0) {
+                        effQty = snap.qty();
+                    } else {
+                        effQty = effQty.min(snap.qty());
+                    }
+                }
                 // ВАЖНО: caller может передать более близкий TP/SL для принудительного/быстрого выхода.
                 // Поэтому TP/SL из PositionStore используем только как fallback, а не затираем входные значения.
                 if ((effTp == null || effTp.signum() <= 0) && snap.tp() != null && snap.tp().signum() > 0) effTp = snap.tp();
@@ -808,7 +909,14 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                     posOpt = positionStore.getPosition(chatId, strategyType, ex, net, sym);
                     if (posOpt.isPresent()) {
                         PositionStore.PositionSnapshot snap = posOpt.get();
-                        if (snap.qty() != null && snap.qty().signum() > 0) effQty = snap.qty();
+                        if (snap.qty() != null && snap.qty().signum() > 0) {
+                            positionQtyFromStore = snap.qty();
+                            if (effQty == null || effQty.signum() <= 0) {
+                                effQty = snap.qty();
+                            } else {
+                                effQty = effQty.min(snap.qty());
+                            }
+                        }
                         // После restore также не затираем caller override для быстрого выхода.
                         if ((effTp == null || effTp.signum() <= 0) && snap.tp() != null && snap.tp().signum() > 0) effTp = snap.tp();
                         if ((effSl == null || effSl.signum() <= 0) && snap.sl() != null && snap.sl().signum() > 0) effSl = snap.sl();
@@ -827,16 +935,13 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         if (effTp == null || effSl == null) return ExitResult.fail("tp/sl_null");
 
         String closeReasonCode = (forcedExitReason != null && !forcedExitReason.isBlank()) ? forcedExitReason : null;
+        boolean forcedExit = closeReasonCode != null;
 
-        boolean tpHit = price.compareTo(effTp) >= 0;
-        boolean slHit = price.compareTo(effSl) <= 0;
-        if (closeReasonCode != null) {
-            tpHit = true;
-            slHit = false;
-        }
-        if (!tpHit && !slHit) return ExitResult.fail("not_hit");
+        boolean tpHit = !forcedExit && price.compareTo(effTp) >= 0;
+        boolean slHit = !forcedExit && price.compareTo(effSl) <= 0;
+        if (!forcedExit && !tpHit && !slHit) return ExitResult.fail("not_hit");
 
-        if (closeReasonCode == null) {
+        if (!forcedExit) {
             closeReasonCode = tpHit ? "TP" : "SL";
         }
 
@@ -865,7 +970,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                     sym,
                     effQty.stripTrailingZeros().toPlainString(),
                     executedExitPrice.stripTrailingZeros().toPlainString(),
-                    tpHit ? "TP" : "SL",
+                    closeReasonCode,
                     pnlPct != null ? pnlPct.stripTrailingZeros().toPlainString() : "null",
                     chatId, ex, net
             );
@@ -875,7 +980,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                     (ss != null ? ss.getTimeframe() : null),
                     ex, net,
                     effectiveTime,
-                    tpHit ? "TP" : "SL",
+                    closeReasonCode,
                     pnlPct,
                     executedExitPrice,
                     entryPriceFromStore,
@@ -888,7 +993,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
 
             try { positionStore.clearPosition(chatId, strategyType, ex, net, sym); } catch (Exception ignored) {}
             failCooldown.clear(exitKey);
-            markWalletBaseSyncGrace(entryKey(chatId, strategyType, ex, net, sym), effectiveTime);
+            markWalletBaseSyncGrace(entryKey(chatId, strategyType, ex, net, sym), Instant.now());
 
             return ExitResult.ok(tpHit, slHit, executedExitPrice, pnlPct != null ? pnlPct : BigDecimal.ZERO);
         }
@@ -906,12 +1011,13 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
 
         BigDecimal freeBase = resolveFreeBaseQty(chatId, strategyType, ss, ex, net, sym);
         BigDecimal originalQty = effQty;
+        BigDecimal fullPositionQty = QtyMath.isPositive(positionQtyFromStore) ? positionQtyFromStore : effQty;
 
         if (freeBase != null) {
             if (QtyMath.isPositive(freeBase)) {
                 if (freeBase.compareTo(effQty) < 0) {
-                    log.warn("⚠️ [Выход] Использую фактический доступный base для полного закрытия | {} baseFree={} positionQty={} tpHit={} slHit={} | chatId={} ex={} net={}",
-                            sym, QtyMath.strip(freeBase), QtyMath.strip(effQty), tpHit, slHit, chatId, ex, net);
+                    log.warn("⚠️ [Выход] Использую фактический доступный base для SELL | {} baseFree={} requestedQty={} positionQty={} tpHit={} slHit={} | chatId={} ex={} net={}",
+                            sym, QtyMath.strip(freeBase), QtyMath.strip(effQty), QtyMath.strip(fullPositionQty), tpHit, slHit, chatId, ex, net);
                     effQty = freeBase;
                 }
             } else {
@@ -948,9 +1054,9 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             return ExitResult.fail("balance");
         }
 
-        BigDecimal positionQtyBeforeSell = normalizeRuntimeQty(effQty, ex, net, sym);
+        BigDecimal positionQtyBeforeSell = normalizeRuntimeQty(fullPositionQty, ex, net, sym);
         if (!QtyMath.isPositive(positionQtyBeforeSell)) {
-            positionQtyBeforeSell = effQty;
+            positionQtyBeforeSell = fullPositionQty;
         }
 
         try {
@@ -1072,8 +1178,21 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
             effectiveEntryPrice = fallbackTickPrice;
         }
 
-        BigDecimal commissionPct = resolveCommissionPctOrNull(chatId, ex, net, ss);
-        BigDecimal pnlPct = calcNetPnlPct(effectiveEntryPrice, executedExitPrice, commissionPct);
+        Long entryOrderId = (posOpt != null && posOpt.isPresent()) ? posOpt.get().entryOrderId() : null;
+        BigDecimal pnlPct = calcRealizedNetPnlPct(
+                chatId,
+                ex,
+                net,
+                sym,
+                order,
+                entryOrderId,
+                effectiveEntryPrice,
+                executedExitPrice,
+                executedQty,
+                ss
+        );
+
+        boolean intendedPartialExit = isIntendedPartialExit(requestedQty, basePositionQty);
 
         if (QtyMath.isPositive(remainingQty)) {
             BigDecimal remainingNotional = null;
@@ -1111,6 +1230,37 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
 
                 remainingQty = BigDecimal.ZERO;
             }
+        }
+
+        if (QtyMath.isPositive(remainingQty) && intendedPartialExit) {
+            syncRemainingPositionAfterIncompleteSell(
+                    chatId,
+                    strategyType,
+                    ex,
+                    net,
+                    sym,
+                    effectiveEntryPrice,
+                    remainingQty,
+                    tpPrice,
+                    slPrice,
+                    posOpt,
+                    effectiveTime
+            );
+
+            failCooldown.clear(exitKey);
+
+            log.info("✅ [Выход] PARTIAL SELL исполнен | {} soldQty={} remainingQty={} exitPrice={} pnlPct={} reason={} | chatId={} ex={} net={}",
+                    sym,
+                    QtyMath.strip(executedQty),
+                    QtyMath.strip(remainingQty),
+                    QtyMath.strip(executedExitPrice),
+                    pnlPct != null ? QtyMath.strip(pnlPct) : "null",
+                    closeReasonCode,
+                    chatId,
+                    ex,
+                    net);
+
+            return ExitResult.ok(false, false, executedExitPrice, pnlPct != null ? pnlPct : BigDecimal.ZERO);
         }
 
         if (QtyMath.isPositive(remainingQty)) {
@@ -1193,7 +1343,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         } catch (Exception ignored) {
         }
         failCooldown.clear(exitKey);
-        markWalletBaseSyncGrace(entryKey(chatId, strategyType, ex, net, sym), effectiveTime);
+        markWalletBaseSyncGrace(entryKey(chatId, strategyType, ex, net, sym), Instant.now());
 
         boolean isLoss = (pnlPct != null && pnlPct.signum() < 0);
 
@@ -1214,6 +1364,16 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         }
 
         return ExitResult.ok(tpHit, slHit, executedExitPrice, pnlPct != null ? pnlPct : BigDecimal.ZERO);
+    }
+
+    private boolean isIntendedPartialExit(BigDecimal requestedQty,
+                                          BigDecimal positionQtyBeforeSell) {
+        if (!QtyMath.isPositive(requestedQty) || !QtyMath.isPositive(positionQtyBeforeSell)) {
+            return false;
+        }
+
+        BigDecimal epsilon = new BigDecimal("0.00000001");
+        return requestedQty.add(epsilon).compareTo(positionQtyBeforeSell) < 0;
     }
 
     private void syncRemainingPositionAfterIncompleteSell(Long chatId,
@@ -1612,6 +1772,15 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                     quoteAsset != null ? "no_free_quote_balance:" + quoteAsset : "no_free_balance");
         }
 
+        BigDecimal explicitBudget = explicitQuoteBudgetOverride.get();
+        if (QtyMath.isPositive(explicitBudget)) {
+            BigDecimal quote = free.min(explicitBudget).stripTrailingZeros();
+            if (!QtyMath.isPositive(quote)) {
+                return new QuoteBudget(BigDecimal.ZERO, StrategySettings.CapitalMode.FIX, explicitBudget, free, "explicit_budget_too_small");
+            }
+            return new QuoteBudget(quote, StrategySettings.CapitalMode.FIX, explicitBudget, free, "explicit_budget");
+        }
+
         StrategySettings.CapitalMode mode = ss.getCapitalMode();
         if (mode == null) mode = StrategySettings.CapitalMode.ALL;
 
@@ -1965,20 +2134,17 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                 || "PARTIALLYFILLEDCANCELED".equals(status);
     }
 
-    private MlGateDecision evaluateMlGate(StrategySettings ss, StrategyType strategyType) {
-        if (ss == null) {
-            return MlGateDecision.pass(BigDecimal.ZERO, BigDecimal.ZERO);
+    private MlGateDecision evaluateMlGate(StrategyType strategyType, StrategySettings ss) {
+        if (strategyType == StrategyType.SCALPING) {
+            BigDecimal confidence = ss != null ? normalizeProb(ss.getMlConfidence()) : BigDecimal.ZERO;
+            BigDecimal minProb = (ss != null && ss.getGateMinProb() != null)
+                    ? normalizeProb(ss.getGateMinProb())
+                    : BigDecimal.ZERO;
+            return MlGateDecision.bypass(confidence, minProb, "ml_runtime_gate_already_checked");
         }
 
-        // Для SCALPING ML-фильтр уже применяется внутри самой стратегии
-        // с учётом режима рынка и адаптации риска. Повторная проверка здесь
-        // только дублирует veto и режет нормальные входы.
-        if (strategyType == StrategyType.SCALPING) {
-            return MlGateDecision.bypass(
-                    normalizeProb(ss.getMlConfidence()),
-                    normalizeProb(ss.getGateMinProb()),
-                    "ml_runtime_gate_already_checked"
-            );
+        if (ss == null) {
+            return MlGateDecision.pass(BigDecimal.ZERO, BigDecimal.ZERO);
         }
 
         BigDecimal confidenceRaw = ss.getMlConfidence();
@@ -2004,8 +2170,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
         boolean hasUsableModel = hasUsableMlModel(ss);
         boolean failOpen = isMlFailOpenEnabled(ss, hasUsableModel);
 
-        boolean mlConfidenceMissing = (confidenceRaw == null)
-                || (!hasUsableModel && confidence.signum() <= 0);
+        boolean mlConfidenceMissing = (confidenceRaw == null) || confidence.signum() <= 0;
 
         if (!hasUsableModel) {
             if (mode == AdvancedControlMode.HYBRID || failOpen) {
@@ -2803,31 +2968,112 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                                                   String exchange,
                                                   NetworkType network,
                                                   StrategySettings ss) {
-        if (chatId == null || exchange == null || network == null || accountBalanceService == null) {
+        if (chatId == null || exchange == null || network == null) {
             return null;
         }
 
-        try {
-            AccountFees fees = accountBalanceService.getAccountFees(chatId, exchange, network);
-            if (fees == null) return null;
+        String ex = safeExchange(exchange);
+        String cacheKey = feeCacheKey(chatId, ex, network);
 
-            if (fees.getTakerPct() != null && fees.getTakerPct().signum() > 0) {
-                return fees.getTakerPct();
+        if (accountBalanceService != null) {
+            try {
+                AccountFees fees = accountBalanceService.getAccountFees(chatId, ex, network);
+                BigDecimal resolved = normalizeFeePct(firstPositiveFee(fees));
+                if (QtyMath.isPositive(resolved)) {
+                    lastKnownTakerFeePct.put(cacheKey, resolved);
+                    return resolved;
+                }
+            } catch (Exception e) {
+                log.debug("Не удалось получить комиссию аккаунта | chatId={} ex={} net={} err={}",
+                        chatId, ex, network, e.toString());
             }
-            if (fees.getMakerPct() != null && fees.getMakerPct().signum() > 0) {
-                return fees.getMakerPct();
-            }
-            return null;
-        } catch (Exception e) {
-            log.debug("Не удалось получить комиссию аккаунта | chatId={} ex={} net={} err={}",
-                    chatId, exchange, network, e.toString());
-            return null;
         }
+
+        if (useCachedFeeWhenUnavailable) {
+            BigDecimal cached = normalizeFeePct(lastKnownTakerFeePct.get(cacheKey));
+            if (QtyMath.isPositive(cached)) {
+                String logKey = "fee_cache:" + cacheKey;
+                if (shouldLogNow(logKey, ENTRY_BLOCK_LOG_THROTTLE_MS)) {
+                    log.warn("⚠️ [Fee] Использую кэшированную комиссию, потому что fee API временно недоступен | chatId={} ex={} net={} feePct={}",
+                            chatId,
+                            ex,
+                            network,
+                            QtyMath.strip(cached));
+                }
+                return cached;
+            }
+        }
+
+        BigDecimal fallback = normalizeFeePct(fallbackTakerFeePct);
+        if (QtyMath.isPositive(fallback)) {
+            String logKey = "fee_fallback:" + cacheKey;
+            if (shouldLogNow(logKey, ENTRY_BLOCK_LOG_THROTTLE_MS)) {
+                log.warn("⚠️ [Fee] Использую fallback-комиссию, потому что fee API ничего не вернул | chatId={} ex={} net={} feePct={}",
+                        chatId,
+                        ex,
+                        network,
+                        QtyMath.strip(fallback));
+            }
+            return fallback;
+        }
+
+        return null;
     }
 
+    private String feeCacheKey(Long chatId,
+                               String exchange,
+                               NetworkType network) {
+        return chatId + ":" + safeExchange(exchange) + ":" + (network != null ? network.name() : "NA");
+    }
 
+    private BigDecimal firstPositive(BigDecimal... values) {
+        if (values == null) {
+            return null;
+        }
+        for (BigDecimal value : values) {
+            if (value != null && value.signum() > 0) {
+                return value;
+            }
+        }
+        return null;
+    }
 
+    private BigDecimal firstPositiveFee(AccountFees fees) {
+        if (fees == null) {
+            return null;
+        }
+        if (fees.getTakerPct() != null && fees.getTakerPct().signum() > 0) {
+            return fees.getTakerPct();
+        }
+        if (fees.getMakerPct() != null && fees.getMakerPct().signum() > 0) {
+            return fees.getMakerPct();
+        }
+        return null;
+    }
 
+    private BigDecimal normalizeFeePct(BigDecimal feePct) {
+        if (feePct == null || feePct.signum() <= 0) {
+            return null;
+        }
+        return feePct.setScale(6, RoundingMode.HALF_UP).stripTrailingZeros();
+    }
+
+    private BigDecimal resolveCommissionPctOrSafeDefault(Long chatId,
+                                                         String exchange,
+                                                         NetworkType network,
+                                                         StrategySettings ss) {
+        BigDecimal resolved = resolveCommissionPctOrNull(chatId, exchange, network, ss);
+        if (QtyMath.isPositive(resolved)) {
+            return resolved;
+        }
+
+        BigDecimal configuredFallback = sanitizePctConfig(fallbackTakerFeePct, "0.18");
+        if (QtyMath.isPositive(configuredFallback)) {
+            return configuredFallback.setScale(6, RoundingMode.HALF_UP).stripTrailingZeros();
+        }
+
+        return new BigDecimal("0.18");
+    }
 
     private BigDecimal sanitizePctConfig(BigDecimal value, String fallback) {
         if (value == null || value.signum() <= 0) return new BigDecimal(fallback);
@@ -2881,7 +3127,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
     public BigDecimal estimateRoundTripFeePct(Long chatId,
                                               String exchange,
                                               NetworkType network) {
-        BigDecimal feePct = resolveCommissionPctOrNull(chatId, safeExchange(exchange), network, null);
+        BigDecimal feePct = resolveCommissionPctOrSafeDefault(chatId, safeExchange(exchange), network, null);
         if (!QtyMath.isPositive(feePct)) {
             return BigDecimal.ZERO;
         }
@@ -2914,13 +3160,219 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                 .stripTrailingZeros();
     }
 
+    public BigDecimal resolveMinProfitableExitPrice(Long chatId,
+                                                    String exchange,
+                                                    NetworkType network,
+                                                    BigDecimal entryPrice) {
+        if (!QtyMath.isPositive(entryPrice)) {
+            return null;
+        }
+
+        BigDecimal minTpPct = resolveMinProfitableTpPct(chatId, exchange, network);
+        return calcTp(entryPrice, minTpPct);
+    }
+
+    private BigDecimal calcRealizedNetPnlPct(Long chatId,
+                                             String exchange,
+                                             NetworkType network,
+                                             String symbol,
+                                             Order exitOrder,
+                                             Long entryOrderId,
+                                             BigDecimal entryPrice,
+                                             BigDecimal exitPrice,
+                                             BigDecimal executedQty,
+                                             StrategySettings ss) {
+        BigDecimal fallbackCommissionPct = resolveCommissionPctOrNull(chatId, exchange, network, ss);
+        BigDecimal fallback = calcNetPnlPct(entryPrice, exitPrice, fallbackCommissionPct);
+
+        if (!QtyMath.isPositive(entryPrice) || !QtyMath.isPositive(exitPrice) || !QtyMath.isPositive(executedQty)) {
+            return fallback;
+        }
+
+        OrderEntity entryEntity = loadOrderEntity(entryOrderId);
+        OrderEntity exitEntity = loadOrderEntity(exitOrder != null ? exitOrder.getId() : null);
+
+        BigDecimal costQuote = entryPrice.multiply(executedQty);
+        if (costQuote.signum() <= 0) {
+            return fallback;
+        }
+
+        BigDecimal grossQuotePnl = exitPrice.subtract(entryPrice).multiply(executedQty);
+        BigDecimal feeQuote = BigDecimal.ZERO;
+        boolean haveRealFee = false;
+
+        BigDecimal entryFeeQuote = feeToQuote(entryEntity, entryPrice, executedQty, symbol);
+        if (entryFeeQuote != null) {
+            feeQuote = feeQuote.add(entryFeeQuote);
+            haveRealFee = true;
+        }
+
+        BigDecimal exitFeeQuote = feeToQuote(exitEntity, exitPrice, null, symbol);
+        if (exitFeeQuote != null) {
+            feeQuote = feeQuote.add(exitFeeQuote);
+            haveRealFee = true;
+        }
+
+        if (!haveRealFee) {
+            return fallback;
+        }
+
+        BigDecimal netQuotePnl = grossQuotePnl.subtract(feeQuote);
+        return netQuotePnl
+                .divide(costQuote, 12, RoundingMode.HALF_UP)
+                .multiply(BigDecimal.valueOf(100))
+                .setScale(6, RoundingMode.HALF_UP);
+    }
+
+    private OrderEntity loadOrderEntity(Long orderId) {
+        if (orderId == null || orderRepository == null) {
+            return null;
+        }
+        try {
+            return orderRepository.findById(orderId).orElse(null);
+        } catch (Exception e) {
+            log.debug("Не удалось загрузить order entity id={} err={}", orderId, e.toString());
+            return null;
+        }
+    }
+
+    private BigDecimal feeToQuote(OrderEntity entity,
+                                  BigDecimal priceForConversion,
+                                  BigDecimal executedQtyForProrate,
+                                  String symbol) {
+        if (entity == null || entity.getFeeTotal() == null || entity.getFeeTotal().signum() <= 0) {
+            return null;
+        }
+
+        String feeAsset = normalizeUpperNullable(entity.getFeeAsset());
+        BigDecimal feeTotal = entity.getFeeTotal();
+        BigDecimal effectiveFee = feeTotal;
+
+        BigDecimal orderExecutedQty = firstPositive(
+                positiveOrNull(entity.getExecutedQty()),
+                positiveOrNull(entity.getQuantity())
+        );
+
+        if (QtyMath.isPositive(executedQtyForProrate) && QtyMath.isPositive(orderExecutedQty)
+                && executedQtyForProrate.compareTo(orderExecutedQty) < 0) {
+            BigDecimal ratio = executedQtyForProrate.divide(orderExecutedQty, 12, RoundingMode.HALF_UP);
+            effectiveFee = feeTotal.multiply(ratio);
+        }
+
+        String quoteAsset = quoteAsset(symbol);
+        String baseAsset = baseAsset(symbol);
+
+        if (feeAsset == null) {
+            return effectiveFee;
+        }
+        if (quoteAsset != null && quoteAsset.equalsIgnoreCase(feeAsset)) {
+            return effectiveFee;
+        }
+        if (baseAsset != null && baseAsset.equalsIgnoreCase(feeAsset) && QtyMath.isPositive(priceForConversion)) {
+            return effectiveFee.multiply(priceForConversion);
+        }
+
+        return null;
+    }
+
+    private String quoteAsset(String symbol) {
+        String sym = normalizeSymbol(symbol);
+        if (sym == null) return null;
+        for (String suffix : List.of("USDT", "USDC", "BUSD", "FDUSD", "BTC", "ETH", "BNB", "EUR", "TRY")) {
+            if (sym.endsWith(suffix) && sym.length() > suffix.length()) {
+                return suffix;
+            }
+        }
+        return null;
+    }
+
+    private String baseAsset(String symbol) {
+        String sym = normalizeSymbol(symbol);
+        String quote = quoteAsset(sym);
+        if (sym == null || quote == null || sym.length() <= quote.length()) {
+            return null;
+        }
+        return sym.substring(0, sym.length() - quote.length());
+    }
+
     public BigDecimal estimateNetPnlPct(Long chatId,
                                         String exchange,
                                         NetworkType network,
                                         BigDecimal entryPrice,
                                         BigDecimal exitPrice) {
-        BigDecimal feePct = resolveCommissionPctOrNull(chatId, safeExchange(exchange), network, null);
+        BigDecimal feePct = resolveCommissionPctOrSafeDefault(chatId, safeExchange(exchange), network, null);
+        if (!QtyMath.isPositive(feePct)) {
+            return null;
+        }
         return calcNetPnlPct(entryPrice, exitPrice, feePct);
+    }
+
+    public BigDecimal estimateConservativeNetExitPnlPct(Long chatId,
+                                                        StrategyType strategyType,
+                                                        String exchange,
+                                                        NetworkType network,
+                                                        String symbol,
+                                                        BigDecimal entryPrice,
+                                                        BigDecimal exitPrice,
+                                                        BigDecimal entryQty) {
+        BigDecimal feePct = resolveCommissionPctOrSafeDefault(chatId, safeExchange(exchange), network, null);
+        if (!QtyMath.isPositive(feePct)) {
+            return null;
+        }
+
+        BigDecimal netPnlPct = calcNetPnlPct(entryPrice, exitPrice, feePct);
+        if (netPnlPct == null) {
+            return null;
+        }
+
+        BigDecimal conservative = netPnlPct;
+
+        BigDecimal normalizedEntryQty = normalizeRuntimeQty(entryQty, exchange, network, symbol);
+        if (QtyMath.isPositive(normalizedEntryQty)) {
+            BigDecimal freeBase = resolveFreeBaseQty(chatId, strategyType, null, exchange, network, symbol);
+            if (QtyMath.isPositive(freeBase)) {
+                BigDecimal sellableQty = normalizeRuntimeQty(normalizedEntryQty.min(freeBase), exchange, network, symbol);
+                if (sellableQty.compareTo(normalizedEntryQty) < 0) {
+                    BigDecimal unsellableQty = normalizedEntryQty.subtract(sellableQty);
+                    BigDecimal qtyLossPct = unsellableQty
+                            .divide(normalizedEntryQty, 12, RoundingMode.HALF_UP)
+                            .multiply(BigDecimal.valueOf(100))
+                            .setScale(6, RoundingMode.HALF_UP);
+                    conservative = conservative.subtract(qtyLossPct);
+                }
+            }
+        }
+
+        BigDecimal extraBufferPct = sanitizePctConfig(fastExitExtraBufferPct, "0.05");
+        conservative = conservative.subtract(extraBufferPct);
+
+        return conservative.setScale(6, RoundingMode.HALF_UP);
+    }
+
+    public boolean hasConservativeFastExitProfit(Long chatId,
+                                                 StrategyType strategyType,
+                                                 String exchange,
+                                                 NetworkType network,
+                                                 String symbol,
+                                                 BigDecimal entryPrice,
+                                                 BigDecimal exitPrice,
+                                                 BigDecimal entryQty) {
+        BigDecimal conservativeNetPnlPct = estimateConservativeNetExitPnlPct(
+                chatId,
+                strategyType,
+                exchange,
+                network,
+                symbol,
+                entryPrice,
+                exitPrice,
+                entryQty
+        );
+        if (conservativeNetPnlPct == null) {
+            return false;
+        }
+
+        BigDecimal minNetProfitPct = sanitizePctConfig(fastExitMinNetProfitPct, "0.01");
+        return conservativeNetPnlPct.compareTo(minNetProfitPct) >= 0;
     }
 
     private BigDecimal calcNetPnlPct(BigDecimal entryPrice,
@@ -3042,7 +3494,7 @@ public class TradeExecutionServiceImpl implements TradeExecutionService {
                     .setScale(8, RoundingMode.HALF_UP);
 
             if (walletBaseNotional.compareTo(minNotional) >= 0) {
-                if (isWalletBaseSyncGraceActive(key, effectiveNow)) {
+                if (isWalletBaseSyncGraceActive(key, Instant.now())) {
                     log.info("♻️ [Вход] Игнорирую wallet-base precheck во время post-exit sync grace | {} baseFree={} baseNotional={} minNotional={} | chatId={} ex={} net={}",
                             sym,
                             QtyMath.strip(baseFreeTradable),

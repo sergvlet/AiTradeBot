@@ -32,7 +32,11 @@ public class AccountBalanceService {
     @Value("${trade.balance-cache.ttl-ms:5000}")
     private long balanceCacheTtlMs;
 
+    @Value("${trade.balance-snapshot-log-throttle-ms:300000}")
+    private long balanceSnapshotLogThrottleMs;
+
     private final Map<String, CachedSnapshot> snapshotCache = new ConcurrentHashMap<>();
+    private final Map<String, Instant> snapshotLogTimes = new ConcurrentHashMap<>();
 
     private record CachedSnapshot(AccountBalanceSnapshot snapshot, Instant expiresAt) {}
 
@@ -142,16 +146,19 @@ public class AccountBalanceService {
 
             AccountBalanceSnapshot.AssetBalance selectedBalance = balances.get(selected);
 
-            log.info("💰 SNAPSHOT chatId={} type={} ex={} net={} selected={} free={} locked={} total={} assets={}",
-                    chatId,
-                    type,
-                    ex,
-                    net,
-                    selected,
-                    selectedBalance != null ? selectedBalance.getFreeSafe() : BigDecimal.ZERO,
-                    selectedBalance != null ? selectedBalance.getLockedSafe() : BigDecimal.ZERO,
-                    selectedBalance != null ? selectedBalance.getTotalSafe() : BigDecimal.ZERO,
-                    availableAssets);
+            String snapshotLogKey = chatId + "|" + type + "|" + ex + "|" + net + "|" + selected;
+            if (shouldLogSnapshot(snapshotLogKey)) {
+                log.info("💰 SNAPSHOT chatId={} type={} ex={} net={} selected={} free={} locked={} total={} assets={}",
+                        chatId,
+                        type,
+                        ex,
+                        net,
+                        selected,
+                        selectedBalance != null ? selectedBalance.getFreeSafe() : BigDecimal.ZERO,
+                        selectedBalance != null ? selectedBalance.getLockedSafe() : BigDecimal.ZERO,
+                        selectedBalance != null ? selectedBalance.getTotalSafe() : BigDecimal.ZERO,
+                        availableAssets);
+            }
 
             AccountBalanceSnapshot snapshot = AccountBalanceSnapshot.builder()
                     .availableAssets(availableAssets)
@@ -225,6 +232,21 @@ public class AccountBalanceService {
                     chatId, ex, net, e.toString());
             return null;
         }
+    }
+
+    private boolean shouldLogSnapshot(String key) {
+        if (key == null || key.isBlank()) return true;
+        Instant now = Instant.now();
+        Instant prev = snapshotLogTimes.get(key);
+        long throttleMs = Math.max(5_000L, balanceSnapshotLogThrottleMs);
+        if (prev != null) {
+            long ageMs = java.time.Duration.between(prev, now).toMillis();
+            if (ageMs >= 0 && ageMs < throttleMs) {
+                return false;
+            }
+        }
+        snapshotLogTimes.put(key, now);
+        return true;
     }
 
     private AccountBalanceSnapshot buildErrorSnapshot(String selectedAsset, String error) {
@@ -328,5 +350,6 @@ public class AccountBalanceService {
         return BigDecimal.valueOf(v);
     }
 }
+
 
 

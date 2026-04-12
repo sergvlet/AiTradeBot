@@ -239,6 +239,24 @@ public class InMemoryPositionStoreImpl implements PositionStore {
 
         String prefix = prefixKey(chatId, type, ex, network);
         positions.keySet().removeIf(k -> k.startsWith(prefix));
+        suppressedRestoreUntil.keySet().removeIf(k -> k.startsWith(prefix));
+
+        try {
+            for (StrategyPositionEntity entity : strategyPositionRepository.findAll()) {
+                if (entity == null) continue;
+                if (!chatId.equals(entity.getChatId())) continue;
+                if (entity.getStrategyType() != type) continue;
+                if (!ex.equalsIgnoreCase(normUpper(entity.getExchangeName()))) continue;
+                if (entity.getNetworkType() != network) continue;
+                if (entity.getStatus() != StrategyPositionStatus.OPEN && entity.getStatus() != StrategyPositionStatus.CLOSING) continue;
+
+                entity.setStatus(StrategyPositionStatus.CLOSED);
+                entity.setClosedAt(Instant.now());
+                entity.setLastExchangeSyncAt(Instant.now());
+                strategyPositionRepository.save(entity);
+            }
+        } catch (Exception ignored) {
+        }
     }
 
     public void suppressRestore(Long chatId,

@@ -17,10 +17,6 @@ import java.util.concurrent.ConcurrentHashMap;
 public class StrategyBindingProcessor implements BeanPostProcessor {
 
     private final StrategyRegistry registry;
-
-    /**
-     * Защита от повторной регистрации одного и того же bean/type при прокси/реинициализации.
-     */
     private final Set<String> processed = ConcurrentHashMap.newKeySet();
 
     public StrategyBindingProcessor(StrategyRegistry registry) {
@@ -39,26 +35,30 @@ public class StrategyBindingProcessor implements BeanPostProcessor {
             targetClass = bean.getClass();
         }
 
-        StrategyBinding binding =
-                AnnotatedElementUtils.findMergedAnnotation(targetClass, StrategyBinding.class);
+        StrategyBinding binding = AnnotatedElementUtils.findMergedAnnotation(targetClass, StrategyBinding.class);
 
         if (binding == null) {
-            log.debug("Strategy bean has no @StrategyBinding: beanName={}, class={}",
-                    beanName, targetClass.getName());
+            if (log.isDebugEnabled()) {
+                log.debug("Стратегия без @StrategyBinding пропущена: beanName={}, class={}", beanName, targetClass.getName());
+            }
             return bean;
         }
 
         String dedupKey = binding.value().name() + "|" + beanName + "|" + targetClass.getName();
         if (!processed.add(dedupKey)) {
-            log.debug("Strategy binding already processed: type={} beanName={} class={}",
-                    binding.value(), beanName, targetClass.getName());
+            if (log.isDebugEnabled()) {
+                log.debug("Повторная регистрация пропущена: type={} beanName={} class={}",
+                        binding.value(), beanName, targetClass.getName());
+            }
             return bean;
         }
 
         registry.register(binding.value(), strategy);
 
-        log.info("✅ Strategy bound: {} -> {} (beanName={})",
-                binding.value(), targetClass.getSimpleName(), beanName);
+        if (log.isDebugEnabled()) {
+            log.debug("✅ Strategy bound: {} -> {} (beanName={})",
+                    binding.value(), targetClass.getSimpleName(), beanName);
+        }
 
         return bean;
     }

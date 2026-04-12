@@ -1186,9 +1186,9 @@ public class AiStrategyOrchestrator {
 
         return type == StrategyType.WINDOW_SCALPING
                || type == StrategyType.FIBONACCI_GRID
-               || type == StrategyType.EMA_CROSSOVER;
-    }
-    private StrategySettings markStartFailedInactive(StrategySettings settings, String source) {
+               || type == StrategyType.EMA_CROSSOVER
+               || type == StrategyType.SCALPING;
+    }    private StrategySettings markStartFailedInactive(StrategySettings settings, String source) {
         if (settings == null) {
             return null;
         }

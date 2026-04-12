@@ -297,9 +297,6 @@ window.SettingsApi = (function () {
         return `/strategies/${encodeURIComponent(ctx.type)}/config/state?${params.toString()}`;
     }
 
-    const uiStateRefreshTracker = new Map();
-    const UI_STATE_REFRESH_MIN_GAP_MS = 1500;
-
     async function refreshUiStateIfConfig(url, data, opts) {
         ensureStore();
         const ctx = parseConfigCtx(url, data);
@@ -307,14 +304,6 @@ window.SettingsApi = (function () {
 
         const stateUrl = buildStateUrl(ctx, opts);
         if (!stateUrl) return;
-
-        const refreshKey = `${ctx.type}|${ctx.chatId}|${ctx.exchange}|${ctx.network}`;
-        const now = Date.now();
-        const last = uiStateRefreshTracker.get(refreshKey) || 0;
-        if (now - last < UI_STATE_REFRESH_MIN_GAP_MS) {
-            return;
-        }
-        uiStateRefreshTracker.set(refreshKey, now);
 
         try {
             const state = await getJson(stateUrl);
@@ -327,5 +316,4 @@ window.SettingsApi = (function () {
 
     return { getJson, postForm, postJson };
 })();
-
 

@@ -734,6 +734,8 @@ public class OrderServiceImpl implements OrderService {
         entity.setExecutedQty(order.getExecutedQty());
         entity.setExecutedQuoteQty(order.getExecutedQuoteQty());
         entity.setAvgExecutedPrice(order.getAvgPrice());
+        entity.setFeeTotal(order.getFeeTotal());
+        entity.setFeeAsset(order.getFeeAsset());
         entity.setStatus(order.getStatus());
         entity.setExchangeStatus(order.getStatus());
         entity.setFilled(order.isFilled());
@@ -758,7 +760,9 @@ public class OrderServiceImpl implements OrderService {
             entity.setNetworkType(finalNetwork.name());
         }
 
-        if (entity.getPrice() != null && entity.getQuantity() != null) {
+        if (entity.getExecutedQuoteQty() != null && entity.getExecutedQuoteQty().signum() > 0) {
+            entity.setTotal(entity.getExecutedQuoteQty());
+        } else if (entity.getPrice() != null && entity.getQuantity() != null) {
             entity.setTotal(entity.getPrice().multiply(entity.getQuantity()));
         }
 
@@ -918,6 +922,15 @@ public class OrderServiceImpl implements OrderService {
                 : finalPrice);
 
         BigDecimal executedQty = normalizeExecutedQtyForPersistence(sideNorm, executedQtyRaw, descriptor);
+        BigDecimal executedQuoteQty = executed != null && executed.getExecutedQuoteQty() != null && executed.getExecutedQuoteQty().signum() > 0
+                ? executed.getExecutedQuoteQty().stripTrailingZeros()
+                : (executedPrice != null && executedQty != null ? executedPrice.multiply(executedQty).stripTrailingZeros() : null);
+        BigDecimal feeTotal = executed != null && executed.getFeeTotal() != null && executed.getFeeTotal().signum() > 0
+                ? executed.getFeeTotal().stripTrailingZeros()
+                : null;
+        String feeAsset = executed != null && executed.getFeeAsset() != null && !executed.getFeeAsset().isBlank()
+                ? executed.getFeeAsset().trim().toUpperCase(Locale.ROOT)
+                : null;
         String status = executed != null && executed.getStatus() != null && !executed.getStatus().isBlank()
                 ? executed.getStatus().trim().toUpperCase(Locale.ROOT)
                 : "FILLED";
@@ -939,8 +952,10 @@ public class OrderServiceImpl implements OrderService {
         entity.setPrice(executedPrice);
         entity.setQuantity(executedQty);
         entity.setExecutedQty(executedQty);
-        entity.setExecutedQuoteQty(executedPrice != null && executedQty != null ? executedPrice.multiply(executedQty) : null);
+        entity.setExecutedQuoteQty(executedQuoteQty);
         entity.setAvgExecutedPrice(executedPrice);
+        entity.setFeeTotal(feeTotal);
+        entity.setFeeAsset(feeAsset);
         entity.setStrategyType(strategyType.name());
         entity.setStatus(status);
         entity.setExchangeStatus(status);
@@ -953,7 +968,9 @@ public class OrderServiceImpl implements OrderService {
         entity.setReduceOnly("SELL".equals(sideNorm));
         entity.setCloseOrder("SELL".equals(sideNorm));
 
-        if (executedPrice != null && executedQty != null) {
+        if (executedQuoteQty != null && executedQuoteQty.signum() > 0) {
+            entity.setTotal(executedQuoteQty);
+        } else if (executedPrice != null && executedQty != null) {
             entity.setTotal(executedPrice.multiply(executedQty));
         }
 
@@ -1339,6 +1356,8 @@ public class OrderServiceImpl implements OrderService {
         order.setExecutedQty(entity.getExecutedQty());
         order.setExecutedQuoteQty(entity.getExecutedQuoteQty());
         order.setAvgPrice(entity.getAvgExecutedPrice());
+        order.setFeeTotal(entity.getFeeTotal());
+        order.setFeeAsset(entity.getFeeAsset());
         order.setStatus(entity.getStatus());
         order.setFilled(Boolean.TRUE.equals(entity.getFilled()));
         order.setTime(entity.getTimestamp());
@@ -1428,6 +1447,8 @@ public class OrderServiceImpl implements OrderService {
         return guard != null ? guard.minNotional() : null;
     }
 }
+
+
 
 
 

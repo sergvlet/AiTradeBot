@@ -25,6 +25,7 @@ public class Order {
     /** id ордера на бирже */
     private String orderId;
 
+    private String exchangeTradeId;
     private String clientOrderId;
     private String positionUid;
     private String correlationId;
@@ -59,6 +60,10 @@ public class Order {
     private BigDecimal executedQuoteQty;
     private BigDecimal requestedQty;
     private BigDecimal requestedPrice;
+
+    /** Реальная комиссия исполнения */
+    private BigDecimal feeTotal;
+    private String feeAsset;
 
     /** Статус ордера */
     private String status;

@@ -86,9 +86,14 @@ public class ScalpingPositionManager {
         Instant time = now != null ? now : Instant.now();
 
         ExitResult forcedExit = maybeApplyBreakEvenAndForceRules(chatId, state, price, time, snapshot, settings);
-        if (forcedExit != null && forcedExit.executed()) {
-            afterExit(chatId, state, price, time, forcedExit);
-            return ManageResult.exit(forcedExit.reason() != null ? forcedExit.reason() : "forced_exit");
+        if (forcedExit != null) {
+            if (forcedExit.executed()) {
+                afterExit(chatId, state, price, time, forcedExit);
+                return ManageResult.exit(forcedExit.reason() != null ? forcedExit.reason() : "forced_exit");
+            }
+            if ("partial_exit_done".equalsIgnoreCase(forcedExit.reason())) {
+                return ManageResult.none();
+            }
         }
 
         ExitResult protective = tradeExecutionService.executeExitIfHit(
@@ -145,6 +150,10 @@ public class ScalpingPositionManager {
             return null;
         }
 
+        TradeExecutionServiceImpl impl = executionServiceImplProvider.getIfAvailable();
+        BigDecimal netPnlPct = estimateNetPnlPct(chatId, state, price, pnlPct, impl);
+        boolean fastExitProfitable = hasConservativeFastExitProfit(chatId, state, price, impl);
+
         if (!state.isBreakEvenApplied() && state.getBreakEvenTriggerPct() != null
                 && pnlPct.compareTo(state.getBreakEvenTriggerPct()) >= 0
                 && state.getEntryPrice() != null) {
@@ -169,30 +178,66 @@ public class ScalpingPositionManager {
                 && settings.getPartialExitPct() < 1.0d
                 && settings.getPartialExitTriggerPct() != null
                 && pnlPct.compareTo(BigDecimal.valueOf(settings.getPartialExitTriggerPct()).setScale(8, RoundingMode.HALF_UP)) >= 0) {
-            TradeExecutionServiceImpl impl = executionServiceImplProvider.getIfAvailable();
             if (impl != null) {
-                BigDecimal qtyToClose = state.getEntryQty().multiply(BigDecimal.valueOf(settings.getPartialExitPct()))
-                        .setScale(8, RoundingMode.DOWN);
-                if (qtyToClose.signum() > 0) {
-                    ExitResult partial = impl.executeExitNow(
+                if (!fastExitProfitable) {
+                    log.info("[SCALPING] ⏸ Частичный выход пропущен: после комиссий и буфера реальной прибыли ещё нет chatId={} symbol={} grossPnlPct={} netPnlPct={}",
                             chatId,
-                            StrategyType.SCALPING,
                             state.getSymbol(),
-                            price,
-                            now,
-                            qtyToClose,
-                            state.getTp(),
-                            state.getSl(),
-                            state.getExchange(),
-                            state.getNetwork(),
-                            "PARTIAL_EXIT"
-                    );
-                    if (partial != null && partial.executed()) {
-                        state.setPartialExitDone(true);
-                        syncFromStore(chatId, state, true);
-                        log.info("[SCALPING] ✂️ Частичный выход выполнен chatId={} symbol={} qty={} exitPrice={} reason={}",
-                                chatId, state.getSymbol(), fmt(qtyToClose), fmt(partial.exitPrice()), partial.reason());
-                        live.pushTrade(chatId, StrategyType.SCALPING, state.getSymbol(), "SELL", partial.exitPrice(), qtyToClose, now);
+                            fmt(pnlPct),
+                            fmt(netPnlPct));
+                } else {
+                    BigDecimal qtyBeforePartial = state.getEntryQty();
+                    BigDecimal qtyToClose = qtyBeforePartial.multiply(BigDecimal.valueOf(settings.getPartialExitPct()))
+                            .setScale(8, RoundingMode.DOWN);
+                    if (qtyToClose.signum() > 0) {
+                        ExitResult partial = impl.executeExitNow(
+                                chatId,
+                                StrategyType.SCALPING,
+                                state.getSymbol(),
+                                price,
+                                now,
+                                qtyToClose,
+                                state.getTp(),
+                                state.getSl(),
+                                state.getExchange(),
+                                state.getNetwork(),
+                                "PARTIAL_EXIT"
+                        );
+                        if (partial != null && partial.executed()) {
+                            state.setPartialExitDone(true);
+                            syncFromStore(chatId, state, true);
+
+                            BigDecimal remainingQty = state.isInPosition() && state.getEntryQty() != null
+                                    ? state.getEntryQty()
+                                    : BigDecimal.ZERO;
+
+                            BigDecimal soldQty = qtyBeforePartial != null
+                                    ? qtyBeforePartial.subtract(remainingQty)
+                                    : qtyToClose;
+                            if (soldQty == null || soldQty.signum() <= 0) {
+                                soldQty = qtyToClose;
+                            }
+
+                            if (state.isInPosition()) {
+                                log.info("[SCALPING] ✂️ Частичный выход выполнен chatId={} symbol={} soldQty={} remainingQty={} exitPrice={} reason={}",
+                                        chatId,
+                                        state.getSymbol(),
+                                        fmt(soldQty),
+                                        fmt(remainingQty),
+                                        fmt(partial.exitPrice()),
+                                        partial.reason());
+                            } else {
+                                log.warn("[SCALPING] ⚠️ Запрошен частичный выход, но позиция закрыта полностью chatId={} symbol={} soldQty={} exitPrice={} reason={}",
+                                        chatId,
+                                        state.getSymbol(),
+                                        fmt(soldQty),
+                                        fmt(partial.exitPrice()),
+                                        partial.reason());
+                            }
+
+                            live.pushTrade(chatId, StrategyType.SCALPING, state.getSymbol(), "SELL", partial.exitPrice(), soldQty, now);
+                            return ExitResult.fail("partial_exit_done");
+                        }
                     }
                 }
             }
@@ -201,9 +246,13 @@ public class ScalpingPositionManager {
         if (state.getEntryOpenedAt() != null && state.getMaxHoldSec() != null && state.getMaxHoldSec() > 0) {
             long hold = Duration.between(state.getEntryOpenedAt(), now).getSeconds();
             if (hold >= state.getMaxHoldSec()) {
-                log.info("[SCALPING] ⏱ Time-stop: держим позицию слишком долго chatId={} symbol={} holdSec={} limit={}",
-                        chatId, state.getSymbol(), hold, state.getMaxHoldSec());
-                return forceExit(chatId, state, price, now, "TIME_STOP");
+                if (fastExitProfitable) {
+                    log.info("[SCALPING] ⏱ Time-stop: позиция держится долго и уже есть реальный плюс chatId={} symbol={} holdSec={} limit={} grossPnlPct={} netPnlPct={}",
+                            chatId, state.getSymbol(), hold, state.getMaxHoldSec(), fmt(pnlPct), fmt(netPnlPct));
+                    return forceExit(chatId, state, price, now, "TIME_STOP");
+                }
+                log.info("[SCALPING] ⏸ Time-stop пропущен: позиция ещё не покрыла комиссии и буфер chatId={} symbol={} holdSec={} limit={} grossPnlPct={} netPnlPct={}",
+                        chatId, state.getSymbol(), hold, state.getMaxHoldSec(), fmt(pnlPct), fmt(netPnlPct));
             }
         }
 
@@ -212,9 +261,13 @@ public class ScalpingPositionManager {
                     || snapshot.regime() == ScalpingMarketRegime.NO_TRADE
                     || snapshot.regime() == ScalpingMarketRegime.TREND_DOWN;
             if (emergency) {
-                log.info("[SCALPING] 🚨 Early-exit: режим рынка ухудшился chatId={} symbol={} regime={} reason={}",
-                        chatId, state.getSymbol(), snapshot.regime(), snapshot.reason());
-                return forceExit(chatId, state, price, now, "EARLY_EXIT_" + snapshot.regime().name());
+                if (fastExitProfitable) {
+                    log.info("[SCALPING] 🚨 Early-exit: режим рынка ухудшился, но прибыль уже реальна chatId={} symbol={} regime={} reason={} grossPnlPct={} netPnlPct={}",
+                            chatId, state.getSymbol(), snapshot.regime(), snapshot.reason(), fmt(pnlPct), fmt(netPnlPct));
+                    return forceExit(chatId, state, price, now, "EARLY_EXIT_" + snapshot.regime().name());
+                }
+                log.info("[SCALPING] ⏸ Early-exit пропущен: режим плохой, но выход сейчас ещё не покрывает комиссии chatId={} symbol={} regime={} reason={} grossPnlPct={} netPnlPct={}",
+                        chatId, state.getSymbol(), snapshot.regime(), snapshot.reason(), fmt(pnlPct), fmt(netPnlPct));
             }
         }
 
@@ -250,18 +303,67 @@ public class ScalpingPositionManager {
                            BigDecimal price,
                            Instant now,
                            ExitResult result) {
+        BigDecimal exitQty = state.getEntryQty();
+        BigDecimal exitPrice = result != null && result.exitPrice() != null ? result.exitPrice() : price;
         boolean stoppedOut = result != null && (result.slHit() || (result.pnlPercent() != null && result.pnlPercent().signum() < 0));
-        live.pushTrade(chatId, StrategyType.SCALPING, state.getSymbol(), "SELL", price, state.getEntryQty(), now);
+
+        live.pushTrade(chatId, StrategyType.SCALPING, state.getSymbol(), "SELL", exitPrice, exitQty, now);
         live.clearTpSl(chatId, StrategyType.SCALPING, state.getSymbol());
         live.clearPriceLines(chatId, StrategyType.SCALPING, state.getSymbol());
-        log.info("[SCALPING] ✅ Выход из позиции chatId={} symbol={} reason={} pnlPct={} stop={}",
+
+        log.info("[SCALPING] ✅ Выход из позиции chatId={} symbol={} reason={} exitPrice={} qty={} pnlPct={} stop={}",
                 chatId,
                 state.getSymbol(),
                 result != null ? result.reason() : "UNKNOWN",
+                fmt(exitPrice),
+                fmt(exitQty),
                 result != null ? fmt(result.pnlPercent()) : "null",
                 stoppedOut);
+
         state.setExits(state.getExits() + 1);
         state.resetPositionFlags(now, stoppedOut);
+        syncFromStore(chatId, state, false);
+    }
+
+
+    private boolean hasConservativeFastExitProfit(Long chatId,
+                                                  ScalpingRuntimeState state,
+                                                  BigDecimal price,
+                                                  TradeExecutionServiceImpl impl) {
+        if (impl == null || state == null || price == null || price.signum() <= 0) {
+            return false;
+        }
+        if (state.getEntryPrice() == null || state.getEntryPrice().signum() <= 0) {
+            return false;
+        }
+        if (state.getEntryQty() == null || state.getEntryQty().signum() <= 0) {
+            return false;
+        }
+        return impl.hasConservativeFastExitProfit(
+                chatId,
+                StrategyType.SCALPING,
+                state.getExchange(),
+                state.getNetwork(),
+                state.getSymbol(),
+                state.getEntryPrice(),
+                price,
+                state.getEntryQty()
+        );
+    }
+
+    private BigDecimal estimateNetPnlPct(Long chatId,
+                                         ScalpingRuntimeState state,
+                                         BigDecimal price,
+                                         BigDecimal fallbackGrossPct,
+                                         TradeExecutionServiceImpl impl) {
+        if (impl == null || state == null || price == null || price.signum() <= 0) {
+            return fallbackGrossPct;
+        }
+        if (state.getEntryPrice() == null || state.getEntryPrice().signum() <= 0) {
+            return fallbackGrossPct;
+        }
+        BigDecimal net = impl.estimateNetPnlPct(chatId, state.getExchange(), state.getNetwork(), state.getEntryPrice(), price);
+        return net != null ? net : fallbackGrossPct;
     }
 
     private void persistPosition(Long chatId, ScalpingRuntimeState state, Instant now) {
@@ -295,5 +397,8 @@ public class ScalpingPositionManager {
         public static ManageResult exit(String reason) { return new ManageResult(true, reason); }
     }
 }
+
+
+
 
 

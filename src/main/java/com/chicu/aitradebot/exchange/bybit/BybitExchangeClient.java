@@ -27,6 +27,7 @@ import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -36,12 +37,16 @@ public class BybitExchangeClient implements ExchangeClient {
     private static final String MAIN = "https://api.bybit.com";
     private static final String TESTNET = "https://api-testnet.bybit.com";
 
-    private static final String RECV_WINDOW = "5000";
+    private static final String RECV_WINDOW = "10000";
     private static final String DEFAULT_BALANCE_COINS = "USDT,USDC,BTC,ETH,BNB,SOL,XRP,ADA,DOGE,MNT";
     private static final int FALLBACK_QTY_SCALE = 8;
+    private static final long SERVER_TIME_RESYNC_INTERVAL_MS = 60_000L;
 
     private final Map<String, BigDecimal> qtyStepCache = new ConcurrentHashMap<>();
     private final Map<String, BigDecimal> quoteStepCache = new ConcurrentHashMap<>();
+    private final Map<String, AccountFees> accountFeeCache = new ConcurrentHashMap<>();
+    private final AtomicLong serverTimeOffsetMs = new AtomicLong(0L);
+    private final AtomicLong lastServerTimeSyncMs = new AtomicLong(0L);
 
     private final RestTemplate rest;
     private final ExchangeSettingsService settingsService;
@@ -416,7 +421,10 @@ public class BybitExchangeClient implements ExchangeClient {
                 .price(finalPrice)
                 .quantity(dtoBaseQty)
                 .executedQty(finalQty)
+                .executedQuoteQty(finalState.executedQuoteQty())
                 .avgPrice(finalPrice)
+                .feeTotal(finalState.feeTotal())
+                .feeAsset(finalState.feeAsset())
                 .status(finalStatus)
                 .filled(filled)
                 .time(finalState.timeMs())
@@ -430,10 +438,15 @@ public class BybitExchangeClient implements ExchangeClient {
                                                   BigDecimal fallbackQty,
                                                   BigDecimal fallbackPrice) {
         if (orderId == null || orderId.isBlank()) {
+            BigDecimal safeQty = positiveOrNull(fallbackQty) != null ? fallbackQty : BigDecimal.ZERO;
+            BigDecimal safePrice = positiveOrNull(fallbackPrice) != null ? fallbackPrice : BigDecimal.ZERO;
             return new FinalMarketState(
-                    normalizeFinalMarketStatus(null, fallbackQty, BigDecimal.ZERO),
-                    positiveOrNull(fallbackQty) != null ? fallbackQty : BigDecimal.ZERO,
-                    positiveOrNull(fallbackPrice) != null ? fallbackPrice : BigDecimal.ZERO,
+                    normalizeFinalMarketStatus(null, safeQty, BigDecimal.ZERO),
+                    safeQty,
+                    safePrice,
+                    safeQty.signum() > 0 && safePrice.signum() > 0 ? safeQty.multiply(safePrice) : BigDecimal.ZERO,
+                    null,
+                    null,
                     System.currentTimeMillis()
             );
         }
@@ -460,10 +473,15 @@ public class BybitExchangeClient implements ExchangeClient {
             return lastSeen;
         }
 
+        BigDecimal safeQty = positiveOrNull(fallbackQty) != null ? fallbackQty : BigDecimal.ZERO;
+        BigDecimal safePrice = positiveOrNull(fallbackPrice) != null ? fallbackPrice : BigDecimal.ZERO;
         return new FinalMarketState(
-                normalizeFinalMarketStatus(null, fallbackQty, BigDecimal.ZERO),
-                positiveOrNull(fallbackQty) != null ? fallbackQty : BigDecimal.ZERO,
-                positiveOrNull(fallbackPrice) != null ? fallbackPrice : BigDecimal.ZERO,
+                normalizeFinalMarketStatus(null, safeQty, BigDecimal.ZERO),
+                safeQty,
+                safePrice,
+                safeQty.signum() > 0 && safePrice.signum() > 0 ? safeQty.multiply(safePrice) : BigDecimal.ZERO,
+                null,
+                null,
                 System.currentTimeMillis()
         );
     }
@@ -498,9 +516,22 @@ public class BybitExchangeClient implements ExchangeClient {
         JSONObject item = list.optJSONObject(0);
         if (item == null) return null;
 
-        BigDecimal execQty = safeDecimal(item.opt("cumExecQty"));
+        String sym = normalizeSymbolOrThrow(symbol);
+        String side = normalizeRealtimeSide(item.optString("side", null));
+
+        BigDecimal grossExecQty = safeDecimal(item.opt("cumExecQty"));
         BigDecimal avgPrice = safeDecimal(item.opt("avgPrice"));
         BigDecimal leavesQty = safeDecimal(item.opt("leavesQty"));
+
+        FeeInfo feeInfo = extractFeeInfo(item.opt("cumFeeDetail"), item.opt("cumExecFee"));
+        BigDecimal execQty = adjustSpotExecutedQtyByFee(sym, side, grossExecQty, feeInfo);
+        BigDecimal execQuoteQty = firstPositive(
+                safeDecimal(item.opt("cumExecValue")),
+                safeDecimal(item.opt("cumExecAmt")),
+                positiveOrNull(avgPrice) != null && positiveOrNull(grossExecQty) != null ? avgPrice.multiply(grossExecQty) : null
+        );
+        BigDecimal feeTotal = feeInfo != null ? positiveOrNull(feeInfo.amount()) : null;
+        String feeAsset = feeInfo != null && feeInfo.asset() != null ? feeInfo.asset() : guessQuoteAsset(sym);
 
         long timeMs = 0L;
         try {
@@ -512,12 +543,15 @@ public class BybitExchangeClient implements ExchangeClient {
             timeMs = System.currentTimeMillis();
         }
 
-        String status = normalizeFinalMarketStatus(item.optString("orderStatus", null), execQty, leavesQty);
+        String status = normalizeFinalMarketStatus(item.optString("orderStatus", null), grossExecQty, leavesQty);
 
         return new FinalMarketState(
                 status,
                 execQty,
                 avgPrice,
+                execQuoteQty,
+                feeTotal,
+                feeAsset,
                 timeMs
         );
     }
@@ -573,13 +607,138 @@ public class BybitExchangeClient implements ExchangeClient {
         };
     }
 
+    private BigDecimal adjustSpotExecutedQtyByFee(String symbol,
+                                                  String side,
+                                                  BigDecimal grossExecQty,
+                                                  FeeInfo feeInfo) {
+        if (positiveOrNull(grossExecQty) == null) {
+            return BigDecimal.ZERO;
+        }
+        if (feeInfo == null || positiveOrNull(feeInfo.amount()) == null) {
+            return grossExecQty;
+        }
+        if (!"BUY".equalsIgnoreCase(side)) {
+            return grossExecQty;
+        }
+
+        String baseAsset = resolveBaseAsset(symbol);
+        if (baseAsset == null) {
+            return grossExecQty;
+        }
+        if (!baseAsset.equalsIgnoreCase(feeInfo.asset())) {
+            return grossExecQty;
+        }
+
+        BigDecimal netExecQty = grossExecQty.subtract(feeInfo.amount());
+        if (netExecQty.signum() <= 0) {
+            return BigDecimal.ZERO;
+        }
+
+        return netExecQty.stripTrailingZeros();
+    }
+
+    private FeeInfo extractFeeInfo(Object cumFeeDetailRaw, Object cumExecFeeRaw) {
+        JSONObject feeDetail = toJsonObjectOrNull(cumFeeDetailRaw);
+        if (feeDetail != null && feeDetail.length() > 0) {
+            for (String key : feeDetail.keySet()) {
+                String asset = normalizeUpper(key);
+                BigDecimal amount = safeDecimal(feeDetail.opt(key));
+                if (asset != null && positiveOrNull(amount) != null) {
+                    return new FeeInfo(asset, amount);
+                }
+            }
+        }
+
+        BigDecimal amount = safeDecimal(cumExecFeeRaw);
+        if (positiveOrNull(amount) != null) {
+            return new FeeInfo(null, amount);
+        }
+
+        return new FeeInfo(null, BigDecimal.ZERO);
+    }
+
+    private JSONObject toJsonObjectOrNull(Object raw) {
+        if (raw == null) {
+            return null;
+        }
+        if (raw instanceof JSONObject jsonObject) {
+            return jsonObject;
+        }
+        try {
+            String text = String.valueOf(raw).trim();
+            if (text.isEmpty() || "null".equalsIgnoreCase(text) || "{}".equals(text)) {
+                return null;
+            }
+            return new JSONObject(text);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private String resolveBaseAsset(String symbol) {
+        String sym = normalizeUpper(symbol);
+        if (sym == null) {
+            return null;
+        }
+
+        String[] quotes = {"USDT", "USDC", "BUSD", "FDUSD", "TUSD", "BTC", "ETH", "EUR", "TRY", "BRL", "GBP", "UAH", "PLN"};
+        for (String quote : quotes) {
+            if (sym.endsWith(quote) && sym.length() > quote.length()) {
+                return sym.substring(0, sym.length() - quote.length());
+            }
+        }
+
+        return null;
+    }
+
+    private record FeeInfo(String asset, BigDecimal amount) {}
+
     private record FinalMarketState(
             String status,
             BigDecimal executedQty,
             BigDecimal avgPrice,
+            BigDecimal executedQuoteQty,
+            BigDecimal feeTotal,
+            String feeAsset,
             long timeMs
     ) {}
 
+
+    private String resolveRealtimeFeeAsset(JSONObject item, String symbol) {
+        try {
+            JSONObject feeDetail = item.optJSONObject("cumFeeDetail");
+            if (feeDetail != null) {
+                Iterator<String> keys = feeDetail.keys();
+                while (keys.hasNext()) {
+                    String asset = keys.next();
+                    BigDecimal amount = safeDecimal(feeDetail.opt(asset));
+                    if (amount.signum() > 0) {
+                        return normalizeUpper(asset);
+                    }
+                }
+            }
+
+            String feeAsset = normalizeUpper(item.optString("feeCurrency", null));
+            if (feeAsset != null) {
+                return feeAsset;
+            }
+
+            return guessQuoteAsset(symbol);
+        } catch (Exception e) {
+            return guessQuoteAsset(symbol);
+        }
+    }
+
+    private String guessQuoteAsset(String symbol) {
+        String sym = normalizeUpper(symbol);
+        if (sym == null) return null;
+        for (String suffix : List.of("USDT", "USDC", "BUSD", "FDUSD", "BTC", "ETH", "BNB", "EUR", "TRY")) {
+            if (sym.endsWith(suffix) && sym.length() > suffix.length()) {
+                return suffix;
+            }
+        }
+        return null;
+    }
 
     private BigDecimal normalizeBaseQty(String symbol, NetworkType network, BigDecimal qty) {
         BigDecimal safeQty = positiveOrNull(qty);
@@ -1208,6 +1367,8 @@ public class BybitExchangeClient implements ExchangeClient {
     @Override
     public AccountFees getAccountFees(long chatId, NetworkType networkType) {
 
+        String cacheKey = feeCacheKey(chatId, networkType);
+
         try {
             ExchangeSettings s = resolve(chatId, networkType);
 
@@ -1221,22 +1382,43 @@ public class BybitExchangeClient implements ExchangeClient {
                     HttpMethod.GET
             );
 
-            if (raw == null || raw.isBlank()) return null;
+            if (raw == null || raw.isBlank()) {
+                return accountFeeCache.get(cacheKey);
+            }
 
             JSONObject json = new JSONObject(raw);
 
             int retCode = json.optInt("retCode", -1);
+            if (retCode == 10002) {
+                log.warn("⚠️ BYBIT getAccountFees retCode=10002, форсирую синхронизацию времени и повторяю запрос");
+                ensureServerTimeOffsetFresh(networkType, true);
+
+                raw = signedV5(
+                        s,
+                        "/v5/account/fee-rate",
+                        params,
+                        HttpMethod.GET,
+                        false
+                );
+                if (raw == null || raw.isBlank()) {
+                    return accountFeeCache.get(cacheKey);
+                }
+
+                json = new JSONObject(raw);
+                retCode = json.optInt("retCode", -1);
+            }
+
             if (retCode != 0) {
                 log.warn("⚠️ BYBIT getAccountFees retCode={} msg={}",
                         retCode, json.optString("retMsg"));
-                return null;
+                return accountFeeCache.get(cacheKey);
             }
 
             JSONObject result = json.optJSONObject("result");
-            if (result == null) return null;
+            if (result == null) return accountFeeCache.get(cacheKey);
 
             JSONArray list = result.optJSONArray("list");
-            if (list == null || list.isEmpty()) return null;
+            if (list == null || list.isEmpty()) return accountFeeCache.get(cacheKey);
 
             JSONObject fees = list.getJSONObject(0);
 
@@ -1251,16 +1433,22 @@ public class BybitExchangeClient implements ExchangeClient {
                     ? AccountFees.normalizePct(takerRate.multiply(BigDecimal.valueOf(100)))
                     : null;
 
-            return AccountFees.builder()
+            AccountFees resolved = AccountFees.builder()
                     .makerPct(makerPct)
                     .takerPct(takerPct)
                     .build();
+
+            if ((makerPct != null && makerPct.signum() > 0) || (takerPct != null && takerPct.signum() > 0)) {
+                accountFeeCache.put(cacheKey, resolved);
+            }
+
+            return resolved;
 
         } catch (Exception e) {
             log.warn("⚠️ BYBIT getAccountFees failed (chatId={}, network={}): {}",
                     chatId, networkType, e.toString());
             if (log.isDebugEnabled()) log.debug("Stacktrace getAccountFees", e);
-            return null;
+            return accountFeeCache.get(cacheKey);
         }
     }
 
@@ -1495,8 +1683,20 @@ public class BybitExchangeClient implements ExchangeClient {
             Map<String, String> params,
             HttpMethod method
     ) throws Exception {
+        return signedV5(s, endpoint, params, method, true);
+    }
 
-        long ts = System.currentTimeMillis();
+    private String signedV5(
+            ExchangeSettings s,
+            String endpoint,
+            Map<String, String> params,
+            HttpMethod method,
+            boolean allowTimestampRetry
+    ) throws Exception {
+
+        ensureServerTimeOffsetFresh(s.getNetwork(), false);
+
+        long ts = System.currentTimeMillis() + serverTimeOffsetMs.get();
 
         String payload = toQuery(params);
         String preSign = ts + s.getApiKey() + RECV_WINDOW + payload;
@@ -1520,11 +1720,101 @@ public class BybitExchangeClient implements ExchangeClient {
 
         try {
             ResponseEntity<String> resp = rest.exchange(url, method, entity, String.class);
-            return resp.getBody();
+            String body = resp.getBody();
+            if (allowTimestampRetry && isTimestampWindowError(body)) {
+                log.warn("⚠️ BYBIT signed request retCode=10002, синхронизирую время и повторяю запрос endpoint={}", endpoint);
+                ensureServerTimeOffsetFresh(s.getNetwork(), true);
+                return signedV5(s, endpoint, params, method, false);
+            }
+            return body;
         } catch (HttpClientErrorException e) {
             String body = e.getResponseBodyAsString();
+            if (allowTimestampRetry && isTimestampWindowError(body)) {
+                log.warn("⚠️ BYBIT http retCode=10002, синхронизирую время и повторяю запрос endpoint={}", endpoint);
+                ensureServerTimeOffsetFresh(s.getNetwork(), true);
+                return signedV5(s, endpoint, params, method, false);
+            }
             throw new RuntimeException("BYBIT http error: " + body, e);
         }
+    }
+
+    private void ensureServerTimeOffsetFresh(NetworkType networkType, boolean force) {
+        long now = System.currentTimeMillis();
+        long lastSync = lastServerTimeSyncMs.get();
+        if (!force && lastSync > 0 && (now - lastSync) < SERVER_TIME_RESYNC_INTERVAL_MS) {
+            return;
+        }
+
+        synchronized (lastServerTimeSyncMs) {
+            long currentNow = System.currentTimeMillis();
+            long currentLastSync = lastServerTimeSyncMs.get();
+            if (!force && currentLastSync > 0 && (currentNow - currentLastSync) < SERVER_TIME_RESYNC_INTERVAL_MS) {
+                return;
+            }
+
+            try {
+                long serverTimeMs = fetchServerTimeMs(networkType);
+                long offset = serverTimeMs - System.currentTimeMillis();
+                serverTimeOffsetMs.set(offset);
+                lastServerTimeSyncMs.set(System.currentTimeMillis());
+                log.info("🕒 BYBIT time sync ok net={} serverOffsetMs={}", networkType, offset);
+            } catch (Exception e) {
+                log.warn("⚠️ BYBIT time sync failed net={} msg={}", networkType, e.toString());
+            }
+        }
+    }
+
+    private long fetchServerTimeMs(NetworkType networkType) {
+        String raw = rest.getForObject(baseUrl(networkType) + "/v5/market/time", String.class);
+        if (raw == null || raw.isBlank()) {
+            throw new IllegalStateException("BYBIT market/time returned empty body");
+        }
+
+        JSONObject root = new JSONObject(raw);
+        if (root.optInt("retCode", -1) != 0) {
+            throw new IllegalStateException("BYBIT market/time retCode=" + root.optInt("retCode") + " msg=" + root.optString("retMsg"));
+        }
+
+        JSONObject result = root.optJSONObject("result");
+        if (result != null) {
+            String timeNano = result.optString("timeNano", null);
+            if (timeNano != null && !timeNano.isBlank()) {
+                return new BigDecimal(timeNano).divide(BigDecimal.valueOf(1_000_000L), 0, RoundingMode.HALF_UP).longValue();
+            }
+            String timeSecond = result.optString("timeSecond", null);
+            if (timeSecond != null && !timeSecond.isBlank()) {
+                return new BigDecimal(timeSecond).multiply(BigDecimal.valueOf(1000L)).longValue();
+            }
+        }
+
+        long topLevelTime = root.optLong("time", 0L);
+        if (topLevelTime > 0) {
+            return topLevelTime;
+        }
+
+        throw new IllegalStateException("BYBIT market/time payload has no server timestamp");
+    }
+
+    private boolean isTimestampWindowError(String rawBody) {
+        if (rawBody == null || rawBody.isBlank()) {
+            return false;
+        }
+
+        try {
+            JSONObject root = new JSONObject(rawBody);
+            if (root.optInt("retCode", -1) == 10002) {
+                return true;
+            }
+            String msg = root.optString("retMsg", "");
+            return msg != null && msg.toLowerCase(Locale.ROOT).contains("recvwindow");
+        } catch (Exception ignored) {
+            String lowered = rawBody.toLowerCase(Locale.ROOT);
+            return lowered.contains("10002") && lowered.contains("recvwindow");
+        }
+    }
+
+    private String feeCacheKey(long chatId, NetworkType networkType) {
+        return chatId + ":" + (networkType != null ? networkType.name() : "NA");
     }
 
     private String sign(String data, String secret) throws Exception {
@@ -1645,6 +1935,8 @@ public class BybitExchangeClient implements ExchangeClient {
         return safe.setScale(4, RoundingMode.DOWN).stripTrailingZeros();
     }
 }
+
+
 
 
 

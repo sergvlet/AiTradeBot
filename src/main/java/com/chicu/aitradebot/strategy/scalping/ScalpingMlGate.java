@@ -16,7 +16,7 @@ public class ScalpingMlGate {
                                  ScalpingMarketRegimeSnapshot snapshot,
                                  EntryDecision decision) {
         if (strategySettings == null || decision == null) {
-            return MlGateResult.pass("ml не используется");
+            return MlGateResult.pass("ML не используется");
         }
 
         AdvancedControlMode mode = strategySettings.getAdvancedControlMode() != null
@@ -29,18 +29,37 @@ public class ScalpingMlGate {
 
         BigDecimal confidence = normalizeProb(strategySettings.getMlConfidenceSafe());
         BigDecimal threshold = normalizeProb(strategySettings.getEffectiveGateMinProbOrNull());
+
         if (threshold == null || threshold.signum() <= 0) {
             return MlGateResult.pass("ML-фильтр включён без порога, вход разрешён");
         }
 
+        if (confidence == null || confidence.signum() == 0) {
+            return MlGateResult.adjust(
+                    "Нет свежей уверенности ML, вход не блокирую, но уменьшаю риск",
+                    new BigDecimal("0.50"),
+                    new BigDecimal("0.95"),
+                    new BigDecimal("0.92")
+            );
+        }
+
         BigDecimal hardVetoFloor = threshold.multiply(resolveHardVetoMultiplier(snapshot, decision));
-        BigDecimal heavyAdjustFloor = threshold.multiply(new BigDecimal("0.82"));
+        BigDecimal strongAdjustFloor = threshold.multiply(resolveStrongAdjustMultiplier(snapshot, decision));
+        BigDecimal lightAdjustFloor = threshold.multiply(resolveLightAdjustMultiplier(snapshot, decision));
 
         if (confidence.compareTo(hardVetoFloor) < 0) {
+            if (canSoftPass(snapshot, decision)) {
+                return MlGateResult.adjust(
+                        "ML сомневается, но сетап сильный — вхожу сильно уменьшенным объёмом",
+                        new BigDecimal("0.35"),
+                        new BigDecimal("0.92"),
+                        new BigDecimal("0.88")
+                );
+            }
             return MlGateResult.veto("ML запретил вход: уверенность модели слишком низкая");
         }
 
-        if (confidence.compareTo(heavyAdjustFloor) < 0) {
+        if (confidence.compareTo(strongAdjustFloor) < 0) {
             return MlGateResult.adjust(
                     "ML пропускает вход только с сильным уменьшением риска",
                     new BigDecimal("0.45"),
@@ -49,7 +68,7 @@ public class ScalpingMlGate {
             );
         }
 
-        if (confidence.compareTo(threshold) < 0) {
+        if (confidence.compareTo(lightAdjustFloor) < 0) {
             return MlGateResult.adjust(
                     "ML уменьшил размер позиции и слегка ужесточил риск",
                     new BigDecimal("0.72"),
@@ -58,7 +77,9 @@ public class ScalpingMlGate {
             );
         }
 
-        if (snapshot != null && snapshot.chaosScore() != null && snapshot.chaosScore().compareTo(new BigDecimal("60")) > 0) {
+        if (snapshot != null
+                && snapshot.chaosScore() != null
+                && snapshot.chaosScore().compareTo(new BigDecimal("60")) > 0) {
             return MlGateResult.adjust(
                     "ML увидел повышенный риск и уменьшил размер позиции",
                     new BigDecimal("0.82"),
@@ -70,10 +91,32 @@ public class ScalpingMlGate {
         return MlGateResult.pass("ML подтвердил вход");
     }
 
+    private boolean canSoftPass(ScalpingMarketRegimeSnapshot snapshot,
+                                EntryDecision decision) {
+        if (snapshot == null || snapshot.regime() == null) {
+            return false;
+        }
+
+        boolean allowedRegime =
+                snapshot.regime() == ScalpingMarketRegime.TREND_UP
+                        || snapshot.regime() == ScalpingMarketRegime.RANGE;
+
+        boolean calmEnough =
+                snapshot.chaosScore() == null
+                        || snapshot.chaosScore().compareTo(new BigDecimal("30")) <= 0;
+
+        boolean strongDecision =
+                decision != null
+                        && decision.score() != null
+                        && decision.score().compareTo(new BigDecimal("55")) >= 0;
+
+        return allowedRegime && calmEnough && strongDecision;
+    }
+
     private BigDecimal resolveHardVetoMultiplier(ScalpingMarketRegimeSnapshot snapshot,
                                                  EntryDecision decision) {
         if (decision != null && decision.setupType() == ScalpingSetupType.BREAKOUT_CONTINUATION) {
-            return new BigDecimal("0.62");
+            return new BigDecimal("0.50");
         }
 
         if (snapshot != null
@@ -81,10 +124,34 @@ public class ScalpingMlGate {
                 && (snapshot.regime() == ScalpingMarketRegime.TREND_UP || snapshot.regime() == ScalpingMarketRegime.RANGE)
                 && snapshot.chaosScore() != null
                 && snapshot.chaosScore().compareTo(new BigDecimal("25")) <= 0) {
-            return new BigDecimal("0.60");
+            return new BigDecimal("0.48");
         }
 
-        return new BigDecimal("0.68");
+        return new BigDecimal("0.58");
+    }
+
+    private BigDecimal resolveStrongAdjustMultiplier(ScalpingMarketRegimeSnapshot snapshot,
+                                                     EntryDecision decision) {
+        if (decision != null && decision.setupType() == ScalpingSetupType.BREAKOUT_CONTINUATION) {
+            return new BigDecimal("0.78");
+        }
+        if (snapshot != null && snapshot.regime() == ScalpingMarketRegime.TREND_UP) {
+            return new BigDecimal("0.82");
+        }
+        return new BigDecimal("0.86");
+    }
+
+    private BigDecimal resolveLightAdjustMultiplier(ScalpingMarketRegimeSnapshot snapshot,
+                                                    EntryDecision decision) {
+        if (decision != null
+                && decision.score() != null
+                && decision.score().compareTo(new BigDecimal("60")) >= 0) {
+            return new BigDecimal("0.96");
+        }
+        if (snapshot != null && snapshot.regime() == ScalpingMarketRegime.RANGE) {
+            return new BigDecimal("0.94");
+        }
+        return ONE;
     }
 
     private BigDecimal normalizeProb(BigDecimal value) {

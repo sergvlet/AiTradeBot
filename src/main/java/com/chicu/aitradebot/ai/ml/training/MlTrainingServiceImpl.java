@@ -378,7 +378,7 @@ public class MlTrainingServiceImpl implements MlTrainingService {
         String modelKey = MlGateway.buildContextModelKey(type, exchange, networkName, symbol, timeframe);
 
         Instant now = Instant.now();
-        boolean bypassCooldown = reasonNorm.toLowerCase(Locale.ROOT).contains("prepare_start");
+        boolean bypassCooldown = isPrepareReason(reasonNorm);
         String cooldownKey = cooldownKey(modelKey);
         Instant last = lastTrainAt.get(cooldownKey);
         long cooldownMinutes = Math.max(0, props.getCooldownMinutes());
@@ -392,7 +392,9 @@ public class MlTrainingServiceImpl implements MlTrainingService {
 
         int candlesLimit = candlesLimitOverride != null && candlesLimitOverride > 0
                 ? candlesLimitOverride
-                : (ss.getCachedCandlesLimit() != null && ss.getCachedCandlesLimit() > 0 ? ss.getCachedCandlesLimit() : Math.max(300, props.getRowsLimit() * 3));
+                : (ss.getCachedCandlesLimit() != null && ss.getCachedCandlesLimit() > 0
+                ? ss.getCachedCandlesLimit()
+                : Math.max(300, props.getRowsLimit() * 3));
 
         List<Object> candles = loadSelectedCandles(chatId, type, exchange, network, symbol, timeframe, candlesLimit);
         if (candles.isEmpty()) {
@@ -427,10 +429,10 @@ public class MlTrainingServiceImpl implements MlTrainingService {
             );
             rows = buildFiboRowsFromCandles(candles, cfg, candlesLimit, chatId, symbol, exchange, networkName, timeframe);
             params.put("datasetSource", "selected_candles");
-            params.put("gridLevels", cfg.gridLevels);
-            params.put("distancePct", cfg.distancePct);
-            params.put("tpPct", cfg.takeProfitPct);
-            params.put("slPct", cfg.stopLossPct);
+            params.put("gridLevels", cfg.gridLevels());
+            params.put("distancePct", cfg.distancePct());
+            params.put("tpPct", cfg.takeProfitPct());
+            params.put("slPct", cfg.stopLossPct());
         } else if (type == StrategyType.SCALPING) {
             ScalpingTrainingConfig cfg = resolveScalpingTrainingConfig(chatId, exchange, network, symbol, timeframe);
             featureSchema = List.of(
@@ -455,10 +457,10 @@ public class MlTrainingServiceImpl implements MlTrainingService {
             );
             rows = buildScalpingRowsFromCandles(candles, cfg, candlesLimit, chatId, symbol, exchange, networkName, timeframe);
             params.put("datasetSource", "selected_candles");
-            params.put("windowSize", cfg.windowSize);
-            params.put("tpPct", cfg.takeProfitPct);
-            params.put("slPct", cfg.stopLossPct);
-            params.put("minImpulsePct", cfg.minImpulsePct);
+            params.put("windowSize", cfg.windowSize());
+            params.put("tpPct", cfg.takeProfitPct());
+            params.put("slPct", cfg.stopLossPct());
+            params.put("minImpulsePct", cfg.minImpulsePct());
         } else {
             WindowTrainingConfig cfg = resolveWindowTrainingConfig(chatId, exchange, network, symbol, timeframe);
             featureSchema = List.of(
@@ -482,16 +484,23 @@ public class MlTrainingServiceImpl implements MlTrainingService {
             );
             rows = buildWindowRowsFromCandles(candles, cfg, candlesLimit, chatId, symbol, exchange, networkName, timeframe);
             params.put("datasetSource", "selected_candles");
-            params.put("windowSize", cfg.windowSize);
-            params.put("tpPct", cfg.takeProfitPct);
-            params.put("slPct", cfg.stopLossPct);
+            params.put("windowSize", cfg.windowSize());
+            params.put("tpPct", cfg.takeProfitPct());
+            params.put("slPct", cfg.stopLossPct());
         }
 
         String computedSchemaHash = computeSchemaHash(featureSchema);
-        if (rows.size() < props.getMinSamples()) {
-            log.warn("🧠 TRAIN SKIP: not enough candle rows modelKey={} rows={} minSamples={} schemaHash={} candles={} type={}",
-                    modelKey, rows.size(), props.getMinSamples(), computedSchemaHash, candles.size(), type);
+        int minSamplesRequired = resolveMinSamplesForReason(reasonNorm);
+
+        if (rows.size() < minSamplesRequired) {
+            log.warn("🧠 TRAIN SKIP: not enough candle rows modelKey={} rows={} minSamplesRequired={} globalMinSamples={} schemaHash={} candles={} type={} reason={}",
+                    modelKey, rows.size(), minSamplesRequired, props.getMinSamples(), computedSchemaHash, candles.size(), type, reasonNorm);
             return new MlTrainingResult(false, false, modelKey, null, computedSchemaHash, "not_enough_candle_rows=" + rows.size());
+        }
+
+        if (rows.size() < props.getMinSamples()) {
+            log.warn("🧠 TRAIN RELAXED-MIN-SAMPLES modelKey={} rows={} prepareMinSamples={} globalMinSamples={} type={} reason={}",
+                    modelKey, rows.size(), minSamplesRequired, props.getMinSamples(), type, reasonNorm);
         }
 
         boolean settingsChangedBeforeTrain = false;
@@ -528,10 +537,12 @@ public class MlTrainingServiceImpl implements MlTrainingService {
         params.put("schemaHash", computedSchemaHash);
         params.put("exchange", exchange);
         params.put("network", networkName);
+        params.put("minSamplesRequired", minSamplesRequired);
+        params.put("globalMinSamples", props.getMinSamples());
         req.setParams(params);
 
-        log.info("🧠 TRAIN START type={} ex={} net={} sym={} tf={} rows={} candles={} schemaSize={} schemaHash={} modelKey={} reason={} source=selected_candles",
-                type, exchange, networkName, symbol, timeframe, rows.size(), candles.size(), featureSchema.size(), computedSchemaHash, modelKey, reasonNorm);
+        log.info("🧠 TRAIN START type={} ex={} net={} sym={} tf={} rows={} candles={} schemaSize={} schemaHash={} modelKey={} reason={} source=selected_candles minSamplesRequired={}",
+                type, exchange, networkName, symbol, timeframe, rows.size(), candles.size(), featureSchema.size(), computedSchemaHash, modelKey, reasonNorm, minSamplesRequired);
 
         MlTrainResponse resp;
         try {
@@ -579,10 +590,29 @@ public class MlTrainingServiceImpl implements MlTrainingService {
         publishSettingsUpdated(chatId, type, "ml_train:" + reasonNorm);
         lastTrainAt.put(cooldownKey, now);
 
-        log.info("🧠 TRAIN DONE type={} ex={} net={} sym={} tf={} applied={} modelKey={} ver={} schemaHash={} rows={} source=selected_candles",
-                type, exchange, networkName, symbol, timeframe, applied, responseModelKey, responseModelVersion, finalSchemaHash, rows.size());
+        log.info("🧠 TRAIN DONE type={} ex={} net={} sym={} tf={} applied={} modelKey={} ver={} schemaHash={} rows={} source=selected_candles minSamplesRequired={}",
+                type, exchange, networkName, symbol, timeframe, applied, responseModelKey, responseModelVersion, finalSchemaHash, rows.size(), minSamplesRequired);
 
         return new MlTrainingResult(true, applied, responseModelKey, responseModelVersion, finalSchemaHash, null);
+    }
+
+    private int resolveMinSamplesForReason(String reasonNorm) {
+        int globalMin = Math.max(1, props.getMinSamples());
+
+        if (!isPrepareReason(reasonNorm)) {
+            return globalMin;
+        }
+
+        int prepareMin = Math.max(1, props.getPrepareMinSamples());
+        return Math.min(globalMin, prepareMin);
+    }
+
+    private boolean isPrepareReason(String reasonNorm) {
+        if (reasonNorm == null || reasonNorm.isBlank()) {
+            return false;
+        }
+        String normalized = reasonNorm.trim().toLowerCase(Locale.ROOT);
+        return normalized.contains("prepare_start");
     }
 
     private List<Object> loadSelectedCandles(Long chatId,

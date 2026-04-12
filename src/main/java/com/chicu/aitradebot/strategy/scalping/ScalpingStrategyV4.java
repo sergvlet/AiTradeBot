@@ -22,12 +22,10 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
-import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.util.Comparator;
-import java.util.Deque;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -43,7 +41,7 @@ public class ScalpingStrategyV4 implements TradingStrategy,
         AiStrategyOrchestrator.PrepareStartAware {
 
     private static final Duration SETTINGS_REFRESH_EVERY = Duration.ofSeconds(10);
-    private static final Duration HOLD_LOG_EVERY = Duration.ofSeconds(45);
+    private static final Duration HOLD_LOG_EVERY = Duration.ofSeconds(60);
     private static final Duration INTRABAR_REEVAL = Duration.ofSeconds(2);
     private static final int MIN_CANDLES_TO_WORK = 24;
     private static final ZoneId ZONE = ZoneId.of("Europe/Warsaw");
@@ -66,6 +64,7 @@ public class ScalpingStrategyV4 implements TradingStrategy,
     private final com.chicu.aitradebot.trade.TradeExecutionService tradeExecutionService;
 
     private final Map<Long, ScalpingRuntimeState> states = new ConcurrentHashMap<>();
+    private final Map<Long, Instant> entryBlockedUntil = new ConcurrentHashMap<>();
 
     private MlTrainingServiceImpl mlTrainer() {
         return mlTrainingServiceProvider != null ? mlTrainingServiceProvider.getIfAvailable() : null;
@@ -90,6 +89,7 @@ public class ScalpingStrategyV4 implements TradingStrategy,
         state.setNetwork(network != null ? network : (strategy.getNetworkType() != null ? strategy.getNetworkType() : NetworkType.TESTNET));
         state.setSymbol(firstNonBlank(upper(strategy.getSymbol()), upper(settings.getSymbol()), "BTCUSDT"));
         state.setTimeframe(firstNonBlank(lower(strategy.getTimeframe()), lower(settings.getTimeframe()), "1m"));
+        state.setSettingsFingerprint(buildSettingsFingerprint(strategy, settings));
         state.setLastSettingsLoadAt(Instant.now());
         preloadFromCache(chatId, state);
         positionManager.syncFromStore(chatId, state, true);
@@ -99,7 +99,23 @@ public class ScalpingStrategyV4 implements TradingStrategy,
                 state.getExchange(), state.getNetwork(), state.getSymbol(), state.getTimeframe());
 
         live.pushState(chatId, StrategyType.SCALPING, state.getSymbol(), true);
-        live.pushSignal(chatId, StrategyType.SCALPING, state.getSymbol(), state.getTimeframe(), Signal.hold("Стратегия запущена"));
+        if (state.isInPosition()) {
+            live.pushSignal(chatId, StrategyType.SCALPING, state.getSymbol(), state.getTimeframe(),
+                    Signal.hold("Позиция восстановлена, сопровождение активно"));
+            log.warn("[SCALPING] ♻️ При старте восстановлена открытая позиция chatId={} ex={} net={} symbol={} tf={} entry={} qty={} tp={} sl={} openedAt={}",
+                    chatId,
+                    state.getExchange(),
+                    state.getNetwork(),
+                    state.getSymbol(),
+                    state.getTimeframe(),
+                    fmt(state.getEntryPrice()),
+                    fmt(state.getEntryQty()),
+                    fmt(state.getTp()),
+                    fmt(state.getSl()),
+                    state.getEntryOpenedAt());
+        } else {
+            live.pushSignal(chatId, StrategyType.SCALPING, state.getSymbol(), state.getTimeframe(), Signal.hold("Стратегия запущена"));
+        }
 
         log.info("[SCALPING] ▶️ Запуск скальпера chatId={} ex={} net={} symbol={} tf={} window={} regimeAuto={} trend={} range={} breakout={} orderVolume={}",
                 chatId,
@@ -123,6 +139,7 @@ public class ScalpingStrategyV4 implements TradingStrategy,
     @Override
     public void stop(Long chatId, String ignored, String exchange, NetworkType network) {
         ScalpingRuntimeState state = states.remove(chatId);
+        entryBlockedUntil.remove(chatId);
         if (state == null) return;
 
         adaptiveRuntimeController.onStrategyStopped(chatId, StrategyType.SCALPING, state.getExchange(), state.getNetwork());
@@ -179,15 +196,31 @@ public class ScalpingStrategyV4 implements TradingStrategy,
             int required = Math.max(MIN_CANDLES_TO_WORK, settings.getWindowSize() + 8);
             List<Candle> candles = marketDataStreamService.getCachedCandles(chatId, StrategyType.SCALPING, ex, net, sym, tf, desired);
             int usable = countUsableClosedCandles(candles);
+            boolean restoredTrackedPosition = hasTrackedPosition(chatId, ex, net, sym, tf);
 
             MlTrainingServiceImpl trainer = mlTrainer();
             if (trainer == null) {
+                if (restoredTrackedPosition) {
+                    log.warn("[SCALPING] ⚠️ prepareStart: ML trainer недоступен, но открытая позиция уже восстановлена. Разрешаю manage-only старт chatId={} ex={} net={} symbol={} tf={}",
+                            chatId, ex, net, sym, tf);
+                    return AiStrategyOrchestrator.PreparationResult.ok("manage_only:trainer_missing");
+                }
+                if (usable >= required) {
+                    log.warn("[SCALPING] ⚠️ prepareStart: ML trainer недоступен, но контекст уже достаточный. Разрешаю старт на текущих настройках chatId={} ex={} net={} symbol={} tf={} usable={} need={}",
+                            chatId, ex, net, sym, tf, usable, required);
+                    return AiStrategyOrchestrator.PreparationResult.ok("context_ready_without_trainer");
+                }
                 return AiStrategyOrchestrator.PreparationResult.fail("trainer_missing");
             }
 
             if (usable < required) {
-                log.warn("[SCALPING] В runtime-кэше мало свечей перед стартом chatId={} symbol={} tf={} usable={} need={} | пытаюсь прогреть контекст через ML loader",
-                        chatId, sym, tf, usable, required);
+                if (restoredTrackedPosition) {
+                    log.warn("[SCALPING] ⚠️ prepareStart: свечей меньше желаемого, но есть восстановленная позиция. Разрешаю сопровождение chatId={} ex={} net={} symbol={} tf={} usable={} need={}",
+                            chatId, ex, net, sym, tf, usable, required);
+                } else {
+                    log.warn("[SCALPING] В runtime-кэше мало свечей перед стартом chatId={} symbol={} tf={} usable={} need={} | пытаюсь прогреть контекст через ML loader",
+                            chatId, sym, tf, usable, required);
+                }
             } else {
                 log.info("[SCALPING] Контекст перед стартом готов chatId={} symbol={} tf={} usable={} need={}",
                         chatId, sym, tf, usable, required);
@@ -204,15 +237,35 @@ public class ScalpingStrategyV4 implements TradingStrategy,
                     "prepare_start_train"
             );
             if (result == null) {
+                if (restoredTrackedPosition) {
+                    log.warn("[SCALPING] ⚠️ prepareStart: train result = null, но позиция уже восстановлена. Разрешаю manage-only старт chatId={} ex={} net={} symbol={} tf={}",
+                            chatId, ex, net, sym, tf);
+                    return AiStrategyOrchestrator.PreparationResult.ok("manage_only:train_result_null");
+                }
                 return AiStrategyOrchestrator.PreparationResult.fail("train_result_null");
             }
+
             if (!result.ok() || !result.applied()) {
-                return AiStrategyOrchestrator.PreparationResult.fail(result.error() != null ? result.error() : "train_not_applied");
+                String error = result.error() != null ? result.error() : "train_not_applied";
+
+                if (restoredTrackedPosition) {
+                    log.warn("[SCALPING] ⚠️ prepareStart: обучение не применилось, но позиция уже восстановлена. Разрешаю сопровождение chatId={} ex={} net={} symbol={} tf={} reason={}",
+                            chatId, ex, net, sym, tf, error);
+                    return AiStrategyOrchestrator.PreparationResult.ok("manage_only:" + error);
+                }
+
+                if (canUseExistingRuntimeContext(usable, required, error)) {
+                    log.warn("[SCALPING] ⚠️ prepareStart: новое обучение не применилось, но контекст уже рабочий. Разрешаю старт на текущих настройках chatId={} ex={} net={} symbol={} tf={} usable={} need={} reason={}",
+                            chatId, ex, net, sym, tf, usable, required, error);
+                    return AiStrategyOrchestrator.PreparationResult.ok("context_ready_existing_model:" + error);
+                }
+
+                return AiStrategyOrchestrator.PreparationResult.fail(error);
             }
 
             List<Candle> warmedCandles = marketDataStreamService.getCachedCandles(chatId, StrategyType.SCALPING, ex, net, sym, tf, desired);
             int warmedUsable = countUsableClosedCandles(warmedCandles);
-            if (warmedUsable < required) {
+            if (warmedUsable < required && !restoredTrackedPosition) {
                 log.warn("[SCALPING] После прогрева контекст всё ещё слабый chatId={} ex={} net={} symbol={} tf={} usable={} need={} | модель обучена, но старт пока рискованный",
                         chatId, ex, net, sym, tf, warmedUsable, required);
             }
@@ -273,6 +326,7 @@ public class ScalpingStrategyV4 implements TradingStrategy,
                                String exchange,
                                NetworkType network) {
         if (type != StrategyType.SCALPING || kline == null || !kline.isClosed()) return;
+        entryBlockedUntil.remove(chatId);
         ScalpingRuntimeState state = states.get(chatId);
         if (state == null || !state.isActive()) return;
 
@@ -333,6 +387,15 @@ public class ScalpingStrategyV4 implements TradingStrategy,
                                    ScalpingMarketRegimeSnapshot snapshot,
                                    boolean intrabar) {
         if (state.isInPosition()) return;
+
+        Instant blockedUntil = entryBlockedUntil.get(chatId);
+        if (blockedUntil != null) {
+            if (now.isBefore(blockedUntil)) {
+                return;
+            }
+            entryBlockedUntil.remove(chatId);
+        }
+
         EntryDecision decision = selectDecision(state, snapshot, features);
         if (decision == null || !decision.allowed()) {
             pushHold(chatId, state, "decision_blocked", decision != null ? decision.reason() : "Сетап не найден", now);
@@ -368,20 +431,16 @@ public class ScalpingStrategyV4 implements TradingStrategy,
                 ? features.priceChangePct()
                 : new BigDecimal("0.000001");
 
-        EntryResult entry = tradeExecutionService.executeEntry(
-                chatId,
-                StrategyType.SCALPING,
-                state.getSymbol(),
-                price,
-                diffPct,
-                now,
-                state.getStrategySettings(),
-                decision.tpPct(),
-                decision.slPct()
-        );
+        EntryResult entry = executeEntry(chatId, state, price, diffPct, now, decision);
 
         if (entry == null || !entry.executed()) {
             String reason = entry != null ? entry.reason() : "entry_null";
+            if ("tp_too_small_for_fees".equals(reason)
+                    || "min_notional".equals(reason)
+                    || "wallet_base_untracked_position".equals(reason)
+                    || "balance".equals(reason)) {
+                entryBlockedUntil.put(chatId, now.plusSeconds(55));
+            }
             pushHold(chatId, state, "entry_blocked", "Вход не выполнен: " + reason, now);
             return;
         }
@@ -417,6 +476,54 @@ public class ScalpingStrategyV4 implements TradingStrategy,
                 decision.reason());
     }
 
+
+    private EntryResult executeEntry(Long chatId,
+                                     ScalpingRuntimeState state,
+                                     BigDecimal price,
+                                     BigDecimal diffPct,
+                                     Instant now,
+                                     EntryDecision decision) {
+        BigDecimal requestedQuoteBudget = resolveRequestedQuoteBudget(state);
+        if (requestedQuoteBudget != null
+                && tradeExecutionService instanceof com.chicu.aitradebot.trade.TradeExecutionServiceImpl impl) {
+            return impl.executeEntryWithQuoteBudget(
+                    chatId,
+                    StrategyType.SCALPING,
+                    state.getSymbol(),
+                    price,
+                    diffPct,
+                    now,
+                    state.getStrategySettings(),
+                    decision.tpPct(),
+                    decision.slPct(),
+                    requestedQuoteBudget
+            );
+        }
+
+        return tradeExecutionService.executeEntry(
+                chatId,
+                StrategyType.SCALPING,
+                state.getSymbol(),
+                price,
+                diffPct,
+                now,
+                state.getStrategySettings(),
+                decision.tpPct(),
+                decision.slPct()
+        );
+    }
+
+    private BigDecimal resolveRequestedQuoteBudget(ScalpingRuntimeState state) {
+        if (state == null || state.getScalpingSettings() == null) {
+            return null;
+        }
+        Double orderVolume = state.getScalpingSettings().getOrderVolume();
+        if (orderVolume == null || !Double.isFinite(orderVolume) || orderVolume <= 0.0d) {
+            return null;
+        }
+        return BigDecimal.valueOf(orderVolume).stripTrailingZeros();
+    }
+
     private EntryDecision selectDecision(ScalpingRuntimeState state,
                                          ScalpingMarketRegimeSnapshot snapshot,
                                          ScalpingFeatureSnapshot features) {
@@ -437,6 +544,44 @@ public class ScalpingStrategyV4 implements TradingStrategy,
                     case RANGE -> range;
                     case SQUEEZE, TREND_DOWN, CHAOS, NO_TRADE -> EntryDecision.block(snapshot.regime(), ScalpingSetupType.NO_TRADE, snapshot.reason(), features.toMlFeatures());
                 });
+    }
+
+    private boolean hasTrackedPosition(Long chatId,
+                                      String exchange,
+                                      NetworkType network,
+                                      String symbol,
+                                      String timeframe) {
+        try {
+            ScalpingRuntimeState probe = new ScalpingRuntimeState();
+            probe.setActive(true);
+            probe.setExchange(exchange);
+            probe.setNetwork(network);
+            probe.setSymbol(symbol);
+            probe.setTimeframe(timeframe);
+            positionManager.syncFromStore(chatId, probe, false);
+            return probe.isInPosition()
+                    && probe.getEntryQty() != null
+                    && probe.getEntryQty().signum() > 0
+                    && probe.getEntryPrice() != null
+                    && probe.getEntryPrice().signum() > 0;
+        } catch (Exception e) {
+            log.debug("[SCALPING] hasTrackedPosition check skipped chatId={} symbol={} err={}", chatId, symbol, e.toString());
+            return false;
+        }
+    }
+
+    private boolean canUseExistingRuntimeContext(int usable, int required, String error) {
+        if (usable < required) {
+            return false;
+        }
+        if (error == null || error.isBlank()) {
+            return false;
+        }
+        String normalized = error.toLowerCase(Locale.ROOT);
+        return normalized.startsWith("not_enough_candle_rows")
+                || normalized.startsWith("not_enough_samples")
+                || normalized.startsWith("cooldown")
+                || normalized.startsWith("train_not_applied");
     }
 
     private void preloadFromCache(Long chatId, ScalpingRuntimeState state) {
@@ -485,7 +630,6 @@ public class ScalpingStrategyV4 implements TradingStrategy,
         while (state.getCloseWindow().size() > hardLimit) state.getCloseWindow().removeFirst();
         while (state.getCandleWindow().size() > hardLimit) state.getCandleWindow().removeFirst();
     }
-
 
     private int countUsableClosedCandles(List<Candle> candles) {
         if (candles == null || candles.isEmpty()) return 0;
@@ -572,12 +716,23 @@ public class ScalpingStrategyV4 implements TradingStrategy,
         }
         state.setLastHoldReason(holdSignature);
         state.setLastHoldAt(logNow);
-        adaptiveRuntimeController.onHold(chatId, StrategyType.SCALPING, state.getExchange(), state.getNetwork(), code, logNow);
+
+        boolean suppressAdaptiveHold = Objects.equals(code, "entry_blocked")
+                && text != null
+                && (text.contains("tp_too_small_for_fees")
+                || text.contains("min_notional")
+                || text.contains("wallet_base_untracked_position")
+                || text.contains("balance"));
+
+        if (!suppressAdaptiveHold) {
+            adaptiveRuntimeController.onHold(chatId, StrategyType.SCALPING, state.getExchange(), state.getNetwork(), code, logNow);
+        }
         live.pushSignal(chatId, StrategyType.SCALPING, state.getSymbol(), state.getTimeframe(), Signal.hold(text));
 
         boolean noisyTechnicalReason = Objects.equals(code, "warmup")
                 || Objects.equals(code, "features_unavailable")
-                || Objects.equals(code, "decision_blocked");
+                || Objects.equals(code, "decision_blocked")
+                || Objects.equals(code, "ml_veto");
 
         if (noisyTechnicalReason) {
             if (log.isDebugEnabled()) {
@@ -678,7 +833,4 @@ public class ScalpingStrategyV4 implements TradingStrategy,
         return current.getMessage() != null && !current.getMessage().isBlank() ? current.getMessage() : throwable.getClass().getSimpleName();
     }
 }
-
-
-
 

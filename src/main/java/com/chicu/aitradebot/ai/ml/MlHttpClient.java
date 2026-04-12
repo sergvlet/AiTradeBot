@@ -17,24 +17,22 @@ import java.io.IOException;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 @Slf4j
 public class MlHttpClient implements MlClient {
 
     private static final MediaType JSON = MediaType.parse("application/json; charset=utf-8");
+    private static final long STARTUP_HEALTH_GRACE_MS = 20_000L;
+    private static final long HEALTH_WARN_THROTTLE_MS = 15_000L;
 
     private final OkHttpClient http;
     private final ObjectMapper om;
     private final String baseUrl;
-
-    /**
-     * Если задан — клиент сам ставит X-API-KEY.
-     */
     private final String apiKey;
 
-    // =====================================================
-    // CTOR
-    // =====================================================
+    private final long createdAtMs = System.currentTimeMillis();
+    private final AtomicLong lastHealthWarnAtMs = new AtomicLong(0);
 
     public MlHttpClient(OkHttpClient http, ObjectMapper om, String baseUrl) {
         this(http, om, baseUrl, null);
@@ -46,10 +44,6 @@ public class MlHttpClient implements MlClient {
         this.baseUrl = trimSlash(baseUrl);
         this.apiKey = (apiKey == null || apiKey.isBlank()) ? null : apiKey.trim();
     }
-
-    // =====================================================
-    // API
-    // =====================================================
 
     @Override
     public MlHealthResponse health() {
@@ -91,10 +85,6 @@ public class MlHttpClient implements MlClient {
         return postJson(url, request, MlTrainResponse.class, "train", "train");
     }
 
-    // =====================================================
-    // Request builders
-    // =====================================================
-
     private Request.Builder withAuth(Request.Builder b) {
         if (apiKey != null) {
             b.header("X-API-KEY", apiKey);
@@ -133,14 +123,21 @@ public class MlHttpClient implements MlClient {
                 String bodySafe = safe(body);
                 String err = "http_" + resp.code() + (bodySafe != null && !bodySafe.isBlank() ? (": " + bodySafe) : "");
 
-                log.warn("🧠 ML {}: HTTP {} | tookMs={} | {} | body={}",
-                        op, resp.code(), tookMs, ctx, bodySafe);
+                if (isHealthOp(op)) {
+                    logHealthProblem("HTTP " + resp.code(), tookMs, ctx, bodySafe);
+                } else {
+                    log.warn("🧠 ML {}: HTTP {} | tookMs={} | {} | body={}", op, resp.code(), tookMs, ctx, bodySafe);
+                }
 
                 return errorResponse(responseType, err);
             }
 
             if (body == null || body.isBlank()) {
-                log.warn("🧠 ML {}: пустой body | tookMs={} | {}", op, tookMs, ctx);
+                if (isHealthOp(op)) {
+                    logHealthProblem("пустой body", tookMs, ctx, null);
+                } else {
+                    log.warn("🧠 ML {}: пустой body | tookMs={} | {}", op, tookMs, ctx);
+                }
                 return errorResponse(responseType, "empty_body");
             }
 
@@ -154,19 +151,52 @@ public class MlHttpClient implements MlClient {
 
         } catch (IOException e) {
             long tookMs = System.currentTimeMillis() - ts;
-            log.warn("🧠 ML {}: IO ошибка | tookMs={} | {} | err={}", op, tookMs, ctx, safeMsg(e));
+
+            if (isHealthOp(op)) {
+                logHealthProblem("IO ошибка", tookMs, ctx, safeMsg(e));
+            } else {
+                log.warn("🧠 ML {}: IO ошибка | tookMs={} | {} | err={}", op, tookMs, ctx, safeMsg(e));
+            }
+
             return errorResponse(responseType, "io_error: " + safeMsg(e));
 
         } catch (Exception e) {
             long tookMs = System.currentTimeMillis() - ts;
-            log.warn("🧠 ML {}: ошибка разбора ответа | tookMs={} | {} | err={}", op, tookMs, ctx, safeMsg(e));
+
+            if (isHealthOp(op)) {
+                logHealthProblem("ошибка разбора ответа", tookMs, ctx, safeMsg(e));
+            } else {
+                log.warn("🧠 ML {}: ошибка разбора ответа | tookMs={} | {} | err={}", op, tookMs, ctx, safeMsg(e));
+            }
+
             return errorResponse(responseType, "parse_error: " + safeMsg(e));
         }
     }
 
-    // =====================================================
-    // Predict validation
-    // =====================================================
+    private void logHealthProblem(String problem, long tookMs, String ctx, String extra) {
+        long now = System.currentTimeMillis();
+        boolean startupGrace = (now - createdAtMs) < STARTUP_HEALTH_GRACE_MS;
+        String suffix = (extra == null || extra.isBlank()) ? "" : " | err=" + extra;
+
+        if (startupGrace) {
+            if (log.isDebugEnabled()) {
+                log.debug("🧠 ML health: {} | tookMs={} | {}{}", problem, tookMs, ctx, suffix);
+            }
+            return;
+        }
+
+        long prev = lastHealthWarnAtMs.get();
+        if (now - prev < HEALTH_WARN_THROTTLE_MS && !log.isDebugEnabled()) {
+            return;
+        }
+        lastHealthWarnAtMs.set(now);
+
+        log.warn("🧠 ML health: {} | tookMs={} | {}{}", problem, tookMs, ctx, suffix);
+    }
+
+    private boolean isHealthOp(String op) {
+        return "health".equalsIgnoreCase(op);
+    }
 
     private MlPredictResponse validatePredictRequest(MlPredictRequest request) {
         if (request == null) {
@@ -214,10 +244,6 @@ public class MlHttpClient implements MlClient {
                + " order=" + orderCount;
     }
 
-    // =====================================================
-    // Error response
-    // =====================================================
-
     @SuppressWarnings("unchecked")
     private <T> T errorResponse(Class<T> responseType, String error) {
         long now = System.currentTimeMillis();
@@ -248,10 +274,6 @@ public class MlHttpClient implements MlClient {
 
         throw new IllegalStateException("Cannot create error response for " + responseType.getName());
     }
-
-    // =====================================================
-    // Utils
-    // =====================================================
 
     private String safe(String s) {
         if (s == null) return "null";

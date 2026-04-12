@@ -13,7 +13,9 @@ import com.chicu.aitradebot.domain.enums.AdvancedControlMode;
 import com.chicu.aitradebot.exchange.model.AccountFees;
 import com.chicu.aitradebot.exchange.model.ApiKeyDiagnostics;
 import com.chicu.aitradebot.exchange.service.ExchangeSettingsService;
+import com.chicu.aitradebot.market.dto.MarketOverviewDto;
 import com.chicu.aitradebot.market.model.SymbolDescriptor;
+import com.chicu.aitradebot.market.service.MarketInfoService;
 import com.chicu.aitradebot.market.service.MarketSymbolService;
 import com.chicu.aitradebot.orchestrator.AiStrategyOrchestrator;
 import com.chicu.aitradebot.service.StrategySettingsCommandService;
@@ -53,13 +55,14 @@ public class StrategySettingsController {
     private final ExchangeSettingsService exchangeSettingsService;
     private final StrategySettingsCache settingsCache;
     private final AccountBalanceService accountBalanceService;
+    private final MarketInfoService marketInfoService;
     private final MarketSymbolService marketSymbolService;
     private final StrategyAdvancedRegistry strategyAdvancedRegistry;
     private final AiStrategyOrchestrator orchestrator;
     private final AutoTunerOrchestrator autoTuner;
 
     private static final List<String> DEFAULT_TIMEFRAMES = List.of(
-            "1s", "5s", "15s", "1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d"
+            "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d", "1w", "1mo"
     );
 
     private static final List<String> AVAILABLE_EXCHANGES = List.of("BINANCE", "BYBIT", "OKX");
@@ -87,8 +90,9 @@ public class StrategySettingsController {
 
         boolean ctxChanged = patchContextIfChanged(strategy, exchange, network);
         boolean phaseChanged = syncRunPhaseWithContextChanged(strategy, exchange, network);
-
-        if (ctxChanged || phaseChanged) {
+        List<String> availableTimeframes = resolveAvailableTimeframes(exchange, network);
+        boolean timeframeChanged = ensureAllowedTimeframe(strategy, availableTimeframes);
+        if (ctxChanged || phaseChanged || timeframeChanged) {
             try {
                 strategy = saveStrategySettings(chatId, strategyType, strategy);
             } catch (Exception e) {
@@ -177,7 +181,7 @@ public class StrategySettingsController {
         model.addAttribute("selectedNetwork", network);
 
         model.addAttribute("availableExchanges", AVAILABLE_EXCHANGES);
-        model.addAttribute("availableTimeframes", DEFAULT_TIMEFRAMES);
+        model.addAttribute("availableTimeframes", availableTimeframes);
 
         model.addAttribute("exchangeSettings", exchangeSettings);
         model.addAttribute("diagnosticsSupported", diagnosticsSupported);
@@ -208,8 +212,7 @@ public class StrategySettingsController {
             @RequestParam(value = "exchange", required = false) String exchangeParam,
             @RequestParam(value = "network", required = false) String networkParam,
             @RequestParam(value = "diagnostics", required = false, defaultValue = "false") boolean diagnostics,
-            @RequestParam(value = "lite", required = false, defaultValue = "true") boolean lite,
-            @RequestParam(value = "balance", required = false, defaultValue = "false") boolean balance
+            @RequestParam(value = "lite", required = false, defaultValue = "false") boolean lite
     ) {
         StrategyType strategyType = parseStrategyType(typeRaw);
 
@@ -226,8 +229,7 @@ public class StrategySettingsController {
         String ex = resolveExchange(exchangeParam, s);
         NetworkType net = resolveNetwork(networkParam, s);
 
-        boolean includeBalance = balance || !lite;
-        StrategyUiState state = buildUiState(chatId, strategyType, s, ex, net, diagnostics, includeBalance, false, null, null);
+        StrategyUiState state = buildUiState(chatId, strategyType, s, ex, net, diagnostics, !lite, false, null, null);
         return ResponseEntity.ok(state);
     }
 
@@ -262,6 +264,11 @@ public class StrategySettingsController {
         }
 
         s = applySaveScope(chatId, strategyType, exchange, network, saveScope, params, s);
+
+        List<String> availableTimeframes = resolveAvailableTimeframes(exchange, network);
+        if (ensureAllowedTimeframe(s, availableTimeframes)) {
+            s = saveStrategySettings(chatId, strategyType, s);
+        }
 
         CtxSnap after = snap(s);
         boolean contextChanged = ctxChanged(before, after);
@@ -318,6 +325,11 @@ public class StrategySettingsController {
         }
 
         s = applySaveScope(chatId, strategyType, exchange, network, saveScope, params, s);
+
+        List<String> availableTimeframes = resolveAvailableTimeframes(exchange, network);
+        if (ensureAllowedTimeframe(s, availableTimeframes)) {
+            s = saveStrategySettings(chatId, strategyType, s);
+        }
 
         CtxSnap after = snap(s);
 
@@ -822,6 +834,9 @@ public class StrategySettingsController {
 
         Boolean hasKeys = (es != null) ? es.hasBaseKeys() : null;
 
+        List<String> availableTimeframes = resolveAvailableTimeframes(ex, net);
+        String effectiveTimeframe = chooseAllowedTimeframe(normalizeTimeframe(s.getTimeframe()), availableTimeframes);
+
         StrategyUiState.AssetBalance balance = null;
         if (ab != null) {
             balance = new StrategyUiState.AssetBalance(selectedAsset, ab.getFree(), ab.getLocked());
@@ -857,10 +872,11 @@ public class StrategySettingsController {
                 s.isMlGateEnabled(),
                 normalizeAsset(selectedAsset),
                 normalizeSymbol(s.getSymbol()),
-                normalizeTimeframe(s.getTimeframe()),
+                effectiveTimeframe,
                 s.getCachedCandlesLimit(),
                 s.getCapitalMode(),
                 s.getCapitalValue(),
+                availableTimeframes,
                 assets,
                 balance,
                 hasKeys,
@@ -888,6 +904,7 @@ public class StrategySettingsController {
             Integer cachedCandlesLimit,
             StrategySettings.CapitalMode capitalMode,
             BigDecimal capitalValue,
+            List<String> availableTimeframes,
             List<String> availableAssets,
             AssetBalance selectedBalance,
             Boolean hasKeys,
@@ -1353,9 +1370,117 @@ public class StrategySettingsController {
     }
 
     private String normalizeTimeframe(String tf) {
+        return canonicalizeTimeframe(tf);
+    }
+
+
+    private List<String> resolveAvailableTimeframes(String exchange, NetworkType network) {
+        String ex = normalizeExchange(exchange);
+        NetworkType net = (network != null) ? network : NetworkType.TESTNET;
+
+        try {
+            MarketOverviewDto overview = marketInfoService.getOverview(ex, net);
+            if (overview != null && overview.getTimeframes() != null && !overview.getTimeframes().isEmpty()) {
+                List<String> canonical = canonicalizeTimeframes(overview.getTimeframes());
+                if (!canonical.isEmpty()) {
+                    return canonical;
+                }
+            }
+        } catch (Exception e) {
+            log.warn("⚠ Не удалось получить таймфреймы ex={} net={}: {}", ex, net, e.getMessage());
+        }
+
+        return fallbackTimeframesForExchange(ex);
+    }
+
+    private List<String> fallbackTimeframesForExchange(String exchange) {
+        String ex = normalizeExchange(exchange);
+        if ("BYBIT".equals(ex)) {
+            return List.of("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d", "1w", "1mo");
+        }
+        if ("BINANCE".equals(ex)) {
+            return List.of("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1mo");
+        }
+        return DEFAULT_TIMEFRAMES;
+    }
+
+    private boolean ensureAllowedTimeframe(StrategySettings strategy, List<String> availableTimeframes) {
+        if (strategy == null) return false;
+
+        List<String> allowed = canonicalizeTimeframes(availableTimeframes);
+        String current = normalizeTimeframe(strategy.getTimeframe());
+        String next = chooseAllowedTimeframe(current, allowed);
+
+        if (next == null) {
+            return false;
+        }
+
+        if (!Objects.equals(current, next) || !Objects.equals(strategy.getTimeframe(), next)) {
+            strategy.setTimeframe(next);
+            return true;
+        }
+
+        return false;
+    }
+
+    private String chooseAllowedTimeframe(String current, List<String> availableTimeframes) {
+        List<String> allowed = canonicalizeTimeframes(availableTimeframes);
+        if (allowed.isEmpty()) {
+            return current != null ? current : "1m";
+        }
+
+        String normalizedCurrent = normalizeTimeframe(current);
+        if (normalizedCurrent != null && allowed.contains(normalizedCurrent)) {
+            return normalizedCurrent;
+        }
+
+        return allowed.getFirst();
+    }
+
+    private List<String> canonicalizeTimeframes(Collection<String> raw) {
+        LinkedHashSet<String> out = new LinkedHashSet<>();
+        if (raw != null) {
+            for (String timeframe : raw) {
+                String normalized = canonicalizeTimeframe(timeframe);
+                if (normalized != null) {
+                    out.add(normalized);
+                }
+            }
+        }
+        return out.isEmpty() ? new ArrayList<>(DEFAULT_TIMEFRAMES) : new ArrayList<>(out);
+    }
+
+    private String canonicalizeTimeframe(String tf) {
         if (tf == null) return null;
-        String t = tf.trim();
-        return t.isEmpty() ? null : t;
+
+        String raw = tf.trim();
+        if (raw.isEmpty()) return null;
+
+        if ("M".equals(raw) || "1M".equals(raw)) return "1mo";
+        if ("W".equals(raw) || "1W".equals(raw)) return "1w";
+        if ("D".equals(raw) || "1D".equals(raw)) return "1d";
+        if ("3D".equals(raw)) return "3d";
+
+        String lower = raw.toLowerCase(Locale.ROOT);
+
+        return switch (lower) {
+            case "1", "1m" -> "1m";
+            case "3", "3m" -> "3m";
+            case "5", "5m" -> "5m";
+            case "15", "15m" -> "15m";
+            case "30", "30m" -> "30m";
+            case "60", "1h" -> "1h";
+            case "120", "2h" -> "2h";
+            case "240", "4h" -> "4h";
+            case "360", "6h" -> "6h";
+            case "480", "8h" -> "8h";
+            case "720", "12h" -> "12h";
+            case "1d", "d" -> "1d";
+            case "3d" -> "3d";
+            case "1w", "w" -> "1w";
+            case "1mo", "1mon", "1month" -> "1mo";
+            default -> lower;
+        };
     }
 
     private BigDecimal parseBigDecimalOrNull(String v) {
@@ -1493,6 +1618,5 @@ public class StrategySettingsController {
         }
     }
 }
-
 
 

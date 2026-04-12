@@ -8,7 +8,6 @@ import org.springframework.stereotype.Service;
 
 import java.lang.reflect.Method;
 import java.util.EnumMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -21,18 +20,9 @@ public class AutoTunerOrchestrator {
 
     private final Map<StrategyType, StrategyAutoTuner> tuners = new EnumMap<>(StrategyType.class);
     private final StrategyEnvResolver envResolver;
-
-    /** ✅ 1 контекст (chatId/type/exchange/network) — 1 тюнинг одновременно. */
     private final Set<TuningKey> inFlight = ConcurrentHashMap.newKeySet();
-
-    /** ✅ Debounce/anti-spam по контексту (chatId/type/exchange/network) + signature. */
     private final Map<TuningKey, LastRun> lastRunByKey = new ConcurrentHashMap<>();
 
-    /**
-     * cooldown для одинакового signature:
-     * ✅ применяем ТОЛЬКО если прошлый результат был APPLIED или NO_IMPROVEMENT
-     * ❌ НЕ применяем для ERROR/NO_TRADES (чтобы можно было быстро повторить)
-     */
     private static final long COOLDOWN_MS = 60_000L;
 
     public AutoTunerOrchestrator(List<StrategyAutoTuner> tunerList,
@@ -57,10 +47,6 @@ public class AutoTunerOrchestrator {
     }
 
     public TuningResult tune(TuningRequest request) {
-
-        // ==========================
-        // ✅ Валидация
-        // ==========================
         if (request == null) return reject("request = null");
 
         Long chatId = request.chatId();
@@ -72,15 +58,9 @@ public class AutoTunerOrchestrator {
         StrategyAutoTuner tuner = tuners.get(type);
         if (tuner == null) return reject("Тюнер для " + type + " не зарегистрирован");
 
-        // ==========================
-        // ✅ Безопасный env (НИКАКИХ дефолтов MAINNET/BINANCE)
-        // ==========================
         ResolvedEnv env = resolveEnv(chatId, type, request.exchange(), request.network());
         if (!env.ok) return reject(env.failReason);
 
-        // ==========================
-        // ✅ Анти-гонка
-        // ==========================
         TuningKey key = new TuningKey(chatId, type, env.exchange, env.network);
         if (!inFlight.add(key)) {
             return TuningResult.builder()
@@ -93,7 +73,6 @@ public class AutoTunerOrchestrator {
         String signatureForCatch = "unknown";
 
         try {
-            // ✅ Нормализованный запрос
             TuningRequest normalized = TuningRequest.builder()
                     .chatId(chatId)
                     .strategyType(type)
@@ -111,16 +90,25 @@ public class AutoTunerOrchestrator {
             String signature = signatureOf(normalized);
             signatureForCatch = signature;
 
-            // ==========================
-            // ✅ Cooldown по signature (строгий, но НЕ блокируем ERROR/NO_TRADES)
-            // ==========================
             LastRun last = lastRunByKey.get(key);
             long now = System.currentTimeMillis();
 
             boolean adaptiveReason = isAdaptiveReason(normalized.reason());
+            if (adaptiveReason && isNonTunableAdaptiveReason(normalized.reason())) {
+                log.info("🧠 TUNE SKIP (non-tunable reason) chatId={} type={} ex={} net={} reason={}",
+                        chatId, type, env.exchange, env.network, safe(normalized.reason()));
+                lastRunByKey.put(key, new LastRun(signature, now, last != null ? last.modelVersion() : null, TuneOutcome.NO_IMPROVEMENT));
+                return TuningResult.builder()
+                        .applied(false)
+                        .reason("Тюнинг пропущен: причина не относится к настройке фильтров")
+                        .modelVersion(last != null ? last.modelVersion() : null)
+                        .build();
+            }
             boolean sameSignature = (last != null && signature.equals(last.signature()));
             boolean withinCooldown = (last != null && (now - last.atMs()) < COOLDOWN_MS);
-            boolean cooldownApplies = (last != null && (last.outcome() == TuneOutcome.APPLIED || (last.outcome() == TuneOutcome.NO_IMPROVEMENT && !adaptiveReason)));
+            boolean cooldownApplies = (last != null
+                    && (last.outcome() == TuneOutcome.APPLIED
+                    || (last.outcome() == TuneOutcome.NO_IMPROVEMENT && !adaptiveReason)));
 
             if (sameSignature && withinCooldown && cooldownApplies) {
                 log.info("🧠 TUNE SKIP (cooldown) chatId={} type={} ex={} net={} signature={} ageMs={} lastOutcome={}",
@@ -141,7 +129,6 @@ public class AutoTunerOrchestrator {
                     safe(normalized.reason())
             );
 
-            // фиксируем RUNNING сразу (анти-спам от автосейва/триггеров)
             lastRunByKey.put(key, new LastRun(signature, now, null, TuneOutcome.RUNNING));
 
             TuningResult res = tuner.tune(normalized);
@@ -151,20 +138,14 @@ public class AutoTunerOrchestrator {
             }
 
             long tookMs = System.currentTimeMillis() - startedAtMs;
+            boolean mlVetoAdaptiveReason = isMlVetoAdaptiveReason(normalized.reason());
 
-            // ==========================
-            // ✅ NO_TRADES: даём тюнеру разжать фильтры,
-            // и НЕ блокируем следующий прогон cooldown-ом.
-            // ==========================
             if (isNoTrades(res)) {
-                // Для стартового/обычного live-запуска coarse-adjust опасен:
-                // стратегия уже прошла prepare/validate, а этот прогон лишь диагностический.
-                // Разжимать фильтры можно только по адаптивным триггерам.
-                if (adaptiveReason) {
+                if (adaptiveReason && !mlVetoAdaptiveReason) {
                     tryAdjustCoarseFilters(tuner, normalized);
-                } else if (log.isDebugEnabled()) {
-                    log.debug("🧠 NO_TRADES without adaptive reason -> coarse-adjust skipped chatId={} type={} ex={} net={} reason={}",
-                            chatId, type, env.exchange, env.network, safe(normalized.reason()));
+                } else if (adaptiveReason) {
+                    log.info("🧠 NO_TRADES при причине {} → coarse filters не трогаю, потому что корень проблемы в ML gate",
+                            safe(normalized.reason()));
                 }
 
                 log.info("✅ TUNE DONE outcome=NO_TRADES applied=false scoreBefore={} scoreAfter={} model={} tookMs={} reason={}",
@@ -176,7 +157,7 @@ public class AutoTunerOrchestrator {
                 );
 
                 lastRunByKey.put(key, new LastRun(signature, System.currentTimeMillis(), safe(res.modelVersion()), TuneOutcome.NO_TRADES));
-                return res; // ✅ возвращаем оригинальный res
+                return res;
             }
 
             log.info("✅ TUNE DONE applied={} scoreBefore={} scoreAfter={} model={} tookMs={} reason={}",
@@ -188,7 +169,10 @@ public class AutoTunerOrchestrator {
                     safe(res.reason())
             );
 
-            if (!res.applied() && adaptiveReason && shouldForceRelaxAfterNoImprovement(res)) {
+            if (!res.applied()
+                    && adaptiveReason
+                    && shouldForceRelaxAfterNoImprovement(res)
+                    && !mlVetoAdaptiveReason) {
                 tryAdjustCoarseFilters(tuner, normalized);
             }
 
@@ -214,10 +198,6 @@ public class AutoTunerOrchestrator {
             inFlight.remove(key);
         }
     }
-
-    // =========================================================
-    // env resolve (NO DEFAULTS)
-    // =========================================================
 
     private record ResolvedEnv(boolean ok, String exchange, NetworkType network, String failReason) {}
 
@@ -245,14 +225,9 @@ public class AutoTunerOrchestrator {
         return new ResolvedEnv(true, ex, net, null);
     }
 
-    // =========================================================
-    // helpers
-    // =========================================================
-
     private static TuningResult reject(String reason) {
         return TuningResult.builder().applied(false).reason(reason).build();
     }
-
 
     private static boolean isAdaptiveReason(String reason) {
         String normalized = safe(reason).toLowerCase(Locale.ROOT);
@@ -260,6 +235,22 @@ public class AutoTunerOrchestrator {
                 || normalized.startsWith("regime_shift:")
                 || normalized.startsWith("loss_recovery:")
                 || normalized.startsWith("profit_expand:");
+    }
+
+    private static boolean isNonTunableAdaptiveReason(String reason) {
+        String normalized = safe(reason).toLowerCase(Locale.ROOT);
+        return normalized.startsWith("starvation:decision_blocked")
+                || normalized.startsWith("starvation:entry_blocked")
+                || normalized.contains("tp_too_small_for_fees")
+                || normalized.contains("min_notional")
+                || normalized.contains("wallet_base_untracked_position")
+                || normalized.contains("balance");
+    }
+
+    private static boolean isMlVetoAdaptiveReason(String reason) {
+        String normalized = safe(reason).toLowerCase(Locale.ROOT);
+        return normalized.startsWith("starvation:ml_veto")
+                || normalized.contains("ml_veto");
     }
 
     private static boolean shouldForceRelaxAfterNoImprovement(TuningResult res) {
@@ -320,7 +311,6 @@ public class AutoTunerOrchestrator {
                 return (sb <= -1.0 && sa <= -1.0);
             }
         } catch (Exception ignore) {
-            // ignore
         }
 
         return false;
@@ -334,9 +324,7 @@ public class AutoTunerOrchestrator {
                 Object v = m.invoke(res);
                 if (v instanceof Number num) return num.intValue();
             } catch (NoSuchMethodException ignore) {
-                // ignore
             } catch (Exception ignore) {
-                // ignore
             }
         }
         return null;
@@ -347,12 +335,6 @@ public class AutoTunerOrchestrator {
         return null;
     }
 
-    /**
-     * ✅ После NO_TRADES даём тюнеру шанс "разжать" грубые фильтры.
-     * Опционально, через reflection:
-     * - adjustCoarseFilters(TuningRequest)
-     * - onNoTrades(TuningRequest)
-     */
     private static void tryAdjustCoarseFilters(StrategyAutoTuner tuner, TuningRequest req) {
         if (tuner == null || req == null) return;
 
@@ -413,8 +395,3 @@ public class AutoTunerOrchestrator {
             TuneOutcome outcome
     ) {}
 }
-
-
-
-
-

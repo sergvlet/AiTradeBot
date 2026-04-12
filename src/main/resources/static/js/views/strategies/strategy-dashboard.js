@@ -873,7 +873,8 @@ document.addEventListener("DOMContentLoaded", () => {
     connectWs(false);
 
     // Фоновый polling контекста убран.
-    // Дашборд синхронизируется по focus/visibility и после загрузки snapshot.
+    // Дашборд синхронизируется после загрузки snapshot, а также по focus/visibility.
+
     window.addEventListener("focus", () => {
         syncDashboardContext(true).catch(() => {});
     });
@@ -900,7 +901,6 @@ document.addEventListener("DOMContentLoaded", () => {
     chartCtrl.adjustBarSpacing();
     console.log("📊 Strategy Dashboard INITIALIZED");
 });
-
 
 
 

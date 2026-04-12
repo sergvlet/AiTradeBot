@@ -429,6 +429,112 @@
             if (typeof v === "object" && v.name) return String(v.name);
             return String(v);
         }
+        function normTf(v) {
+            if (v === null || v === undefined) return "";
+            const raw = String(v).trim();
+            if (!raw) return "";
+
+            if (raw === "M" || raw === "1M") return "1mo";
+            if (raw === "W" || raw === "1W") return "1w";
+            if (raw === "D" || raw === "1D") return "1d";
+            if (raw === "3D") return "3d";
+
+            const lower = raw.toLowerCase();
+            switch (lower) {
+                case "1":
+                case "1m":
+                    return "1m";
+                case "3":
+                case "3m":
+                    return "3m";
+                case "5":
+                case "5m":
+                    return "5m";
+                case "15":
+                case "15m":
+                    return "15m";
+                case "30":
+                case "30m":
+                    return "30m";
+                case "60":
+                case "1h":
+                    return "1h";
+                case "120":
+                case "2h":
+                    return "2h";
+                case "240":
+                case "4h":
+                    return "4h";
+                case "360":
+                case "6h":
+                    return "6h";
+                case "480":
+                case "8h":
+                    return "8h";
+                case "720":
+                case "12h":
+                    return "12h";
+                case "d":
+                case "1d":
+                    return "1d";
+                case "3d":
+                    return "3d";
+                case "w":
+                case "1w":
+                    return "1w";
+                case "1mo":
+                case "1mon":
+                case "1month":
+                    return "1mo";
+                default:
+                    return lower;
+            }
+        }
+
+        function syncTimeframeOptions(state) {
+            const select = byId("tradeTimeframeSelect");
+            const readonly = byId("tradeTimeframeReadonly");
+            if (!select) return;
+
+            const list = Array.isArray(state?.availableTimeframes)
+                ? state.availableTimeframes.map(normTf).filter(Boolean)
+                : [];
+
+            const desired = normTf(state?.timeframe || select.value);
+            const nextValue = list.includes(desired)
+                ? desired
+                : (list[0] || desired || "");
+
+            const currentOptions = Array.from(select.options || []).map(o => normTf(o.value));
+            const sameOptions =
+                currentOptions.length === list.length &&
+                currentOptions.every((value, index) => value === list[index]);
+
+            if (list.length && !sameOptions && document.activeElement !== select) {
+                select.innerHTML = "";
+                list.forEach(tf => {
+                    const option = document.createElement("option");
+                    option.value = tf;
+                    option.textContent = tf;
+                    select.appendChild(option);
+                });
+            }
+
+            if (nextValue && document.activeElement !== select) {
+                select.value = nextValue;
+            }
+
+            text(readonly, nextValue || "—");
+
+            const root = getRoot();
+            if (root && nextValue) {
+                root.setAttribute("data-timeframe", nextValue);
+            }
+
+            if (window.StrategySettingsContext) {
+                window.StrategySettingsContext.timeframe = nextValue || "";
+            }
+        }
 
         function applyStateToDom(state) {
             if (!state) return;
@@ -490,6 +596,8 @@
                 const hint = byId("assetInHint");
                 if (hint) hint.textContent = aa;
             }
+
+            syncTimeframeOptions(state);
         }
 
         const sub = (typeof Store.onChange === "function") ? Store.onChange : Store.subscribe;
